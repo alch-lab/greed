@@ -1,0 +1,16 @@
+[package]
+name = "execution"
+description = "Live execution: WS order placement, reconciliation, circuit breakers (Phase 4+)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+core = { workspace = true }
+strategy = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tokio = { workspace = true }

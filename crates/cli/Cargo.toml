@@ -1,0 +1,26 @@
+[package]
+name = "cli"
+description = "Command-line entry points: ingest / collect / backtest / validate"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "trader"
+path = "src/main.rs"
+
+[dependencies]
+core = { workspace = true }
+data = { workspace = true }
+signals = { workspace = true }
+strategy = { workspace = true }
+backtest = { workspace = true }
+execution = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+anyhow = { workspace = true }
+config = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+tokio = { workspace = true }

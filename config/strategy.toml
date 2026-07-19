@@ -1,0 +1,61 @@
+# 策略装配配置
+# 策略 = signals[] + filters[] + trigger + exits[] 的声明式组合。
+
+[strategy]
+signals = [
+    # "ObiZones",        # 色带 OBI（待采集数据）
+    "AggDeltaTier",       # 总Delta阈值档位
+    "OiQuadrant",         # OI 四象限
+    "LargeTradeFlow",     # AGGR 大单速率（力竭反转辅助）
+]
+filters = [
+    "TrendRegimeFilter",  # 单边禁反转
+    # "InZoneFilter",     # Phase 2：只在色带区内扣扳机
+    "SessionFilter",      # 时段过滤
+    "EventCalendarFilter",# 宏观事件窗口禁开仓
+    "CircuitBreaker",     # 日连损2次/回撤3% 熔断
+]
+trigger = "ExhaustionReversal"  # 力竭反转三条件
+exits = [
+    "BreakevenAt300",     # 离开300美元推保本
+    "TieredTakeProfit",   # TP1/TP2
+    "TimeStop",           # 时间止损
+]
+
+# ---- 信号参数（默认值，校准只做单调微调）----
+
+[strategy.plugins.AggDeltaTier]
+t1 = 1.0   # B USD
+t2 = 2.0
+t3 = 3.0
+t4 = 3.5
+window_hours = 24
+r_trend = 2.0
+
+[strategy.plugins.OiQuadrant]
+oi_reset_pct = 3.0       # 30m 内 OI 降幅阈值 → 当日观望
+
+[strategy.plugins.LargeTradeFlow]
+size_large_usd = 200_000
+window_secs = 10
+surge_mult = 5.0
+
+[strategy.plugins.ExhaustionReversal]
+# renko 砖参数（Exocharts Trend Reversal 200-124，BTC 永续调教值）
+tick_usd = 0.5
+t_ren_ticks = 200        # 同向 100 美元/砖
+r_ren_ticks = 124        # 反向 62 美元出反转砖
+# 三条件
+vol_mult_exh = 3.0       # 放量倍数（×时段系数）
+dur_max_ms = 30_000      # 快速上限（秒/砖）
+prog_ratio = 0.4         # 力竭不推进比
+delta_flip_pct = 8.0     # Delta 反转阈值
+trapped_min_btc = 50.0   # 针尖被套加分项（非必要）
+# 时段系数（周末/亚盘/美盘流动性差异，校准重点）
+session_scaler = { asia = 1.0, europe = 1.0, us = 0.8, weekend = 0.6 }
+
+[strategy.exits.BreakevenAt300]
+trigger_usd = 300        # 离开入场价 300 美元推保本（教程统计90%不亏）
+
+[strategy.exits.TieredTakeProfit]
+tp1_pct = 50             # TP1 平仓比例

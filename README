@@ -1,0 +1,24 @@
+
+## 插件化策略
+
+策略 = 插件的组合装配（见 `config/strategy.toml`）：
+
+- **Signal**（信号源）：ObiZones / AggDeltaTier / OiQuadrant / LargeTradeFlow
+- **Filter**（过滤）：TrendRegimeFilter / SessionFilter / EventCalendarFilter / CircuitBreaker / InZoneFilter
+- **Trigger**（扳机）：ExhaustionReversal / BlueBandMarket / GridCluster
+- **Exit**（出场）：BreakevenAt300 / TieredTakeProfit / DegradeOnPassive / TimeStop / ReverseOnSignal
+
+新增规则（如 Discord/kiyotaka 补充）= 实现对应 trait + 注册 + 改一行配置，
+可与现有基线做同数据、同风控的受控 A/B 对比。
+
+## 快速开始
+
+```bash
+cargo build --workspace
+cargo test  --workspace
+
+# 子命令（随 PR 逐步启用）
+cargo run -p cli -- help
+# cargo run -p cli -- ingest   --config config/base.toml   # PR-3
+# cargo run -p cli -- backtest --config config/base.toml   # PR-10
+# cargo run -p cli -- collect  --config config/base.toml   # PR-11（色带采集，常驻）

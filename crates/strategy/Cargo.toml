@@ -1,0 +1,13 @@
+[package]
+name = "strategy"
+description = "Strategy orchestration: plugin assembly, FSM, risk controls, position sizing"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+core = { workspace = true }
+signals = { workspace = true }
+serde = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }

@@ -1,0 +1,51 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/core",
+    "crates/data",
+    "crates/signals",
+    "crates/strategy",
+    "crates/backtest",
+    "crates/execution",
+    "crates/cli",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+repository = "https://example.com/trdr-quant"
+
+# 统一依赖版本，子 crate 用 { workspace = true } 引用
+[workspace.dependencies]
+# 内部 crate
+core      = { path = "crates/core" }
+data      = { path = "crates/data" }
+signals   = { path = "crates/signals" }
+strategy  = { path = "crates/strategy" }
+backtest  = { path = "crates/backtest" }
+execution = { path = "crates/execution" }
+
+# 异步运行时（PR-11 采集器 / 实盘启用）
+tokio = { version = "1", features = ["full"] }
+
+# 序列化
+serde      = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# 配置与错误处理
+config    = { version = "0.14", default-features = false, features = ["toml"] }
+thiserror = "1"
+anyhow    = "1"
+
+# 日志
+tracing            = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# 测试
+proptest = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

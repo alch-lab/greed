@@ -1,0 +1,13 @@
+[package]
+name = "core"
+description = "Domain models, event bus, and plugin contracts shared by all crates"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }

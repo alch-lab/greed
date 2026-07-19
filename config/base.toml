@@ -1,0 +1,18 @@
+[general]
+symbol = "BTCUSDT"
+lake_dir = "data/lake"
+log_level = "info"
+
+# 采集
+[collector]
+exchanges = ["binance_futures", "bybit", "okx"]
+book_snapshot_ms = 5000
+oi_tick_ms = 60000
+# 订单簿只保留距中间价 ±6% 内的档位（覆盖最远 5% 色带区间 + 余量）
+book_depth_band_pct = 6.0
+
+# 回测
+[backtest]
+taker_fee_bps = 4.0
+maker_fee_bps = 2.0
+slippage_bps = 1.0
