@@ -30,7 +30,7 @@ pub enum Verdict {
     Veto(&'static str),
 }
 
-//// 插件共享只读上下文
+/// 插件共享只读上下文
 #[derive(Debug, Default)]
 pub struct Ctx {
     pub placeholder: (),
