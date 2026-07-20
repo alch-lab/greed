@@ -6,10 +6,16 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
-core = { workspace = true }
+tcore = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 anyhow = { workspace = true }
 tracing = { workspace = true }
 tokio = { workspace = true }
+csv = { workspace = true }
+reqwest = { workspace = true }
+parquet2 = { workspace = true }
+zip = { workspace = true }
+chrono = { workspace = true }
+bytes = { workspace = true }

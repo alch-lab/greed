@@ -19,7 +19,7 @@ repository = "https://example.com/trdr-quant"
 # 统一依赖版本，子 crate 用 { workspace = true } 引用
 [workspace.dependencies]
 # 内部 crate
-core      = { path = "crates/core" }
+tcore     = { path = "crates/core", package = "core" }
 data      = { path = "crates/data" }
 signals   = { path = "crates/signals" }
 strategy  = { path = "crates/strategy" }
@@ -41,6 +41,17 @@ anyhow    = "1"
 # 日志
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# 数据层
+csv      = "1"
+reqwest  = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
+parquet2 = "0.17"
+zip      = { version = "2", default-features = false, features = ["deflate"] }
+chrono   = { version = "0.4", default-features = false, features = ["std", "clock"] }
+bytes    = "1"
+
+# CLI（ingest）
+clap = { version = "4", features = ["derive"] }
 
 # 测试
 proptest = "1"

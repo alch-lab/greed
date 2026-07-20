@@ -1,4 +1,4 @@
-//! 基础值类型
+//! 领域基础类型
 //!
 //! 核心约定：
 //! - **价格与数量用定点 `i64`**，杜绝浮点误差（回测与实盘数值一致性的根基）。
@@ -16,25 +16,24 @@ use std::fmt;
 ///
 /// 内部存 `i64`，表示 `value × 1e-8` 美元。
 /// 例：`Price::from_f64(67000.5)` 内部为 `6_700_050_000_000`。
-/// 交易对，如 BTCUSDT。
 pub const PRICE_SCALE: i64 = 100_000_000; // 1e8
 
 /// 数量定点：1 单位 = 1e-8（币 / 合约张数），与价格同精度便于相乘。
 pub const QTY_SCALE: i64 = 100_000_000; // 1e8
 
-/// 定点价格
+/// 定点价格。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Price(i64);
 
 impl Price {
     pub const ZERO: Price = Price(0);
 
-    /// 从原始定点整数构造(value 已是 x1e8 后的小数)
+    /// 从原始定点整数构造（value 已是 ×1e8 后的小数）。
     pub const fn from_raw(raw: i64) -> Self {
         Price(raw)
     }
 
-    /// 从浮点数构造(仅用于配置/测试边界；生产路径尽量使用 from_raw / from_ticks)
+    /// 从浮点构造（仅用于配置/测试边界；生产路径尽量用 from_raw / from_ticks）。
     pub fn from_f64(v: f64) -> Self {
         Price((v * PRICE_SCALE as f64).round() as i64)
     }
@@ -44,7 +43,7 @@ impl Price {
         Price::from_f64(ticks as f64 * tick_size)
     }
 
-    /// 原始定点值(x1e8)
+    /// 原始定点值（×1e8）。
     pub const fn raw(self) -> i64 {
         self.0
     }
@@ -76,8 +75,8 @@ impl fmt::Display for Price {
     }
 }
 
-/// 定点数量(币数或张数)
-#[derive(Debug, Clone, Copy, PartialEq, PartialOrd, Serialize, Deserialize)]
+/// 定点数量（币数或张数）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 pub struct Qty(i64);
 
 impl Qty {
@@ -86,15 +85,12 @@ impl Qty {
     pub const fn from_raw(raw: i64) -> Self {
         Qty(raw)
     }
-
-    pub const fn from_f64(v: f64) -> Self {
+    pub fn from_f64(v: f64) -> Self {
         Qty((v * QTY_SCALE as f64).round() as i64)
     }
-
     pub const fn raw(self) -> i64 {
         self.0
     }
-
     pub fn to_f64(self) -> f64 {
         self.0 as f64 / QTY_SCALE as f64
     }
@@ -107,7 +103,7 @@ impl fmt::Display for Qty {
 }
 
 /// 名义价值（USD）= Price × Qty。
-/// 结果用 f64 表示美元（名义值只做量级判断，不参与累加守恒，故允许浮点）
+/// 结果用 f64 表示美元（名义值只做量级判断，不参与累加守恒，故允许浮点）。
 pub fn notional_usd(price: Price, qty: Qty) -> f64 {
     price.to_f64() * qty.to_f64()
 }
@@ -116,7 +112,7 @@ pub fn notional_usd(price: Price, qty: Qty) -> f64 {
 // 交易标识与时间
 // ============================================================================
 
-/// 交易对，如 BTCUSDT
+/// 交易对，如 BTCUSDT。
 #[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct Symbol(String);
 
@@ -135,28 +131,31 @@ impl fmt::Display for Symbol {
     }
 }
 
-/// UTC 毫秒时间戳
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// UTC 毫秒时间戳。
+#[derive(
+    Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize, Default,
+)]
 pub struct Timestamp(i64);
 
 impl Timestamp {
     pub const ZERO: Timestamp = Timestamp(0);
 
-    pub fn from_millis(ms: i64) -> Self {
+    pub const fn from_millis(ms: i64) -> Self {
         Self(ms)
     }
-    pub fn as_millis(self) -> i64 {
+    pub const fn as_millis(self) -> i64 {
         self.0
     }
-    /// 距另一时间戳的毫秒差(self - other,可为负)
+    /// 距另一时间戳的毫秒差（self - other，可为负）。
     pub fn diff_ms(self, other: Timestamp) -> i64 {
         self.0 - other.0
     }
-    /// 增加毫秒
+    /// 增加毫秒。
     pub fn add_ms(self, ms: i64) -> Timestamp {
         Timestamp(self.0 + ms)
     }
 }
+
 impl fmt::Display for Timestamp {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         // 简单可读格式：秒级时间戳（报告层再做时区格式化）
@@ -164,39 +163,53 @@ impl fmt::Display for Timestamp {
     }
 }
 
-/// 交易所来源
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+/// 交易所来源。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Exchange {
-    Binance,
-    ByBit,
+    BinanceSpot,
+    BinanceFutures,
+    Bybit,
     Okx,
 }
 
 impl Exchange {
     pub fn as_str(self) -> &'static str {
         match self {
-            Exchange::Binance => "binance",
-            Exchange::ByBit => "bybit",
+            Exchange::BinanceSpot => "binance_spot",
+            Exchange::BinanceFutures => "binance_futures",
+            Exchange::Bybit => "bybit",
             Exchange::Okx => "okx",
         }
     }
+
+    /// 从字符串解析（与 [`Self::as_str`] 互逆）；未知名称返回 None。
+    pub fn parse(s: &str) -> Option<Self> {
+        match s {
+            "binance_spot" => Some(Exchange::BinanceSpot),
+            "binance_futures" => Some(Exchange::BinanceFutures),
+            "bybit" => Some(Exchange::Bybit),
+            "okx" => Some(Exchange::Okx),
+            _ => None,
+        }
+    }
 }
-/// 买卖方向
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+
+/// 买卖方向。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub enum Side {
     Buy,
     Sell,
 }
 
 impl Side {
-    /// 反方向
+    /// 反方向。
     pub fn opposite(self) -> Side {
         match self {
-            Side::Buy => Self::Sell,
-            Side::Sell => Self::Buy,
+            Side::Buy => Side::Sell,
+            Side::Sell => Side::Buy,
         }
     }
-    /// 用于带符号计算：Buy=+1，Sell=-1
+    /// 用于带符号计算：Buy=+1, Sell=-1。
     pub fn sign(self) -> i64 {
         match self {
             Side::Buy => 1,

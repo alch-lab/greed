@@ -186,7 +186,7 @@ mod tests {
     fn trade(price: f64, qty: f64, is_buyer_maker: bool) -> Trade {
         Trade {
             ts: ts(1000),
-            exchange: Exchange::Binance,
+            exchange: Exchange::BinanceFutures,
             symbol: sym(),
             price: Price::from_f64(price),
             qty: Qty::from_f64(qty),
@@ -215,7 +215,7 @@ mod tests {
         // 中间价 100；bid 99.9/99.5/99.0，ask 100.1/100.5/101.0
         BookSnapshot {
             ts: ts(1000),
-            exchange: Exchange::Binance,
+            exchange: Exchange::BinanceFutures,
             symbol: sym(),
             bids: vec![
                 (Price::from_f64(99.9), Qty::from_f64(1.0)),

@@ -1,63 +1,51 @@
-//! trader 命令行入口（PR-1：子命令骨架 + 配置加载 + 日志初始化）。
+//! trader 命令行入口。
 //!
-//! 后续 PR 逐步接入实现：
-//! - `ingest`   → PR-3  （历史数据导入）
-//! - `collect`  → PR-11 （实时采集 daemon）
-//! - `backtest` → PR-10 （端到端回测）
+//! 已接入：
+//! - `ingest`   → Binance aggTrades 历史数据导入数据湖
+//!
+//! 待接入：
+//! - `collect`  → 实时采集 daemon
+//! - `backtest` → 端到端回测
 
 use anyhow::{Context, Result};
+use clap::{Parser, Subcommand};
+use data::{ingest_day, Lake, Market};
+use tracing::{error, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
-#[derive(Debug)]
+#[derive(Parser, Debug)]
+#[command(name = "trader", version, about = "TRDR 订单流量化系统", long_about = None)]
 struct Cli {
+    #[command(subcommand)]
     command: Command,
-    config_path: String,
 }
 
-#[derive(Debug)]
+#[derive(Subcommand, Debug)]
 enum Command {
-    Ingest,
+    /// 导入 Binance 历史 aggTrades 到本地数据湖
+    Ingest {
+        /// 交易对，如 BTCUSDT
+        #[arg(long, default_value = "BTCUSDT")]
+        symbol: String,
+        /// 市场：perp（USDT永续）或 spot
+        #[arg(long, default_value = "perp")]
+        market: String,
+        /// 起始日期 yyyy-mm-dd（含）
+        #[arg(long)]
+        from: String,
+        /// 结束日期 yyyy-mm-dd（含）
+        #[arg(long)]
+        to: String,
+        /// 数据湖目录
+        #[arg(long, default_value = "data/lake")]
+        lake: String,
+    },
+    /// 启动三所实时采集 daemon（PR-11）
     Collect,
+    /// 运行回测（PR-10）
     Backtest,
+    /// 校验配置与数据（PR-10）
     Validate,
-    Help,
-}
-
-fn parse_args() -> Cli {
-    let mut args = std::env::args().skip(1);
-    let command = match args.next().as_deref() {
-        Some("ingest") => Command::Ingest,
-        Some("collect") => Command::Collect,
-        Some("backtest") => Command::Backtest,
-        Some("validate") => Command::Validate,
-        _ => Command::Help,
-    };
-    let mut config_path = "config/base.toml".to_string();
-    while let Some(a) = args.next() {
-        if a == "--config" {
-            if let Some(p) = args.next() {
-                config_path = p;
-            }
-        }
-    }
-    Cli {
-        command,
-        config_path,
-    }
-}
-
-fn print_help() {
-    println!(
-        "trader — TRDR 订单流量化系统\n\
-         \n\
-         用法: trader <命令> [--config <路径>]\n\
-         \n\
-         命令:\n\
-         \x20 ingest     导入 Binance 历史数据到本地数据湖      (PR-3)\n\
-         \x20 collect    启动三所实时采集 daemon               (PR-11)\n\
-         \x20 backtest   运行回测并输出绩效报告               (PR-10)\n\
-         \x20 validate   校验配置与数据完整性                (PR-10)\n"
-    );
 }
 
 fn init_tracing() {
@@ -65,27 +53,96 @@ fn init_tracing() {
     fmt().with_env_filter(filter).with_target(false).init();
 }
 
-fn main() -> Result<()> {
+/// 生成 [from, to] 闭区间的日期序列（yyyy-mm-dd），要求 from <= to。
+fn date_range(from: &str, to: &str) -> Result<Vec<String>> {
+    let parse = |s: &str| -> Result<chrono::NaiveDate> {
+        chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+            .with_context(|| format!("日期格式错误（应 yyyy-mm-dd）: {}", s))
+    };
+    let start = parse(from)?;
+    let end = parse(to)?;
+    if start > end {
+        anyhow::bail!("起始日期晚于结束日期: {} > {}", from, to);
+    }
+    let mut out = Vec::new();
+    let mut d = start;
+    while d <= end {
+        out.push(d.format("%Y-%m-%d").to_string());
+        d += chrono::Duration::days(1);
+    }
+    Ok(out)
+}
+
+#[tokio::main]
+async fn main() -> Result<()> {
     init_tracing();
-    let cli = parse_args();
+    let cli = Cli::parse();
 
     match cli.command {
-        Command::Help => {
-            print_help();
+        Command::Ingest {
+            symbol,
+            market,
+            from,
+            to,
+            lake,
+        } => {
+            let market = match market.as_str() {
+                "perp" | "um" | "futures" => Market::UsdtPerp,
+                "spot" => Market::Spot,
+                other => anyhow::bail!("未知市场: {}（用 perp 或 spot）", other),
+            };
+            let lake = Lake::new(&lake);
+            let dates = date_range(&from, &to)?;
+            let client = reqwest::Client::builder()
+                .user_agent("trader-ingest/0.1")
+                .build()?;
+
+            let mut total_rows = 0usize;
+            let mut total_bytes = 0usize;
+            let mut done = 0usize;
+            let mut skipped = 0usize;
+            for date in &dates {
+                match ingest_day(&client, &lake, market, &symbol, date).await {
+                    Ok(Some(s)) => {
+                        total_rows += s.rows;
+                        total_bytes += s.bytes;
+                        done += 1;
+                        info!(%date, rows = s.rows, "导入完成");
+                    }
+                    Ok(None) => {
+                        skipped += 1;
+                        info!(%date, "无数据，跳过");
+                    }
+                    Err(e) => {
+                        error!(%date, error = %e, "导入失败");
+                        anyhow::bail!("导入 {} 失败: {}", date, e);
+                    }
+                }
+            }
+            info!(
+                days = done,
+                skipped,
+                total_rows,
+                total_mb = total_bytes / 1_048_576,
+                "全部导入完成"
+            );
             Ok(())
         }
-        other => {
-            // 统一校验配置可读（后续 PR 换成强类型 Settings）
-            let raw = std::fs::read_to_string(&cli.config_path)
-                .with_context(|| format!("无法读取配置文件: {}", cli.config_path))?;
-            tracing::info!(config = %cli.config_path, bytes = raw.len(), "配置加载成功");
-            match other {
-                Command::Ingest => anyhow::bail!("ingest 未实现（PR-3）"),
-                Command::Collect => anyhow::bail!("collect 未实现（PR-11）"),
-                Command::Backtest => anyhow::bail!("backtest 未实现（PR-10）"),
-                Command::Validate => anyhow::bail!("validate 未实现（PR-10）"),
-                Command::Help => unreachable!(),
-            }
-        }
+        Command::Collect => anyhow::bail!("collect 未实现（PR-11）"),
+        Command::Backtest => anyhow::bail!("backtest 未实现（PR-10）"),
+        Command::Validate => anyhow::bail!("validate 未实现（PR-10）"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn date_range_inclusive() {
+        let r = date_range("2024-01-01", "2024-01-03").unwrap();
+        assert_eq!(r, vec!["2024-01-01", "2024-01-02", "2024-01-03"]);
+        assert_eq!(date_range("2024-01-01", "2024-01-01").unwrap().len(), 1);
+        assert!(date_range("2024-01-02", "2024-01-01").is_err());
     }
 }
