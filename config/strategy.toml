@@ -1,12 +1,12 @@
-# 策略装配配置
+# 策略装配配置（PR-4 起生效；对应规则书 §5 参数表）
 # 策略 = signals[] + filters[] + trigger + exits[] 的声明式组合。
 
 [strategy]
 signals = [
-    # "ObiZones",        # 色带 OBI（待采集数据）
-    "AggDeltaTier",       # 总Delta阈值档位
-    "OiQuadrant",         # OI 四象限
-    "LargeTradeFlow",     # AGGR 大单速率（力竭反转辅助）
+    # "ObiZones",        # Phase 2：色带 OBI（待采集数据）
+    "AggDeltaTier",       # PR-9：总Delta阈值档位
+    "OiQuadrant",         # PR-9：OI 四象限
+    "LargeTradeFlow",     # PR-8：AGGR 大单速率（力竭反转辅助）
 ]
 filters = [
     "TrendRegimeFilter",  # 单边禁反转
@@ -22,7 +22,7 @@ exits = [
     "TimeStop",           # 时间止损
 ]
 
-# ---- 信号参数（默认值，校准只做单调微调）----
+# ---- 信号参数（对应规则书 §5，默认值锚定教程，校准只做单调微调）----
 
 [strategy.plugins.AggDeltaTier]
 t1 = 1.0   # B USD
@@ -54,8 +54,8 @@ trapped_min_btc = 50.0   # 针尖被套加分项（非必要）
 # 时段系数（周末/亚盘/美盘流动性差异，校准重点）
 session_scaler = { asia = 1.0, europe = 1.0, us = 0.8, weekend = 0.6 }
 
-[strategy.exits.BreakevenAt300]
+[strategy.plugins.BreakevenAt300]
 trigger_usd = 300        # 离开入场价 300 美元推保本（教程统计90%不亏）
 
-[strategy.exits.TieredTakeProfit]
+[strategy.plugins.TieredTakeProfit]
 tp1_pct = 50             # TP1 平仓比例

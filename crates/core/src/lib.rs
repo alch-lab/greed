@@ -10,18 +10,28 @@ pub mod event;
 pub mod plugin;
 pub mod types;
 
-pub use clock::Clock;
-pub use event::Event;
-pub use types::{Exchange, Price, Qty, Side, Symbol, Timestamp, PRICE_SCALE, QTY_SCALE};
+pub use clock::{Clock, EventClock, SystemClock};
+pub use event::{BookSnapshot, Event, OiTick, Trade};
+pub use plugin::{
+    Ctx, ExitAction, ExitPlugin, FilterPlugin, OrderIntent, Position, Signal, SignalKind,
+    SignalPlugin, TriggerPlugin, Verdict,
+};
+pub use types::{
+    notional_usd, Exchange, Price, Qty, Side, Symbol, Timestamp, PRICE_SCALE, QTY_SCALE,
+};
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// 冒烟测试：核心类型可用、crate 可链接。
     #[test]
     fn core_smoke() {
         let s = Symbol::new("BTCUSDT");
         assert_eq!(s.as_str(), "BTCUSDT");
+        let p = Price::from_f64(67000.0);
+        let q = Qty::from_f64(0.5);
+        assert!(notional_usd(p, q) > 0.0);
         let t = Timestamp::from_millis(1_700_000_000_000);
         assert!(t.as_millis() > 0);
     }

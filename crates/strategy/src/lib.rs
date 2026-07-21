@@ -1,21 +1,29 @@
 //! strategy：策略编排。
 //!
-//! - `registry` / `assemble` → 插件注册表 + TOML 装配
-//! - `filters` / `triggers` / `exits` → 具体插件实现
-//! - `fsm` → Phase 3（策略状态机 FLAT/WATCHING/ENTERED_*/HALTED/DISABLED）
+//! 落地插件框架：
+//! - [`registry`]：插件注册表（名称 → 工厂）。
+//! - [`assemble`]：从 TOML 把插件装配成 [`assemble::Strategy`]。
+//! - [`builtin`]：内置插件注册入口（filters/exits/triggers）。
+//! - [`filters`] / [`exits`] / [`triggers`]：基础插件实现。
+//!
+//!  后续在 signals crate 实现信号插件后于此注册；Phase 3 实现 [`fsm`] 状态机。
 
 pub mod assemble;
+pub mod builtin;
 pub mod exits;
-pub mod filter;
+pub mod filters;
 pub mod fsm;
 pub mod registry;
 pub mod triggers;
+
+pub use assemble::{assemble, assemble_from_toml, Strategy};
+pub use builtin::builtin_registry;
+pub use registry::{PluginBuildError, PluginRegistry};
 
 #[cfg(test)]
 mod tests {
     #[test]
     fn strategy_smoke() {
-        // 冒烟测试：crate 可链接、模块可加载。
         assert_eq!(1 + 1, 2);
     }
 }
