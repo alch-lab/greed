@@ -10,6 +10,11 @@ pub mod engine;
 pub mod fees;
 pub mod report;
 
+pub use account::{Account, Fill, FillRequest, OpenPosition};
+pub use broker::{Broker, Execution, Order, OrderKind};
+pub use engine::{BacktestConfig, BacktestEngine, BacktestResult};
+pub use fees::FeeModel;
+
 #[cfg(test)]
 mod tests {
     #[test]
