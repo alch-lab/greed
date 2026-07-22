@@ -260,7 +260,7 @@ ratio < 1/r_trend    → TREND_UP（禁做空反转）
 ## 3.1 Workspace 结构
 
 ```
-trader/
+greed/
 ├── crates/
 │   ├── core/        领域模型 + 事件流 + 插件契约
 │   ├── data/        数据层：历史导入 + Parquet 数据湖 + 实时采集

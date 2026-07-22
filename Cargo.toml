@@ -46,14 +46,19 @@ tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 # 数据层
 csv      = "1"
 reqwest  = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
-parquet2 = "0.17"
+parquet2 = {version = "0.17", features = ["zstd"]}
 zip      = { version = "2", default-features = false, features = ["deflate"] }
 chrono   = { version = "0.4", default-features = false, features = ["std", "clock"] }
 bytes    = "1"
+bincode  = "1"
+crc32fast = "1"
 
 # CLI（ingest）
 clap = { version = "4", features = ["derive"] }
 
+# 实时采集
+tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"]}
+futures-util = { version = "0.3", default-features = false }
 # 测试
 proptest = "1"
 

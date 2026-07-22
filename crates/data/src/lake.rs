@@ -15,13 +15,14 @@ use parquet2::write::{
 };
 use std::fs::{self, File};
 use std::io::BufWriter;
+use std::matches;
 use std::path::{Path, PathBuf};
 use tcore::event::Trade;
 use tcore::types::{Exchange, Symbol, Timestamp};
 use thiserror::Error;
 
 use crate::normalize::NormalizedTrade;
-use crate::schema::{trade_schema, TradeColumns};
+use crate::schema::{book_schema, oi_schema, trade_schema, BookRow, OiRow, TradeColumns};
 
 #[derive(Debug, Error)]
 pub enum LakeError {
@@ -59,6 +60,22 @@ impl Lake {
     pub fn dir(&self, exchange: Exchange, symbol: &Symbol) -> PathBuf {
         self.root
             .join("trades")
+            .join(exchange.as_str())
+            .join(symbol.as_str())
+    }
+
+    /// 订单簿快照目录：`{root}/book/{exchange}/{symbol}/`
+    pub fn book_dir(&self, exchange: Exchange, symbol: &Symbol) -> PathBuf {
+        self.root
+            .join("book")
+            .join(exchange.as_str())
+            .join(symbol.as_str())
+    }
+
+    /// OI 目录：`{root}/oi/{exchange}/symbol}/`
+    pub fn oi_dir(&self, exchange: Exchange, symbol: &Symbol) -> PathBuf {
+        self.root
+            .join("oi")
             .join(exchange.as_str())
             .join(symbol.as_str())
     }
@@ -224,10 +241,112 @@ pub fn write_shard(
     let row_group = DynIter::new(column_iters.into_iter());
 
     let file = BufWriter::new(File::create(path)?);
-    let mut writer = FileWriter::new(file, schema, options, Some("trader-lake".into()));
+    let mut writer = FileWriter::new(file, schema, options, Some("greed-lake".into()));
     writer.write(row_group)?;
     writer.end(None)?;
     Ok(records.len())
+}
+
+// ============================================================================
+// book / oi 表写入
+// ============================================================================
+
+/// 通用列式写出：一组 DataPage 按 schema 写为单 row group 文件。
+fn write_columnar(
+    path: &Path,
+    schema: parquet2::metadata::SchemaDescriptor,
+    pages: Vec<Page>,
+    compression: CompressionOptions,
+) -> Result<(), LakeError> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let options = WriteOptions {
+        write_statistics: false,
+        version: Version::V2,
+    };
+    let make_col = |page: Page| {
+        DynStreamingIterator::new(Compressor::new_from_vec(
+            DynIter::new(std::iter::once(Ok::<Page, parquet2::error::Error>(page))),
+            compression,
+            vec![],
+        ))
+    };
+    let column_iters: Vec<_> = pages.into_iter().map(|p| Ok(make_col(p))).collect();
+    let row_group = DynIter::new(column_iters.into_iter());
+    let file = BufWriter::new(File::create(path)?);
+    let mut writer = FileWriter::new(file, schema, options, Some("greed-lake".into()));
+    writer.write(row_group)?;
+    writer.end(None)?;
+    Ok(())
+}
+
+/// 写入订单簿快照分片，返回行数。
+pub fn write_book_shard(
+    path: &Path,
+    rows: &[BookRow],
+    compression: CompressionOptions,
+) -> Result<usize, LakeError> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let options = WriteOptions {
+        write_statistics: false,
+        version: Version::V2,
+    };
+    let schema = book_schema();
+    let cols = schema.columns().to_vec();
+    let ts_ms: Vec<i64> = rows.iter().map(|r| r.ts_ms).collect();
+    let exchange: Vec<Vec<u8>> = rows
+        .iter()
+        .map(|r| r.exchange.clone().into_bytes())
+        .collect();
+    let symbol: Vec<Vec<u8>> = rows.iter().map(|r| r.symbol.clone().into_bytes()).collect();
+    let bids: Vec<Vec<u8>> = rows.iter().map(|r| r.bids_json.clone()).collect();
+    let asks: Vec<Vec<u8>> = rows.iter().map(|r| r.asks_json.clone()).collect();
+    let uid: Vec<i64> = rows.iter().map(|r| r.last_update_id).collect();
+    let pages = vec![
+        vec_to_page(&ts_ms, &options, &cols[0].descriptor)?,
+        binary_to_page(&exchange, &cols[1].descriptor)?,
+        binary_to_page(&symbol, &cols[2].descriptor)?,
+        binary_to_page(&bids, &cols[3].descriptor)?,
+        binary_to_page(&asks, &cols[4].descriptor)?,
+        vec_to_page(&uid, &options, &cols[5].descriptor)?,
+    ];
+    write_columnar(path, schema, pages, compression)?;
+    Ok(rows.len())
+}
+
+/// 写入 OI 分片，返回行数。
+pub fn write_oi_shard(
+    path: &Path,
+    rows: &[OiRow],
+    compression: CompressionOptions,
+) -> Result<usize, LakeError> {
+    if rows.is_empty() {
+        return Ok(0);
+    }
+    let options = WriteOptions {
+        write_statistics: false,
+        version: Version::V2,
+    };
+    let schema = oi_schema();
+    let cols = schema.columns().to_vec();
+    let ts_ms: Vec<i64> = rows.iter().map(|r| r.ts_ms).collect();
+    let exchange: Vec<Vec<u8>> = rows
+        .iter()
+        .map(|r| r.exchange.clone().into_bytes())
+        .collect();
+    let symbol: Vec<Vec<u8>> = rows.iter().map(|r| r.symbol.clone().into_bytes()).collect();
+    let oi: Vec<i64> = rows.iter().map(|r| r.oi_raw).collect();
+    let pages = vec![
+        vec_to_page(&ts_ms, &options, &cols[0].descriptor)?,
+        binary_to_page(&exchange, &cols[1].descriptor)?,
+        binary_to_page(&symbol, &cols[2].descriptor)?,
+        vec_to_page(&oi, &options, &cols[3].descriptor)?,
+    ];
+    write_columnar(path, schema, pages, compression)?;
+    Ok(rows.len())
 }
 
 // ============================================================================
@@ -324,21 +443,100 @@ pub fn read_range(
     }
     let mut entries: Vec<PathBuf> = fs::read_dir(&dir)?
         .filter_map(|e| e.ok().map(|e| e.path()))
-        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("parquet"))
+        .filter(|p| {
+            matches!(
+                p.extension().and_then(|s| s.to_str()),
+                Some("parquet") | Some("binlog")
+            )
+        })
         .collect();
     entries.sort();
 
     let mut trades: Vec<Trade> = Vec::new();
     for path in entries {
-        let cols = read_shard(&path)?;
-        for t in cols.into_trades().map_err(LakeError::Data)? {
-            if t.ts >= from && t.ts < to {
-                trades.push(t);
+        if path.extension().and_then(|s| s.to_str()) == Some("binlog") {
+            for row in crate::live::binlog::read_trade_log(&path)? {
+                let t = row.into_trade().map_err(LakeError::Data)?;
+                if t.ts >= from && t.ts < to {
+                    trades.push(t);
+                }
+            }
+        } else {
+            let cols = read_shard(&path)?;
+            for t in cols.into_trades().map_err(LakeError::Data)? {
+                if t.ts >= from && t.ts < to {
+                    trades.push(t);
+                }
             }
         }
     }
+
     trades.sort_by_key(|t| t.ts);
     Ok(trades)
+}
+
+/// 读取单个订单簿分片为行（book 行数少，直接行式返回）。
+pub fn read_book_shard(path: &Path) -> Result<Vec<BookRow>, LakeError> {
+    if path.extension().and_then(|s| s.to_str()) == Some("binlog") {
+        return crate::live::binlog::read_book_log(path);
+    }
+
+    let mut file = File::open(path)?;
+    let metadata = read_metadata(&mut file)?;
+    let schema = metadata.schema().clone();
+
+    let mut ts_ms: Vec<i64> = Vec::new();
+    let mut exchange: Vec<Vec<u8>> = Vec::new();
+    let mut symbol: Vec<Vec<u8>> = Vec::new();
+    let mut bids: Vec<Vec<u8>> = Vec::new();
+    let mut asks: Vec<Vec<u8>> = Vec::new();
+    let mut uid: Vec<i64> = Vec::new();
+
+    for (col_idx, field) in schema.fields().iter().enumerate() {
+        let name = field.name().to_string();
+        for row_group in metadata.row_groups.iter() {
+            let col_chunk = row_group
+                .columns()
+                .get(col_idx)
+                .ok_or_else(|| LakeError::Data(format!("缺列 {}", name)))?;
+            let pages = get_page_iterator(col_chunk, &mut file, None, vec![], usize::MAX)?;
+            let mut scratch = Vec::new();
+            for page in pages {
+                let compressed = page?;
+                let page = decompress(compressed, &mut scratch)?;
+                let data_page = match page {
+                    Page::Data(dp) => dp,
+                    Page::Dict(_) => continue,
+                };
+                let buffer = data_page.buffer();
+                match name.as_str() {
+                    "ts_ms" => push_i64(buffer, &mut ts_ms),
+                    "exchange" => push_binary(buffer, &mut exchange),
+                    "symbol" => push_binary(buffer, &mut symbol),
+                    "bids_json" => push_binary(buffer, &mut bids),
+                    "asks_json" => push_binary(buffer, &mut asks),
+                    "last_update_id" => push_i64(buffer, &mut uid),
+                    _ => {}
+                }
+            }
+        }
+    }
+
+    let n = ts_ms.len();
+    let mut out = Vec::with_capacity(n);
+    for i in 0..n {
+        out.push(BookRow {
+            ts_ms: ts_ms[i],
+            exchange: String::from_utf8(exchange[i].clone())
+                .map_err(|e| LakeError::Data(format!("exchange 非 UTF-8: {}", e)))?,
+            symbol: String::from_utf8(symbol[i].clone())
+                .map_err(|e| LakeError::Data(format!("symbol 非 UTF-8: {}", e)))?,
+            bids_json: bids[i].clone(),
+            asks_json: asks[i].clone(),
+            last_update_id: uid[i],
+        });
+    }
+    Ok(out)
 }
 
 #[cfg(test)]

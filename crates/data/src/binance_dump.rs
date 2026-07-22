@@ -6,15 +6,13 @@
 //!
 //! 本模块提供：单日下载（含 zip 解压）→ 解析 → 写数据湖分片的完整管线。
 
+use crate::lake::{Lake, LakeError};
+use crate::live::binlog::{append_trade_log, day_path};
+use crate::normalize::{parse_aggtrades_csv, NormalizeError};
 use std::io::Cursor;
-use std::path::Path;
 use tcore::types::{Exchange, Symbol};
 use thiserror::Error;
 use tracing::{info, warn};
-
-use crate::lake::{write_shard, Lake, LakeError};
-use crate::normalize::{parse_aggtrades_csv, NormalizeError};
-use parquet2::compression::CompressionOptions;
 
 #[derive(Debug, Error)]
 pub enum DumpError {
@@ -118,8 +116,9 @@ pub async fn ingest_day(
     )?;
     let rows = records.len();
 
-    let path = lake.shard_path(market.exchange(), &Symbol::new(symbol), date);
-    write_shard(Path::new(&path), &records, CompressionOptions::Snappy)?;
+    let path = day_path(lake.dir(market.exchange(), &Symbol::new(symbol)), date);
+    append_trade_log(&path, &records)?;
+
     info!(%date, rows, "已写入分片");
     Ok(Some(IngestStats {
         rows,

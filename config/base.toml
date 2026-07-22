@@ -1,18 +1,20 @@
-[general]
-symbol = "BTCUSDT"
-lake_dir = "data/lake"
-log_level = "info"
-
-# 采集
+# 采集: v1 只实现币安（合约+现货）；bybit/okx 后续适配时加入列表即可。
 [collector]
-exchanges = ["binance_futures", "bybit", "okx"]
+exchanges = ["binance_futures", "binance_spot"]
+symbol = "BTCUSDT"
+# 开关
+enable_trades = true        # 合约 aggTrade（WS + REST 回补）
+enable_spot_trades = true   # 现货 aggTrade（现货买盘）
+enable_book = true          # 合约订单簿快照（REST 轮询）
+enable_oi = true            # 合约 OI（REST 轮询）
+# 节奏
 book_snapshot_ms = 5000
 oi_tick_ms = 60000
 # 订单簿只保留距中间价 ±6% 内的档位（覆盖最远 5% 色带区间 + 余量）
 book_depth_band_pct = 6.0
-
-# 回测
-[backtest]
-taker_fee_bps = 4.0
-maker_fee_bps = 2.0
-slippage_bps = 1.0
+book_depth_limit = 1000
+# 落盘缓冲阈值（达到即写盘；跨天自动切分）
+trades_flush_rows = 500000
+book_flush_rows = 2000
+flush_tick_secs = 60
+max_buffer_secs = 300

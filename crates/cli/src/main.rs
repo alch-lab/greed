@@ -1,4 +1,4 @@
-//! trader 命令行入口。
+//! greed 命令行入口。
 //!
 //! 已接入：
 //! - `ingest`   → Binance aggTrades 历史数据导入数据湖
@@ -9,12 +9,13 @@
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use data::live::{run_collector, CollectorConfig};
 use data::{ingest_day, Lake, Market};
 use tracing::{error, info};
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Parser, Debug)]
-#[command(name = "trader", version, about = "TRDR 订单流量化系统", long_about = None)]
+#[command(name = "greed", version, about = "TRDR 订单流量化系统", long_about = None)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -40,8 +41,15 @@ enum Command {
         #[arg(long, default_value = "data/lake")]
         lake: String,
     },
-    /// 启动三所实时采集 daemon（PR-11）
-    Collect,
+    /// 启动实时采集 daemon（PR-11：trades + 订单簿快照 + OI → 数据湖）
+    Collect {
+        /// 配置文件路径（读 [collector] 节）
+        #[arg(long, default_value = "config/base.toml")]
+        config: String,
+        /// 试运行：只统计速率不落盘（验证连通性）
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// 运行回测（PR-10）
     Backtest,
     /// 校验配置与数据（PR-10）
@@ -94,7 +102,7 @@ async fn main() -> Result<()> {
             let lake = Lake::new(&lake);
             let dates = date_range(&from, &to)?;
             let client = reqwest::Client::builder()
-                .user_agent("trader-ingest/0.1")
+                .user_agent("greed-ingest/0.1")
                 .build()?;
 
             let mut total_rows = 0usize;
@@ -128,7 +136,15 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        Command::Collect => anyhow::bail!("collect 未实现（PR-11）"),
+        Command::Collect { config, dry_run } => {
+            let text = std::fs::read_to_string(&config)
+                .with_context(|| format!("读取配置失败: {}", config))?;
+            let cfg = CollectorConfig::from_toml_str(&text)
+                .with_context(|| format!("解析配置 [collector] 失败: {}", config))?;
+            info!(%config, dry_run, symbol = %cfg.symbol, lake = %cfg.lake_dir, "启动采集");
+            run_collector(cfg, dry_run).await?;
+            Ok(())
+        }
         Command::Backtest => anyhow::bail!("backtest 未实现（PR-10）"),
         Command::Validate => anyhow::bail!("validate 未实现（PR-10）"),
     }
