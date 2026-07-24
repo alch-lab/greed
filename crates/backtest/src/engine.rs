@@ -13,6 +13,7 @@
 use crate::account::{Account, Fill, FillRequest};
 use crate::broker::{Broker, Order, OrderKind};
 use crate::fees::FeeModel;
+use crate::report::EquityPoint;
 use strategy::Strategy;
 use tcore::plugin::{Ctx, ExitAction, OrderIntent, Signal, Verdict};
 use tcore::types::{Price, Qty, Symbol, Timestamp};
@@ -40,12 +41,14 @@ impl Default for BacktestConfig {
     }
 }
 
-/// 回测结果。
+/// 回测结果Ò
 #[derive(Debug)]
 pub struct BacktestResult {
     pub fills: Vec<Fill>,
     pub final_equity: f64,
     pub initial_cash: f64,
+    /// 权益曲线（按 UTC 日采集）
+    pub equity_curve: Vec<EquityPoint>,
 }
 
 /// 回测引擎。
@@ -58,6 +61,8 @@ pub struct BacktestEngine {
     symbol: Symbol,
     latest_price: Option<Price>,
     config: BacktestConfig,
+    equity_curve: Vec<EquityPoint>,
+    last_equity_day: i64,
 }
 
 impl BacktestEngine {
@@ -73,6 +78,8 @@ impl BacktestEngine {
             symbol,
             latest_price: None,
             config,
+            equity_curve: Vec::new(),
+            last_equity_day: i64::MIN,
         }
     }
 
@@ -90,6 +97,20 @@ impl BacktestEngine {
             fills: self.account.fills().to_vec(),
             final_equity: self.account.equity(final_px),
             initial_cash: self.config.initial_cash,
+            equity_curve: std::mem::take(&mut self.equity_curve),
+        }
+    }
+
+    /// 按 UTC 日采样权益
+    fn sample_equity(&mut self, ts: Timestamp) {
+        let day = ts.as_millis() / 86_400_000;
+        if day != self.last_equity_day {
+            self.last_equity_day = day;
+            let px = self.latest_price.unwrap_or(Price::ZERO);
+            self.equity_curve.push(EquityPoint {
+                ts_ms: ts.as_millis(),
+                equity: self.account.equity(px),
+            });
         }
     }
 
@@ -99,6 +120,7 @@ impl BacktestEngine {
         self.clock.advance_to(trade.ts);
         self.latest_price = Some(trade.price);
         self.update_env_flags(trade.ts, trade.price);
+        self.sample_equity(trade.ts);
 
         // 2) 撮合器挂单触发（止损/限价）
         let execs = self.broker.on_trade_price(trade.ts, trade.price);
@@ -195,9 +217,20 @@ impl BacktestEngine {
 
     /// 无持仓时尝试开仓。
     fn try_enter(&mut self, trade: &Trade, signals: &[Signal]) {
-        let Some(intent) = self.strategy.trigger.should_fire(signals, &self.ctx) else {
+        // 通用无状态扳机优先;力竭反转等有状态扳机走 on_signals 路径
+        let intent = self
+            .strategy
+            .trigger
+            .should_fire(signals, &self.ctx)
+            .or_else(|| {
+                self.strategy
+                    .trigger
+                    .on_signals(signals, &self.ctx, &self.symbol)
+            });
+        let Some(intent) = intent else {
             return;
         };
+
         // 过滤器裁决：任一 Veto 则放弃；Scale 取最小系数
         let mut scale = 1.0f64;
         for fp in self.strategy.filters.iter() {

@@ -178,6 +178,15 @@ pub trait TriggerPlugin: Send {
     fn name(&self) -> &'static str;
     /// 返回 `Some(intent)` 表示入场
     fn should_fire(&self, signals: &[Signal], ctx: &Ctx) -> Option<OrderIntent>;
+    /// 有状态扣机钩子
+    fn on_signals(
+        &mut self,
+        _signals: &[Signal],
+        _ctx: &Ctx,
+        _symbol: &Symbol,
+    ) -> Option<OrderIntent> {
+        None
+    }
 }
 
 /// 出场管理插件

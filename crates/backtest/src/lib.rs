@@ -9,11 +9,13 @@ pub mod broker;
 pub mod engine;
 pub mod fees;
 pub mod report;
+pub mod stats;
 
 pub use account::{Account, Fill, FillRequest, OpenPosition};
 pub use broker::{Broker, Execution, Order, OrderKind};
 pub use engine::{BacktestConfig, BacktestEngine, BacktestResult};
 pub use fees::FeeModel;
+pub use report::{build_report, pair_round_trips, to_json, to_markdown, EquityPoint, ReportConfig};
 
 #[cfg(test)]
 mod tests {

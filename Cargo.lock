@@ -138,6 +138,7 @@ dependencies = [
  "core",
  "data",
  "serde",
+ "serde_json",
  "signals",
  "strategy",
  "thiserror 1.0.69",

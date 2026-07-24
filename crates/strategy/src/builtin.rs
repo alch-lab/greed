@@ -31,7 +31,17 @@ pub fn register_builtin(r: &mut PluginRegistry) {
     r.register_trigger("NoopTrigger", triggers::build_noop);
     r.register_trigger("ExhaustionReversal", triggers::build_exhaustion);
 
-    // ---- 信号（PR-8/9 填充完整逻辑；此处注册占位骨架供装配）----
+    // ---- 信号 ----
+    r.register_signal("RenkoBricks", |p| {
+        let g = |k: &str, d: f64| p.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
+        let trend = g("t_ren_ticks", 200.0) * g("tick_usd", 0.5);
+        let reversal = g("r_run_ticks", 124.0) * g("tick_usd", 0.5);
+
+        Ok(Box::new(signals::renko::RenkoBricks::new(
+            signals::renko::RenkoConfig::trend_reversal_usd(trend, reversal),
+        )) as Box<dyn tcore::SignalPlugin>)
+    });
+
     r.register_signal("AggDeltaTier", |p| {
         Ok(Box::new(signals::agg_delta::AggDeltaTier::from_params(p))
             as Box<dyn tcore::SignalPlugin>)

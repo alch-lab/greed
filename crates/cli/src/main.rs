@@ -8,10 +8,15 @@
 //! - `backtest` → 端到端回测
 
 use anyhow::{Context, Result};
+use backtest::{
+    build_report, pair_round_trips, to_json, to_markdown, BacktestConfig, BacktestEngine,
+    ReportConfig,
+};
 use clap::{Parser, Subcommand};
 use data::live::{run_collector, CollectorConfig};
 use data::{ingest_day, Lake, Market};
 use signals::renko::{brick_stats, bricks_to_csv, stats_to_markdown, RenkoConfig, RenkoEngine};
+use strategy::{assemble_from_toml, builtin_registry};
 use tcore::types::{Exchange, Symbol, Timestamp};
 use tracing::{error, info};
 use tracing_subscriber::{fmt, EnvFilter};
@@ -53,7 +58,41 @@ enum Command {
         dry_run: bool,
     },
     /// 运行回测（PR-10）
-    Backtest,
+    Backtest {
+        /// 交易对，如 BTCUSDT
+        #[arg(long, default_value = "BTCUSDT")]
+        symbol: String,
+        /// 市场：perp（USDT永续）或 spot
+        #[arg(long, default_value = "perp")]
+        market: String,
+        /// 起始日期 yyyy-mm-dd（含）
+        #[arg(long)]
+        from: String,
+        /// 结束日期 yyyy-mm-dd（含）
+        #[arg(long)]
+        to: String,
+        /// 数据湖目录
+        #[arg(long, default_value = "data/lake")]
+        lake: String,
+        /// 策略 TOML 配置路径
+        #[arg(long)]
+        strategy: String,
+        /// 初始资金
+        #[arg(long, default_value_t = 100_000.0)]
+        cash: f64,
+        /// 风险分数
+        #[arg(long, default_value_t = 0.0075)]
+        risk_pct: f64,
+        /// 几何自然反转率
+        #[arg(long, default_value_t = 0.605)]
+        geo_baseline: f64,
+        /// 试验次数（DSR 用）
+        #[arg(long, default_value_t = 1)]
+        trials: usize,
+        /// 输出前缀
+        #[arg(long, default_value = "out/backtest")]
+        out: String,
+    },
     /// 校验配置与数据（PR-10）
     Validate,
 
@@ -247,7 +286,101 @@ async fn main() -> Result<()> {
             println!("{}", stats_to_markdown(&stats));
             Ok(())
         }
-        Command::Backtest => anyhow::bail!("backtest 未实现（PR-10）"),
+        Command::Backtest {
+            symbol,
+            market,
+            from,
+            to,
+            lake,
+            strategy,
+            cash,
+            risk_pct,
+            geo_baseline,
+            trials,
+            out,
+        } => {
+            let exchange = match market.as_str() {
+                "perp" | "um" | "futures" => Exchange::BinanceFutures,
+                "spot" => Exchange::BinanceSpot,
+                other => anyhow::bail!("未知市场: {}（用 perp 或 spot）", other),
+            };
+            let parse = |s: &str| -> Result<chrono::NaiveDate> {
+                chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
+                    .with_context(|| format!("日期格式错误（应 yyyy-mm-dd）: {}", s))
+            };
+            let from_ms = parse(&from)?
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis();
+            let to_ms = (parse(&to)? + chrono::Duration::days(1))
+                .and_hms_opt(0, 0, 0)
+                .unwrap()
+                .and_utc()
+                .timestamp_millis();
+
+            // 装配策略
+            let toml_str = std::fs::read_to_string(&strategy)
+                .with_context(|| format!("读策略配置失败: {}", strategy))?;
+            let strat = assemble_from_toml(&toml_str, &builtin_registry())
+                .map_err(|e| anyhow::anyhow!("装配策略失败: {}", e))?;
+            info!(%strategy, "{}", strat.describe());
+
+            // 读数据
+            let lake = Lake::new(&lake);
+            let sym = Symbol::new(&symbol);
+            info!(%symbol, %from, %to, "读取数据湖");
+            let trades = data::lake::read_range(
+                &lake,
+                exchange,
+                &sym,
+                Timestamp::from_millis(from_ms),
+                Timestamp::from_millis(to_ms),
+            )?;
+            info!(rows = trades.len(), "回放逐笔 → 回测引擎");
+
+            // 跑回测
+            let cfg = BacktestConfig {
+                initial_cash: cash,
+                risk_pct,
+                ..Default::default()
+            };
+            let mut engine = BacktestEngine::new(strat, sym.clone(), cfg);
+            let result = engine.run(&trades);
+            info!(
+                fills = result.fills.len(),
+                final_equity = result.final_equity,
+                "回测完成"
+            );
+
+            // PR-7 报告
+            let trips = pair_round_trips(&result.fills);
+            let rc = ReportConfig {
+                geometric_baseline: geo_baseline,
+                n_trials: trials,
+                risk_pct,
+                ..Default::default()
+            };
+            let report = build_report(&trips, &result.equity_curve, &rc, &[]);
+
+            if let Some(parent) = std::path::Path::new(&out).parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let md_path = format!("{}.md", out);
+            let json_path = format!("{}.json", out);
+            std::fs::write(&md_path, to_markdown(&report))?;
+            std::fs::write(&json_path, to_json(&report)?)?;
+
+            println!("{}", to_markdown(&report));
+            info!(
+                trips = trips.len(),
+                gate = %report.gate_verdict,
+                md = %md_path,
+                json = %json_path,
+                "报告已写出"
+            );
+            Ok(())
+        }
         Command::Validate => anyhow::bail!("validate 未实现（PR-10）"),
     }
 }
