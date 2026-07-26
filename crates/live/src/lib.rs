@@ -18,5 +18,6 @@ pub mod warmup;
 
 pub use broker::AnyBroker;
 pub use engine::{EngineSnapshot, LiveConfig, LiveEngine, PositionSnap};
+pub use feed::MAINNET_WS;
 pub use rest::{RestClient, SymbolFilters};
 pub use warmup::{warmup_engine, MAINNET_FAPI};

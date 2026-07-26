@@ -19,6 +19,11 @@ use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
 
+/// 主网公共行情 WS（无需密钥，只读）。
+/// paper/dry 模式的行情源：testnet 成交流稀疏、价格陈旧且偏离真实市场，
+/// 信号与回测（主网历史数据）保持同一价格环境；订单仍由 testnet 撮合。
+pub const MAINNET_WS: &str = "wss://fstream.binance.com";
+
 #[derive(Debug, Deserialize)]
 struct RawAggTrade {
     #[serde(rename = "p")]

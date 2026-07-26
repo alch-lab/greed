@@ -95,10 +95,16 @@ pub async fn run_trade(
         .map_err(|e| anyhow::anyhow!("装配策略失败: {}", e))?;
     info!(strategy = %args.strategy, mode = mode.as_str(), "{}", strat.describe());
 
+    // 行情与执行分离：paper/dry 的 K 线/信号用主网公共行情（testnet 成交流稀疏、
+    // 价格陈旧且偏离真实市场，与回测的主网历史数据也不一致）；订单仍由 testnet
+    // 撮合。Live 用主网（与配置一致）。--ws-base 可显式覆盖。
     let ws_base = args
         .ws_base
         .clone()
-        .unwrap_or_else(|| account.ws_base().to_string());
+        .unwrap_or_else(|| match mode {
+            TradeMode::Dry | TradeMode::Paper => live::MAINNET_WS.to_string(),
+            TradeMode::Live => account.ws_base().to_string(),
+        });
     let http = data::live::build_http_client(collector.effective_proxy().as_deref());
 
     // 经纪层：dry（模拟撮合）或 testnet/主网（真实下单）
@@ -106,7 +112,7 @@ pub async fn run_trade(
         info!(
             cash = args.cash,
             ws = %ws_base,
-            "dry-run：模拟撮合，不下真实订单（testnet 行情较稀疏，可加 --ws-base wss://fstream.binance.com 用主网行情）"
+            "dry-run：模拟撮合，不下真实订单"
         );
         (live::AnyBroker::dry(FeeModel::default()), args.cash, 1e-8, 0.0)
     } else {
@@ -146,6 +152,9 @@ pub async fn run_trade(
             mode = mode.as_str(),
             "账户就绪（空仓启动）"
         );
+        if mode == TradeMode::Paper {
+            info!(ws = %ws_base, "行情=主网公共 WS，执行=testnet（信号价格与回测同环境）");
+        }
         (
             live::AnyBroker::testnet(rest, &collector.symbol, filters),
             wallet,
@@ -174,12 +183,12 @@ pub async fn run_trade(
     let mut engine = live::LiveEngine::new(strat, broker, cfg, initial_cash, started_at);
     engine.persist_journal();
 
-    // 启动预热：历史 K 线重建信号状态（免去 ~20h 实时攒线），
-    // dry 用主网公共数据，paper/live 用对应环境端点。预热失败不阻塞启动（退化为实时攒线）。
-    let warmup_base = if mode == TradeMode::Dry {
-        live::MAINNET_FAPI
-    } else {
-        account.rest_base()
+    // 启动预热：历史 K 线重建信号状态（免去 ~20h 实时攒线）。
+    // 预热端点与行情源保持一致（paper/dry = 主网公共数据，live = 主网），
+    // 预热失败不阻塞启动（退化为实时攒线）。
+    let warmup_base = match mode {
+        TradeMode::Dry | TradeMode::Paper => live::MAINNET_FAPI,
+        TradeMode::Live => account.rest_base(),
     };
     match live::warmup_engine(&mut engine, &http, warmup_base, &collector.symbol).await {
         Ok(n) => info!(n, "预热完成，立即具备出信号能力"),
