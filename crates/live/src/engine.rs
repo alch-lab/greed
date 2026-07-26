@@ -137,9 +137,24 @@ impl LiveEngine {
         &self.account
     }
 
+    /// 预热专用：只推进时钟/价格并喂信号插件，**不做撮合/持仓管理/开仓评估**。
+    /// 用于启动时用历史 K 线合成逐笔重建信号状态（EMA/ATR/RSI），
+    /// 避免基于陈旧价格触发交易。
+    pub fn warmup_trade(&mut self, trade: &Trade) {
+        self.clock.advance_to(trade.ts);
+        self.latest_price = Some(trade.price);
+        self.update_env_flags(trade.ts, trade.price);
+        let ev = Event::Trade(trade.clone());
+        self.ctx.now = Some(trade.ts);
+        for sp in self.strategy.signals.iter_mut() {
+            for sig in sp.on_event(&ev, &self.ctx) {
+                self.ctx.set_latest(sig);
+            }
+        }
+    }
+
     /// 状态快照（控制面轮询用）。
-    pub fn snapshot(&self) -> EngineSnapshot {
-        let px = self.latest_price;
+    pub fn snapshot(&self) -> EngineSnapshot {        let px = self.latest_price;
         EngineSnapshot {
             last_price: px.map(|p| p.to_f64()),
             equity: self.account.equity(px.unwrap_or(Price::ZERO)),

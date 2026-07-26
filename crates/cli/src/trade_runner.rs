@@ -9,7 +9,7 @@ use data::live::config::AccountConfig;
 use data::live::CollectorConfig;
 use strategy::{assemble_from_toml, builtin_registry};
 use tcore::types::Exchange;
-use tracing::info;
+use tracing::{info, warn};
 
 /// 运行模式：干跑 / 模拟盘（testnet）/ 实盘（主网）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -172,6 +172,19 @@ pub async fn run_trade(
         std::fs::create_dir_all(parent)?;
     }
     let mut engine = live::LiveEngine::new(strat, broker, cfg, initial_cash, started_at);
+    engine.persist_journal();
+
+    // 启动预热：历史 K 线重建信号状态（免去 ~20h 实时攒线），
+    // dry 用主网公共数据，paper/live 用对应环境端点。预热失败不阻塞启动（退化为实时攒线）。
+    let warmup_base = if mode == TradeMode::Dry {
+        live::MAINNET_FAPI
+    } else {
+        account.rest_base()
+    };
+    match live::warmup_engine(&mut engine, &http, warmup_base, &collector.symbol).await {
+        Ok(n) => info!(n, "预热完成，立即具备出信号能力"),
+        Err(e) => warn!(error = %e, "预热失败，退化为实时攒线（出信号需等待 K 线积累）"),
+    }
     engine.persist_journal();
 
     // 行情 feed → 引擎；1s 节拍做成交轮询/采样/对账/状态上报

@@ -14,7 +14,9 @@ pub mod broker;
 pub mod engine;
 pub mod feed;
 pub mod rest;
+pub mod warmup;
 
 pub use broker::AnyBroker;
 pub use engine::{EngineSnapshot, LiveConfig, LiveEngine, PositionSnap};
 pub use rest::{RestClient, SymbolFilters};
+pub use warmup::{warmup_engine, MAINNET_FAPI};
