@@ -617,6 +617,7 @@ fn exec_backtest(
         intents: result.intents.clone(),
         fills: result.fills.clone(),
         equity_curve: result.equity_curve.clone(),
+        evals: Vec::new(),
     };
     std::fs::write(journal_path, serde_json::to_string_pretty(&j)?)?;
 

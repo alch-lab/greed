@@ -224,6 +224,7 @@ pub async fn run_trade(
                         "position": snap.position,
                         "n_intents": snap.n_intents,
                         "n_fills": snap.n_fills,
+                        "last_eval": snap.last_eval,
                     }));
                 }
             }

@@ -15,7 +15,7 @@
 
 use std::path::PathBuf;
 
-use backtest::{Account, EquityPoint, FillRequest, Journal, JournalIntent, JournalMeta};use strategy::Strategy;
+use backtest::{Account, EquityPoint, FillRequest, Journal, JournalEval, JournalIntent, JournalMeta};use strategy::Strategy;
 use tcore::plugin::{Ctx, ExitAction, OrderIntent, Signal, Verdict};
 use tcore::types::{Price, Qty, Symbol, Timestamp};
 use tcore::{Event, EventClock, Trade};
@@ -60,6 +60,8 @@ pub struct EngineSnapshot {
     pub position: Option<PositionSnap>,
     pub n_intents: usize,
     pub n_fills: usize,
+    /// 最近一次策略评估说明（信号插件 eval_note）
+    pub last_eval: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -85,6 +87,10 @@ pub struct LiveEngine {
     intents: Vec<JournalIntent>,
     equity_curve: Vec<EquityPoint>,
     last_equity_sample_ms: i64,
+    // ---- 策略评估流水（可观测性：为什么下单/不下单）----
+    evals: Vec<JournalEval>,
+    last_eval_keys: Vec<Option<(i64, String)>>,
+    latest_eval: Option<serde_json::Value>,
     // ---- 入场挂起 ----
     pending_entry: Option<PendingEntry>,
     // ---- 熔断状态（同回测）----
@@ -108,6 +114,7 @@ impl LiveEngine {
         started_at: String,
     ) -> Self {
         let symbol = Symbol::new(&config.symbol);
+        let n_signals = strategy.signals.len();
         LiveEngine {
             strategy,
             broker,
@@ -121,6 +128,9 @@ impl LiveEngine {
             intents: Vec::new(),
             equity_curve: Vec::new(),
             last_equity_sample_ms: 0,
+            evals: Vec::new(),
+            last_eval_keys: vec![None; n_signals],
+            latest_eval: None,
             pending_entry: None,
             cb_day: i64::MIN,
             cb_day_start_equity: 0.0,
@@ -151,6 +161,46 @@ impl LiveEngine {
                 self.ctx.set_latest(sig);
             }
         }
+        // 预热只刷新最新评估（不入流水，避免历史 K 线刷屏）
+        self.refresh_eval_notes(false);
+    }
+
+    /// 收集各信号插件的评估说明（eval_note）。
+    /// `append=true` 时把新评估追加进 journal 流水（封顶 300 条）；
+    /// `false`（预热）只更新最新快照与去重键。
+    fn refresh_eval_notes(&mut self, append: bool) {
+        for (i, sp) in self.strategy.signals.iter().enumerate() {
+            let Some(note) = sp.eval_note() else { continue };
+            let key = (
+                note.get("ts_ms").and_then(|v| v.as_i64()).unwrap_or(0),
+                note.get("decision")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+            );
+            let changed = match self.last_eval_keys.get(i) {
+                Some(Some(k)) => k != &key,
+                _ => true,
+            };
+            if !changed {
+                continue;
+            }
+            if let Some(slot) = self.last_eval_keys.get_mut(i) {
+                *slot = Some(key);
+            }
+            self.latest_eval = Some(note.clone());
+            if append {
+                self.evals.push(JournalEval {
+                    ts_ms: note.get("ts_ms").and_then(|v| v.as_i64()).unwrap_or(0),
+                    source: sp.name().to_string(),
+                    note,
+                });
+                if self.evals.len() > 300 {
+                    let excess = self.evals.len() - 300;
+                    self.evals.drain(0..excess);
+                }
+            }
+        }
     }
 
     /// 状态快照（控制面轮询用）。
@@ -168,6 +218,7 @@ impl LiveEngine {
             }),
             n_intents: self.intents.len(),
             n_fills: self.account.fills().len(),
+            last_eval: self.latest_eval.clone(),
         }
     }
 
@@ -208,6 +259,8 @@ impl LiveEngine {
                 new_signals.push(sig);
             }
         }
+        // 2.1) 评估说明入流水（为什么下单/不下单，前端展示）
+        self.refresh_eval_notes(true);
 
         // 3) 持仓管理 / 开仓评估
         if self.account.position().is_some() {
@@ -679,6 +732,7 @@ impl LiveEngine {
             intents: self.intents.clone(),
             fills: self.account.fills().to_vec(),
             equity_curve: self.equity_curve.clone(),
+            evals: self.evals.clone(),
         };
         let path = &self.config.journal_path;
         let tmp = path.with_extension("tmp");
@@ -832,6 +886,51 @@ trigger = "NoopTrigger"
         let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
         let j: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(j["equity_curve"].as_array().unwrap().len(), 2);
+        let _ = std::fs::remove_file(&cfg.journal_path);
+    }
+
+    /// 评估流水：真实 MR 策略跑 260 根 5m bar，
+    /// journal.evals 应有「为什么观望」的评估记录，快照带 last_eval。
+    #[tokio::test]
+    async fn eval_notes_flow_to_journal() {
+        let toml = r#"
+[strategy]
+signals = ["DualTfMeanReversion"]
+trigger = "NoopTrigger"
+
+[strategy.plugins.DualTfMeanReversion]
+fast_bar_ms = 300000
+slow_bar_ms = 3600000
+fast_ema_p = 20
+slow_ema_p = 20
+deviation_threshold = 0.015
+"#;
+        let strat = assemble_from_toml(toml, &builtin_registry()).unwrap();
+        let cfg = test_config("evals");
+        let _ = std::fs::remove_file(&cfg.journal_path);
+        let mut eng = LiveEngine::new(
+            strat,
+            AnyBroker::dry(FeeModel::default()),
+            cfg.clone(),
+            100_000.0,
+            "2026-07-26".into(),
+        );
+        for i in 0..260i64 {
+            let price = 67000.0 + ((i % 8) as f64 - 4.0) * 5.0;
+            eng.on_trade(&trade(i * 300_000, price)).await;
+        }
+        // 快照带最新评估
+        let snap = eng.snapshot();
+        let eval = snap.last_eval.expect("快照应带 last_eval");
+        assert_eq!(eval["decision"], "none");
+        assert!(eval["reason"].as_str().unwrap().contains("观望"));
+        // journal 落盘含评估流水（warmup 进度 + 攒满后的逐 bar 评估）
+        let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+        let j: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let evals = j["evals"].as_array().unwrap();
+        assert!(evals.len() > 200, "evals={}", evals.len());
+        assert_eq!(evals[0]["source"], "DualTfMeanReversion");
+        assert_eq!(evals[0]["note"]["decision"], "warmup");
         let _ = std::fs::remove_file(&cfg.journal_path);
     }
 }

@@ -21,6 +21,15 @@ pub struct JournalIntent {
     pub reason: String,
 }
 
+/// 一条策略评估记录（信号插件每次评估后产生，可观测性用）。
+/// `note` 为插件自定义 JSON（偏离/阈值/趋势/决策/原因等）。
+#[derive(Debug, Clone, Serialize)]
+pub struct JournalEval {
+    pub ts_ms: i64,
+    pub source: String,
+    pub note: serde_json::Value,
+}
+
 /// 完整流水（CLI `--journal` 导出 JSON 的顶层结构）。
 #[derive(Debug, Serialize)]
 pub struct Journal {
@@ -28,6 +37,8 @@ pub struct Journal {
     pub intents: Vec<JournalIntent>,
     pub fills: Vec<crate::account::Fill>,
     pub equity_curve: Vec<crate::report::EquityPoint>,
+    /// 策略评估流水（为什么下单/不下单）；回测不收集则为空
+    pub evals: Vec<JournalEval>,
 }
 
 #[derive(Debug, Serialize)]

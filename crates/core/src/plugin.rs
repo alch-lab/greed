@@ -165,6 +165,12 @@ impl Ctx {
 pub trait SignalPlugin: Send {
     fn name(&self) -> &'static str;
     fn on_event(&mut self, ev: &Event, ctx: &Ctx) -> Vec<Signal>;
+    /// 最近一次评估说明（可观测性）：插件在每次评估后更新，
+    /// 供控制面展示「依据什么条件、为什么下单/不下单」。
+    /// 载荷为 JSON（结构由插件自定）。默认 None = 插件不提供。
+    fn eval_note(&self) -> Option<serde_json::Value> {
+        None
+    }
 }
 
 /// 过滤器插件

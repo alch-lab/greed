@@ -43,6 +43,8 @@ pub struct DualTfMeanReversion {
     slow_ema: f64,
 
     last_signal_dir: Option<String>,
+    /// 最近一次评估说明（可观测性，供控制面展示）
+    last_eval: Option<serde_json::Value>,
 }
 
 impl DualTfMeanReversion {
@@ -58,6 +60,7 @@ impl DualTfMeanReversion {
             slow_cur_idx: None, slow_open: 0.0, slow_high: 0.0, slow_low: 0.0, slow_close: 0.0,
             slow_bars: Vec::new(), slow_ema: 0.0,
             last_signal_dir: None,
+            last_eval: None,
         }
     }
 
@@ -138,6 +141,7 @@ impl DualTfMeanReversion {
         let price = t.price.to_f64();
 
         // 更新快速 bar
+        let mut fast_closed = false;
         let fast_idx = ts / self.fast_bar_ms * self.fast_bar_ms;
         match self.fast_cur_idx {
             None => {
@@ -151,6 +155,7 @@ impl DualTfMeanReversion {
             }
             Some(_) => {
                 // 关闭快速 bar
+                fast_closed = true;
                 if self.fast_bars.is_empty() {
                     self.fast_ema = self.fast_close;
                 } else {
@@ -194,48 +199,103 @@ impl DualTfMeanReversion {
             }
         }
 
-        // 只在快速 bar 关闭时检查信号
+        // 信号检查（快慢线攒满 EMA 周期后才评估）
         if self.fast_bars.len() < self.fast_ema_p || self.slow_bars.len() < self.slow_ema_p {
+            if fast_closed {
+                self.last_eval = Some(serde_json::json!({
+                    "ts_ms": ts,
+                    "price": self.fast_close,
+                    "decision": "warmup",
+                    "reason": format!(
+                        "预热中：快线 {}/{} 根，慢线 {}/{} 根（攒满后才评估信号）",
+                        self.fast_bars.len(), self.fast_ema_p,
+                        self.slow_bars.len(), self.slow_ema_p
+                    ),
+                }));
+            }
             return Vec::new();
         }
 
         let deviation = (self.fast_close - self.fast_ema) / self.fast_ema;
         let trend = if self.slow_close > self.slow_ema { 1 } else if self.slow_close < self.slow_ema { -1 } else { 0 };
+        let trend_text = match trend { 1 => "向上", -1 => "向下", _ => "持平" };
+        let dev_pct = deviation * 100.0;
+        let thr_pct = self.deviation_threshold * 100.0;
 
         let mut sigs = Vec::new();
+        // 本次评估的结论与人话解释（控制面「为什么下单/不下单」展示用）
+        let mut decision = "none";
+        let mut reason = format!(
+            "5m 偏离 {:+.2}%，未达 ±{:.1}% 阈值，观望（再跌 {:.2}% 触发做多 / 再涨 {:.2}% 触发做空）",
+            dev_pct, thr_pct, dev_pct + thr_pct, thr_pct - dev_pct
+        );
 
         // 路径 A 过滤：ATR 爆发期不交易（趋势爆发时均值回归容易被碾压）
         if self.atr_burst() {
-            return sigs;
-        }
-        let rsi = self.rsi();
-
-        // 大趋势向上 → 只做 oversold（做多）
-        // 大趋势向下 → 只做 overbought（做空）
-        // 不确定 → 双向
-
-        if deviation > self.deviation_threshold {
-            // RSI 动量守卫：RSI < rsi_no_short_below 时不做空（跌深不追空）
-            let rsi_block = rsi.map(|r| r < self.rsi_no_short_below).unwrap_or(false);
-            if !rsi_block && trend <= 0 && self.last_signal_dir.as_ref() != Some(&"overbought".to_string()) {
-                sigs.push(Signal::new(
-                    SignalKind::TrendRegime, t.ts, self.name(),
-                    serde_json::json!({"regime": "overbought", "price": self.fast_close, "ema": self.fast_ema, "trend": trend}),
-                ));
-                self.last_signal_dir = Some("overbought".to_string());
-            }
-        } else if deviation < -self.deviation_threshold {
-            // RSI 动量守卫：RSI > rsi_no_long_above 时不做多（涨高不追多）
-            let rsi_block = rsi.map(|r| r > self.rsi_no_long_above).unwrap_or(false);
-            if !rsi_block && trend >= 0 && self.last_signal_dir.as_ref() != Some(&"oversold".to_string()) {
-                sigs.push(Signal::new(
-                    SignalKind::TrendRegime, t.ts, self.name(),
-                    serde_json::json!({"regime": "oversold", "price": self.fast_close, "ema": self.fast_ema, "trend": trend}),
-                ));
-                self.last_signal_dir = Some("oversold".to_string());
-            }
+            reason = format!("5m 偏离 {:+.2}%，但 ATR 爆发抑制中（波动骤增），暂停交易", dev_pct);
         } else {
-            self.last_signal_dir = None;
+            let rsi = self.rsi();
+
+            // 大趋势向上 → 只做 oversold（做多）
+            // 大趋势向下 → 只做 overbought（做空）
+            // 不确定 → 双向
+            if deviation > self.deviation_threshold {
+                // RSI 动量守卫：RSI < rsi_no_short_below 时不做空（跌深不追空）
+                let rsi_block = rsi.map(|r| r < self.rsi_no_short_below).unwrap_or(false);
+                if rsi_block {
+                    reason = format!("5m 超买 {:+.2}%，但 RSI 动量守卫拦截（跌深不追空）", dev_pct);
+                } else if trend > 0 {
+                    reason = format!("5m 超买 {:+.2}%，但 1h 趋势{}，趋势过滤放弃做空", dev_pct, trend_text);
+                } else if self.last_signal_dir.as_deref() == Some("overbought") {
+                    decision = "cooldown";
+                    reason = format!("5m 超买 {:+.2}% + 1h 趋势{}，同向信号冷却中（等待偏离复位）", dev_pct, trend_text);
+                } else {
+                    decision = "short";
+                    reason = format!("5m 超买 {:+.2}% + 1h 趋势{} → 逢高做空", dev_pct, trend_text);
+                    sigs.push(Signal::new(
+                        SignalKind::TrendRegime, t.ts, self.name(),
+                        serde_json::json!({"regime": "overbought", "price": self.fast_close, "ema": self.fast_ema, "trend": trend}),
+                    ));
+                    self.last_signal_dir = Some("overbought".to_string());
+                }
+            } else if deviation < -self.deviation_threshold {
+                // RSI 动量守卫：RSI > rsi_no_long_above 时不做多（涨高不追多）
+                let rsi_block = rsi.map(|r| r > self.rsi_no_long_above).unwrap_or(false);
+                if rsi_block {
+                    reason = format!("5m 超卖 {:+.2}%，但 RSI 动量守卫拦截（涨高不追多）", dev_pct);
+                } else if trend < 0 {
+                    reason = format!("5m 超卖 {:+.2}%，但 1h 趋势{}，趋势过滤放弃做多", dev_pct, trend_text);
+                } else if self.last_signal_dir.as_deref() == Some("oversold") {
+                    decision = "cooldown";
+                    reason = format!("5m 超卖 {:+.2}% + 1h 趋势{}，同向信号冷却中（等待偏离复位）", dev_pct, trend_text);
+                } else {
+                    decision = "long";
+                    reason = format!("5m 超卖 {:+.2}% + 1h 趋势{} → 逢低做多", dev_pct, trend_text);
+                    sigs.push(Signal::new(
+                        SignalKind::TrendRegime, t.ts, self.name(),
+                        serde_json::json!({"regime": "oversold", "price": self.fast_close, "ema": self.fast_ema, "trend": trend}),
+                    ));
+                    self.last_signal_dir = Some("oversold".to_string());
+                }
+            } else {
+                self.last_signal_dir = None;
+            }
+        }
+
+        // 记录评估说明：快线收盘必记；盘中触发信号也记（信号更重要，后写覆盖收盘快照）
+        if fast_closed || !sigs.is_empty() {
+            self.last_eval = Some(serde_json::json!({
+                "ts_ms": ts,
+                "price": self.fast_close,
+                "fast_ema": self.fast_ema,
+                "slow_close": self.slow_close,
+                "slow_ema": self.slow_ema,
+                "deviation_pct": dev_pct,
+                "threshold_pct": thr_pct,
+                "trend": trend_text,
+                "decision": decision,
+                "reason": reason,
+            }));
         }
 
         sigs
@@ -246,6 +306,9 @@ impl SignalPlugin for DualTfMeanReversion {
     fn name(&self) -> &'static str { "DualTfMeanReversion" }
     fn on_event(&mut self, ev: &Event, _ctx: &Ctx) -> Vec<Signal> {
         match ev { Event::Trade(t) => self.on_trade(t), _ => Vec::new() }
+    }
+    fn eval_note(&self) -> Option<serde_json::Value> {
+        self.last_eval.clone()
     }
 }
 
@@ -267,5 +330,86 @@ impl DualTfMeanReversion {
         s.rsi_no_long_above = g("rsi_no_long_above", 70.0);
         s.rsi_no_short_below = g("rsi_no_short_below", 30.0);
         s
+    }
+}
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tcore::types::{Exchange, Price, Qty, Symbol, Timestamp};
+
+    fn trade(ts_ms: i64, price: f64) -> tcore::Trade {
+        tcore::Trade {
+            ts: Timestamp::from_millis(ts_ms),
+            exchange: Exchange::BinanceFutures,
+            symbol: Symbol::new("BTCUSDT"),
+            price: Price::from_f64(price),
+            qty: Qty::from_f64(0.01),
+            is_buyer_maker: false,
+        }
+    }
+
+    fn feed(s: &mut DualTfMeanReversion, n: i64) {
+        let ctx = Ctx::default();
+        for i in 0..n {
+            // 每个 5m bar 一笔成交，价格小幅波动（不触发信号）
+            let price = 67000.0 + ((i % 8) as f64 - 4.0) * 5.0;
+            let ev = Event::Trade(trade(i * 300_000, price));
+            s.on_event(&ev, &ctx);
+        }
+    }
+
+    /// 预热期：eval_note 报告 warmup 进度（快/慢线攒线数）
+    #[test]
+    fn eval_note_reports_warmup_progress() {
+        let mut s = DualTfMeanReversion::new(300_000, 3_600_000, 20, 20, 0.015);
+        feed(&mut s, 5);
+        let note = s.eval_note().expect("预热期也应有评估说明");
+        assert_eq!(note["decision"], "warmup");
+        assert!(note["reason"].as_str().unwrap().contains("预热中"));
+    }
+
+    /// 攒满后：每次快线收盘产出评估说明，无信号时 decision=none 且解释观望原因
+    #[test]
+    fn eval_note_explains_no_signal() {
+        let mut s = DualTfMeanReversion::new(300_000, 3_600_000, 20, 20, 0.015);
+        feed(&mut s, 260); // 260 根 5m ≈ 21.7h，慢线也攒满 20 根
+        let note = s.eval_note().expect("攒满后应有评估说明");
+        assert_eq!(note["decision"], "none");
+        let reason = note["reason"].as_str().unwrap();
+        assert!(reason.contains("观望"), "reason={}", reason);
+        assert!(reason.contains("触发做多"), "应提示距触发距离: {}", reason);
+        assert!(note["deviation_pct"].as_f64().unwrap().abs() < 1.5);
+        assert!(note["fast_ema"].as_f64().unwrap() > 0.0);
+        assert!(note["trend"].as_str().is_some());
+    }
+
+    /// 超卖 + 趋势向上：eval_note 给出做多决策与人话原因
+    #[test]
+    fn eval_note_explains_long_signal() {
+        let mut s = DualTfMeanReversion::new(300_000, 3_600_000, 20, 20, 0.015);
+        // 慢线稳步上行（趋势向上）：每小时 +300，EMA 滞后足以扛住急跌
+        let ctx = Ctx::default();
+        let mut i: i64 = 0;
+        for h in 0..22 {
+            for m in 0..12 {
+                let price = 60000.0 + h as f64 * 300.0 + (m % 3) as f64;
+                let ev = Event::Trade(trade(i * 300_000, price));
+                s.on_event(&ev, &ctx);
+                i += 1;
+            }
+        }
+        // 急砸 2%：一根 5m 内直接打到超卖区
+        let base = 60000.0 + 21.0 * 300.0;
+        let ev = Event::Trade(trade(i * 300_000 + 1, base * 0.98));
+        let sigs = s.on_event(&ev, &ctx);
+        assert!(!sigs.is_empty(), "超卖 + 趋势向上应出做多信号");
+        let note = s.eval_note().unwrap();
+        assert_eq!(note["decision"], "long");
+        assert!(note["reason"].as_str().unwrap().contains("逢低做多"));
     }
 }
