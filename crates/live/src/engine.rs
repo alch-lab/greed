@@ -39,6 +39,8 @@ pub struct LiveConfig {
     pub min_notional: f64,
     /// journal 输出路径（原子重写）
     pub journal_path: PathBuf,
+    /// 评估流水全量落盘路径（JSONL append；journal 只留环形 300 条，分析用全量）
+    pub eval_log_path: PathBuf,
     /// 策略描述（写进 journal meta，前端展示）
     pub strategy_name: String,
 }
@@ -73,6 +75,23 @@ pub struct PositionSnap {
     pub unrealized_pnl: f64,
 }
 
+/// 一笔持仓的绩效追踪：开仓建立、平仓结算成 trip 记录。
+#[derive(Debug, Clone)]
+struct PosTrack {
+    side: String,
+    entry_price: f64,
+    entry_ts_ms: i64,
+    /// 最大有利偏移 %（MFE：浮盈峰值）
+    mfe_pct: f64,
+    /// 最大不利偏移 %（MAE：浮亏峰值，负值）
+    mae_pct: f64,
+    /// 开仓时的 fill 下标（平仓时汇总本 trip 的已实现盈亏）
+    start_fill_idx: usize,
+    /// 上次观察到的持仓数量（识别加仓）
+    last_qty: f64,
+    adds: u32,
+}
+
 pub struct LiveEngine {
     strategy: Strategy,
     broker: AnyBroker,
@@ -91,6 +110,8 @@ pub struct LiveEngine {
     evals: Vec<JournalEval>,
     last_eval_keys: Vec<Option<(i64, String)>>,
     latest_eval: Option<serde_json::Value>,
+    // ---- 持仓绩效追踪（MFE/MAE，优化止盈止损的核心数据）----
+    pos_track: Option<PosTrack>,
     // ---- 入场挂起 ----
     pending_entry: Option<PendingEntry>,
     // ---- 熔断状态（同回测）----
@@ -131,6 +152,7 @@ impl LiveEngine {
             evals: Vec::new(),
             last_eval_keys: vec![None; n_signals],
             latest_eval: None,
+            pos_track: None,
             pending_entry: None,
             cb_day: i64::MIN,
             cb_day_start_equity: 0.0,
@@ -165,10 +187,36 @@ impl LiveEngine {
         self.refresh_eval_notes(false);
     }
 
+    /// 评估记录入环形流水（journal 展示，cap 300）并追加全量 JSONL（分析用）。
+    fn push_eval(&mut self, entry: JournalEval) {
+        self.latest_eval = Some(entry.note.clone());
+        self.evals.push(entry.clone());
+        if self.evals.len() > 300 {
+            let excess = self.evals.len() - 300;
+            self.evals.drain(0..excess);
+        }
+        // 全量 JSONL（append-only；失败不阻塞交易）
+        let line = serde_json::json!({
+            "ts_ms": entry.ts_ms,
+            "source": entry.source,
+            "note": entry.note,
+        });
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&self.config.eval_log_path)
+        {
+            use std::io::Write;
+            if let Err(e) = writeln!(f, "{}", line) {
+                warn!(error = %e, "eval JSONL 写入失败");
+            }
+        }
+    }
+
     /// 收集各信号插件的评估说明（eval_note）。
-    /// `append=true` 时把新评估追加进 journal 流水（封顶 300 条）；
-    /// `false`（预热）只更新最新快照与去重键。
+    /// `append=true` 时把新评估追加进流水；`false`（预热）只更新最新快照与去重键。
     fn refresh_eval_notes(&mut self, append: bool) {
+        let mut pending: Vec<JournalEval> = Vec::new();
         for (i, sp) in self.strategy.signals.iter().enumerate() {
             let Some(note) = sp.eval_note() else { continue };
             let key = (
@@ -188,18 +236,95 @@ impl LiveEngine {
             if let Some(slot) = self.last_eval_keys.get_mut(i) {
                 *slot = Some(key);
             }
-            self.latest_eval = Some(note.clone());
             if append {
-                self.evals.push(JournalEval {
+                pending.push(JournalEval {
                     ts_ms: note.get("ts_ms").and_then(|v| v.as_i64()).unwrap_or(0),
                     source: sp.name().to_string(),
                     note,
                 });
-                if self.evals.len() > 300 {
-                    let excess = self.evals.len() - 300;
-                    self.evals.drain(0..excess);
-                }
+            } else {
+                self.latest_eval = Some(note);
             }
+        }
+        for entry in pending {
+            self.push_eval(entry);
+        }
+    }
+
+    /// 持仓绩效追踪：开仓建档 → 持仓中更新 MFE/MAE → 平仓写 trip 记录。
+    /// 平仓可能发生在 on_trade（dry 撮合）或 on_timer（testnet 轮询），两处都调。
+    fn track_position(&mut self, ts: Timestamp, price: Price) {
+        match (self.account.position().copied(), self.pos_track.take()) {
+            (Some(p), None) => {
+                // 建档即记录当前偏离（首根 K 线可能就是峰值，不能漏）
+                let px = price.to_f64();
+                let entry = p.entry_price.to_f64();
+                let sign = if format!("{:?}", p.side) == "Buy" { 1.0 } else { -1.0 };
+                let dev = (px - entry) / entry * 100.0 * sign;
+                self.pos_track = Some(PosTrack {
+                    side: format!("{:?}", p.side),
+                    entry_price: entry,
+                    entry_ts_ms: ts.as_millis(),
+                    mfe_pct: dev.max(0.0),
+                    mae_pct: dev.min(0.0),
+                    start_fill_idx: self.account.fills().len(),
+                    last_qty: p.qty.to_f64(),
+                    adds: 0,
+                });
+            }
+            (Some(p), Some(mut t)) => {
+                let px = price.to_f64();
+                let sign = if t.side == "Buy" { 1.0 } else { -1.0 };
+                let dev = (px - t.entry_price) / t.entry_price * 100.0 * sign;
+                t.mfe_pct = t.mfe_pct.max(dev);
+                t.mae_pct = t.mae_pct.min(dev);
+                let q = p.qty.to_f64();
+                if q > t.last_qty + 1e-9 {
+                    t.adds += 1;
+                }
+                t.last_qty = q;
+                self.pos_track = Some(t);
+            }
+            (None, Some(mut t)) => {
+                // 平仓：平仓这笔成交的价格也是偏移路径的一部分（先更新再结算）
+                let px = price.to_f64();
+                let sign = if t.side == "Buy" { 1.0 } else { -1.0 };
+                let dev = (px - t.entry_price) / t.entry_price * 100.0 * sign;
+                t.mfe_pct = t.mfe_pct.max(dev);
+                t.mae_pct = t.mae_pct.min(dev);
+                // 汇总本 trip 的 fills，写 trip 记录（MFE/MAE 是优化 TP/SL 的核心数据）
+                let fills = self.account.fills();
+                let trip_fills = &fills[t.start_fill_idx.min(fills.len())..];
+                let exit = trip_fills.last();
+                let exit_price = exit.map(|f| f.price.to_f64());
+                let exit_reason = exit.map(|f| f.reason.clone()).unwrap_or_default();
+                let realized: f64 = trip_fills.iter().map(|f| f.realized_pnl - f.fee).sum();
+                let holding_min = (ts.as_millis() - t.entry_ts_ms) as f64 / 60_000.0;
+                let side_cn = if t.side == "Buy" { "多单" } else { "空单" };
+                let reason = format!(
+                    "{}出场（{}）：持仓 {:.0}min，净盈亏 {:+.2} USD（MFE {:+.2}% / MAE {:+.2}%，加仓 {} 次）",
+                    side_cn, exit_reason, holding_min, realized, t.mfe_pct, t.mae_pct, t.adds
+                );
+                self.push_eval(JournalEval {
+                    ts_ms: ts.as_millis(),
+                    source: "engine".into(),
+                    note: serde_json::json!({
+                        "ts_ms": ts.as_millis(),
+                        "decision": "trip_closed",
+                        "side": t.side,
+                        "entry_price": t.entry_price,
+                        "exit_price": exit_price,
+                        "exit_reason": exit_reason,
+                        "pnl_usd": realized,
+                        "mfe_pct": t.mfe_pct,
+                        "mae_pct": t.mae_pct,
+                        "holding_min": holding_min,
+                        "adds": t.adds,
+                        "reason": reason,
+                    }),
+                });
+            }
+            (None, None) => {}
         }
     }
 
@@ -273,6 +398,8 @@ impl LiveEngine {
         // 4) 熔断统计
         self.cb_note_fills();
         self.cb_update(trade.ts, trade.price);
+        // 5) 持仓绩效追踪（MFE/MAE，平仓时写 trip 记录）
+        self.track_position(trade.ts, trade.price);
         self.persist_journal();
     }
 
@@ -300,6 +427,9 @@ impl LiveEngine {
             if got_fill {
                 self.settle_pending_entry(now).await;
                 self.cb_note_fills();
+                if let Some(px) = self.latest_price {
+                    self.track_position(now, px);
+                }
                 self.persist_journal();
             }
         }
@@ -789,6 +919,7 @@ trigger = "NoopTrigger"
             qty_step: 1e-8,
             min_notional: 0.0,
             journal_path: std::env::temp_dir().join(format!("greed-live-test-{}.json", tag)),
+            eval_log_path: std::env::temp_dir().join(format!("greed-live-test-{}.jsonl", tag)),
             strategy_name: "test".into(),
         }
     }
@@ -887,6 +1018,62 @@ trigger = "NoopTrigger"
         let j: serde_json::Value = serde_json::from_str(&text).unwrap();
         assert_eq!(j["equity_curve"].as_array().unwrap().len(), 2);
         let _ = std::fs::remove_file(&cfg.journal_path);
+    }
+
+    /// 持仓绩效：开仓→先涨 1% 再击穿止损，trip 记录含 MFE/MAE、出场原因，且 JSONL 全量落盘。
+    #[tokio::test]
+    async fn trip_records_mfe_mae() {
+        let cfg = test_config("trip");
+        let _ = std::fs::remove_file(&cfg.journal_path);
+        let _ = std::fs::remove_file(&cfg.eval_log_path);
+        let mut eng = LiveEngine::new(
+            noop_strategy(),
+            AnyBroker::dry(FeeModel::default()),
+            cfg.clone(),
+            100_000.0,
+            "2026-07-26".into(),
+        );
+        let t0 = trade(0, 67000.0);
+        eng.on_trade(&t0).await;
+        let intent = OrderIntent {
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            qty: Qty::from_f64(0.1),
+            limit_price: None,
+            stop_price: Price::from_f64(66800.0),
+            tp1_price: None,
+            reason: "manual".into(),
+            ts: t0.ts,
+        };
+        eng.enter(&t0, intent).await;
+        // 先涨 1%（MFE 峰值），再回落击穿止损
+        eng.on_trade(&trade(1000, 67670.0)).await;
+        eng.on_trade(&trade(2000, 67200.0)).await;
+        eng.on_trade(&trade(3000, 66750.0)).await;
+        assert!(eng.account().position().is_none());
+
+        let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
+        let j: serde_json::Value = serde_json::from_str(&text).unwrap();
+        let trips: Vec<_> = j["evals"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|e| e["note"]["decision"] == "trip_closed")
+            .collect();
+        assert_eq!(trips.len(), 1, "应恰好一条 trip 记录");
+        let note = &trips[0]["note"];
+        assert!(note["mfe_pct"].as_f64().unwrap() > 0.9, "MFE 应约 +1%: {}", note["mfe_pct"]);
+        assert!(note["mae_pct"].as_f64().unwrap() < 0.0, "MAE 应为负");
+        assert_eq!(note["exit_reason"], "stop");
+        assert_eq!(note["side"], "Buy");
+        assert!(note["pnl_usd"].as_f64().unwrap() < 0.0, "止损单净盈亏为负");
+        assert!(note["reason"].as_str().unwrap().contains("MFE"));
+
+        // JSONL 全量落盘含同一条记录
+        let jsonl = std::fs::read_to_string(&cfg.eval_log_path).unwrap();
+        assert!(jsonl.contains("trip_closed"));
+        let _ = std::fs::remove_file(&cfg.journal_path);
+        let _ = std::fs::remove_file(&cfg.eval_log_path);
     }
 
     /// 评估流水：真实 MR 策略跑 260 根 5m bar，

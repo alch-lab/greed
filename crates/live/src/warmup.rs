@@ -81,13 +81,15 @@ pub async fn fetch_klines(
 
 /// 一根 K 线 → 四笔虚拟成交（开→高→低→收），时间戳放在 bar 内
 /// （open+0/1/2/3 秒），保证落入正确的 bar 桶且顺序确定。
+/// qty=0：合成逐笔不携带成交量，避免污染信号插件的量比基线
+/// （策略层会跳过 0 量 bar，量比在实时段积累后生效）。
 fn kline_to_trades(k: &Kline, exchange: Exchange, symbol: &Symbol) -> Vec<Trade> {
     let mk = |offset_ms: i64, price: f64| Trade {
         ts: Timestamp::from_millis(k.open_time_ms + offset_ms),
         exchange,
         symbol: symbol.clone(),
         price: Price::from_f64(price),
-        qty: Qty::from_f64(0.001),
+        qty: Qty::from_f64(0.0),
         is_buyer_maker: false,
     };
     vec![

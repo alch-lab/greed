@@ -25,8 +25,13 @@ pub struct DualTfMeanReversion {
     // 快速 bar（5分钟）
     fast_cur_idx: Option<i64>,
     fast_open: f64, fast_high: f64, fast_low: f64, fast_close: f64,
+    fast_vol: f64,             // 当前 bar 成交额（USD，评估记录用）
     fast_bars: Vec<f64>, // close prices for fast EMA
     fast_ema: f64,
+    /// 最近一根已关闭 bar 的 (open, high, low, close, vol)——near-miss 分析用
+    closed_bar: Option<(f64, f64, f64, f64, f64)>,
+    /// 已关闭 bar 的成交额基线（量比计算；跳过 0 = 预热合成段）
+    vol_hist: Vec<f64>,
 
     // ATR/RSI 状态（基于已收快速 bar）
     prev_fast_close: Option<f64>,
@@ -36,11 +41,21 @@ pub struct DualTfMeanReversion {
     rsi_avg_loss: Option<f64>,
     rsi_count: usize,
 
+    // 记录用指标：ATR(14)/RSI(14) 始终计算（可观测性特征快照），
+    // 与上面的过滤用 ATR/RSI 完全独立，不改变任何信号/过滤行为
+    rec_atr: Option<f64>,
+    rec_atr_hist: Vec<f64>,
+    rec_rsi_avg_gain: Option<f64>,
+    rec_rsi_avg_loss: Option<f64>,
+    rec_rsi_count: usize,
+
     // 慢速 bar（1小时）
     slow_cur_idx: Option<i64>,
     slow_open: f64, slow_high: f64, slow_low: f64, slow_close: f64,
     slow_bars: Vec<f64>,
     slow_ema: f64,
+    /// 慢线 EMA 历史（趋势斜率，cap 10）
+    slow_ema_hist: Vec<f64>,
 
     last_signal_dir: Option<String>,
     /// 最近一次评估说明（可观测性，供控制面展示）
@@ -54,11 +69,16 @@ impl DualTfMeanReversion {
             atr_period: 0, atr_avg_period: 20, atr_max_mult: 1.3,
             rsi_period: 0, rsi_no_long_above: 70.0, rsi_no_short_below: 30.0,
             fast_cur_idx: None, fast_open: 0.0, fast_high: 0.0, fast_low: 0.0, fast_close: 0.0,
+            fast_vol: 0.0,
             fast_bars: Vec::new(), fast_ema: 0.0,
+            closed_bar: None, vol_hist: Vec::new(),
             prev_fast_close: None, atr: None, atr_hist: Vec::new(),
             rsi_avg_gain: None, rsi_avg_loss: None, rsi_count: 0,
+            rec_atr: None, rec_atr_hist: Vec::new(),
+            rec_rsi_avg_gain: None, rec_rsi_avg_loss: None, rec_rsi_count: 0,
             slow_cur_idx: None, slow_open: 0.0, slow_high: 0.0, slow_low: 0.0, slow_close: 0.0,
             slow_bars: Vec::new(), slow_ema: 0.0,
+            slow_ema_hist: Vec::new(),
             last_signal_dir: None,
             last_eval: None,
         }
@@ -70,6 +90,34 @@ impl DualTfMeanReversion {
             let tr = (high - low)
                 .max((high - prev).abs())
                 .max((low - prev).abs());
+            // 记录用 ATR(14)：始终维护（特征快照，不过滤）
+            const REC_P: f64 = 14.0;
+            let rec = match self.rec_atr {
+                Some(a) => (a * (REC_P - 1.0) + tr) / REC_P,
+                None => tr,
+            };
+            self.rec_atr = Some(rec);
+            self.rec_atr_hist.push(rec);
+            if self.rec_atr_hist.len() > 40 {
+                self.rec_atr_hist.remove(0);
+            }
+            // 记录用 RSI(14)：始终维护（特征快照，不过滤）
+            {
+                let chg = close - prev;
+                let gain = chg.max(0.0);
+                let loss = (-chg).max(0.0);
+                match (self.rec_rsi_avg_gain, self.rec_rsi_avg_loss) {
+                    (Some(g), Some(l)) => {
+                        self.rec_rsi_avg_gain = Some((g * (REC_P - 1.0) + gain) / REC_P);
+                        self.rec_rsi_avg_loss = Some((l * (REC_P - 1.0) + loss) / REC_P);
+                    }
+                    _ => {
+                        self.rec_rsi_avg_gain = Some(gain);
+                        self.rec_rsi_avg_loss = Some(loss);
+                    }
+                }
+                self.rec_rsi_count += 1;
+            }
             if self.atr_period > 0 {
                 let p = self.atr_period as f64;
                 let atr = match self.atr {
@@ -116,6 +164,62 @@ impl DualTfMeanReversion {
         Some(100.0 - 100.0 / (1.0 + rs))
     }
 
+    /// 记录用 RSI(14)（攒满 14 根后有效）
+    fn rec_rsi(&self) -> Option<f64> {
+        if self.rec_rsi_count < 14 {
+            return None;
+        }
+        let g = self.rec_rsi_avg_gain?;
+        let l = self.rec_rsi_avg_loss?;
+        if l < 1e-12 {
+            return Some(100.0);
+        }
+        Some(100.0 - 100.0 / (1.0 + g / l))
+    }
+
+    /// ATR 倍数：当前 ATR(14) / 近 20 根均值（波动环境快照）
+    fn rec_atr_mult(&self) -> Option<f64> {
+        let atr = self.rec_atr?;
+        if self.rec_atr_hist.len() < 21 {
+            return None;
+        }
+        let start = self.rec_atr_hist.len() - 21;
+        let avg: f64 = self.rec_atr_hist[start..self.rec_atr_hist.len() - 1]
+            .iter()
+            .sum::<f64>()
+            / 20.0;
+        if avg > 0.0 { Some(atr / avg) } else { None }
+    }
+
+    /// 量比：最近关闭 bar 成交额 / 近 20 根均值（跳过预热零量段）
+    fn vol_mult(&self) -> Option<f64> {
+        let (_, _, _, _, v) = self.closed_bar?;
+        if v <= 0.0 || self.vol_hist.len() < 11 {
+            return None;
+        }
+        let n = self.vol_hist.len();
+        let start = n.saturating_sub(21);
+        let base: Vec<f64> = self.vol_hist[start..n - 1].to_vec();
+        if base.is_empty() {
+            return None;
+        }
+        let avg: f64 = base.iter().sum::<f64>() / base.len() as f64;
+        if avg > 0.0 { Some(v / avg) } else { None }
+    }
+
+    /// 慢线 EMA 斜率（最近 5 根 1h 的变化率 %，趋势强度）
+    fn slow_slope_pct(&self) -> Option<f64> {
+        let n = self.slow_ema_hist.len();
+        if n < 6 {
+            return None;
+        }
+        let old = self.slow_ema_hist[n - 6];
+        if old.abs() < 1e-12 {
+            return None;
+        }
+        Some((self.slow_ema_hist[n - 1] - old) / old * 100.0)
+    }
+
     /// ATR 爆发抑制：当前 ATR > atr_max_mult × 近期平均 → true（不交易）
     fn atr_burst(&self) -> bool {
         if self.atr_period == 0 {
@@ -136,9 +240,10 @@ impl DualTfMeanReversion {
         price * k + prev * (1.0 - k)
     }
 
-    fn on_trade(&mut self, t: &tcore::Trade) -> Vec<Signal> {
+    fn on_trade(&mut self, t: &tcore::Trade, ctx: &Ctx) -> Vec<Signal> {
         let ts = t.ts.as_millis();
         let price = t.price.to_f64();
+        let notional = t.qty.to_f64() * price;
 
         // 更新快速 bar
         let mut fast_closed = false;
@@ -147,11 +252,13 @@ impl DualTfMeanReversion {
             None => {
                 self.fast_cur_idx = Some(fast_idx);
                 self.fast_open = price; self.fast_high = price; self.fast_low = price; self.fast_close = price;
+                self.fast_vol = notional;
             }
             Some(cur) if cur == fast_idx => {
                 self.fast_high = self.fast_high.max(price);
                 self.fast_low = self.fast_low.min(price);
                 self.fast_close = price;
+                self.fast_vol += notional;
             }
             Some(_) => {
                 // 关闭快速 bar
@@ -163,12 +270,21 @@ impl DualTfMeanReversion {
                 }
                 self.fast_bars.push(self.fast_close);
                 self.update_volatility(self.fast_high, self.fast_low, self.fast_close);
+                // 暂存已关闭 bar 快照（near-miss/量比分析），0 量（预热合成段）不进基线
+                self.closed_bar = Some((self.fast_open, self.fast_high, self.fast_low, self.fast_close, self.fast_vol));
+                if self.fast_vol > 0.0 {
+                    self.vol_hist.push(self.fast_vol);
+                    if self.vol_hist.len() > 40 {
+                        self.vol_hist.remove(0);
+                    }
+                }
                 if self.fast_bars.len() > self.fast_ema_p * 2 {
                     self.fast_bars.remove(0);
                 }
                 // 启动新 bar
                 self.fast_cur_idx = Some(fast_idx);
                 self.fast_open = price; self.fast_high = price; self.fast_low = price; self.fast_close = price;
+                self.fast_vol = notional;
             }
         }
 
@@ -191,6 +307,10 @@ impl DualTfMeanReversion {
                     self.slow_ema = Self::update_ema(self.slow_ema, self.slow_close, self.slow_ema_p);
                 }
                 self.slow_bars.push(self.slow_close);
+                self.slow_ema_hist.push(self.slow_ema);
+                if self.slow_ema_hist.len() > 10 {
+                    self.slow_ema_hist.remove(0);
+                }
                 if self.slow_bars.len() > self.slow_ema_p * 2 {
                     self.slow_bars.remove(0);
                 }
@@ -282,6 +402,19 @@ impl DualTfMeanReversion {
             }
         }
 
+        // near-miss：没出信号但盘中曾触及触发线（阈值敏感性分析的关键数据）
+        if sigs.is_empty() {
+            if let Some((_, h, l, _, _)) = self.closed_bar {
+                let min_dev = (l - self.fast_ema) / self.fast_ema * 100.0;
+                let max_dev = (h - self.fast_ema) / self.fast_ema * 100.0;
+                if min_dev <= -thr_pct {
+                    reason.push_str(&format!("；盘中最低触及 {:+.2}% 后收回（near-miss）", min_dev));
+                } else if max_dev >= thr_pct {
+                    reason.push_str(&format!("；盘中最高触及 {:+.2}% 后回落（near-miss）", max_dev));
+                }
+            }
+        }
+
         // 记录评估说明：快线收盘必记；盘中触发信号也记（信号更重要，后写覆盖收盘快照）
         if fast_closed || !sigs.is_empty() {
             self.last_eval = Some(serde_json::json!({
@@ -295,6 +428,17 @@ impl DualTfMeanReversion {
                 "trend": trend_text,
                 "decision": decision,
                 "reason": reason,
+                // ---- 特征快照（优化分析用；null = 预热段数据不足）----
+                "slow_dev_pct": (self.slow_close - self.slow_ema) / self.slow_ema * 100.0,
+                "slope_5h_pct": self.slow_slope_pct(),
+                "atr_pct": self.rec_atr.map(|a| a / self.fast_close * 100.0),
+                "atr_mult": self.rec_atr_mult(),
+                "rsi": self.rec_rsi(),
+                "vol_mult": self.vol_mult(),
+                "bar_min_dev_pct": self.closed_bar.map(|(_, _, l, _, _)| (l - self.fast_ema) / self.fast_ema * 100.0),
+                "bar_max_dev_pct": self.closed_bar.map(|(_, h, _, _, _)| (h - self.fast_ema) / self.fast_ema * 100.0),
+                "session": ctx.flag("session"),
+                "funding_rate": ctx.flag("funding_rate").and_then(|s| s.parse::<f64>().ok()),
             }));
         }
 
@@ -304,8 +448,8 @@ impl DualTfMeanReversion {
 
 impl SignalPlugin for DualTfMeanReversion {
     fn name(&self) -> &'static str { "DualTfMeanReversion" }
-    fn on_event(&mut self, ev: &Event, _ctx: &Ctx) -> Vec<Signal> {
-        match ev { Event::Trade(t) => self.on_trade(t), _ => Vec::new() }
+    fn on_event(&mut self, ev: &Event, ctx: &Ctx) -> Vec<Signal> {
+        match ev { Event::Trade(t) => self.on_trade(t, ctx), _ => Vec::new() }
     }
     fn eval_note(&self) -> Option<serde_json::Value> {
         self.last_eval.clone()

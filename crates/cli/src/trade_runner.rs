@@ -175,11 +175,16 @@ pub async fn run_trade(
         qty_step,
         min_notional,
         journal_path: std::path::PathBuf::from(&journal_path),
+        eval_log_path: std::path::PathBuf::from(format!(
+            "data/evals/{}.jsonl",
+            mode.as_str()
+        )),
         strategy_name: args.strategy.clone(),
     };
     if let Some(parent) = std::path::Path::new(&journal_path).parent() {
         std::fs::create_dir_all(parent)?;
     }
+    std::fs::create_dir_all("data/evals")?;
     let mut engine = live::LiveEngine::new(strat, broker, cfg, initial_cash, started_at);
     engine.persist_journal();
 
