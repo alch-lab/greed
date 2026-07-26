@@ -16,5 +16,5 @@ pub mod feed;
 pub mod rest;
 
 pub use broker::AnyBroker;
-pub use engine::{LiveConfig, LiveEngine};
+pub use engine::{EngineSnapshot, LiveConfig, LiveEngine, PositionSnap};
 pub use rest::{RestClient, SymbolFilters};

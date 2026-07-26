@@ -93,3 +93,26 @@ export BINANCE_API_SECRET="..."
 `config/base.toml` 的 `[account]` 段按 `testnet = true/false` 自动选择 testnet/实盘端点，密钥只从 `api_key_env` / `api_secret_env` 指定的环境变量读取。
 
 > ⚠️ 上实盘（testnet = false）前，请先在 testnet 模拟盘充分运行验证。
+
+## 控制面 + 前端监控（greed serve + greed-web）
+
+```bash
+./target/release/greed serve --port 8088   # 控制面（前端 /api 代理目标）
+cd ../greed-web && npm run dev             # 前端（回测 / 模拟盘 / 实盘三页）
+```
+
+- **回测页**：选区间/策略/风险档提交异步回测任务，结果直接渲染看板
+- **模拟盘/实盘页**：一键启动/暂停策略（实盘有二次确认），实时状态（最新价/权益/持仓/浮盈亏）+ 决策流水，5s 轮询
+- 交易任务由控制面托管：重复启动返回 409；暂停 = 优雅关停落盘，不撤保护性止损
+- 回测任务 journal 存 `data/journal/backtest/`，重启后历史任务仍可见
+
+## 数据存储与容量
+
+| 数据 | 位置 | 体量 | 增长 |
+|---|---|---|---|
+| 逐笔成交 | `data/lake/trades/` | ~135 MB/天/交易对（binlog） | 单交易对约 50 GB/年 |
+| OI/资金费率 | `data/lake/metrics|funding/` | 总计 <20 MB | 可忽略 |
+| 决策流水 | `data/journal/` | 权益点每分钟一条，约 25 MB/年 | 原子重写，可定期归档 |
+| 回测输出 | `out/` | 每次 <1 MB | 可定期清理 |
+
+磁盘剩余 500+ GB 时单交易对可跑约 10 年；如需多交易对长期运行，后续可做冷数据压缩（binlog → parquet zstd，约 5-10 倍）或滚动清理。

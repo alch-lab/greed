@@ -1,0 +1,42 @@
+{
+  "meta": {
+    "symbol": "BTCUSDT",
+    "from": "2026-01-01",
+    "to": "2026-01-07",
+    "strategy": "config/strategy-final.toml",
+    "initial_cash": 100000.0,
+    "final_equity": 100000.0
+  },
+  "intents": [],
+  "fills": [],
+  "equity_curve": [
+    {
+      "ts_ms": 1767225601807,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1767312000049,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1767398401296,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1767484800015,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1767571200033,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1767657600011,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1767744000027,
+      "equity": 100000.0
+    }
+  ]
+}

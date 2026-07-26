@@ -15,8 +15,7 @@
 
 use std::path::PathBuf;
 
-use backtest::{Account, EquityPoint, FillRequest, Journal, JournalIntent, JournalMeta};
-use strategy::Strategy;
+use backtest::{Account, EquityPoint, FillRequest, Journal, JournalIntent, JournalMeta};use strategy::Strategy;
 use tcore::plugin::{Ctx, ExitAction, OrderIntent, Signal, Verdict};
 use tcore::types::{Price, Qty, Symbol, Timestamp};
 use tcore::{Event, EventClock, Trade};
@@ -50,6 +49,26 @@ struct PendingEntry {
     stop_price: Price,
     tp1_price: Option<Price>,
     expire_ts: Timestamp,
+}
+
+/// 引擎状态快照（控制面 `/api/trade/status` 的数据源）。
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct EngineSnapshot {
+    pub last_price: Option<f64>,
+    pub equity: f64,
+    pub cash: f64,
+    pub position: Option<PositionSnap>,
+    pub n_intents: usize,
+    pub n_fills: usize,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PositionSnap {
+    pub side: String,
+    pub qty: f64,
+    pub entry_price: f64,
+    pub stop_price: Option<f64>,
+    pub unrealized_pnl: f64,
 }
 
 pub struct LiveEngine {
@@ -116,6 +135,25 @@ impl LiveEngine {
 
     pub fn account(&self) -> &Account {
         &self.account
+    }
+
+    /// 状态快照（控制面轮询用）。
+    pub fn snapshot(&self) -> EngineSnapshot {
+        let px = self.latest_price;
+        EngineSnapshot {
+            last_price: px.map(|p| p.to_f64()),
+            equity: self.account.equity(px.unwrap_or(Price::ZERO)),
+            cash: self.account.cash(),
+            position: self.account.position().map(|p| PositionSnap {
+                side: format!("{:?}", p.side),
+                qty: p.qty.to_f64(),
+                entry_price: p.entry_price.to_f64(),
+                stop_price: p.stop_price.map(|s| s.to_f64()),
+                unrealized_pnl: px.map(|x| p.unrealized(x)).unwrap_or(0.0),
+            }),
+            n_intents: self.intents.len(),
+            n_fills: self.account.fills().len(),
+        }
     }
 
     // ==================================================================
