@@ -5,6 +5,11 @@
 //! 短线波段策略逐笔回补断档期意义不大（策略基于 5m/1h K 线），重连即可，
 //! 不回补——缺失的几笔成交不会改变 K 线形态。
 //!
+//! ⚠️ 主网端点：币安于 2026-04-23 永久退役旧版合约 WS 路径
+//! `wss://fstream.binance.com/ws/...`（握手成功但永远零数据），
+//! 市场数据须走 [`MAINNET_WS`]（`wss://fstream.binance.com/market`，
+//! 单流模式 `{base}/ws/{symbol}@aggTrade`）。testnet 旧路径仍可用。
+//!
 //! 消息格式（单流裸订阅 `{base}/ws/{symbol}@aggTrade`）：
 //! ```json
 //! {"e":"aggTrade","E":...,"s":"BTCUSDT","a":5933014,
@@ -22,7 +27,8 @@ use tracing::{info, warn};
 /// 主网公共行情 WS（无需密钥，只读）。
 /// paper/dry 模式的行情源：testnet 成交流稀疏、价格陈旧且偏离真实市场，
 /// 信号与回测（主网历史数据）保持同一价格环境；订单仍由 testnet 撮合。
-pub const MAINNET_WS: &str = "wss://fstream.binance.com";
+/// 注意 `/market` 前缀：旧版 `/ws/...` 裸路径已于 2026-04-23 退役。
+pub const MAINNET_WS: &str = "wss://fstream.binance.com/market";
 
 #[derive(Debug, Deserialize)]
 struct RawAggTrade {

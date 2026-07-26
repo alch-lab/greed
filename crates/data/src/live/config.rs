@@ -143,7 +143,8 @@ impl AccountConfig {
         } else if self.testnet {
             "wss://fstream.binancefuture.com"
         } else {
-            "wss://fstream.binance.com"
+            // 旧版裸路径已于 2026-04-23 退役，市场数据走 /market
+            "wss://fstream.binance.com/market"
         }
     }
 
