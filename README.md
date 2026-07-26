@@ -106,7 +106,8 @@ cd ../greed-web && npm run dev             # 前端（回测 / 模拟盘 / 实�
 - 交易任务由控制面托管：重复启动返回 409；暂停 = 优雅关停落盘，不撤保护性止损
 - 回测任务 journal 存 `data/journal/backtest/`，重启后历史任务仍可见
 - **登录鉴权**：`export GREED_WEB_PASSWORD=<密码>` 后启动 `greed serve`，前端需密码登录
-  （会话 token 内存保存，服务重启即失效）；未设置则无鉴权，仅建议本机使用
+  （会话 token 内存保存 7 天有效，登录按 IP 限流 5 分钟 10 次）；未设置则无鉴权，仅建议本机使用
+- **公网部署**：见 `deploy/DEPLOY.md`（Caddy 自动 HTTPS + systemd，控制面只绑 127.0.0.1）
 
 ## 数据存储与容量
 

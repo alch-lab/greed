@@ -56,11 +56,53 @@ struct AppState {
 }
 
 /// 登录鉴权：环境变量 GREED_WEB_PASSWORD 设置后启用。
-/// 单用户本地工具模型：密码校验通过签发随机会话 token（内存保存，重启失效）。
+/// 单用户模型：密码校验通过签发随机会话 token（内存保存，重启失效，7 天有效）。
+/// 登录接口按 IP 限流（5 分钟 10 次失败），防公网爆破。
 struct AuthState {
     password: Option<String>,
-    tokens: Mutex<std::collections::HashSet<String>>,
+    /// token → 签发时间
+    tokens: Mutex<HashMap<String, std::time::Instant>>,
+    rate: Mutex<LoginRateLimit>,
 }
+
+/// 登录限流：同一 IP 窗口内失败次数封顶。
+struct LoginRateLimit {
+    fails: HashMap<String, (u32, std::time::Instant)>,
+}
+
+impl LoginRateLimit {
+    const WINDOW: std::time::Duration = std::time::Duration::from_secs(300);
+    const MAX_FAILS: u32 = 10;
+
+    fn new() -> Self {
+        LoginRateLimit {
+            fails: HashMap::new(),
+        }
+    }
+    /// true = 允许尝试
+    fn allow(&self, ip: &str) -> bool {
+        match self.fails.get(ip) {
+            Some((n, t0)) if t0.elapsed() < Self::WINDOW => *n < Self::MAX_FAILS,
+            _ => true,
+        }
+    }
+    fn note_fail(&mut self, ip: &str) {
+        let e = self
+            .fails
+            .entry(ip.to_string())
+            .or_insert((0, std::time::Instant::now()));
+        if e.1.elapsed() >= Self::WINDOW {
+            *e = (0, std::time::Instant::now());
+        }
+        e.0 += 1;
+    }
+    fn note_ok(&mut self, ip: &str) {
+        self.fails.remove(ip);
+    }
+}
+
+/// token 有效期（7 天）
+const TOKEN_TTL: std::time::Duration = std::time::Duration::from_secs(7 * 24 * 3600);
 
 /// 生成随机会话 token（/dev/urandom 24 字节 hex；退化用时间+PID）。
 fn gen_token() -> String {
@@ -89,18 +131,47 @@ struct LoginReq {
     password: String,
 }
 
+/// 客户端 IP：优先 X-Forwarded-For（Caddy/nginx 反代注入），回退 TCP 对端。
+fn client_ip(headers: &axum::http::HeaderMap, addr: &std::net::SocketAddr) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.split(',').next())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| addr.ip().to_string())
+}
+
 async fn auth_login(
     State(st): State<Arc<AppState>>,
+    axum::extract::ConnectInfo(addr): axum::extract::ConnectInfo<std::net::SocketAddr>,
+    headers: axum::http::HeaderMap,
     Json(req): Json<LoginReq>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    match &st.auth.password {
-        None => Ok(Json(serde_json::json!({ "auth_required": false }))),
-        Some(pw) if req.password == *pw => {
-            let t = gen_token();
-            st.auth.tokens.lock().await.insert(t.clone());
-            Ok(Json(serde_json::json!({ "auth_required": true, "token": t })))
-        }
-        _ => Err((StatusCode::UNAUTHORIZED, "密码错误".into())),
+    let ip = client_ip(&headers, &addr);
+    let Some(pw) = &st.auth.password else {
+        return Ok(Json(serde_json::json!({ "auth_required": false })));
+    };
+    if !st.auth.rate.lock().await.allow(&ip) {
+        warn!(ip, "登录限流触发");
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            "尝试过于频繁，请 5 分钟后再试".into(),
+        ));
+    }
+    if req.password == *pw {
+        st.auth.rate.lock().await.note_ok(&ip);
+        let t = gen_token();
+        st.auth
+            .tokens
+            .lock()
+            .await
+            .insert(t.clone(), std::time::Instant::now());
+        Ok(Json(serde_json::json!({ "auth_required": true, "token": t })))
+    } else {
+        st.auth.rate.lock().await.note_fail(&ip);
+        warn!(ip, "登录失败（密码错误）");
+        Err((StatusCode::UNAUTHORIZED, "密码错误".into()))
     }
 }
 
@@ -111,7 +182,7 @@ async fn auth_check(State(st): State<Arc<AppState>>) -> StatusCode {
 }
 
 /// 鉴权中间件：未启用（无 GREED_WEB_PASSWORD）直接放行；
-/// 启用时仅放行 /api/auth/login 与 /api/health，其余要求 Bearer token。
+/// 启用时仅放行 /api/auth/login 与 /api/health，其余要求有效 Bearer token（7 天）。
 async fn auth_mw(
     State(st): State<Arc<AppState>>,
     req: axum::extract::Request,
@@ -131,11 +202,37 @@ async fn auth_mw(
         .and_then(|s| s.strip_prefix("Bearer "))
         .map(|s| s.to_string());
     if let Some(t) = token {
-        if st.auth.tokens.lock().await.contains(&t) {
-            return Ok(next.run(req).await);
+        let mut tokens = st.auth.tokens.lock().await;
+        match tokens.get(&t) {
+            Some(issued) if issued.elapsed() < TOKEN_TTL => {
+                return Ok(next.run(req).await);
+            }
+            Some(_) => {
+                tokens.remove(&t); // 过期清理
+            }
+            None => {}
         }
     }
     Err(StatusCode::UNAUTHORIZED)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rate_limit_blocks_after_max_fails() {
+        let mut rl = LoginRateLimit::new();
+        for _ in 0..LoginRateLimit::MAX_FAILS {
+            assert!(rl.allow("1.2.3.4"));
+            rl.note_fail("1.2.3.4");
+        }
+        assert!(!rl.allow("1.2.3.4"));
+        // 其他 IP 不受影响；登录成功清零
+        assert!(rl.allow("5.6.7.8"));
+        rl.note_ok("1.2.3.4");
+        assert!(rl.allow("1.2.3.4"));
+    }
 }
 
 // ============================================================================
@@ -536,12 +633,18 @@ fn exec_backtest(
 // 入口
 // ============================================================================
 
-pub async fn run_serve(port: u16, config: String, strategy: String, lake: String) -> Result<()> {
+pub async fn run_serve(
+    host: &str,
+    port: u16,
+    config: String,
+    strategy: String,
+    lake: String,
+) -> Result<()> {
     let password = std::env::var("GREED_WEB_PASSWORD")
         .ok()
         .filter(|s| !s.trim().is_empty());
     if password.is_some() {
-        info!("控制面鉴权已启用（GREED_WEB_PASSWORD）");
+        info!("控制面鉴权已启用（GREED_WEB_PASSWORD，token 7 天有效，登录按 IP 限流）");
     } else {
         warn!("未设置 GREED_WEB_PASSWORD，控制面无鉴权（仅建议本机使用）");
     }
@@ -553,7 +656,8 @@ pub async fn run_serve(port: u16, config: String, strategy: String, lake: String
         jobs: Arc::new(Mutex::new(HashMap::new())),
         auth: AuthState {
             password,
-            tokens: Mutex::new(std::collections::HashSet::new()),
+            tokens: Mutex::new(HashMap::new()),
+            rate: Mutex::new(LoginRateLimit::new()),
         },
     });
 
@@ -573,8 +677,13 @@ pub async fn run_serve(port: u16, config: String, strategy: String, lake: String
         .layer(CorsLayer::permissive())
         .with_state(state);
 
-    let listener = tokio::net::TcpListener::bind(format!("0.0.0.0:{}", port)).await?;
-    info!(port, "控制面已启动（前端 /api 代理目标）");
-    axum::serve(listener, app).await?;
+    let addr = format!("{}:{}", host, port);
+    let listener = tokio::net::TcpListener::bind(&addr).await?;
+    info!(addr, "控制面已启动（前端 /api 代理目标）");
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await?;
     Ok(())
 }

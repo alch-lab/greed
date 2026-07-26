@@ -201,6 +201,9 @@ enum Command {
     },
     /// HTTP 控制面（PR-13）：前端监控/启停交易/跑回测
     Serve {
+        /// 监听地址（公网部署时保持 127.0.0.1，由 Caddy/nginx 反代暴露）
+        #[arg(long, default_value = "127.0.0.1")]
+        host: String,
         /// 监听端口
         #[arg(long, default_value_t = 8088)]
         port: u16,
@@ -648,11 +651,12 @@ async fn main() -> Result<()> {
             .await
         }
         Command::Serve {
+            host,
             port,
             config,
             strategy,
             lake,
-        } => serve::run_serve(port, config, strategy, lake).await,
+        } => serve::run_serve(&host, port, config, strategy, lake).await,
     }
 }
 

@@ -1,0 +1,27 @@
+[Unit]
+Description=greed 量化控制面（greed serve）
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/greed
+EnvironmentFile=/opt/greed/greed.env
+ExecStart=/opt/greed/greed serve --host 127.0.0.1 --port 8088 --config config/base.toml --strategy config/strategy-final.toml --lake data/lake
+Restart=always
+RestartSec=5
+
+# 安全收敛
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+# 需要写 data/（journal、数据湖），放开工作目录
+ReadWritePaths=/opt/greed/data /opt/greed/out
+
+# 以低权限用户运行（先创建：useradd -r -m -d /opt/greed greed）
+User=greed
+Group=greed
+
+[Install]
+WantedBy=multi-user.target
