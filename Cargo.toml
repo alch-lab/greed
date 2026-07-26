@@ -6,6 +6,7 @@ members = [
     "crates/signals",
     "crates/strategy",
     "crates/backtest",
+    "crates/live",
     "crates/cli",
 ]
 
@@ -23,6 +24,7 @@ data      = { path = "crates/data" }
 signals   = { path = "crates/signals" }
 strategy  = { path = "crates/strategy" }
 backtest  = { path = "crates/backtest" }
+live      = { path = "crates/live" }
 
 # 异步运行时（PR-11 采集器 / 实盘启用）
 tokio = { version = "1", features = ["full"] }
@@ -57,6 +59,10 @@ clap = { version = "4", features = ["derive"] }
 # 实时采集
 tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"]}
 futures-util = { version = "0.3", default-features = false }
+
+# 实盘签名（HMAC-SHA256）
+hmac = "0.12"
+sha2 = "0.10"
 # 测试
 proptest = "1"
 

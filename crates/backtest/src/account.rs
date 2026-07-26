@@ -88,6 +88,9 @@ impl Account {
     pub fn cash(&self) -> f64 {
         self.cash
     }
+    pub fn initial_cash(&self) -> f64 {
+        self.initial_cash
+    }
     pub fn position(&self) -> Option<&OpenPosition> {
         self.position.as_ref()
     }

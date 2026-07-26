@@ -13,6 +13,7 @@ crates/        Rust workspace
   signals/     renko 砖等信号研究工具
   strategy/    策略装配（信号/扳机/过滤器/出场插件 + TOML 注册表）
   backtest/    回测引擎（账户/撮合/手续费/统计/报告/决策流水）
+  live/        模拟盘/实盘执行（行情 WS、签名 REST、经纪层、LiveEngine）
   cli/         greed 二进制入口
 config/
   base.toml              采集配置 + 模拟盘账户 [account]
@@ -61,7 +62,7 @@ cargo test --workspace
 
 前端仓库：[greed-web](../greed-web)（`/Users/wonder/Code/greed-web`），把导出的 journal JSON 放到其 `public/journal/` 即可在看板中查看下单明细、日盈亏曲线、月盈亏、账户余额。
 
-## 模拟盘 API key
+## 模拟盘执行（greed trade）
 
 在 <https://testnet.binancefuture.com> 申请币安合约 testnet 密钥，写入环境变量（不要写进配置文件）：
 
@@ -70,6 +71,25 @@ export BINANCE_API_KEY="..."
 export BINANCE_API_SECRET="..."
 ```
 
+```bash
+# 干跑（不需要密钥）：真实行情 + 模拟撮合，验证全链路
+./target/release/greed trade --strategy config/strategy-final.toml --dry-run \
+  --journal data/journal/live.json --risk-pct 0.015 --max-risk-pct 0.015
+
+# testnet 模拟盘：真实下单（[account] testnet = true）
+./target/release/greed trade --strategy config/strategy-final.toml \
+  --journal data/journal/live.json --risk-pct 0.015 --max-risk-pct 0.015
+```
+
+工作机制：
+
+- **决策与回测同一代码路径**：信号 → 扳机 → 过滤器 → 仓位计算（equity × risk_pct / 止损距离）→ 出场插件，全部复用回测引擎逻辑。
+- **启动安全检查**：必须空仓启动（不接管外部持仓）；自动清遗留挂单、设杠杆（默认 3x 逐仓）、读交易对精度约束（tick/step/最小名义价值）。
+- **成交对账**：testnet 成交经 `userTrades` 每 2s 轮询确认，取真实成交价/手续费/maker 标记；每小时与钱包余额对账，漂移告警。
+- **Journal 原子落盘**：每次意图/成交/权益采样后重写 journal JSON（tmp + rename），前端随时读到最新状态；契约与回测导出完全一致，greed-web 直接可用。
+- **优雅退出**：SIGINT 只落盘退出，**不撤交易所挂单**（止损单是持仓保护）。
+- 行情 WS 断线指数退避重连 + 90s 假死看门狗；`--ws-base` 可覆盖行情源（如 dry-run 用主网更稠密的行情）。
+
 `config/base.toml` 的 `[account]` 段按 `testnet = true/false` 自动选择 testnet/实盘端点，密钥只从 `api_key_env` / `api_secret_env` 指定的环境变量读取。
 
-> 注意：当前只完成配置层。连接 testnet 实际下单的执行引擎尚未实现，落地时将复用同一 Journal 契约，前端无需改动。
+> ⚠️ 上实盘（testnet = false）前，请先在 testnet 模拟盘充分运行验证。

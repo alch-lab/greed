@@ -10,9 +10,10 @@
 use anyhow::{Context, Result};
 use backtest::{
     build_report, pair_round_trips, to_json, to_markdown, BacktestConfig, BacktestEngine,
-    Journal, JournalMeta, ReportConfig,
+    FeeModel, Journal, JournalMeta, ReportConfig,
 };
 use clap::{Parser, Subcommand};
+use data::live::config::AccountConfig;
 use data::live::{run_collector, CollectorConfig};
 use data::{ingest_day, Lake, Market};
 use signals::renko::{brick_stats, bricks_to_csv, stats_to_markdown, RenkoConfig, RenkoEngine};
@@ -156,6 +157,46 @@ enum Command {
         /// 输出前缀（生成 {out}-bricks.csv 与 {out}-stats.md）
         #[arg(long, default_value = "out/renko")]
         out: String,
+    },
+    /// 模拟盘/实盘执行（PR-12）：实时行情 → 策略决策 → testnet 下单 → journal 落盘
+    Trade {
+        /// 配置文件路径（读 [collector] 的 symbol/proxy 与 [account]）
+        #[arg(long, default_value = "config/base.toml")]
+        config: String,
+        /// 策略 TOML 配置路径
+        #[arg(long)]
+        strategy: String,
+        /// journal 输出路径（前端监控数据源，原子重写）
+        #[arg(long, default_value = "data/journal/live.json")]
+        journal: String,
+        /// 初始资金（仅 --dry-run 用；testnet 模式取真实钱包余额）
+        #[arg(long, default_value_t = 100_000.0)]
+        cash: f64,
+        /// 风险分数（同回测）
+        #[arg(long, default_value_t = 0.0075)]
+        risk_pct: f64,
+        /// 单笔最大风险（占 equity 比例上限）
+        #[arg(long, default_value_t = 0.015)]
+        max_risk_pct: f64,
+        /// 限价入场单有效期（毫秒）
+        #[arg(long, default_value_t = 4 * 3_600_000)]
+        entry_ttl_ms: i64,
+        /// 熔断：日连亏笔数上限（0 = 关闭）
+        #[arg(long, default_value_t = 0)]
+        cb_max_daily_losses: u32,
+        /// 熔断：日内回撤上限（0 = 关闭）
+        #[arg(long, default_value_t = 0.0)]
+        cb_daily_dd_pct: f64,
+        /// testnet 杠杆（启动时设置，逐仓）
+        #[arg(long, default_value_t = 3)]
+        leverage: u32,
+        /// 干跑：不连签名接口、不下单，用模拟撮合验证全链路
+        #[arg(long)]
+        dry_run: bool,
+        /// 覆盖行情 WS 地址（如 dry-run 想用主网更稠密的行情：
+        /// --ws-base wss://fstream.binance.com）
+        #[arg(long)]
+        ws_base: Option<String>,
     },
 }
 
@@ -551,7 +592,177 @@ async fn main() -> Result<()> {
                 anyhow::bail!("校验未通过（见上方 ❌ 项）")
             }
         }
+        Command::Trade {
+            config,
+            strategy,
+            journal,
+            cash,
+            risk_pct,
+            max_risk_pct,
+            entry_ttl_ms,
+            cb_max_daily_losses,
+            cb_daily_dd_pct,
+            leverage,
+            dry_run,
+            ws_base,
+        } => {
+            run_trade(TradeArgs {
+                config,
+                strategy,
+                journal,
+                cash,
+                risk_pct,
+                max_risk_pct,
+                entry_ttl_ms,
+                cb_max_daily_losses,
+                cb_daily_dd_pct,
+                leverage,
+                dry_run,
+                ws_base,
+            })
+            .await
+        }
     }
+}
+
+struct TradeArgs {
+    config: String,
+    strategy: String,
+    journal: String,
+    cash: f64,
+    risk_pct: f64,
+    max_risk_pct: f64,
+    entry_ttl_ms: i64,
+    cb_max_daily_losses: u32,
+    cb_daily_dd_pct: f64,
+    leverage: u32,
+    dry_run: bool,
+    ws_base: Option<String>,
+}
+
+/// 模拟盘/实盘执行循环：行情 WS → LiveEngine → journal 落盘。
+async fn run_trade(args: TradeArgs) -> Result<()> {
+    let text = std::fs::read_to_string(&args.config)
+        .with_context(|| format!("读取配置失败: {}", args.config))?;
+    let collector = CollectorConfig::from_toml_str(&text)
+        .with_context(|| format!("解析配置 [collector] 失败: {}", args.config))?;
+    let account = AccountConfig::from_toml_str(&text)
+        .with_context(|| format!("解析配置 [account] 失败: {}", args.config))?;
+
+    let toml_str = std::fs::read_to_string(&args.strategy)
+        .with_context(|| format!("读策略配置失败: {}", args.strategy))?;
+    let strat = assemble_from_toml(&toml_str, &builtin_registry())
+        .map_err(|e| anyhow::anyhow!("装配策略失败: {}", e))?;
+    info!(strategy = %args.strategy, "{}", strat.describe());
+
+    let ws_base = args
+        .ws_base
+        .clone()
+        .unwrap_or_else(|| account.ws_base().to_string());
+    let http = data::live::build_http_client(collector.effective_proxy().as_deref());
+
+    // 经纪层：dry（模拟撮合）或 testnet（真实下单）
+    let (broker, initial_cash, qty_step, min_notional) = if args.dry_run {
+        info!(
+            cash = args.cash,
+            ws = %ws_base,
+            "dry-run：模拟撮合，不下真实订单（testnet 行情较稀疏，可加 --ws-base wss://fstream.binance.com 用主网行情）"
+        );
+        (live::AnyBroker::dry(FeeModel::default()), args.cash, 1e-8, 0.0)
+    } else {
+        let (key, secret) = match (account.api_key(), account.api_secret()) {
+            (Some(k), Some(s)) => (k, s),
+            _ => anyhow::bail!(
+                "缺少 API 凭证：请 export {} 与 {}（testnet 申请：https://testnet.binancefuture.com）",
+                account.api_key_env,
+                account.api_secret_env
+            ),
+        };
+        let mut rest = live::RestClient::new(http.clone(), account.rest_base(), key, secret);
+        rest.sync_time().await?;
+
+        // 启动安全：必须空仓启动（避免接管外部持仓）
+        let amt = rest.position_amt(&collector.symbol).await?;
+        if amt.abs() > 1e-9 {
+            anyhow::bail!(
+                "启动检查失败：{} 存在持仓 {} —— 请先手动平仓（本引擎不接管外部持仓）",
+                collector.symbol,
+                amt
+            );
+        }
+        // 清掉遗留挂单，设置杠杆与逐仓
+        rest.cancel_all_open_orders(&collector.symbol).await?;
+        rest.set_leverage(&collector.symbol, args.leverage).await?;
+        rest.set_margin_isolated(&collector.symbol).await?;
+
+        let filters = rest.symbol_filters(&collector.symbol).await?;
+        let wallet = rest.wallet_balance_usdt().await?;
+        info!(
+            wallet,
+            leverage = args.leverage,
+            tick = filters.tick_size,
+            step = filters.step_size,
+            min_notional = filters.min_notional,
+            "testnet 账户就绪（空仓启动）"
+        );
+        (
+            live::AnyBroker::testnet(rest, &collector.symbol, filters),
+            wallet,
+            filters.step_size,
+            filters.min_notional,
+        )
+    };
+
+    let started_at = chrono::Utc::now().format("%Y-%m-%d").to_string();
+    let cfg = live::LiveConfig {
+        symbol: collector.symbol.clone(),
+        risk_pct: args.risk_pct,
+        max_risk_pct: args.max_risk_pct,
+        entry_ttl_ms: args.entry_ttl_ms,
+        cb_max_daily_losses: args.cb_max_daily_losses,
+        cb_daily_dd_pct: args.cb_daily_dd_pct,
+        qty_step,
+        min_notional,
+        journal_path: std::path::PathBuf::from(&args.journal),
+        strategy_name: args.strategy.clone(),
+    };
+    if let Some(parent) = std::path::Path::new(&args.journal).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut engine = live::LiveEngine::new(strat, broker, cfg, initial_cash, started_at);
+    engine.persist_journal();
+
+    // 行情 feed → 引擎；1s 节拍做成交轮询/采样/对账；SIGINT 优雅退出
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<tcore::Trade>(4096);
+    {
+        let ws = ws_base.clone();
+        let sym = collector.symbol.clone();
+        tokio::spawn(async move {
+            live::feed::run_trade_feed(&ws, &sym, Exchange::BinanceFutures, tx).await;
+        });
+    }
+    info!(symbol = %collector.symbol, journal = %args.journal, "进入交易主循环");
+    let mut timer = tokio::time::interval(std::time::Duration::from_secs(1));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        tokio::select! {
+            maybe = rx.recv() => {
+                match maybe {
+                    Some(t) => engine.on_trade(&t).await,
+                    None => anyhow::bail!("行情通道关闭"),
+                }
+            }
+            _ = timer.tick() => {
+                engine.on_timer(chrono::Utc::now().timestamp_millis()).await;
+            }
+            _ = tokio::signal::ctrl_c() => {
+                info!("收到 SIGINT，优雅退出");
+                engine.shutdown().await;
+                break;
+            }
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]

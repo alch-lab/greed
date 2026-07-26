@@ -1,29 +1,23 @@
 [package]
-name = "cli"
-description = "Command-line entry points: ingest / collect / backtest / validate"
+name = "live"
+description = "Live/paper trading engine: Binance USD-M futures testnet execution with the same strategy code path as backtest"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
 
-[[bin]]
-name = "greed"
-path = "src/main.rs"
-
 [dependencies]
 tcore = { workspace = true }
 data = { workspace = true }
-signals = { workspace = true }
 strategy = { workspace = true }
 backtest = { workspace = true }
-live = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
-anyhow = { workspace = true }
-config = { workspace = true }
 tracing = { workspace = true }
-tracing-subscriber = { workspace = true }
 tokio = { workspace = true }
-clap = { workspace = true }
-chrono = { workspace = true }
 reqwest = { workspace = true }
+tokio-tungstenite = { workspace = true }
+futures-util = { workspace = true }
+chrono = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
