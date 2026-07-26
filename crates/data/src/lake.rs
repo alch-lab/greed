@@ -17,7 +17,7 @@ use std::fs::{self, File};
 use std::io::BufWriter;
 use std::matches;
 use std::path::{Path, PathBuf};
-use tcore::event::Trade;
+use tcore::event::{FundingTick, OiTick, Trade};
 use tcore::types::{Exchange, Symbol, Timestamp};
 use thiserror::Error;
 
@@ -612,4 +612,98 @@ mod tests {
 
         let _ = fs::remove_dir_all(&dir);
     }
+}
+
+// ============================================================================
+// 宏观数据（资金费率 / OI metrics）读取：scripts/fetch_macro_data.py 回补的公开数据
+// ============================================================================
+
+/// 读取币安 daily metrics（5m 粒度 OI），转为 OiTick 流。
+/// 目录约定：`{root}/metrics/{exchange}/{symbol}/yyyy-mm-dd.csv`，
+/// oi_usd 取 `sum_open_interest_value` 列。
+pub fn read_oi_metrics(
+    lake: &Lake,
+    exchange: Exchange,
+    symbol: &Symbol,
+    from: Timestamp,
+    to: Timestamp,
+) -> Result<Vec<OiTick>, LakeError> {
+    let dir = lake
+        .root()
+        .join("metrics")
+        .join(exchange.as_str())
+        .join(symbol.as_str());
+    if !dir.exists() {
+        return Ok(vec![]);
+    }
+    let mut entries: Vec<PathBuf> = fs::read_dir(&dir)?
+        .filter_map(|e| e.ok().map(|e| e.path()))
+        .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("csv"))
+        .collect();
+    entries.sort();
+
+    let mut out = Vec::new();
+    for path in entries {
+        let mut rdr =
+            csv::Reader::from_path(&path).map_err(|e| LakeError::Data(e.to_string()))?;
+        for rec in rdr.records() {
+            let rec = rec.map_err(|e| LakeError::Data(e.to_string()))?;
+            let Some(ts_str) = rec.get(0) else { continue };
+            let Ok(dt) = chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S")
+            else {
+                continue;
+            };
+            let ts = Timestamp::from_millis(dt.and_utc().timestamp_millis());
+            if ts < from || ts >= to {
+                continue;
+            }
+            let oi_usd: f64 = rec.get(3).unwrap_or("0").parse().unwrap_or(0.0);
+            out.push(OiTick {
+                ts,
+                exchange,
+                symbol: symbol.clone(),
+                oi_usd,
+            });
+        }
+    }
+    Ok(out)
+}
+
+/// 读取资金费率历史（8h 粒度）。
+/// 路径约定：`{root}/funding/{exchange}/{symbol}/funding.csv`
+/// （列：funding_time_ms,rate,mark_price）。
+pub fn read_funding(
+    lake: &Lake,
+    exchange: Exchange,
+    symbol: &Symbol,
+    from: Timestamp,
+    to: Timestamp,
+) -> Result<Vec<FundingTick>, LakeError> {
+    let path = lake
+        .root()
+        .join("funding")
+        .join(exchange.as_str())
+        .join(symbol.as_str())
+        .join("funding.csv");
+    if !path.exists() {
+        return Ok(vec![]);
+    }
+    let mut rdr = csv::Reader::from_path(&path).map_err(|e| LakeError::Data(e.to_string()))?;
+    let mut out = Vec::new();
+    for rec in rdr.records() {
+        let rec = rec.map_err(|e| LakeError::Data(e.to_string()))?;
+        let ts_ms: i64 = rec.get(0).unwrap_or("0").parse().unwrap_or(0);
+        let ts = Timestamp::from_millis(ts_ms);
+        if ts < from || ts >= to {
+            continue;
+        }
+        let rate: f64 = rec.get(1).unwrap_or("0").parse().unwrap_or(0.0);
+        out.push(FundingTick {
+            ts,
+            exchange,
+            symbol: symbol.clone(),
+            rate,
+        });
+    }
+    Ok(out)
 }

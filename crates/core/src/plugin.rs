@@ -187,6 +187,17 @@ pub trait TriggerPlugin: Send {
     ) -> Option<OrderIntent> {
         None
     }
+    /// 持仓中加仓钩子（金字塔等）。默认不加仓。
+    /// 返回的 intent 数量若为非零正值，则作为仓位上限（引擎取风险仓与该值的较小者）。
+    fn on_add(
+        &mut self,
+        _pos: &Position,
+        _signals: &[Signal],
+        _ctx: &Ctx,
+        _symbol: &Symbol,
+    ) -> Option<OrderIntent> {
+        None
+    }
 }
 
 /// 出场管理插件

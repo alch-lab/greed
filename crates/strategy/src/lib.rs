@@ -6,13 +6,12 @@
 //! - [`builtin`]：内置插件注册入口（filters/exits/triggers）。
 //! - [`filters`] / [`exits`] / [`triggers`]：基础插件实现。
 //!
-//!  后续在 signals crate 实现信号插件后于此注册；Phase 3 实现 [`fsm`] 状态机。
+//!  信号插件在 signals crate 实现后于 [`builtin`] 注册。
 
 pub mod assemble;
 pub mod builtin;
 pub mod exits;
 pub mod filters;
-pub mod fsm;
 pub mod registry;
 pub mod triggers;
 

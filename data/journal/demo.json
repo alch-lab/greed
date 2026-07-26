@@ -1,0 +1,691 @@
+{
+  "meta": {
+    "symbol": "BTCUSDT",
+    "from": "2026-01-01",
+    "to": "2026-02-28",
+    "strategy": "config/strategy-final.toml",
+    "initial_cash": 100000.0,
+    "final_equity": 107633.11427475039
+  },
+  "intents": [
+    {
+      "ts_ms": 1770014597044,
+      "side": "Sell",
+      "qty": 1.95699057,
+      "limit_price": null,
+      "stop_price": 77414.783,
+      "tp1_price": 75515.07894915,
+      "reason": "pyramid_base(overbought price=76648.30 ema=75515.08)"
+    },
+    {
+      "ts_ms": 1770018449784,
+      "side": "Sell",
+      "qty": 0.97849529,
+      "limit_price": null,
+      "stop_price": 77414.783,
+      "tp1_price": 75515.07894915,
+      "reason": "pyramid_add(L1 price=76909.00)"
+    },
+    {
+      "ts_ms": 1770024466491,
+      "side": "Sell",
+      "qty": 0.97849529,
+      "limit_price": null,
+      "stop_price": 77414.783,
+      "tp1_price": 75515.07894915,
+      "reason": "pyramid_add(L2 price=77178.20)"
+    },
+    {
+      "ts_ms": 1770150669008,
+      "side": "Sell",
+      "qty": 1.92525921,
+      "limit_price": null,
+      "stop_price": 76700.814,
+      "tp1_price": 74818.93133494,
+      "reason": "pyramid_base(overbought price=75941.40 ema=74818.93)"
+    },
+    {
+      "ts_ms": 1770150711857,
+      "side": "Sell",
+      "qty": 0.96262961,
+      "limit_price": null,
+      "stop_price": 76700.814,
+      "tp1_price": 74818.93133494,
+      "reason": "pyramid_add(L1 price=76199.60)"
+    },
+    {
+      "ts_ms": 1770150728347,
+      "side": "Sell",
+      "qty": 0.96262961,
+      "limit_price": null,
+      "stop_price": 76700.814,
+      "tp1_price": 74818.93133494,
+      "reason": "pyramid_add(L2 price=76466.40)"
+    },
+    {
+      "ts_ms": 1770152709063,
+      "side": "Sell",
+      "qty": 1.85606141,
+      "limit_price": null,
+      "stop_price": 77548.507,
+      "tp1_price": 75645.87587031,
+      "reason": "pyramid_base(overbought price=76780.70 ema=75645.88)"
+    },
+    {
+      "ts_ms": 1770302355689,
+      "side": "Sell",
+      "qty": 2.05310535,
+      "limit_price": null,
+      "stop_price": 71555.874,
+      "tp1_price": 69800.19918483,
+      "reason": "pyramid_base(overbought price=70847.40 ema=69800.20)"
+    },
+    {
+      "ts_ms": 1770332683154,
+      "side": "Sell",
+      "qty": 2.29221978,
+      "limit_price": null,
+      "stop_price": 65417.195,
+      "tp1_price": 63812.23495768,
+      "reason": "pyramid_base(overbought price=64769.50 ema=63812.23)"
+    },
+    {
+      "ts_ms": 1770338735913,
+      "side": "Sell",
+      "qty": 2.38603325,
+      "limit_price": null,
+      "stop_price": 64144.999,
+      "tp1_price": 62571.12837153,
+      "reason": "pyramid_base(overbought price=63509.90 ema=62571.13)"
+    },
+    {
+      "ts_ms": 1770340537837,
+      "side": "Sell",
+      "qty": 2.41198195,
+      "limit_price": null,
+      "stop_price": 64767.563,
+      "tp1_price": 63178.55077939,
+      "reason": "pyramid_base(overbought price=64126.30 ema=63178.55)"
+    },
+    {
+      "ts_ms": 1770340554691,
+      "side": "Sell",
+      "qty": 1.20599098,
+      "limit_price": null,
+      "stop_price": 64767.563,
+      "tp1_price": 63178.55077939,
+      "reason": "pyramid_add(L1 price=64344.50)"
+    },
+    {
+      "ts_ms": 1770341759488,
+      "side": "Sell",
+      "qty": 1.20599098,
+      "limit_price": null,
+      "stop_price": 64767.563,
+      "tp1_price": 63178.55077939,
+      "reason": "pyramid_add(L2 price=64569.90)"
+    },
+    {
+      "ts_ms": 1770343588512,
+      "side": "Sell",
+      "qty": 2.31046166,
+      "limit_price": null,
+      "stop_price": 65904.116,
+      "tp1_price": 64284.55306728,
+      "reason": "pyramid_base(overbought price=65251.60 ema=64284.55)"
+    },
+    {
+      "ts_ms": 1770357058143,
+      "side": "Sell",
+      "qty": 2.3225652,
+      "limit_price": null,
+      "stop_price": 66920.58,
+      "tp1_price": 65278.25298265,
+      "reason": "pyramid_base(overbought price=66258.00 ema=65278.25)"
+    },
+    {
+      "ts_ms": 1770357118084,
+      "side": "Sell",
+      "qty": 1.1612826,
+      "limit_price": null,
+      "stop_price": 66920.58,
+      "tp1_price": 65278.25298265,
+      "reason": "pyramid_add(L1 price=66483.30)"
+    },
+    {
+      "ts_ms": 1770357249680,
+      "side": "Sell",
+      "qty": 1.1612826,
+      "limit_price": null,
+      "stop_price": 66920.58,
+      "tp1_price": 65278.25298265,
+      "reason": "pyramid_add(L2 price=66716.00)"
+    }
+  ],
+  "fills": [
+    {
+      "ts": 1770014597044,
+      "side": "Sell",
+      "price": 7664063517000,
+      "qty": 195699057,
+      "fee": 59.99400012260014,
+      "is_maker": false,
+      "realized_pnl": 0.0,
+      "position_side_after": "Sell",
+      "reason": "pyramid_base(overbought price=76648.30 ema=75515.08)"
+    },
+    {
+      "ts": 1770018449784,
+      "side": "Sell",
+      "price": 7690130910000,
+      "qty": 97849529,
+      "fee": 30.099027499673657,
+      "is_maker": false,
+      "realized_pnl": 0.0,
+      "position_side_after": "Sell",
+      "reason": "pyramid_add(L1 price=76909.00)"
+    },
+    {
+      "ts": 1770024466491,
+      "side": "Sell",
+      "price": 7717048218000,
+      "qty": 97849529,
+      "fee": 30.204381336063577,
+      "is_maker": false,
+      "realized_pnl": 0.0,
+      "position_side_after": "Sell",
+      "reason": "pyramid_add(L2 price=77178.20)"
+    },
+    {
+      "ts": 1770024807955,
+      "side": "Buy",
+      "price": 7742264149000,
+      "qty": 391398115,
+      "fee": 121.21230375002716,
+      "is_maker": false,
+      "realized_pnl": -2287.236979204649,
+      "position_side_after": null,
+      "reason": "stop"
+    },
+    {
+      "ts": 1770150669008,
+      "side": "Sell",
+      "price": 7593380586000,
+      "qty": 192525921,
+      "fee": 58.47690363292679,
+      "is_maker": false,
+      "realized_pnl": 0.0,
+      "position_side_after": "Sell",
+      "reason": "pyramid_base(overbought price=75941.40 ema=74818.93)"
+    },
+    {
+      "ts": 1770150711857,
+      "side": "Sell",
+      "price": 7619198004000,
+      "qty": 96262961,
+      "fee": 29.33786241241319,
+      "is_maker": false,
+      "realized_pnl": 0.0,
+      "position_side_after": "Sell",
+      "reason": "pyramid_add(L1 price=76199.60)"
+    },
+    {
+      "ts": 1770150728347,
+      "side": "Sell",
+      "price": 7645875336000,
+      "qty": 96262961,
+      "fee": 29.440583971209197,
+      "is_maker": false,
+      "realized_pnl": 0.0,
+      "position_side_after": "Sell",
+      "reason": "pyramid_add(L2 price=76466.40)"
+    },
+    {
+      "ts": 1770152524510,
+      "side": "Buy",
+      "price": 7670857009000,
+      "qty": 385051843,
+      "fee": 118.14710514819672,
+      "is_maker": false,
+      "realized_pnl": -2229.387829112814,
+      "position_side_after": null,
+      "reason": "stop"
+    },
+    {
+      "ts": 1770152709063,
+      "side": "Sell",
+      "price": 7677302193000,
+      "qty": 185606141,
+      "fee": 56.99817733334269,
+      "is_maker": false,
+      "realized_pnl": 0.0,
+      "position_side_after": "Sell",
+      "reason": "pyramid_base(overbought price=76780.70 ema=75645.88)"
+    },
+    {
+      "ts": 1770156954540,
+      "side": "Buy",
+      "price": 7565336458000,
+      "qty": 185606141,
+      "fee": 56.166916213439535,
+      "is_maker": false,
+      "realized_pnl": 2078.152799757879,
+      "position_side_after": null,
+      "reason": "tp_partial"
+    },
+    {
+      "ts": 1770302355689,
+      "side": "Sell",
+      "price": 7084031526000,
+      "qty": 205310535,
+      "fee": 58.177052102397056,
+      "is_maker": false,
+      "realized_pnl": 0.0,
+      "position_side_after": "Sell",
+      "reason": "pyramid_base(overbought price=70847.40 ema=69800.20)"
+    },
+    {
+      "ts": 1770303322857,
+      "side": "Buy",
+      "price": 6980708001000,
+      "qty": 205310535,
+      "fee": 57.32851577456363,
+      "is_maker": false,
+      "realized_pnl": 2121.340819583583,
+      "position_side_after": null,
+      "reason": "tp_partial"
+    },
+    {
+      "ts": 1770332683154,
+      "side": "Sell",
+      "price": 6476302305000,
+      "qty": 229221978,
+      "fee": 59.380432979122375,
+      "is_maker": false,
+      "realized_pnl": 0.0,
+      "position_side_after": "Sell",
+      "reason": "pyramid_base(overbought price=64769.50 ema=63812.23)"
+    },
+    {
+      "ts": 1770334512029,
+      "side": "Buy",
+      "price": 6381848121000,
+      "qty": 229221978,
+      "fee": 58.514393983648134,
+      "is_maker": false,
+      "realized_pnl": 2165.0974886856075,
+      "position_side_after": null,
+      "reason": "tp_partial"
+    },
+    {
+      "ts": 1770338735913,
+      "side": "Sell",
+      "price": 6350354901000,
+      "qty": 238603325,
+      "fee": 60.60863177234584,
+      "is_maker": false,
+      "realized_pnl": 0.0,
+      "position_side_after": "Sell",
+      "reason": "pyramid_base(overbought price=63509.90 ema=62571.13)"
+    },
+    {
+      "ts": 1770338929342,
+      "side": "Buy",
+      "price": 6257725710000,
+      "qty": 238603325,
+      "fee": 59.72456645375943,
+      "is_maker": false,
+      "realized_pnl": 2210.1632964660075,
+      "position_side_after": null,
+      "reason": "tp_partial"
+    },
+    {
+      "ts": 1770340537837,
+      "side": "Sell",
+      "price": 6411988737000,
+      "qty": 241198195,
+      "fee": 61.862404388989184,
+      "is_maker": false,
+      "realized_pnl": 0.0,
+      "position_side_after": "Sell",
+      "reason": "pyramid_base(overbought price=64126.30 ema=63178.55)"
+    },
+    {
+      "ts": 1770340554691,
+      "side": "Sell",
+      "price": 6433806555000,
+      "qty": 120599098,
+      "fee": 31.036450689579492,
+      "is_maker": false,
+      "realized_pnl": 0.0,
+      "position_side_after": "Sell",
+      "reason": "pyramid_add(L1 price=64344.50)"
+    },
+    {
+      "ts": 1770341759488,
+      "side": "Sell",
+      "price": 6456344301000,
+      "qty": 120599098,
+      "fee": 31.14517196312162,
+      "is_maker": false,
+      "realized_pnl": 0.0,
+      "position_side_after": "Sell",
+      "reason": "pyramid_add(L2 price=64569.90)"
+    },
+    {
+      "ts": 1770342395325,
+      "side": "Buy",
+      "price": 6477407676000,
+      "qty": 482396391,
+      "fee": 124.98712343752389,
+      "is_maker": false,
+      "realized_pnl": -2357.740989598172,
+      "position_side_after": null,
+      "reason": "stop"
+    },
+    {
+      "ts": 1770343588512,
+      "side": "Sell",
+      "price": 6524507484000,
+      "qty": 231046166,
+      "fee": 60.29849756866025,
+      "is_maker": false,
+      "realized_pnl": 0.0,
+      "position_side_after": "Sell",
+      "reason": "pyramid_base(overbought price=65251.60 ema=64284.55)"
+    },
+    {
+      "ts": 1770344601474,
+      "side": "Buy",
+      "price": 6429092845000,
+      "qty": 231046166,
+      "fee": 59.41669010781129,
+      "is_maker": false,
+      "realized_pnl": 2204.5186521224114,
+      "position_side_after": null,
+      "reason": "tp_partial"
+    },
+    {
+      "ts": 1770357058143,
+      "side": "Sell",
+      "price": 6625137420000,
+      "qty": 232256520,
+      "fee": 61.54925446763914,
+      "is_maker": false,
+      "realized_pnl": 0.0,
+      "position_side_after": "Sell",
+      "reason": "pyramid_base(overbought price=66258.00 ema=65278.25)"
+    },
+    {
+      "ts": 1770357118084,
+      "side": "Sell",
+      "price": 6647665167000,
+      "qty": 116128260,
+      "fee": 30.87927155625278,
+      "is_maker": false,
+      "realized_pnl": 0.0,
+      "position_side_after": "Sell",
+      "reason": "pyramid_add(L1 price=66483.30)"
+    },
+    {
+      "ts": 1770357249680,
+      "side": "Sell",
+      "price": 6670932840000,
+      "qty": 116128260,
+      "fee": 30.987352931442338,
+      "is_maker": false,
+      "realized_pnl": 0.0,
+      "position_side_after": "Sell",
+      "reason": "pyramid_add(L2 price=66716.00)"
+    },
+    {
+      "ts": 1770359732679,
+      "side": "Buy",
+      "price": 6528432778000,
+      "qty": 464513040,
+      "fee": 121.30168624577702,
+      "is_maker": false,
+      "realized_pnl": 5285.481773893081,
+      "position_side_after": null,
+      "reason": "tp_partial"
+    }
+  ],
+  "equity_curve": [
+    {
+      "ts_ms": 1767225601807,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1767312000049,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1767398401296,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1767484800015,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1767571200033,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1767657600011,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1767744000027,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1767830400024,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1767916800084,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1768003200015,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1768089600081,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1768176000120,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1768262400015,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1768348800058,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1768435200049,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1768521600017,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1768608001400,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1768694400047,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1768780800055,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1768867200062,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1768953600117,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1769040000106,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1769126401765,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1769212800013,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1769299201633,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1769385601592,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1769472000016,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1769558400009,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1769644801777,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1769731200022,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1769817600012,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1769904000021,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1769990400010,
+      "equity": 100000.0
+    },
+    {
+      "ts_ms": 1770076800311,
+      "equity": 97471.25330808698
+    },
+    {
+      "ts_ms": 1770163200016,
+      "equity": 96971.45073002052
+    },
+    {
+      "ts_ms": 1770249600012,
+      "equity": 96971.45073002052
+    },
+    {
+      "ts_ms": 1770336000078,
+      "equity": 101024.48864344998
+    },
+    {
+      "ts_ms": 1770422400015,
+      "equity": 107633.11427475039
+    },
+    {
+      "ts_ms": 1770508800013,
+      "equity": 107633.11427475039
+    },
+    {
+      "ts_ms": 1770595200014,
+      "equity": 107633.11427475039
+    },
+    {
+      "ts_ms": 1770681600006,
+      "equity": 107633.11427475039
+    },
+    {
+      "ts_ms": 1770768000012,
+      "equity": 107633.11427475039
+    },
+    {
+      "ts_ms": 1770854400007,
+      "equity": 107633.11427475039
+    },
+    {
+      "ts_ms": 1770940800006,
+      "equity": 107633.11427475039
+    },
+    {
+      "ts_ms": 1771027200065,
+      "equity": 107633.11427475039
+    },
+    {
+      "ts_ms": 1771113600006,
+      "equity": 107633.11427475039
+    },
+    {
+      "ts_ms": 1771200000056,
+      "equity": 107633.11427475039
+    },
+    {
+      "ts_ms": 1771286400005,
+      "equity": 107633.11427475039
+    },
+    {
+      "ts_ms": 1771372800009,
+      "equity": 107633.11427475039
+    },
+    {
+      "ts_ms": 1771459200013,
+      "equity": 107633.11427475039
+    },
+    {
+      "ts_ms": 1771545600004,
+      "equity": 107633.11427475039
+    },
+    {
+      "ts_ms": 1771632000008,
+      "equity": 107633.11427475039
+    },
+    {
+      "ts_ms": 1771718400003,
+      "equity": 107633.11427475039
+    },
+    {
+      "ts_ms": 1771804800061,
+      "equity": 107633.11427475039
+    },
+    {
+      "ts_ms": 1771891200094,
+      "equity": 107633.11427475039
+    },
+    {
+      "ts_ms": 1771977600062,
+      "equity": 107633.11427475039
+    },
+    {
+      "ts_ms": 1772064000066,
+      "equity": 107633.11427475039
+    },
+    {
+      "ts_ms": 1772150400065,
+      "equity": 107633.11427475039
+    },
+    {
+      "ts_ms": 1772236800005,
+      "equity": 107633.11427475039
+    }
+  ]
+}

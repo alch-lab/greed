@@ -28,7 +28,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{debug, info, warn};
 
 use super::shard_writer::LiveEvent;
-use super::CollectError;
+use super::{build_http_client, CollectError};
 use crate::normalize::NormalizedTrade;
 
 /// 市场类型（决定 WS/REST 端点与交易所标记）。
@@ -176,6 +176,75 @@ impl GapTracker {
 // 采集任务
 // ============================================================================
 
+type WsStream =
+    tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+
+/// 建立 WS 连接；配置代理时先经 HTTP CONNECT 隧道再 TLS + WS 握手。
+async fn connect_ws(url: &str, proxy: Option<&str>) -> Result<WsStream, CollectError> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    match proxy {
+        None => {
+            let (w, _) = connect_async(url).await?;
+            Ok(w)
+        }
+        Some(px) => {
+            // 目标 host:port（wss 默认 443）
+            let no_scheme = url
+                .trim_start_matches("wss://")
+                .trim_start_matches("ws://");
+            let hostport = no_scheme.split('/').next().unwrap_or("");
+            let (host, port) = match hostport.split_once(':') {
+                Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(443)),
+                None => (hostport.to_string(), 443u16),
+            };
+            // 代理 host:port
+            let px_no_scheme = px
+                .trim_start_matches("http://")
+                .trim_start_matches("https://")
+                .trim_end_matches('/');
+            let px_addr = px_no_scheme.split('/').next().unwrap_or("");
+            let mut stream = tokio::net::TcpStream::connect(px_addr)
+                .await
+                .map_err(|e| CollectError::Data(format!("连接代理 {} 失败: {}", px_addr, e)))?;
+            let req = format!(
+                "CONNECT {}:{} HTTP/1.1\r\nHost: {}:{}\r\n\r\n",
+                host, port, host, port
+            );
+            stream
+                .write_all(req.as_bytes())
+                .await
+                .map_err(|e| CollectError::Data(format!("代理 CONNECT 写入失败: {}", e)))?;
+            // 读响应头直到 \r\n\r\n
+            let mut buf = Vec::with_capacity(512);
+            let mut tmp = [0u8; 1024];
+            loop {
+                let n = stream
+                    .read(&mut tmp)
+                    .await
+                    .map_err(|e| CollectError::Data(format!("代理 CONNECT 读取失败: {}", e)))?;
+                if n == 0 {
+                    return Err(CollectError::Data("代理 CONNECT 响应为空".into()));
+                }
+                buf.extend_from_slice(&tmp[..n]);
+                if buf.windows(4).any(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+                if buf.len() > 8192 {
+                    return Err(CollectError::Data("代理 CONNECT 响应头过长".into()));
+                }
+            }
+            let head = String::from_utf8_lossy(&buf);
+            let status = head.lines().next().unwrap_or("");
+            if !status.contains(" 200") {
+                return Err(CollectError::Data(format!("代理 CONNECT 被拒: {}", status)));
+            }
+            let (w, _) = tokio_tungstenite::client_async_tls(url, stream).await?;
+            Ok(w)
+        }
+    }
+}
+
 /// 运行一个市场的 aggTrade 采集循环（永不返回，除非 channel 关闭）。
 ///
 /// 断线自动重连并回补；所有错误只记日志，不中断 daemon。
@@ -183,13 +252,11 @@ pub async fn run_aggtrade_collector(
     market: BinanceMarket,
     symbol: Symbol,
     tx: mpsc::Sender<LiveEvent>,
+    proxy: Option<String>,
 ) {
     let exchange = market.exchange();
     let symbol_lower = symbol.as_str().to_lowercase();
-    let client = reqwest::Client::builder()
-        .user_agent("greed-collect/0.1")
-        .build()
-        .expect("reqwest client");
+    let client = build_http_client(proxy.as_deref());
     let mut tracker = GapTracker::default();
     let mut backoff_ms = 1_000u64;
 
@@ -205,9 +272,9 @@ pub async fn run_aggtrade_collector(
 
         // 2) 建立 WS
         let url = market.ws_url(&symbol_lower);
-        info!(?market, %url, "连接 aggTrade WS");
-        let ws = match connect_async(&url).await {
-            Ok((w, _)) => w,
+        info!(?market, %url, proxy = proxy.is_some(), "连接 aggTrade WS");
+        let ws = match connect_ws(&url, proxy.as_deref()).await {
+            Ok(w) => w,
             Err(e) => {
                 warn!(?market, error = %e, backoff_ms, "WS 连接失败，退避重试");
                 sleep(backoff_ms).await;

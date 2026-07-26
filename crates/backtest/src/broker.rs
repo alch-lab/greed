@@ -17,6 +17,8 @@ pub struct Order {
     pub qty: Qty,
     pub kind: OrderKind,
     pub reason: String,
+    /// 限价单过期时间（None = 永久挂单）。过期未成交自动撤单。
+    pub expire_ts: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -45,6 +47,7 @@ struct PendingOrder {
     qty: Qty,
     kind: PendingKind,
     reason: String,
+    expire_ts: Option<Timestamp>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -111,6 +114,7 @@ impl Broker {
                         qty: order.qty,
                         kind: PendingKind::Limit(limit),
                         reason: order.reason,
+                        expire_ts: order.expire_ts,
                     });
                     None
                 }
@@ -121,6 +125,7 @@ impl Broker {
                     qty: order.qty,
                     kind: PendingKind::StopMarket(trigger),
                     reason: order.reason,
+                    expire_ts: None,
                 });
                 None
             }
@@ -132,6 +137,12 @@ impl Broker {
         let mut executed = Vec::new();
         let mut still_pending = Vec::new();
         for po in std::mem::take(&mut self.pending) {
+            // 过期限价单自动撤销
+            if let Some(exp) = po.expire_ts {
+                if ts.as_millis() > exp.as_millis() {
+                    continue;
+                }
+            }
             let fill = match po.kind {
                 PendingKind::Limit(limit) => {
                     let hit = match po.side {
@@ -212,6 +223,7 @@ mod tests {
                     qty: Qty::from_f64(1.0),
                     kind: OrderKind::Market,
                     reason: "t".into(),
+                    expire_ts: None,
                 },
             )
             .expect("市价单应立即成交");
@@ -232,6 +244,7 @@ mod tests {
                 qty: Qty::from_f64(1.0),
                 kind: OrderKind::Limit(Price::from_f64(99.0)),
                 reason: "limit".into(),
+                expire_ts: None,
             },
         );
         assert!(r.is_none());
@@ -257,6 +270,7 @@ mod tests {
                 qty: Qty::from_f64(1.0),
                 kind: OrderKind::StopMarket(Price::from_f64(99.0)),
                 reason: "stop".into(),
+                expire_ts: None,
             },
         );
         assert!(b.on_trade_price(ts(2), Price::from_f64(99.5)).is_empty());
@@ -279,6 +293,7 @@ mod tests {
                     qty: Qty::from_f64(1.0),
                     kind: OrderKind::Limit(Price::from_f64(100.5)),
                     reason: "t".into(),
+                    expire_ts: None,
                 },
             )
             .expect("穿越限价应立即成交");

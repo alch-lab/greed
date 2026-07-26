@@ -35,6 +35,10 @@ pub struct CollectorConfig {
     pub flush_tick_secs: u64,
     /// 缓冲最长停留时间（秒；v1.2——即使未到阈值也强制落盘，防崩溃丢数小时数据）
     pub max_buffer_secs: u64,
+    /// 出口代理（如 "http://127.0.0.1:7897"）；币安 API/WS 不可直连的网络下使用。
+    /// 配置缺省时回退读环境变量 GREED_PROXY；都没有则直连。
+    #[serde(default)]
+    pub proxy: Option<String>,
 }
 
 impl Default for CollectorConfig {
@@ -54,6 +58,7 @@ impl Default for CollectorConfig {
             book_flush_rows: 2000,
             flush_tick_secs: 60,
             max_buffer_secs: 300,
+            proxy: None,
         }
     }
 }
@@ -67,6 +72,92 @@ impl CollectorConfig {
             collector: CollectorConfig,
         }
         Ok(toml::from_str::<Wrapper>(text)?.collector)
+    }
+
+    /// 生效的代理地址：配置优先，其次环境变量 GREED_PROXY。
+    pub fn effective_proxy(&self) -> Option<String> {
+        self.proxy
+            .clone()
+            .or_else(|| std::env::var("GREED_PROXY").ok())
+            .filter(|s| !s.trim().is_empty())
+    }
+}
+
+/// 账户/下单凭证配置：对应 `config/base.toml [account]`（模拟盘/实盘）。
+///
+/// 安全约定：**密钥不写入任何文件**，TOML 里只配环境变量名，
+/// 运行时从环境变量读取。模拟盘用币安合约 testnet：
+/// 在 https://testnet.binancefuture.com 申请 key，然后
+/// `export BINANCE_API_KEY=... BINANCE_API_SECRET=...`。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(default)]
+pub struct AccountConfig {
+    /// true = 币安合约 testnet（模拟盘）；false = 主网（实盘，慎用）
+    pub testnet: bool,
+    /// API key 所在环境变量名
+    pub api_key_env: String,
+    /// API secret 所在环境变量名
+    pub api_secret_env: String,
+    /// REST 基础地址（留空按 testnet 自动选择）
+    pub rest_base: String,
+    /// WS 基础地址（留空按 testnet 自动选择）
+    pub ws_base: String,
+}
+
+impl Default for AccountConfig {
+    fn default() -> Self {
+        Self {
+            testnet: true,
+            api_key_env: "BINANCE_API_KEY".into(),
+            api_secret_env: "BINANCE_API_SECRET".into(),
+            rest_base: String::new(),
+            ws_base: String::new(),
+        }
+    }
+}
+
+impl AccountConfig {
+    /// 从 TOML 文本加载（读 `[account]` 节；整节缺失时用默认 = testnet 模拟盘）。
+    pub fn from_toml_str(text: &str) -> Result<Self, toml::de::Error> {
+        #[derive(Deserialize)]
+        struct Wrapper {
+            #[serde(default)]
+            account: AccountConfig,
+        }
+        Ok(toml::from_str::<Wrapper>(text)?.account)
+    }
+
+    pub fn rest_base(&self) -> &str {
+        if !self.rest_base.is_empty() {
+            &self.rest_base
+        } else if self.testnet {
+            "https://testnet.binancefuture.com"
+        } else {
+            "https://fapi.binance.com"
+        }
+    }
+
+    pub fn ws_base(&self) -> &str {
+        if !self.ws_base.is_empty() {
+            &self.ws_base
+        } else if self.testnet {
+            "wss://fstream.binancefuture.com"
+        } else {
+            "wss://fstream.binance.com"
+        }
+    }
+
+    /// 从环境变量读 API key；未设置时返回 None（调用方应报明确错误）。
+    pub fn api_key(&self) -> Option<String> {
+        std::env::var(&self.api_key_env)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
+    }
+
+    pub fn api_secret(&self) -> Option<String> {
+        std::env::var(&self.api_secret_env)
+            .ok()
+            .filter(|s| !s.trim().is_empty())
     }
 }
 
@@ -98,5 +189,19 @@ book_snapshot_ms = 10000
         let cfg = CollectorConfig::from_toml_str("").unwrap();
         assert_eq!(cfg.symbol, "BTCUSDT");
         assert_eq!(cfg.lake_dir, "data/lake");
+    }
+
+    #[test]
+    fn account_defaults_to_testnet() {
+        let acc = AccountConfig::from_toml_str("").unwrap();
+        assert!(acc.testnet);
+        assert_eq!(acc.rest_base(), "https://testnet.binancefuture.com");
+        assert_eq!(acc.ws_base(), "wss://fstream.binancefuture.com");
+    }
+
+    #[test]
+    fn account_mainnet_override() {
+        let acc = AccountConfig::from_toml_str("[account]\ntestnet = false\n").unwrap();
+        assert_eq!(acc.rest_base(), "https://fapi.binance.com");
     }
 }

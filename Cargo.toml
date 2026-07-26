@@ -6,7 +6,6 @@ members = [
     "crates/signals",
     "crates/strategy",
     "crates/backtest",
-    "crates/execution",
     "crates/cli",
 ]
 
@@ -24,7 +23,6 @@ data      = { path = "crates/data" }
 signals   = { path = "crates/signals" }
 strategy  = { path = "crates/strategy" }
 backtest  = { path = "crates/backtest" }
-execution = { path = "crates/execution" }
 
 # 异步运行时（PR-11 采集器 / 实盘启用）
 tokio = { version = "1", features = ["full"] }

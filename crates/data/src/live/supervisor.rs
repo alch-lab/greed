@@ -29,36 +29,40 @@ use super::CollectError;
 pub async fn run_collector(cfg: CollectorConfig, dry_run: bool) -> Result<(), CollectError> {
     let symbol = Symbol::new(&cfg.symbol);
     let (tx, mut rx) = mpsc::channel::<LiveEvent>(16_384);
+    let proxy = cfg.effective_proxy();
+    if let Some(p) = &proxy {
+        info!(proxy = %p, "采集出口走代理");
+    }
 
     let mut tasks = Vec::new();
     if cfg.enable_trades {
-        let (sym, tx) = (symbol.clone(), tx.clone());
+        let (sym, tx, px) = (symbol.clone(), tx.clone(), proxy.clone());
         tasks.push(tokio::spawn(async move {
-            run_aggtrade_collector(BinanceMarket::UsdtPerp, sym, tx).await
+            run_aggtrade_collector(BinanceMarket::UsdtPerp, sym, tx, px).await
         }));
     }
     if cfg.enable_spot_trades {
-        let (sym, tx) = (symbol.clone(), tx.clone());
+        let (sym, tx, px) = (symbol.clone(), tx.clone(), proxy.clone());
         tasks.push(tokio::spawn(async move {
-            run_aggtrade_collector(BinanceMarket::Spot, sym, tx).await
+            run_aggtrade_collector(BinanceMarket::Spot, sym, tx, px).await
         }));
     }
     if cfg.enable_book {
-        let (sym, tx) = (symbol.clone(), tx.clone());
+        let (sym, tx, px) = (symbol.clone(), tx.clone(), proxy.clone());
         let (ms, band, limit) = (
             cfg.book_snapshot_ms,
             cfg.book_depth_band_pct,
             cfg.book_depth_limit,
         );
         tasks.push(tokio::spawn(async move {
-            run_book_poller(sym, ms, band, limit, tx).await
+            run_book_poller(sym, ms, band, limit, tx, px).await
         }));
     }
     if cfg.enable_oi {
-        let (sym, tx) = (symbol.clone(), tx.clone());
+        let (sym, tx, px) = (symbol.clone(), tx.clone(), proxy.clone());
         let ms = cfg.oi_tick_ms;
         tasks.push(tokio::spawn(
-            async move { run_oi_poller(sym, ms, tx).await },
+            async move { run_oi_poller(sym, ms, tx, px).await },
         ));
     }
     // 主持有方释放，保证所有子任务退出后 channel 关闭

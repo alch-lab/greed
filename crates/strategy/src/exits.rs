@@ -124,6 +124,51 @@ fn current_price(ctx: &Ctx) -> Option<tcore::types::Price> {
         .map(tcore::types::Price::from_f64)
 }
 
+/// 百分比移动止损：价格从持仓极值回撤 `trail_pct` 时触发。
+///
+/// 无状态实现：候选止损 = 现价 × (1 ∓ trail_pct)，只在比当前止损更有利时上移/下移。
+/// 价格未走出 trail_pct 之前候选值劣于原止损，自然不会触发——
+/// 即"浮盈超过 trail_pct 后开始锁定利润"。用于 TP1 部分止盈后的 runner 仓位。
+pub struct PercentTrail {
+    pub trail_pct: f64, // 如 0.01 = 1%
+}
+
+impl ExitPlugin for PercentTrail {
+    fn name(&self) -> &'static str {
+        "PercentTrail"
+    }
+    fn manage(&self, pos: &Position, ctx: &Ctx) -> Vec<ExitAction> {
+        let now_px = match current_price(ctx) {
+            Some(p) => p.to_f64(),
+            None => return vec![],
+        };
+        let cur_stop = pos.stop_price.to_f64();
+        match pos.side {
+            Side::Buy => {
+                let candidate = now_px * (1.0 - self.trail_pct);
+                if candidate > cur_stop {
+                    vec![ExitAction::MoveStop(tcore::types::Price::from_f64(candidate))]
+                } else {
+                    vec![]
+                }
+            }
+            Side::Sell => {
+                let candidate = now_px * (1.0 + self.trail_pct);
+                if candidate < cur_stop {
+                    vec![ExitAction::MoveStop(tcore::types::Price::from_f64(candidate))]
+                } else {
+                    vec![]
+                }
+            }
+        }
+    }
+}
+
+pub fn build_percent_trail(p: &Json) -> Result<Box<dyn ExitPlugin>, PluginBuildError> {
+    let pct = p.get("trail_pct").and_then(|v| v.as_f64()).unwrap_or(0.01);
+    Ok(Box::new(PercentTrail { trail_pct: pct }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

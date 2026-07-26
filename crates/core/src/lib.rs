@@ -11,7 +11,7 @@ pub mod plugin;
 pub mod types;
 
 pub use clock::{Clock, EventClock, SystemClock};
-pub use event::{BookSnapshot, Event, OiTick, Trade};
+pub use event::{BookSnapshot, Event, FundingTick, OiTick, Trade};
 pub use plugin::{
     Ctx, ExitAction, ExitPlugin, FilterPlugin, OrderIntent, Position, Signal, SignalKind,
     SignalPlugin, TriggerPlugin, Verdict,

@@ -11,6 +11,7 @@
 //! trend/event/circuit_breaker 标志由后续的信号与风控模块维护。
 
 use crate::account::{Account, Fill, FillRequest};
+use crate::journal::JournalIntent;
 use crate::broker::{Broker, Order, OrderKind};
 use crate::fees::FeeModel;
 use crate::report::EquityPoint;
@@ -28,6 +29,12 @@ pub struct BacktestConfig {
     pub risk_pct: f64,
     /// 单笔最大风险（占 equity 比例上限）
     pub max_risk_pct: f64,
+    /// 限价入场单的有效期（毫秒），超时未成交自动撤单
+    pub entry_ttl_ms: i64,
+    /// 熔断：日连亏笔数上限（0 = 关闭）。触发后当日不再开仓
+    pub cb_max_daily_losses: u32,
+    /// 熔断：日内回撤上限（0 = 关闭）。equity 跌破日初 ×(1-此值) 当日不再开仓
+    pub cb_daily_dd_pct: f64,
 }
 
 impl Default for BacktestConfig {
@@ -37,6 +44,9 @@ impl Default for BacktestConfig {
             fee_model: FeeModel::default(),
             risk_pct: 0.0075,
             max_risk_pct: 0.015,
+            entry_ttl_ms: 4 * 3_600_000, // 默认 4 小时
+            cb_max_daily_losses: 0,
+            cb_daily_dd_pct: 0.0,
         }
     }
 }
@@ -45,6 +55,8 @@ impl Default for BacktestConfig {
 #[derive(Debug)]
 pub struct BacktestResult {
     pub fills: Vec<Fill>,
+    /// 全部下单意图（含被仓位计算调整后的数量）
+    pub intents: Vec<JournalIntent>,
     pub final_equity: f64,
     pub initial_cash: f64,
     /// 权益曲线（按 UTC 日采集）
@@ -63,6 +75,25 @@ pub struct BacktestEngine {
     config: BacktestConfig,
     equity_curve: Vec<EquityPoint>,
     last_equity_day: i64,
+    /// 未成交的限价入场意图（延迟成交后补挂止损/止盈）
+    pending_entry: Option<PendingEntry>,
+    // ---- 熔断状态（日连亏/日回撤）----
+    cb_day: i64,
+    cb_day_start_equity: f64,
+    cb_consec_losses: u32,
+    cb_on: bool,
+    /// 已统计过的成交条数（fills 下标游标）
+    cb_noted_fills: usize,
+    /// 决策流水：下单意图
+    intents: Vec<JournalIntent>,
+}
+
+/// 挂起中的限价入场：成交后需要补挂的止损/止盈参数。
+#[derive(Debug, Clone, Copy)]
+struct PendingEntry {
+    stop_price: Price,
+    tp1_price: Option<Price>,
+    expire_ts: Timestamp,
 }
 
 impl BacktestEngine {
@@ -80,6 +111,13 @@ impl BacktestEngine {
             config,
             equity_curve: Vec::new(),
             last_equity_day: i64::MIN,
+            pending_entry: None,
+            cb_day: i64::MIN,
+            cb_day_start_equity: 0.0,
+            cb_consec_losses: 0,
+            cb_on: false,
+            cb_noted_fills: 0,
+            intents: Vec::new(),
         }
     }
 
@@ -87,17 +125,48 @@ impl BacktestEngine {
         &self.account
     }
 
-    /// 运行整个事件序列，返回结果。
-    pub fn run(&mut self, trades: &[Trade]) -> BacktestResult {
-        for trade in trades {
-            self.on_trade(trade);
+    /// 运行整个事件序列（trades 与 OI/资金费率按时间戳归并后传入），返回结果。
+    pub fn run(&mut self, events: &[Event]) -> BacktestResult {
+        for ev in events {
+            match ev {
+                Event::Trade(t) => self.on_trade(t),
+                Event::Oi(o) => self.on_oi(o, ev),
+                Event::Funding(f) => self.on_funding(f, ev),
+                _ => {}
+            }
         }
         let final_px = self.latest_price.unwrap_or(Price::ZERO);
         BacktestResult {
             fills: self.account.fills().to_vec(),
+            intents: std::mem::take(&mut self.intents),
             final_equity: self.account.equity(final_px),
             initial_cash: self.config.initial_cash,
             equity_curve: std::mem::take(&mut self.equity_curve),
+        }
+    }
+
+    /// OI 刻度：推进时钟并喂给信号插件（不触发撮合/出场/开仓）。
+    fn on_oi(&mut self, o: &tcore::OiTick, ev: &Event) {
+        self.clock.advance_to(o.ts);
+        self.ctx.now = Some(o.ts);
+        for sp in self.strategy.signals.iter_mut() {
+            for sig in sp.on_event(ev, &self.ctx) {
+                self.ctx.set_latest(sig);
+            }
+        }
+    }
+
+    /// 资金费率刻度：写入 ctx.flags["funding_rate"] 供过滤器裁决，并喂给信号插件。
+    fn on_funding(&mut self, f: &tcore::FundingTick, ev: &Event) {
+        self.clock.advance_to(f.ts);
+        self.ctx.now = Some(f.ts);
+        self.ctx
+            .flags
+            .insert("funding_rate".into(), format!("{}", f.rate));
+        for sp in self.strategy.signals.iter_mut() {
+            for sig in sp.on_event(ev, &self.ctx) {
+                self.ctx.set_latest(sig);
+            }
         }
     }
 
@@ -114,6 +183,47 @@ impl BacktestEngine {
         }
     }
 
+    /// 熔断：日 rollover + 阈值评估，把结果写进 ctx.flags["circuit_breaker"]。
+    fn cb_update(&mut self, ts: Timestamp, price: Price) {
+        let day = ts.as_millis() / 86_400_000;
+        if day != self.cb_day {
+            self.cb_day = day;
+            self.cb_day_start_equity = self.account.equity(price);
+            self.cb_consec_losses = 0;
+            self.cb_on = false;
+        }
+        let eq = self.account.equity(price);
+        if self.config.cb_daily_dd_pct > 0.0
+            && self.cb_day_start_equity > 0.0
+            && eq < self.cb_day_start_equity * (1.0 - self.config.cb_daily_dd_pct)
+        {
+            self.cb_on = true;
+        }
+        if self.config.cb_max_daily_losses > 0
+            && self.cb_consec_losses >= self.config.cb_max_daily_losses
+        {
+            self.cb_on = true;
+        }
+        let v = if self.cb_on { "on" } else { "off" };
+        self.ctx.flags.insert("circuit_breaker".into(), v.into());
+    }
+
+    /// 统计新成交的已实现盈亏，维护日连亏计数（开仓 realized=0 忽略）。
+    fn cb_note_fills(&mut self) {
+        let fills = self.account.fills();
+        while self.cb_noted_fills < fills.len() {
+            let f = &fills[self.cb_noted_fills];
+            self.cb_noted_fills += 1;
+            if f.realized_pnl.abs() > 1e-9 {
+                if f.realized_pnl - f.fee < 0.0 {
+                    self.cb_consec_losses += 1;
+                } else {
+                    self.cb_consec_losses = 0;
+                }
+            }
+        }
+    }
+
     /// 处理单个逐笔成交。
     fn on_trade(&mut self, trade: &Trade) {
         // 1) 时钟与最新价
@@ -121,6 +231,7 @@ impl BacktestEngine {
         self.latest_price = Some(trade.price);
         self.update_env_flags(trade.ts, trade.price);
         self.sample_equity(trade.ts);
+        self.cb_update(trade.ts, trade.price);
 
         // 2) 撮合器挂单触发（止损/限价）
         let execs = self.broker.on_trade_price(trade.ts, trade.price);
@@ -135,6 +246,7 @@ impl BacktestEngine {
                 reason: ex.reason,
             });
         }
+        self.settle_pending_entry(trade);
 
         // 3) 信号插件
         let ev = Event::Trade(trade.clone());
@@ -148,13 +260,18 @@ impl BacktestEngine {
             }
         }
 
-        // 4) 持仓管理（出场插件）
+        // 4) 持仓管理（出场插件 + 加仓钩子）
         if self.account.position().is_some() {
             self.manage_position(trade);
+            self.try_add(trade, &new_signals);
         } else {
             // 5) 无持仓：扳机评估
             self.try_enter(trade, &new_signals);
         }
+
+        // 6) 熔断：统计本笔新成交的盈亏并重新评估阈值
+        self.cb_note_fills();
+        self.cb_update(trade.ts, trade.price);
     }
 
     /// 出场插件管理持仓。
@@ -187,6 +304,7 @@ impl BacktestEngine {
                                 qty,
                                 kind: OrderKind::StopMarket(px),
                                 reason: "stop".into(),
+                                expire_ts: None,
                             },
                         );
                     }
@@ -217,6 +335,10 @@ impl BacktestEngine {
 
     /// 无持仓时尝试开仓。
     fn try_enter(&mut self, trade: &Trade, signals: &[Signal]) {
+        // 有未成交的限价入场单在挂：不再开新仓
+        if self.pending_entry.is_some() {
+            return;
+        }
         // 通用无状态扳机优先;力竭反转等有状态扳机走 on_signals 路径
         let intent = self
             .strategy
@@ -231,6 +353,35 @@ impl BacktestEngine {
             return;
         };
 
+        // 过滤器裁决：任一 Veto 则放弃；Scale 取最小系数
+        let mut scale = 1.0f64;
+        for fp in self.strategy.filters.iter() {
+            match fp.check(&intent, &self.ctx) {
+                Verdict::Allow => {}
+                Verdict::Scale(s) => scale = scale.min(s),
+                Verdict::Veto(_) => return,
+            }
+        }
+        let mut intent = intent;
+        intent.qty = Qty::from_f64(intent.qty.to_f64() * scale);
+        self.enter(trade, intent);
+    }
+
+    /// 持仓中尝试加仓（金字塔）。
+    fn try_add(&mut self, trade: &Trade, signals: &[Signal]) {
+        if self.pending_entry.is_some() {
+            return;
+        }
+        let Some(pos) = self.account.position_view(&self.symbol) else {
+            return;
+        };
+        let Some(intent) = self
+            .strategy
+            .trigger
+            .on_add(&pos, signals, &self.ctx, &self.symbol)
+        else {
+            return;
+        };
         // 过滤器裁决：任一 Veto 则放弃；Scale 取最小系数
         let mut scale = 1.0f64;
         for fp in self.strategy.filters.iter() {
@@ -266,6 +417,23 @@ impl BacktestEngine {
             return;
         }
         let qty = Qty::from_f64(qty);
+        self.intents.push(JournalIntent {
+            ts_ms: trade.ts.as_millis(),
+            side: format!("{:?}", intent.side),
+            qty: qty.to_f64(),
+            limit_price: intent.limit_price.map(|p| p.to_f64()),
+            stop_price: intent.stop_price.to_f64(),
+            tp1_price: intent.tp1_price.map(|p| p.to_f64()),
+            reason: intent.reason.clone(),
+        });
+        let is_limit = intent.limit_price.is_some();
+        let expire_ts = if is_limit {
+            Some(Timestamp::from_millis(
+                trade.ts.as_millis() + self.config.entry_ttl_ms,
+            ))
+        } else {
+            None
+        };
 
         let order = Order {
             side: intent.side,
@@ -275,6 +443,7 @@ impl BacktestEngine {
                 None => OrderKind::Market,
             },
             reason: intent.reason.clone(),
+            expire_ts,
         };
         if let Some(ex) = self.broker.submit(trade.ts, trade.price, order) {
             self.account.apply_fill(FillRequest {
@@ -286,13 +455,23 @@ impl BacktestEngine {
                 is_maker: ex.is_maker,
                 reason: ex.reason,
             });
+        } else if is_limit {
+            // 限价单未立即成交：记录挂起意图，成交后由 settle_pending_entry 补挂止损
+            if let Some(exp) = expire_ts {
+                self.pending_entry = Some(PendingEntry {
+                    stop_price: intent.stop_price,
+                    tp1_price: intent.tp1_price,
+                    expire_ts: exp,
+                });
+            }
         }
-        // 设置持仓止损/止盈并挂止损单
+        // 设置持仓止损/止盈并挂止损单（加仓时先撤旧止损单，按新总仓重挂）
         if let Some(p) = self.account.position_mut() {
             p.stop_price = Some(intent.stop_price);
             p.tp1_price = intent.tp1_price;
             let side = p.side;
             let q = p.qty;
+            self.broker.cancel_all();
             self.broker.submit(
                 trade.ts,
                 trade.price,
@@ -301,8 +480,40 @@ impl BacktestEngine {
                     qty: q,
                     kind: OrderKind::StopMarket(intent.stop_price),
                     reason: "stop".into(),
+                    expire_ts: None,
                 },
             );
+        }
+    }
+
+    /// 挂起限价入场的善后：成交→补挂止损/止盈；过期→清除意图。
+    fn settle_pending_entry(&mut self, trade: &Trade) {
+        let Some(pe) = self.pending_entry else {
+            return;
+        };
+        if self.account.position().is_some() {
+            // 延迟成交：补挂止损单与 TP 参考
+            if let Some(p) = self.account.position_mut() {
+                p.stop_price = Some(pe.stop_price);
+                p.tp1_price = pe.tp1_price;
+                let side = p.side;
+                let q = p.qty;
+                self.broker.submit(
+                    trade.ts,
+                    trade.price,
+                    Order {
+                        side: side.opposite(),
+                        qty: q,
+                        kind: OrderKind::StopMarket(pe.stop_price),
+                        reason: "stop".into(),
+                        expire_ts: None,
+                    },
+                );
+            }
+            self.pending_entry = None;
+        } else if trade.ts.as_millis() > pe.expire_ts.as_millis() {
+            // 已过期（broker 侧已撤单）
+            self.pending_entry = None;
         }
     }
 
@@ -317,6 +528,7 @@ impl BacktestEngine {
             qty,
             kind: OrderKind::Market,
             reason: reason.to_string(),
+            expire_ts: None,
         };
         self.broker.cancel_all(); // 清掉止损单
         if let Some(ex) = self.broker.submit(trade.ts, trade.price, order) {
@@ -395,7 +607,8 @@ trigger = "NoopTrigger"
         let trades: Vec<Trade> = (0..1000)
             .map(|i| trade(i * 100, 67000.0 + (i % 50) as f64, 0.01))
             .collect();
-        let res = eng.run(&trades);
+        let events: Vec<Event> = trades.iter().cloned().map(Event::Trade).collect();
+        let res = eng.run(&events);
         assert!(res.fills.is_empty());
         assert_eq!(res.final_equity, res.initial_cash);
         assert_eq!(
@@ -430,7 +643,8 @@ trigger = "NoopTrigger"
         assert!(eng.account().position().is_some());
         // 价格跌到 66750 触发止损
         let trades = vec![trade(1000, 66900.0, 0.01), trade(2000, 66750.0, 0.01)];
-        let res = eng.run(&trades);
+        let events: Vec<Event> = trades.iter().cloned().map(Event::Trade).collect();
+        let res = eng.run(&events);
         // 应有开仓 + 止损平仓两笔成交
         assert_eq!(res.fills.len(), 2);
         assert_eq!(res.fills[1].reason, "stop");

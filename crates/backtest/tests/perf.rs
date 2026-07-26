@@ -1,7 +1,7 @@
 //! 性能回归：空策略回放 100 万笔合成逐笔成交（自包含，不依赖外部数据）。
 //! 验收：空策略跑 1 个月数据 < 30s。此处 1M 笔（约 1.3 天真实密度）应 < 2s。
 use tcore::types::{Exchange, Price, Qty, Symbol, Timestamp};
-use tcore::Trade;
+use tcore::{Event, Trade};
 
 #[test]
 fn replay_1m_synthetic_trades_under_2s() {
@@ -21,13 +21,15 @@ fn replay_1m_synthetic_trades_under_2s() {
     let strat = strategy::assemble_from_toml(toml, &strategy::builtin_registry()).unwrap();
     let mut eng = backtest::BacktestEngine::new(strat, symbol, backtest::BacktestConfig::default());
     let t0 = std::time::Instant::now();
-    let res = eng.run(&trades);
+    let events: Vec<Event> = trades.into_iter().map(Event::Trade).collect();
+    let n = events.len();
+    let res = eng.run(&events);
     let el = t0.elapsed();
     println!(
         "回放 {} 笔耗时 {:?}（{:.0} 笔/秒）",
-        trades.len(),
+        n,
         el,
-        trades.len() as f64 / el.as_secs_f64()
+        n as f64 / el.as_secs_f64()
     );
     assert!(res.fills.is_empty());
     assert_eq!(res.final_equity, res.initial_cash);

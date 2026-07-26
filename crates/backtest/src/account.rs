@@ -25,7 +25,7 @@ pub struct FillRequest {
 }
 
 /// 一笔成交记录（含盈亏与费用），供绩效报告与对账
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize)]
 pub struct Fill {
     pub ts: Timestamp,
     pub side: Side,

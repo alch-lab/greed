@@ -126,6 +126,16 @@ pub struct OiTick {
     pub oi_usd: f64,
 }
 
+/// 资金费率刻度（USDT 永续通常每 8h 一次）
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FundingTick {
+    pub ts: Timestamp,
+    pub exchange: Exchange,
+    pub symbol: Symbol,
+    /// 资金费率（0.0001 = 0.01%；正 = 多头付空头）
+    pub rate: f64,
+}
+
 /// 系统统一事件
 ///
 /// 信号引擎与策略只消费 `Event`，不关心其来着历史 Parquet（回测）
@@ -135,6 +145,7 @@ pub enum Event {
     Trade(Trade),
     Book(BookSnapshot),
     Oi(OiTick),
+    Funding(FundingTick),
     /// 逻辑时钟心跳
     Timer(Timestamp),
 }
@@ -146,6 +157,7 @@ impl Event {
             Event::Trade(t) => t.ts,
             Event::Book(b) => b.ts,
             Event::Oi(o) => o.ts,
+            Event::Funding(f) => f.ts,
             Event::Timer(ts) => *ts,
         }
     }
@@ -155,6 +167,7 @@ impl Event {
             Event::Trade(t) => Some(t.exchange),
             Event::Book(b) => Some(b.exchange),
             Event::Oi(o) => Some(o.exchange),
+            Event::Funding(f) => Some(f.exchange),
             Event::Timer(_) => None,
         }
     }
@@ -163,6 +176,7 @@ impl Event {
             Event::Trade(t) => Some(&t.symbol),
             Event::Book(b) => Some(&b.symbol),
             Event::Oi(o) => Some(&o.symbol),
+            Event::Funding(f) => Some(&f.symbol),
             Event::Timer(_) => None,
         }
     }

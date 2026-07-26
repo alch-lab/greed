@@ -249,7 +249,7 @@ pub struct Attribution {
 }
 
 /// 权益曲线点（由引擎/调用方按日采样提供）。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct EquityPoint {
     pub ts_ms: i64,
     pub equity: f64,

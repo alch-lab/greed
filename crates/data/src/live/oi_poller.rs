@@ -38,11 +38,13 @@ pub fn parse_oi(text: &str, exchange: Exchange, symbol: &Symbol) -> Result<OiRow
 }
 
 /// 运行 OI 轮询循环（合约）。
-pub async fn run_oi_poller(symbol: Symbol, interval_ms: u64, tx: mpsc::Sender<LiveEvent>) {
-    let client = reqwest::Client::builder()
-        .user_agent("greed-collect/0.1")
-        .build()
-        .expect("reqwest client");
+pub async fn run_oi_poller(
+    symbol: Symbol,
+    interval_ms: u64,
+    tx: mpsc::Sender<LiveEvent>,
+    proxy: Option<String>,
+) {
+    let client = super::build_http_client(proxy.as_deref());
     let url = format!(
         "https://fapi.binance.com/fapi/v1/openInterest?symbol={}",
         symbol.as_str()

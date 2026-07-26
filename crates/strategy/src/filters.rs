@@ -110,6 +110,81 @@ pub fn build_event_calendar(_p: &Json) -> Result<Box<dyn FilterPlugin>, PluginBu
     Ok(Box::new(EventCalendarFilter))
 }
 
+/// 资金费率极值过滤（F1）：费率极端拥挤时不顺拥挤方向开仓。
+///
+/// 读取 `Ctx.flags["funding_rate"]`（引擎在 Funding 事件时写入）：
+/// - rate ≥ long_veto_above（默认 0.0005 = 0.05%）：否决做多（多头拥挤，接飞刀风险高）
+/// - rate ≤ short_veto_below（默认 -0.0005）：否决做空（空头拥挤）
+/// 无费率数据（启动期）放行。
+pub struct FundingFilter {
+    long_veto_above: f64,
+    short_veto_below: f64,
+}
+
+impl FilterPlugin for FundingFilter {
+    fn name(&self) -> &'static str {
+        "FundingFilter"
+    }
+    fn check(&self, intent: &OrderIntent, ctx: &Ctx) -> Verdict {
+        use tcore::types::Side;
+        let rate: f64 = match ctx.flag("funding_rate").and_then(|s| s.parse().ok()) {
+            Some(r) => r,
+            None => return Verdict::Allow,
+        };
+        match intent.side {
+            Side::Buy if rate >= self.long_veto_above => Verdict::Veto("funding_crowded_long"),
+            Side::Sell if rate <= self.short_veto_below => Verdict::Veto("funding_crowded_short"),
+            _ => Verdict::Allow,
+        }
+    }
+}
+
+pub fn build_funding(p: &Json) -> Result<Box<dyn FilterPlugin>, PluginBuildError> {
+    let get = |k: &str, d: f64| p.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
+    Ok(Box::new(FundingFilter {
+        long_veto_above: get("long_veto_above", 0.0005),
+        short_veto_below: get("short_veto_below", -0.0005),
+    }))
+}
+
+/// OI 出清确认过滤（F2）：只在"已经去杠杆"时接均值回归单。
+///
+/// 读取 `Ctx.latest_of(OiQuadrant)`（OiTracker 信号）的 `oi_chg`（窗口 OI 变化率）：
+/// 价格急动但 OI 未下降（> -min_oi_drop）说明对手盘还没出清、行情有燃料延续，
+/// 此时接飞刀胜率低 → 否决；OI 已急降（出清）→ 放行。无 OI 数据放行。
+/// 多空对称（v1 的两边信号都是"急动后的回归"）。
+pub struct OiConfirmFilter {
+    min_oi_drop: f64,
+}
+
+impl FilterPlugin for OiConfirmFilter {
+    fn name(&self) -> &'static str {
+        "OiConfirmFilter"
+    }
+    fn check(&self, _intent: &OrderIntent, ctx: &Ctx) -> Verdict {
+        let Some(sig) = ctx.latest_of(tcore::plugin::SignalKind::OiQuadrant) else {
+            return Verdict::Allow;
+        };
+        let chg = sig
+            .payload
+            .get("oi_chg")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0);
+        if chg > -self.min_oi_drop {
+            Verdict::Veto("oi_not_flushed")
+        } else {
+            Verdict::Allow
+        }
+    }
+}
+
+pub fn build_oi_confirm(p: &Json) -> Result<Box<dyn FilterPlugin>, PluginBuildError> {
+    let get = |k: &str, d: f64| p.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
+    Ok(Box::new(OiConfirmFilter {
+        min_oi_drop: get("min_oi_drop", 0.01),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

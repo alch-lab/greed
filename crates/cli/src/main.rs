@@ -10,7 +10,7 @@
 use anyhow::{Context, Result};
 use backtest::{
     build_report, pair_round_trips, to_json, to_markdown, BacktestConfig, BacktestEngine,
-    ReportConfig,
+    Journal, JournalMeta, ReportConfig,
 };
 use clap::{Parser, Subcommand};
 use data::live::{run_collector, CollectorConfig};
@@ -89,12 +89,46 @@ enum Command {
         /// 试验次数（DSR 用）
         #[arg(long, default_value_t = 1)]
         trials: usize,
+        /// 限价入场单有效期（毫秒）
+        #[arg(long, default_value_t = 4 * 3_600_000)]
+        entry_ttl_ms: i64,
+        /// 单笔最大风险（占 equity 比例，封顶 risk_pct）
+        #[arg(long, default_value_t = 0.015)]
+        max_risk_pct: f64,
+        /// 熔断：日连亏笔数上限（0 = 关闭）
+        #[arg(long, default_value_t = 0)]
+        cb_max_daily_losses: u32,
+        /// 熔断：日内回撤上限（0 = 关闭），如 0.02 = 2%
+        #[arg(long, default_value_t = 0.0)]
+        cb_daily_dd_pct: f64,
+        /// 决策流水导出路径（JSON：意图/成交/权益曲线，供前端监控）
+        #[arg(long)]
+        journal: Option<String>,
         /// 输出前缀
         #[arg(long, default_value = "out/backtest")]
         out: String,
     },
-    /// 校验配置与数据（PR-10）
-    Validate,
+    /// 校验配置与数据（PR-10）：装配策略配置 + 检查数据湖覆盖
+    Validate {
+        /// 策略 TOML 配置路径（可选；给出则装配校验）
+        #[arg(long)]
+        strategy: Option<String>,
+        /// 交易对，如 BTCUSDT
+        #[arg(long, default_value = "BTCUSDT")]
+        symbol: String,
+        /// 市场：perp（USDT永续）或 spot
+        #[arg(long, default_value = "perp")]
+        market: String,
+        /// 数据湖目录
+        #[arg(long, default_value = "data/lake")]
+        lake: String,
+        /// 起始日期 yyyy-mm-dd（可选；与 --to 一起给出则检查覆盖）
+        #[arg(long)]
+        from: Option<String>,
+        /// 结束日期 yyyy-mm-dd
+        #[arg(long)]
+        to: Option<String>,
+    },
 
     /// 跑 renko 砖序列并导出统计（砖 CSV + 马尔可夫基线统计）
     Renko {
@@ -297,6 +331,11 @@ async fn main() -> Result<()> {
             risk_pct,
             geo_baseline,
             trials,
+            entry_ttl_ms,
+            max_risk_pct,
+            cb_max_daily_losses,
+            cb_daily_dd_pct,
+            journal,
             out,
         } => {
             let exchange = match market.as_str() {
@@ -337,16 +376,40 @@ async fn main() -> Result<()> {
                 Timestamp::from_millis(from_ms),
                 Timestamp::from_millis(to_ms),
             )?;
-            info!(rows = trades.len(), "回放逐笔 → 回测引擎");
+            // OI / 资金费率（若已用 fetch_macro_data.py 回补则自动并入事件流）
+            let ois = data::lake::read_oi_metrics(
+                &lake,
+                exchange,
+                &sym,
+                Timestamp::from_millis(from_ms),
+                Timestamp::from_millis(to_ms),
+            )?;
+            let fundings = data::lake::read_funding(
+                &lake,
+                exchange,
+                &sym,
+                Timestamp::from_millis(from_ms),
+                Timestamp::from_millis(to_ms),
+            )?;
+            info!(trades = trades.len(), oi = ois.len(), funding = fundings.len(), "回放事件流 → 回测引擎");
+            let mut events: Vec<tcore::Event> = Vec::with_capacity(trades.len() + ois.len() + fundings.len());
+            events.extend(trades.into_iter().map(tcore::Event::Trade));
+            events.extend(ois.into_iter().map(tcore::Event::Oi));
+            events.extend(fundings.into_iter().map(tcore::Event::Funding));
+            events.sort_by_key(|e| e.ts());
 
             // 跑回测
             let cfg = BacktestConfig {
                 initial_cash: cash,
                 risk_pct,
+                entry_ttl_ms,
+                max_risk_pct,
+                cb_max_daily_losses,
+                cb_daily_dd_pct,
                 ..Default::default()
             };
             let mut engine = BacktestEngine::new(strat, sym.clone(), cfg);
-            let result = engine.run(&trades);
+            let result = engine.run(&events);
             info!(
                 fills = result.fills.len(),
                 final_equity = result.final_equity,
@@ -366,6 +429,28 @@ async fn main() -> Result<()> {
             if let Some(parent) = std::path::Path::new(&out).parent() {
                 std::fs::create_dir_all(parent)?;
             }
+            // 决策流水（前端监控数据源）
+            if let Some(jpath) = &journal {
+                let j = Journal {
+                    meta: JournalMeta {
+                        symbol: symbol.clone(),
+                        from: from.clone(),
+                        to: to.clone(),
+                        strategy: strategy.clone(),
+                        initial_cash: cash,
+                        final_equity: result.final_equity,
+                    },
+                    intents: result.intents.clone(),
+                    fills: result.fills.clone(),
+                    equity_curve: result.equity_curve.clone(),
+                };
+                if let Some(parent) = std::path::Path::new(jpath).parent() {
+                    std::fs::create_dir_all(parent)?;
+                }
+                std::fs::write(jpath, serde_json::to_string_pretty(&j)?)?;
+                info!(path = %jpath, "journal 已写出");
+            }
+
             let md_path = format!("{}.md", out);
             let json_path = format!("{}.json", out);
             std::fs::write(&md_path, to_markdown(&report))?;
@@ -381,7 +466,91 @@ async fn main() -> Result<()> {
             );
             Ok(())
         }
-        Command::Validate => anyhow::bail!("validate 未实现（PR-10）"),
+        Command::Validate {
+            strategy,
+            symbol,
+            market,
+            lake,
+            from,
+            to,
+        } => {
+            let mut ok = true;
+
+            // 1) 策略配置装配校验
+            if let Some(path) = &strategy {
+                let toml_str = std::fs::read_to_string(path)
+                    .with_context(|| format!("读策略配置失败: {}", path))?;
+                match assemble_from_toml(&toml_str, &builtin_registry()) {
+                    Ok(strat) => {
+                        println!("✅ 策略装配成功: {}", path);
+                        println!("   {}", strat.describe());
+                    }
+                    Err(e) => {
+                        println!("❌ 策略装配失败: {}: {}", path, e);
+                        ok = false;
+                    }
+                }
+            }
+
+            // 2) 数据湖覆盖检查
+            let exchange = match market.as_str() {
+                "perp" | "um" | "futures" => Exchange::BinanceFutures,
+                "spot" => Exchange::BinanceSpot,
+                other => anyhow::bail!("未知市场: {}（用 perp 或 spot）", other),
+            };
+            let lake = Lake::new(&lake);
+            let sym = Symbol::new(&symbol);
+            let dir = lake.dir(exchange, &sym);
+            if !dir.exists() {
+                println!("❌ 数据湖目录不存在: {}", dir.display());
+                ok = false;
+            } else {
+                let mut days: Vec<String> = std::fs::read_dir(&dir)?
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| {
+                        let n = e.file_name().to_string_lossy().to_string();
+                        n.strip_suffix(".binlog").map(|s| s.to_string())
+                    })
+                    .collect();
+                days.sort();
+                match (days.first(), days.last()) {
+                    (Some(f), Some(l)) => {
+                        println!("✅ 数据湖: {} 共 {} 天（{} → {}）", dir.display(), days.len(), f, l);
+                    }
+                    _ => {
+                        println!("❌ 数据湖为空: {}", dir.display());
+                        ok = false;
+                    }
+                }
+                // 指定区间：检查缺失天
+                if let (Some(f), Some(t)) = (&from, &to) {
+                    let want = date_range(f, t)?;
+                    let have: std::collections::HashSet<&String> = days.iter().collect();
+                    let missing: Vec<&String> =
+                        want.iter().filter(|d| !have.contains(d)).collect();
+                    if missing.is_empty() {
+                        println!("✅ 区间 {} → {} 覆盖完整（{} 天）", f, t, want.len());
+                    } else {
+                        println!(
+                            "❌ 区间 {} → {} 缺失 {} 天: {:?}{}",
+                            f,
+                            t,
+                            missing.len(),
+                            &missing[..missing.len().min(10)],
+                            if missing.len() > 10 { " …" } else { "" }
+                        );
+                        ok = false;
+                    }
+                }
+            }
+
+            if ok {
+                println!("\n校验通过 ✅");
+                Ok(())
+            } else {
+                anyhow::bail!("校验未通过（见上方 ❌ 项）")
+            }
+        }
     }
 }
 

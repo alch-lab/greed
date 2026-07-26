@@ -51,3 +51,17 @@ impl From<crate::lake::LakeError> for CollectError {
         CollectError::Lake(Box::new(e))
     }
 }
+
+/// 构造 reqwest 客户端；配置代理时所有请求走代理。
+pub fn build_http_client(proxy: Option<&str>) -> reqwest::Client {
+    let mut b = reqwest::Client::builder().user_agent("greed-collect/0.1");
+    if let Some(p) = proxy {
+        match reqwest::Proxy::all(p) {
+            Ok(px) => b = b.proxy(px),
+            Err(e) => {
+                tracing::warn!(proxy = p, error = %e, "代理地址非法，回退直连");
+            }
+        }
+    }
+    b.build().expect("reqwest client")
+}

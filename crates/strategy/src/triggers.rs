@@ -21,7 +21,7 @@
 use crate::registry::PluginBuildError;
 use serde_json::Value as Json;
 use std::collections::VecDeque;
-use tcore::plugin::{Ctx, OrderIntent, Signal, SignalKind, TriggerPlugin};
+use tcore::plugin::{Ctx, OrderIntent, Position, Signal, SignalKind, TriggerPlugin};
 use tcore::types::{Price, Qty, Side, Symbol};
 
 /// 占位扳机：从不触发。用于装配链路打通与测试。
@@ -165,11 +165,6 @@ impl ExhaustionReversal {
         let wick_up = Self::f(p, "wick_up_usd");
         let wick_dn = Self::f(p, "wick_down_usd");
         let range = body + wick_up + wick_dn;
-        let (brick_high, brick_low) = if dir == 1 {
-            (close + wick_up, close - body - wick_dn)
-        } else {
-            (close + body + wick_up, close - wick_dn)
-        };
         let delta = Self::f(p, "delta"); // 币
         let delta_pct = if vol > 1e-9 { delta / vol * 100.0 } else { 0.0 };
         let close_px = Price::from_f64(close);
@@ -437,6 +432,9 @@ mod tests {
             chain_n: 0,
             prev_delta_pct: None,
             prev_dir: 0,
+            delta_flip_max_pct: 50.0,
+            cooldown_bricks: 5,
+            cooldown_left: 0,
         };
         let ctx = ctx_with_session("europe");
 
@@ -524,6 +522,9 @@ mod tests {
             chain_n: 3,
             prev_delta_pct: Some(10.0), // 前砖与链同向
             prev_dir: 1,
+            delta_flip_max_pct: 50.0,
+            cooldown_bricks: 5,
+            cooldown_left: 0,
         };
         let ctx = ctx_with_session("europe");
         // 标准反转砖（三条件都满足的形态）
@@ -597,6 +598,9 @@ mod tests {
             chain_n: 0,
             prev_delta_pct: None,
             prev_dir: 0,
+            delta_flip_max_pct: 50.0,
+            cooldown_bricks: 5,
+            cooldown_left: 0,
         };
         let ctx = ctx_with_session("europe");
         // 慢速交替砖（速率低、量小），反转砖也不该触发（条件1 不过）
@@ -633,6 +637,9 @@ mod tests {
             chain_n: 3,
             prev_delta_pct: Some(9.0),
             prev_dir: 1,
+            delta_flip_max_pct: 50.0,
+            cooldown_bricks: 5,
+            cooldown_left: 0,
         };
         let rev = brick_sig(9, -1, 1, true, 4.0, 15_000, 67238.0, -0.4, 30.0, 50.0, 0.0);
         // europe（系数1.0）：阈值 3.0×base，链速率不足 → 不触发
@@ -684,6 +691,9 @@ mod e2e_tests {
             chain_n: 0,
             prev_delta_pct: None,
             prev_dir: 0,
+            delta_flip_max_pct: 100.0, // 黄金样本 |Δ%|=90，上限放宽以免被误判为恐慌
+            cooldown_bricks: 5,
+            cooldown_left: 0,
         };
         let ctx = {
             let mut c = Ctx::default();
@@ -793,4 +803,971 @@ mod e2e_tests {
             "横盘慢速不触发（手册验收）"
         );
     }
+}
+
+
+// ============================================================================
+// 大单冲击跟随扳机
+// ============================================================================
+
+/// 大单冲击跟随扳机。
+///
+/// 消费 LargeTradeImpulse 产生的 FlowSurge 信号，
+/// 顺大单方向（taker side）入场。
+/// 止损：固定百分比（sl_pct）。
+pub struct ImpulseFollow {
+    /// 止损百分比（如 0.0015 = 0.15%）
+    pub sl_pct: f64,
+    /// 最小大单阈值（USD，只处理 >= 此值的信号）
+    pub min_notional: f64,
+}
+
+impl TriggerPlugin for ImpulseFollow {
+    fn name(&self) -> &'static str {
+        "ImpulseFollow"
+    }
+
+    fn should_fire(&self, _signals: &[Signal], _ctx: &Ctx) -> Option<OrderIntent> {
+        None
+    }
+
+    fn on_signals(
+        &mut self,
+        signals: &[Signal],
+        _ctx: &Ctx,
+        symbol: &Symbol,
+    ) -> Option<OrderIntent> {
+        for sig in signals {
+            if sig.kind != SignalKind::FlowSurge {
+                continue;
+            }
+            let p = &sig.payload;
+            let notional = p.get("notional").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if notional < self.min_notional {
+                continue;
+            }
+            let price = p.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let taker_side = p.get("taker_side").and_then(|v| v.as_str()).unwrap_or("");
+            let px = Price::from_f64(price);
+
+            let side = match taker_side {
+                "buy" => Side::Buy,
+                "sell" => Side::Sell,
+                _ => continue,
+            };
+
+            let sl_dist = price * self.sl_pct;
+            let sl = if side == Side::Buy {
+                Price::from_f64(price - sl_dist)
+            } else {
+                Price::from_f64(price + sl_dist)
+            };
+
+            tracing::info!(side = taker_side, price, notional, "ImpulseFollow 扣扳机");
+
+            return Some(OrderIntent {
+                symbol: symbol.clone(),
+                side,
+                qty: Qty::ZERO,
+                limit_price: Some(px),
+                stop_price: sl,
+                tp1_price: None,
+                reason: format!("impulse_follow({} ${:.0})", taker_side, notional),
+                ts: sig.ts,
+            });
+        }
+        None
+    }
+}
+
+pub fn build_impulse_follow(p: &Json) -> Result<Box<dyn TriggerPlugin>, PluginBuildError> {
+    let g = |k: &str, d: f64| p.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
+    Ok(Box::new(ImpulseFollow {
+        sl_pct: g("sl_pct", 0.0015),
+        min_notional: g("min_notional", 100_000.0),
+    }))
+}
+
+
+// ============================================================================
+// 简单 Renko 反转扳机（裸 ≥N 连反转，无三条件）
+// ============================================================================
+
+pub struct SimpleRenkoReversal {
+    pub min_chain: u32,
+    pub sl_buffer_usd: f64,
+    pub cooldown_bricks: u32,
+    chain_n: u32,
+    cooldown_left: u32,
+}
+
+impl SimpleRenkoReversal {
+    fn on_brick(&mut self, sig: &Signal, symbol: &Symbol) -> Option<OrderIntent> {
+        let p = &sig.payload;
+        let dir = p.get("dir").and_then(|v| v.as_f64()).unwrap_or(0.0) as i8;
+        let chain_index = p.get("chain_index").and_then(|v| v.as_f64()).unwrap_or(0.0) as u32;
+        let is_reversal = p.get("is_reversal").and_then(|v| v.as_bool()).unwrap_or(false);
+        let close = p.get("close").and_then(|v| v.as_f64()).unwrap_or(0.0);
+        let close_px = Price::from_f64(close);
+
+        let mut fire = false;
+        let mut fired_chain_n = 0u32;
+        if is_reversal && self.chain_n >= self.min_chain && self.cooldown_left == 0 {
+            fire = true;
+            fired_chain_n = self.chain_n;
+        }
+
+        if chain_index == 1 {
+            self.chain_n = 1;
+        } else {
+            self.chain_n = chain_index;
+        }
+
+        if !fire {
+            return None;
+        }
+        self.cooldown_left = self.cooldown_bricks;
+
+        let side = if dir == 1 { Side::Buy } else { Side::Sell };
+        let low = p.get("low").and_then(|v| v.as_f64()).unwrap_or(close);
+        let high = p.get("high").and_then(|v| v.as_f64()).unwrap_or(close);
+        let sl = if dir == 1 {
+            Price::from_f64(low - self.sl_buffer_usd)
+        } else {
+            Price::from_f64(high + self.sl_buffer_usd)
+        };
+        Some(OrderIntent {
+            symbol: symbol.clone(),
+            side,
+            qty: Qty::ZERO,
+            limit_price: Some(close_px),
+            stop_price: sl,
+            tp1_price: None,
+            reason: format!("simple_renko_rev(c{})", fired_chain_n),
+            ts: sig.ts,
+        })
+    }
+}
+
+impl TriggerPlugin for SimpleRenkoReversal {
+    fn name(&self) -> &'static str {
+        "SimpleRenkoReversal"
+    }
+    fn should_fire(&self, _signals: &[Signal], _ctx: &Ctx) -> Option<OrderIntent> {
+        None
+    }
+    fn on_signals(&mut self, signals: &[Signal], _ctx: &Ctx, symbol: &Symbol) -> Option<OrderIntent> {
+        for sig in signals {
+            if sig.kind == SignalKind::BrickClosed {
+                if let Some(intent) = self.on_brick(sig, symbol) {
+                    return Some(intent);
+                }
+            }
+        }
+        None
+    }
+}
+
+pub fn build_simple_renko(p: &Json) -> Result<Box<dyn TriggerPlugin>, PluginBuildError> {
+    let g = |k: &str, d: f64| p.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
+    Ok(Box::new(SimpleRenkoReversal {
+        min_chain: g("min_chain", 3.0) as u32,
+        sl_buffer_usd: g("sl_buffer_usd", 150.0),
+        cooldown_bricks: g("cooldown_bricks", 0.0) as u32,
+        chain_n: 0,
+        cooldown_left: 0,
+    }))
+}
+
+
+
+// ============================================================================
+// EMA 双均线趋势跟随扳机（v2：全局冷却 + 方向锁定）
+// ============================================================================
+
+/// EMA 交叉趋势跟随。
+///
+/// 消费 `SignalKind::TrendRegime` 信号（由 EmaCross 产生），
+/// 金叉做多、死叉做空，市价单入场，固定百分比止损。
+/// 带**全局冷却**（任何触发后 N 毫秒内不再触发），防止金叉→死叉立即反手。
+pub struct EmaFollow {
+    /// 止损百分比（如 0.003 = 0.3%）
+    pub sl_pct: f64,
+    /// 全局冷却（毫秒）：任何触发后 N 毫秒内不再触发
+    pub cooldown_ms: i64,
+
+    // ---- 内部状态 ----
+    last_fire_ts: i64,
+    last_direction: Option<String>, // "up" / "down"
+}
+
+impl EmaFollow {
+    pub fn new(sl_pct: f64, cooldown_ms: i64) -> Self {
+        Self {
+            sl_pct,
+            cooldown_ms,
+            last_fire_ts: 0,
+            last_direction: None,
+        }
+    }
+}
+
+impl TriggerPlugin for EmaFollow {
+    fn name(&self) -> &'static str {
+        "EmaFollow"
+    }
+
+    fn should_fire(&self, _signals: &[Signal], _ctx: &Ctx) -> Option<OrderIntent> {
+        None
+    }
+
+    fn on_signals(
+        &mut self,
+        signals: &[Signal],
+        _ctx: &Ctx,
+        symbol: &Symbol,
+    ) -> Option<OrderIntent> {
+        for sig in signals {
+            if sig.kind != SignalKind::TrendRegime {
+                continue;
+            }
+            let p = &sig.payload;
+            let direction = p.get("direction").and_then(|v| v.as_str()).unwrap_or("");
+            if direction != "up" && direction != "down" {
+                continue;
+            }
+
+            // 全局冷却：任何触发后 cooldown_ms 内不再触发
+            let ts_ms = sig.ts.as_millis();
+            if (ts_ms - self.last_fire_ts) < self.cooldown_ms {
+                continue;
+            }
+
+            let price = p.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if price <= 0.0 {
+                continue;
+            }
+
+            let side = if direction == "up" { Side::Buy } else { Side::Sell };
+            let sl_dist = price * self.sl_pct;
+            let sl = if side == Side::Buy {
+                Price::from_f64(price - sl_dist)
+            } else {
+                Price::from_f64(price + sl_dist)
+            };
+
+            self.last_fire_ts = ts_ms;
+            self.last_direction = Some(direction.to_string());
+
+            tracing::info!(side = ?side, price, sl_pct = self.sl_pct, "EmaFollow 扣扳机");
+
+            return Some(OrderIntent {
+                symbol: symbol.clone(),
+                side,
+                qty: Qty::ZERO,
+                limit_price: None, // 市价单
+                stop_price: sl,
+                tp1_price: None,
+                reason: format!("ema_follow({} @ {:.2})", direction, price),
+                ts: sig.ts,
+            });
+        }
+        None
+    }
+}
+
+pub fn build_ema_follow(p: &Json) -> Result<Box<dyn TriggerPlugin>, PluginBuildError> {
+    let g = |k: &str, d: f64| p.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
+    Ok(Box::new(EmaFollow::new(
+        g("sl_pct", 0.003),
+        g("cooldown_ms", 300_000.0) as i64, // 默认 5 分钟冷却
+    )))
+}
+
+
+// ============================================================================
+// 均值回归触发器
+// ============================================================================
+
+/// 均值回归跟随。
+///
+/// 消费 `EmaMeanReversion` 产生的 overbought/oversold 信号：
+/// - overbought（价格高于 EMA）→ 做空，止盈 = EMA，止损 = 固定百分比
+/// - oversold（价格低于 EMA）→ 做多，止盈 = EMA，止损 = 固定百分比
+/// 带全局冷却。
+pub struct MeanReversionFollow {
+    pub sl_pct: f64,
+    pub cooldown_ms: i64,
+
+    last_fire_ts: i64,
+}
+
+impl MeanReversionFollow {
+    pub fn new(sl_pct: f64, cooldown_ms: i64) -> Self {
+        Self {
+            sl_pct,
+            cooldown_ms,
+            last_fire_ts: 0,
+        }
+    }
+}
+
+impl TriggerPlugin for MeanReversionFollow {
+    fn name(&self) -> &'static str {
+        "MeanReversionFollow"
+    }
+
+    fn should_fire(&self, _signals: &[Signal], _ctx: &Ctx) -> Option<OrderIntent> {
+        None
+    }
+
+    fn on_signals(
+        &mut self,
+        signals: &[Signal],
+        _ctx: &Ctx,
+        symbol: &Symbol,
+    ) -> Option<OrderIntent> {
+        for sig in signals {
+            if sig.kind != SignalKind::TrendRegime {
+                continue;
+            }
+            let p = &sig.payload;
+            let regime = p.get("regime").and_then(|v| v.as_str()).unwrap_or("");
+            if regime != "overbought" && regime != "oversold" {
+                continue;
+            }
+
+            // 全局冷却
+            let ts_ms = sig.ts.as_millis();
+            if (ts_ms - self.last_fire_ts) < self.cooldown_ms {
+                continue;
+            }
+
+            let price = p.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let ema = p.get("ema").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if price <= 0.0 || ema <= 0.0 {
+                continue;
+            }
+
+            let side = if regime == "oversold" { Side::Buy } else { Side::Sell };
+            let sl_dist = price * self.sl_pct;
+            let sl = if side == Side::Buy {
+                Price::from_f64(price - sl_dist)
+            } else {
+                Price::from_f64(price + sl_dist)
+            };
+            let tp = Price::from_f64(ema);
+
+            self.last_fire_ts = ts_ms;
+
+            tracing::info!(side = ?side, price, ema, sl_pct = self.sl_pct, "MeanReversionFollow 扣扳机");
+
+            return Some(OrderIntent {
+                symbol: symbol.clone(),
+                side,
+                qty: Qty::ZERO,
+                limit_price: None,
+                stop_price: sl,
+                tp1_price: Some(tp),
+                reason: format!("mean_revert({} price={:.2} ema={:.2})", regime, price, ema),
+                ts: sig.ts,
+            });
+        }
+        None
+    }
+}
+
+pub fn build_mean_reversion_follow(p: &Json) -> Result<Box<dyn TriggerPlugin>, PluginBuildError> {
+    let g = |k: &str, d: f64| p.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
+    Ok(Box::new(MeanReversionFollow::new(
+        g("sl_pct", 0.01),
+        g("cooldown_ms", 1_800_000.0) as i64, // 默认 30 分钟冷却
+    )))
+}
+
+
+// ============================================================================
+// 布林带均值回归触发器
+// ============================================================================
+
+/// 布林带均值回归跟随。
+///
+/// 消费 `BollingerMeanReversion` 产生的 overbought/oversold 信号：
+/// 止损 = std × 倍数，止盈 = EMA。
+pub struct BollingerReversionFollow {
+    pub sl_std_mult: f64,
+    pub cooldown_ms: i64,
+    last_fire_ts: i64,
+}
+
+impl BollingerReversionFollow {
+    pub fn new(sl_std_mult: f64, cooldown_ms: i64) -> Self {
+        Self { sl_std_mult, cooldown_ms, last_fire_ts: 0 }
+    }
+}
+
+impl TriggerPlugin for BollingerReversionFollow {
+    fn name(&self) -> &'static str { "BollingerReversionFollow" }
+    fn should_fire(&self, _signals: &[Signal], _ctx: &Ctx) -> Option<OrderIntent> { None }
+
+    fn on_signals(&mut self, signals: &[Signal], _ctx: &Ctx, symbol: &Symbol) -> Option<OrderIntent> {
+        for sig in signals {
+            if sig.kind != SignalKind::TrendRegime { continue; }
+            let p = &sig.payload;
+            let regime = p.get("regime").and_then(|v| v.as_str()).unwrap_or("");
+            if regime != "overbought" && regime != "oversold" { continue; }
+
+            let ts_ms = sig.ts.as_millis();
+            if (ts_ms - self.last_fire_ts) < self.cooldown_ms { continue; }
+
+            let price = p.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let ema = p.get("ema").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let std = p.get("std").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if price <= 0.0 || ema <= 0.0 || std <= 0.0 { continue; }
+
+            let side = if regime == "oversold" { Side::Buy } else { Side::Sell };
+            let sl_dist = std * self.sl_std_mult;
+            let sl = if side == Side::Buy {
+                Price::from_f64(price - sl_dist)
+            } else {
+                Price::from_f64(price + sl_dist)
+            };
+            let tp = Price::from_f64(ema);
+
+            self.last_fire_ts = ts_ms;
+            tracing::info!(side = ?side, price, ema, std, "BollingerReversionFollow 扣扳机");
+
+            return Some(OrderIntent {
+                symbol: symbol.clone(), side, qty: Qty::ZERO,
+                limit_price: None, stop_price: sl, tp1_price: Some(tp),
+                reason: format!("bollinger_mr({} @ {:.2} ema={:.2} std={:.2})", regime, price, ema, std),
+                ts: sig.ts,
+            });
+        }
+        None
+    }
+}
+
+pub fn build_bollinger_reversion(p: &Json) -> Result<Box<dyn TriggerPlugin>, PluginBuildError> {
+    let g = |k: &str, d: f64| p.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
+    Ok(Box::new(BollingerReversionFollow::new(
+        g("sl_std_mult", 1.5),
+        g("cooldown_ms", 7_200_000.0) as i64, // 默认 2 小时冷却
+    )))
+}
+
+
+// ============================================================================
+// ATR 止损均值回归扳机（配合 VolAdaptiveMr）
+// ============================================================================
+
+/// ATR 止损均值回归跟随。
+///
+/// 消费 `VolAdaptiveMr` 的 overbought/oversold 信号（payload 带 atr）：
+/// - 止损 = 入场价 ∓ sl_atr_mult × ATR（噪声自适应，仓位随之反比缩放）
+/// - 止盈 = 快速 EMA（均值目标），配合部分止盈 + 移动止损可让利润奔跑
+pub struct MrAtrFollow {
+    pub sl_atr_mult: f64,
+    pub cooldown_ms: i64,
+    /// TP1 模式：>0 时用固定盈亏比（入场价 ± tp_r_mult × 止损距离）；=0 时用 EMA 目标
+    pub tp_r_mult: f64,
+    /// 限价入场深度（ATR 倍数）：>0 时在信号价内侧 entry_limit_atr×ATR 挂限价单（maker），
+    /// 止损/止盈以限价成交价为锚；=0 时市价入场（taker）
+    pub entry_limit_atr: f64,
+    last_fire_ts: i64,
+}
+
+impl MrAtrFollow {
+    pub fn new(sl_atr_mult: f64, cooldown_ms: i64, tp_r_mult: f64, entry_limit_atr: f64) -> Self {
+        Self {
+            sl_atr_mult,
+            cooldown_ms,
+            tp_r_mult,
+            entry_limit_atr,
+            last_fire_ts: 0,
+        }
+    }
+}
+
+impl TriggerPlugin for MrAtrFollow {
+    fn name(&self) -> &'static str {
+        "MrAtrFollow"
+    }
+
+    fn should_fire(&self, _signals: &[Signal], _ctx: &Ctx) -> Option<OrderIntent> {
+        None
+    }
+
+    fn on_signals(
+        &mut self,
+        signals: &[Signal],
+        _ctx: &Ctx,
+        symbol: &Symbol,
+    ) -> Option<OrderIntent> {
+        for sig in signals {
+            if sig.kind != SignalKind::TrendRegime {
+                continue;
+            }
+            let p = &sig.payload;
+            let regime = p.get("regime").and_then(|v| v.as_str()).unwrap_or("");
+            if regime != "overbought" && regime != "oversold" {
+                continue;
+            }
+
+            // 全局冷却
+            let ts_ms = sig.ts.as_millis();
+            if (ts_ms - self.last_fire_ts) < self.cooldown_ms {
+                continue;
+            }
+
+            let price = p.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let ema = p.get("ema").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let atr = p.get("atr").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if price <= 0.0 || ema <= 0.0 || atr <= 0.0 {
+                continue;
+            }
+
+            let side = if regime == "oversold" { Side::Buy } else { Side::Sell };
+            // 入场价：限价模式下向回调更深处挂 maker 单
+            let entry = if self.entry_limit_atr > 0.0 {
+                if side == Side::Buy {
+                    price - atr * self.entry_limit_atr
+                } else {
+                    price + atr * self.entry_limit_atr
+                }
+            } else {
+                price
+            };
+            let sl_dist = atr * self.sl_atr_mult;
+            let sl = if side == Side::Buy {
+                Price::from_f64(entry - sl_dist)
+            } else {
+                Price::from_f64(entry + sl_dist)
+            };
+            let tp = if self.tp_r_mult > 0.0 {
+                // 固定盈亏比目标（波段）：入场价 ± tp_r_mult × 止损距离
+                if side == Side::Buy {
+                    Price::from_f64(entry + sl_dist * self.tp_r_mult)
+                } else {
+                    Price::from_f64(entry - sl_dist * self.tp_r_mult)
+                }
+            } else {
+                Price::from_f64(ema)
+            };
+
+            self.last_fire_ts = ts_ms;
+
+            tracing::info!(side = ?side, price, entry, ema, atr, sl_atr_mult = self.sl_atr_mult, "MrAtrFollow 扣扳机");
+
+            return Some(OrderIntent {
+                symbol: symbol.clone(),
+                side,
+                qty: Qty::ZERO,
+                limit_price: if self.entry_limit_atr > 0.0 {
+                    Some(Price::from_f64(entry))
+                } else {
+                    None
+                },
+                stop_price: sl,
+                tp1_price: Some(tp),
+                reason: format!(
+                    "mr_atr({} price={:.2} ema={:.2} atr={:.2})",
+                    regime, price, ema, atr
+                ),
+                ts: sig.ts,
+            });
+        }
+        None
+    }
+}
+
+pub fn build_mr_atr_follow(p: &Json) -> Result<Box<dyn TriggerPlugin>, PluginBuildError> {
+    let g = |k: &str, d: f64| p.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
+    Ok(Box::new(MrAtrFollow::new(
+        g("sl_atr_mult", 1.5),
+        g("cooldown_ms", 1_800_000.0) as i64, // 默认 30 分钟冷却
+        g("tp_r_mult", 0.0),                  // 默认 EMA 目标；>0 用固定盈亏比
+        g("entry_limit_atr", 0.0),            // 默认市价入场；>0 挂限价 maker 单
+    )))
+}
+
+
+// ============================================================================
+// 金字塔均值回归触发器（路径 D）
+// ============================================================================
+
+/// 金字塔加仓均值回归。
+///
+/// 初始入场逻辑与 `MeanReversionFollow` 相同（overbought→空 / oversold→多，TP=EMA）；
+/// 持仓中若价格沿不利方向继续偏离 `add_step_pct`，按 `add_size_frac` 递减加仓，
+/// 最多 `max_adds` 次，止损保持初始价位不变（TP=EMA 对全部仓位生效）。
+pub struct PyramidMrFollow {
+    pub sl_pct: f64,
+    pub cooldown_ms: i64,
+    /// 加仓间距（相对上一层成交价，如 0.0035 = 0.35%）
+    pub add_step_pct: f64,
+    /// 每层数量 = 基础层 × 此系数
+    pub add_size_frac: f64,
+    /// 最大加仓次数（总层数 = 1 + max_adds）
+    pub max_adds: u32,
+
+    last_fire_ts: i64,
+    // 金字塔状态（按持仓 entry_ts 对齐，换仓自动重置）
+    pos_key: Option<i64>,
+    adds_done: u32,
+    last_layer_price: f64,
+}
+
+impl PyramidMrFollow {
+    pub fn new(
+        sl_pct: f64,
+        cooldown_ms: i64,
+        add_step_pct: f64,
+        add_size_frac: f64,
+        max_adds: u32,
+    ) -> Self {
+        Self {
+            sl_pct,
+            cooldown_ms,
+            add_step_pct,
+            add_size_frac,
+            max_adds,
+            last_fire_ts: 0,
+            pos_key: None,
+            adds_done: 0,
+            last_layer_price: 0.0,
+        }
+    }
+}
+
+impl TriggerPlugin for PyramidMrFollow {
+    fn name(&self) -> &'static str {
+        "PyramidMrFollow"
+    }
+
+    fn should_fire(&self, _signals: &[Signal], _ctx: &Ctx) -> Option<OrderIntent> {
+        None
+    }
+
+    fn on_signals(
+        &mut self,
+        signals: &[Signal],
+        _ctx: &Ctx,
+        symbol: &Symbol,
+    ) -> Option<OrderIntent> {
+        for sig in signals {
+            if sig.kind != SignalKind::TrendRegime {
+                continue;
+            }
+            let p = &sig.payload;
+            let regime = p.get("regime").and_then(|v| v.as_str()).unwrap_or("");
+            if regime != "overbought" && regime != "oversold" {
+                continue;
+            }
+
+            let ts_ms = sig.ts.as_millis();
+            if (ts_ms - self.last_fire_ts) < self.cooldown_ms {
+                continue;
+            }
+
+            let price = p.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let ema = p.get("ema").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if price <= 0.0 || ema <= 0.0 {
+                continue;
+            }
+
+            let side = if regime == "oversold" { Side::Buy } else { Side::Sell };
+            let sl_dist = price * self.sl_pct;
+            let sl = if side == Side::Buy {
+                Price::from_f64(price - sl_dist)
+            } else {
+                Price::from_f64(price + sl_dist)
+            };
+            let tp = Price::from_f64(ema);
+
+            self.last_fire_ts = ts_ms;
+            // 新一笔交易：金字塔状态由 on_add 按 pos.entry_ts 自行对齐
+            self.pos_key = None;
+            self.adds_done = 0;
+            self.last_layer_price = price;
+
+            tracing::info!(side = ?side, price, ema, "PyramidMrFollow 首层扣扳机");
+
+            return Some(OrderIntent {
+                symbol: symbol.clone(),
+                side,
+                qty: Qty::ZERO,
+                limit_price: None,
+                stop_price: sl,
+                tp1_price: Some(tp),
+                reason: format!("pyramid_base({} price={:.2} ema={:.2})", regime, price, ema),
+                ts: sig.ts,
+            });
+        }
+        None
+    }
+
+    fn on_add(
+        &mut self,
+        pos: &Position,
+        _signals: &[Signal],
+        ctx: &Ctx,
+        symbol: &Symbol,
+    ) -> Option<OrderIntent> {
+        if self.adds_done >= self.max_adds {
+            return None;
+        }
+        // 与当前持仓对齐（新持仓则重置层数）
+        let key = pos.entry_ts.as_millis();
+        if self.pos_key != Some(key) {
+            self.pos_key = Some(key);
+            self.adds_done = 0;
+            self.last_layer_price = pos.entry_price.to_f64();
+        }
+        let price: f64 = ctx.flag("last_price")?.parse().ok()?;
+        if price <= 0.0 {
+            return None;
+        }
+        // 价格沿不利方向再偏离 add_step_pct 才加下一层
+        let triggered = match pos.side {
+            Side::Buy => price <= self.last_layer_price * (1.0 - self.add_step_pct),
+            Side::Sell => price >= self.last_layer_price * (1.0 + self.add_step_pct),
+        };
+        if !triggered {
+            return None;
+        }
+        // 本层数量 = 基础层 × frac；基础层 = 当前总仓 / (1 + adds_done×frac)
+        let base_qty = pos.qty.to_f64() / (1.0 + self.adds_done as f64 * self.add_size_frac);
+        let add_qty = base_qty * self.add_size_frac;
+        if add_qty <= 1e-9 {
+            return None;
+        }
+        self.adds_done += 1;
+        self.last_layer_price = price;
+
+        tracing::info!(
+            side = ?pos.side,
+            price,
+            layer = self.adds_done,
+            add_qty,
+            "PyramidMrFollow 加仓"
+        );
+
+        Some(OrderIntent {
+            symbol: symbol.clone(),
+            side: pos.side,
+            qty: Qty::from_f64(add_qty),
+            limit_price: None,
+            stop_price: pos.stop_price, // 止损保持初始价位
+            tp1_price: pos.tp1_price,   // TP=EMA 对全部仓位生效
+            reason: format!("pyramid_add(L{} price={:.2})", self.adds_done, price),
+            ts: pos.entry_ts, // 仅作占位；引擎以当前 trade 时间下单
+        })
+    }
+}
+
+pub fn build_pyramid_mr_follow(p: &Json) -> Result<Box<dyn TriggerPlugin>, PluginBuildError> {
+    let g = |k: &str, d: f64| p.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
+    Ok(Box::new(PyramidMrFollow::new(
+        g("sl_pct", 0.01),
+        g("cooldown_ms", 1_800_000.0) as i64,
+        g("add_step_pct", 0.0035),
+        g("add_size_frac", 0.5),
+        g("max_adds", 2.0) as u32,
+    )))
+}
+
+
+// ============================================================================
+// Regime 切换触发器（路径 B）
+// ============================================================================
+
+/// 消费 `RegimeSwitchMr` 的四类信号：
+/// - overbought/oversold（震荡腿）：与 MeanReversionFollow 相同，SL=sl_pct，TP=EMA。
+/// - trend_long/trend_short（趋势腿）：SL=trend_sl_pct（更宽），不挂 TP1，
+///   交由出场插件（PercentTrail/TimeStop）让利润奔跑。
+pub struct RegimeSwitchFollow {
+    pub sl_pct: f64,
+    pub trend_sl_pct: f64,
+    pub cooldown_ms: i64,
+
+    last_fire_ts: i64,
+}
+
+impl RegimeSwitchFollow {
+    pub fn new(sl_pct: f64, trend_sl_pct: f64, cooldown_ms: i64) -> Self {
+        Self {
+            sl_pct,
+            trend_sl_pct,
+            cooldown_ms,
+            last_fire_ts: 0,
+        }
+    }
+}
+
+impl TriggerPlugin for RegimeSwitchFollow {
+    fn name(&self) -> &'static str {
+        "RegimeSwitchFollow"
+    }
+
+    fn should_fire(&self, _signals: &[Signal], _ctx: &Ctx) -> Option<OrderIntent> {
+        None
+    }
+
+    fn on_signals(
+        &mut self,
+        signals: &[Signal],
+        _ctx: &Ctx,
+        symbol: &Symbol,
+    ) -> Option<OrderIntent> {
+        for sig in signals {
+            if sig.kind != SignalKind::TrendRegime || sig.source != "RegimeSwitchMr" {
+                continue;
+            }
+            let p = &sig.payload;
+            let regime = p.get("regime").and_then(|v| v.as_str()).unwrap_or("");
+
+            let ts_ms = sig.ts.as_millis();
+            if (ts_ms - self.last_fire_ts) < self.cooldown_ms {
+                continue;
+            }
+
+            let price = p.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let ema = p.get("ema").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if price <= 0.0 {
+                continue;
+            }
+
+            let (side, sl_pct, tp) = match regime {
+                "oversold" => (Side::Buy, self.sl_pct, Some(Price::from_f64(ema))),
+                "overbought" => (Side::Sell, self.sl_pct, Some(Price::from_f64(ema))),
+                "trend_long" => (Side::Buy, self.trend_sl_pct, None),
+                "trend_short" => (Side::Sell, self.trend_sl_pct, None),
+                _ => continue,
+            };
+            if matches!(regime, "oversold" | "overbought") && ema <= 0.0 {
+                continue;
+            }
+
+            let sl_dist = price * sl_pct;
+            let sl = if side == Side::Buy {
+                Price::from_f64(price - sl_dist)
+            } else {
+                Price::from_f64(price + sl_dist)
+            };
+
+            self.last_fire_ts = ts_ms;
+
+            tracing::info!(side = ?side, price, regime, sl_pct, "RegimeSwitchFollow 扣扳机");
+
+            return Some(OrderIntent {
+                symbol: symbol.clone(),
+                side,
+                qty: Qty::ZERO,
+                limit_price: None,
+                stop_price: sl,
+                tp1_price: tp,
+                reason: format!("regime_switch({} price={:.2} ema={:.2})", regime, price, ema),
+                ts: sig.ts,
+            });
+        }
+        None
+    }
+}
+
+pub fn build_regime_switch_follow(p: &Json) -> Result<Box<dyn TriggerPlugin>, PluginBuildError> {
+    let g = |k: &str, d: f64| p.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
+    Ok(Box::new(RegimeSwitchFollow::new(
+        g("sl_pct", 0.01),
+        g("trend_sl_pct", 0.02),
+        g("cooldown_ms", 1_800_000.0) as i64,
+    )))
+}
+
+
+// ============================================================================
+// 挤兑完成触发器（F3）
+// ============================================================================
+
+/// 消费 `SqueezeCompletion` 的 f3_long/f3_short 信号：
+/// 市价入场，止损用信号载荷的结构锚（窗口极值外），TP1 = 载荷中的 EMA。
+pub struct SqueezeFollow {
+    pub cooldown_ms: i64,
+    last_fire_ts: i64,
+}
+
+impl SqueezeFollow {
+    pub fn new(cooldown_ms: i64) -> Self {
+        Self {
+            cooldown_ms,
+            last_fire_ts: 0,
+        }
+    }
+}
+
+impl TriggerPlugin for SqueezeFollow {
+    fn name(&self) -> &'static str {
+        "SqueezeFollow"
+    }
+
+    fn should_fire(&self, _signals: &[Signal], _ctx: &Ctx) -> Option<OrderIntent> {
+        None
+    }
+
+    fn on_signals(
+        &mut self,
+        signals: &[Signal],
+        _ctx: &Ctx,
+        symbol: &Symbol,
+    ) -> Option<OrderIntent> {
+        for sig in signals {
+            if sig.source != "SqueezeCompletion" {
+                continue;
+            }
+            let p = &sig.payload;
+            let regime = p.get("regime").and_then(|v| v.as_str()).unwrap_or("");
+            let side = match regime {
+                "f3_long" => Side::Buy,
+                "f3_short" => Side::Sell,
+                _ => continue,
+            };
+
+            let ts_ms = sig.ts.as_millis();
+            if (ts_ms - self.last_fire_ts) < self.cooldown_ms {
+                continue;
+            }
+
+            let price = p.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let ema = p.get("ema").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            let sl = p.get("sl").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if price <= 0.0 || ema <= 0.0 || sl <= 0.0 {
+                continue;
+            }
+
+            self.last_fire_ts = ts_ms;
+            tracing::info!(side = ?side, price, sl, ema, "SqueezeFollow 扣扳机");
+
+            return Some(OrderIntent {
+                symbol: symbol.clone(),
+                side,
+                qty: Qty::ZERO,
+                limit_price: None,
+                stop_price: Price::from_f64(sl),
+                tp1_price: Some(Price::from_f64(ema)),
+                reason: format!(
+                    "squeeze({} price={:.2} sl={:.2} ema={:.2})",
+                    regime, price, sl, ema
+                ),
+                ts: sig.ts,
+            });
+        }
+        None
+    }
+}
+
+pub fn build_squeeze_follow(p: &Json) -> Result<Box<dyn TriggerPlugin>, PluginBuildError> {
+    let g = |k: &str, d: f64| p.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
+    Ok(Box::new(SqueezeFollow::new(
+        g("cooldown_ms", 7_200_000.0) as i64, // 默认 2 小时冷却
+    )))
 }

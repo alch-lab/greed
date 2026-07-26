@@ -18,3 +18,11 @@ trades_flush_rows = 500000
 book_flush_rows = 2000
 flush_tick_secs = 60
 max_buffer_secs = 300
+
+# 模拟盘账户（币安合约 testnet）。密钥不写在此文件：
+# 在 https://testnet.binancefuture.com 申请后 export 到环境变量即可。
+# 上实盘时把 testnet 改为 false（⚠️ 先用模拟盘充分验证）。
+[account]
+testnet = true
+api_key_env = "BINANCE_API_KEY"
+api_secret_env = "BINANCE_API_SECRET"
