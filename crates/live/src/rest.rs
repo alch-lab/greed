@@ -221,7 +221,7 @@ impl RestClient {
         Ok(())
     }
 
-    /// 设逐仓（已是对应模式时币安返回 -4059，视为成功）。
+    /// 设逐仓（已是逐仓时币安返回 -4046 / -4059，视为成功）。
     pub async fn set_margin_isolated(&self, symbol: &str) -> Result<(), RestError> {
         match self
             .signed(
@@ -235,7 +235,7 @@ impl RestClient {
             .await
         {
             Ok(_) => Ok(()),
-            Err(RestError::Binance { code, .. }) if code == -4059 => Ok(()),
+            Err(RestError::Binance { code, .. }) if code == -4046 || code == -4059 => Ok(()),
             Err(e) => Err(e),
         }
     }
