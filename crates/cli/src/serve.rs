@@ -52,6 +52,90 @@ struct AppState {
     lake: String,
     trade: Mutex<Option<TradeHandle>>,
     jobs: Arc<Mutex<HashMap<String, JobInfo>>>,
+    auth: AuthState,
+}
+
+/// 登录鉴权：环境变量 GREED_WEB_PASSWORD 设置后启用。
+/// 单用户本地工具模型：密码校验通过签发随机会话 token（内存保存，重启失效）。
+struct AuthState {
+    password: Option<String>,
+    tokens: Mutex<std::collections::HashSet<String>>,
+}
+
+/// 生成随机会话 token（/dev/urandom 24 字节 hex；退化用时间+PID）。
+fn gen_token() -> String {
+    use std::io::Read;
+    let mut b = [0u8; 24];
+    match std::fs::File::open("/dev/urandom") {
+        Ok(mut f) => {
+            let _ = f.read_exact(&mut b);
+        }
+        Err(_) => {
+            let n = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+                ^ (std::process::id() as u128);
+            for (i, chunk) in b.chunks_mut(16).enumerate() {
+                chunk.copy_from_slice(&(n.wrapping_add(i as u128)).to_le_bytes());
+            }
+        }
+    }
+    b.iter().map(|x| format!("{:02x}", x)).collect()
+}
+
+#[derive(Deserialize)]
+struct LoginReq {
+    password: String,
+}
+
+async fn auth_login(
+    State(st): State<Arc<AppState>>,
+    Json(req): Json<LoginReq>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    match &st.auth.password {
+        None => Ok(Json(serde_json::json!({ "auth_required": false }))),
+        Some(pw) if req.password == *pw => {
+            let t = gen_token();
+            st.auth.tokens.lock().await.insert(t.clone());
+            Ok(Json(serde_json::json!({ "auth_required": true, "token": t })))
+        }
+        _ => Err((StatusCode::UNAUTHORIZED, "密码错误".into())),
+    }
+}
+
+async fn auth_check(State(st): State<Arc<AppState>>) -> StatusCode {
+    // 能走到这里说明已通过中间件（或未启用鉴权）
+    let _ = st;
+    StatusCode::OK
+}
+
+/// 鉴权中间件：未启用（无 GREED_WEB_PASSWORD）直接放行；
+/// 启用时仅放行 /api/auth/login 与 /api/health，其余要求 Bearer token。
+async fn auth_mw(
+    State(st): State<Arc<AppState>>,
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, StatusCode> {
+    if st.auth.password.is_none() {
+        return Ok(next.run(req).await);
+    }
+    let path = req.uri().path().to_string();
+    if path == "/api/auth/login" || path == "/api/health" {
+        return Ok(next.run(req).await);
+    }
+    let token = req
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "))
+        .map(|s| s.to_string());
+    if let Some(t) = token {
+        if st.auth.tokens.lock().await.contains(&t) {
+            return Ok(next.run(req).await);
+        }
+    }
+    Err(StatusCode::UNAUTHORIZED)
 }
 
 // ============================================================================
@@ -453,16 +537,30 @@ fn exec_backtest(
 // ============================================================================
 
 pub async fn run_serve(port: u16, config: String, strategy: String, lake: String) -> Result<()> {
+    let password = std::env::var("GREED_WEB_PASSWORD")
+        .ok()
+        .filter(|s| !s.trim().is_empty());
+    if password.is_some() {
+        info!("控制面鉴权已启用（GREED_WEB_PASSWORD）");
+    } else {
+        warn!("未设置 GREED_WEB_PASSWORD，控制面无鉴权（仅建议本机使用）");
+    }
     let state = Arc::new(AppState {
         config,
         default_strategy: strategy,
         lake,
         trade: Mutex::new(None),
         jobs: Arc::new(Mutex::new(HashMap::new())),
+        auth: AuthState {
+            password,
+            tokens: Mutex::new(std::collections::HashSet::new()),
+        },
     });
 
     let app = Router::new()
         .route("/api/health", get(|| async { Json(serde_json::json!({"ok": true})) }))
+        .route("/api/auth/login", post(auth_login))
+        .route("/api/auth/check", get(auth_check))
         .route("/api/strategies", get(list_strategies))
         .route("/api/trade/status", get(trade_status))
         .route("/api/trade/start", post(trade_start))
@@ -471,6 +569,7 @@ pub async fn run_serve(port: u16, config: String, strategy: String, lake: String
         .route("/api/backtest/run", post(backtest_run))
         .route("/api/backtest/jobs", get(backtest_jobs))
         .route("/api/backtest/jobs/{id}/journal", get(backtest_journal))
+        .layer(axum::middleware::from_fn_with_state(state.clone(), auth_mw))
         .layer(CorsLayer::permissive())
         .with_state(state);
 
