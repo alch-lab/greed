@@ -452,25 +452,64 @@ pub fn read_range(
         .collect();
     entries.sort();
 
-    let mut trades: Vec<Trade> = Vec::new();
-    for path in entries {
+    // 按文件并行解码（binlog 逐行 serde 是回测加载的最大热点），
+    // 文件序=日期序，拼接后仅做一次近有序稳定排序。
+    let load_one = |path: &PathBuf| -> Result<Vec<Trade>, LakeError> {
+        let mut out = Vec::new();
         if path.extension().and_then(|s| s.to_str()) == Some("binlog") {
-            for row in crate::live::binlog::read_trade_log(&path)? {
+            for row in crate::live::binlog::read_trade_log(path)? {
                 let t = row.into_trade().map_err(LakeError::Data)?;
                 if t.ts >= from && t.ts < to {
-                    trades.push(t);
+                    out.push(t);
                 }
             }
         } else {
-            let cols = read_shard(&path)?;
+            let cols = read_shard(path)?;
             for t in cols.into_trades().map_err(LakeError::Data)? {
                 if t.ts >= from && t.ts < to {
-                    trades.push(t);
+                    out.push(t);
                 }
             }
         }
-    }
+        Ok(out)
+    };
 
+    let n = entries.len();
+    let workers = std::thread::available_parallelism()
+        .map(|p| p.get())
+        .unwrap_or(4)
+        .min(n.max(1));
+    let next = std::sync::atomic::AtomicUsize::new(0);
+    let mut per_file: Vec<Vec<Trade>> = vec![Vec::new(); n];
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for _ in 0..workers {
+            handles.push(s.spawn(|| {
+                let mut local: Vec<(usize, Result<Vec<Trade>, LakeError>)> = Vec::new();
+                loop {
+                    let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if i >= n {
+                        break;
+                    }
+                    let r = load_one(&entries[i]);
+                    local.push((i, r));
+                }
+                local
+            }));
+        }
+        for h in handles {
+            for (i, r) in h.join().expect("加载线程 panic") {
+                per_file[i] = r?;
+            }
+        }
+        Ok::<(), LakeError>(())
+    })?;
+
+    let total: usize = per_file.iter().map(|v| v.len()).sum();
+    let mut trades: Vec<Trade> = Vec::with_capacity(total);
+    for v in per_file {
+        trades.extend(v);
+    }
     trades.sort_by_key(|t| t.ts);
     Ok(trades)
 }

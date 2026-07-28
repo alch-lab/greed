@@ -13,6 +13,10 @@ pub struct DualTfMeanReversion {
     fast_ema_p: usize,
     slow_ema_p: usize,
     deviation_threshold: f64,
+    /// 自适应阈值：>0 时阈值 = dev_atr_mult × ATR(14)/price（随波动环境伸缩），
+    /// 并受 dev_min_pct 下限约束；0 = 使用固定 deviation_threshold
+    dev_atr_mult: f64,
+    dev_min_pct: f64,
 
     // 可选过滤器（路径 A）：ATR 爆发抑制 + RSI 动量守卫；0 = 关闭
     atr_period: usize,
@@ -66,6 +70,7 @@ impl DualTfMeanReversion {
     pub fn new(fast_bar_ms: i64, slow_bar_ms: i64, fast_ema_p: usize, slow_ema_p: usize, deviation: f64) -> Self {
         Self {
             fast_bar_ms, slow_bar_ms, fast_ema_p, slow_ema_p, deviation_threshold: deviation,
+            dev_atr_mult: 0.0, dev_min_pct: 0.006,
             atr_period: 0, atr_avg_period: 20, atr_max_mult: 1.3,
             rsi_period: 0, rsi_no_long_above: 70.0, rsi_no_short_below: 30.0,
             fast_cur_idx: None, fast_open: 0.0, fast_high: 0.0, fast_low: 0.0, fast_close: 0.0,
@@ -220,6 +225,19 @@ impl DualTfMeanReversion {
         Some((self.slow_ema_hist[n - 1] - old) / old * 100.0)
     }
 
+    /// 有效偏离阈值（小数形式）：自适应模式 = k × ATR%（下限 dev_min_pct），
+    /// 否则固定值。ATR 未就绪时退回固定值。
+    fn eff_threshold(&self) -> f64 {
+        if self.dev_atr_mult > 0.0 {
+            if let Some(atr) = self.rec_atr {
+                if self.fast_close > 1e-9 {
+                    return (self.dev_atr_mult * atr / self.fast_close).max(self.dev_min_pct);
+                }
+            }
+        }
+        self.deviation_threshold
+    }
+
     /// ATR 爆发抑制：当前 ATR > atr_max_mult × 近期平均 → true（不交易）
     fn atr_burst(&self) -> bool {
         if self.atr_period == 0 {
@@ -339,8 +357,9 @@ impl DualTfMeanReversion {
         let deviation = (self.fast_close - self.fast_ema) / self.fast_ema;
         let trend = if self.slow_close > self.slow_ema { 1 } else if self.slow_close < self.slow_ema { -1 } else { 0 };
         let trend_text = match trend { 1 => "向上", -1 => "向下", _ => "持平" };
+        let thr = self.eff_threshold();
         let dev_pct = deviation * 100.0;
-        let thr_pct = self.deviation_threshold * 100.0;
+        let thr_pct = thr * 100.0;
 
         let mut sigs = Vec::new();
         // 本次评估的结论与人话解释（控制面「为什么下单/不下单」展示用）
@@ -359,7 +378,7 @@ impl DualTfMeanReversion {
             // 大趋势向上 → 只做 oversold（做多）
             // 大趋势向下 → 只做 overbought（做空）
             // 不确定 → 双向
-            if deviation > self.deviation_threshold {
+            if deviation > thr {
                 // RSI 动量守卫：RSI < rsi_no_short_below 时不做空（跌深不追空）
                 let rsi_block = rsi.map(|r| r < self.rsi_no_short_below).unwrap_or(false);
                 if rsi_block {
@@ -378,7 +397,7 @@ impl DualTfMeanReversion {
                     ));
                     self.last_signal_dir = Some("overbought".to_string());
                 }
-            } else if deviation < -self.deviation_threshold {
+            } else if deviation < -thr {
                 // RSI 动量守卫：RSI > rsi_no_long_above 时不做多（涨高不追多）
                 let rsi_block = rsi.map(|r| r > self.rsi_no_long_above).unwrap_or(false);
                 if rsi_block {
@@ -473,6 +492,9 @@ impl DualTfMeanReversion {
         s.rsi_period = g("rsi_period", 0.0) as usize;
         s.rsi_no_long_above = g("rsi_no_long_above", 70.0);
         s.rsi_no_short_below = g("rsi_no_short_below", 30.0);
+        // 自适应阈值（不配 = 固定阈值，保持定稿行为）
+        s.dev_atr_mult = g("dev_atr_mult", 0.0);
+        s.dev_min_pct = g("dev_min_pct", 0.006);
         s
     }
 }
@@ -555,5 +577,47 @@ mod tests {
         let note = s.eval_note().unwrap();
         assert_eq!(note["decision"], "long");
         assert!(note["reason"].as_str().unwrap().contains("逢低做多"));
+    }
+
+    /// 自适应阈值：低波动环境下 -0.8% 偏离（固定 1.5% 阈值打不到）
+    /// 在 8×ATR（下限 0.6%）下应触发；同一价格序列固定阈值不触发。
+    #[test]
+    fn adaptive_threshold_fires_in_low_vol() {
+        let build = |adaptive: bool| {
+            let mut s = DualTfMeanReversion::new(300_000, 3_600_000, 20, 20, 0.015);
+            if adaptive {
+                s.dev_atr_mult = 8.0;
+                s.dev_min_pct = 0.006;
+            }
+            s
+        };
+        // 慢线稳步上行（趋势向上），5m 窄幅（低 ATR）
+        let feed = |s: &mut DualTfMeanReversion| {
+            let ctx = Ctx::default();
+            let mut i: i64 = 0;
+            for h in 0..22 {
+                for m in 0..12 {
+                    let price = 60000.0 + h as f64 * 300.0 + (m % 3) as f64;
+                    let ev = Event::Trade(trade(i * 300_000, price));
+                    s.on_event(&ev, &ctx);
+                    i += 1;
+                }
+            }
+            (ctx, i)
+        };
+        // 只跌 0.8%：固定 1.5% 阈值够不着
+        let mut fixed = build(false);
+        let (ctx, i) = feed(&mut fixed);
+        let base = 60000.0 + 21.0 * 300.0;
+        let ev = Event::Trade(trade(i * 300_000 + 1, base * 0.992));
+        assert!(fixed.on_event(&ev, &ctx).is_empty(), "固定 1.5% 阈值不应触发");
+
+        let mut adaptive = build(true);
+        let (ctx, i) = feed(&mut adaptive);
+        let ev = Event::Trade(trade(i * 300_000 + 1, base * 0.992));
+        assert!(!adaptive.on_event(&ev, &ctx).is_empty(), "自适应 8×ATR 应触发");
+        let note = adaptive.eval_note().unwrap();
+        assert_eq!(note["decision"], "long");
+        assert!(note["threshold_pct"].as_f64().unwrap() < 1.0, "有效阈值应低于 1%");
     }
 }
