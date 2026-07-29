@@ -1410,6 +1410,8 @@ pub struct PyramidMrFollow {
     pub add_size_frac: f64,
     /// 最大加仓次数（总层数 = 1 + max_adds）
     pub max_adds: u32,
+    /// 首层限价偏移（如 0.002 = 朝有利方向让价 0.2% 挂限价单）；<0 表示市价入场（默认）
+    pub limit_offset_pct: f64,
 
     last_fire_ts: i64,
     // 金字塔状态（按持仓 entry_ts 对齐，换仓自动重置）
@@ -1432,6 +1434,7 @@ impl PyramidMrFollow {
             add_step_pct,
             add_size_frac,
             max_adds,
+            limit_offset_pct: -1.0,
             last_fire_ts: 0,
             pos_key: None,
             adds_done: 0,
@@ -1491,13 +1494,26 @@ impl TriggerPlugin for PyramidMrFollow {
             self.adds_done = 0;
             self.last_layer_price = price;
 
-            tracing::info!(side = ?side, price, ema, "PyramidMrFollow 首层扣扳机");
+            // 首层限价入场：朝有利方向让价 limit_offset_pct，吃 maker 费率；
+            // offset < 0 时保持市价（行为与历史版本一致）
+            let limit_price = if self.limit_offset_pct >= 0.0 {
+                let lp = if side == Side::Buy {
+                    price * (1.0 - self.limit_offset_pct)
+                } else {
+                    price * (1.0 + self.limit_offset_pct)
+                };
+                Some(Price::from_f64(lp))
+            } else {
+                None
+            };
+
+            tracing::info!(side = ?side, price, ema, limit_offset_pct = self.limit_offset_pct, "PyramidMrFollow 首层扣扳机");
 
             return Some(OrderIntent {
                 symbol: symbol.clone(),
                 side,
                 qty: Qty::ZERO,
-                limit_price: None,
+                limit_price,
                 stop_price: sl,
                 tp1_price: Some(tp),
                 reason: format!("pyramid_base({} price={:.2} ema={:.2})", regime, price, ema),
@@ -1568,13 +1584,15 @@ impl TriggerPlugin for PyramidMrFollow {
 
 pub fn build_pyramid_mr_follow(p: &Json) -> Result<Box<dyn TriggerPlugin>, PluginBuildError> {
     let g = |k: &str, d: f64| p.get(k).and_then(|v| v.as_f64()).unwrap_or(d);
-    Ok(Box::new(PyramidMrFollow::new(
+    let mut t = PyramidMrFollow::new(
         g("sl_pct", 0.01),
         g("cooldown_ms", 1_800_000.0) as i64,
         g("add_step_pct", 0.0035),
         g("add_size_frac", 0.5),
         g("max_adds", 2.0) as u32,
-    )))
+    );
+    t.limit_offset_pct = g("limit_offset_pct", -1.0);
+    Ok(Box::new(t))
 }
 
 

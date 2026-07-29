@@ -16,8 +16,10 @@ ROOT = "/Users/wonder/Code/greed"
 BIN = f"{ROOT}/target/release/greed"
 
 CONFIGS = [
-    "exp-g-fixed12-1h",   # 第二轮：固定 1.2%（复刻显示信号量 ≈2.7×）
-    "exp-h-fixed10-1h",   # 第二轮：固定 1.0%（信号量 ≈5×）
+    "exp-off00",   # 限价入场 offset=0（信号价挂单）
+    "exp-off10",   # 让价 0.1%
+    "exp-off20",   # 让价 0.2%
+    "exp-off30",   # 让价 0.3%
 ]
 PERIODS = {
     "2025": ("2025-01-01", "2025-12-31"),

@@ -1,0 +1,31 @@
+# 实验配置（限价入场 offset=0.0；基线=strategy-final）
+[strategy]
+signals = ["DualTfMeanReversion"]
+trigger = "PyramidMrFollow"
+filters = ["CircuitBreaker"]
+exits = ["TieredTakeProfit", "TimeStop"]
+
+[strategy.plugins.DualTfMeanReversion]
+fast_bar_ms = 300000
+slow_bar_ms = 3600000
+fast_ema_p = 20
+slow_ema_p = 20
+deviation_threshold = 0.015
+
+[strategy.plugins.PyramidMrFollow]
+sl_pct = 0.01
+cooldown_ms = 1800000
+add_step_pct = 0.0035
+add_size_frac = 0.5
+max_adds = 2
+limit_offset_pct = 0.0
+
+[strategy.plugins.TieredTakeProfit]
+tp1_pct = 100
+
+[strategy.plugins.TimeStop]
+max_hours = 6.0
+
+[strategy.plugins.CircuitBreaker]
+max_daily_loss = 5
+drawdown_pct = 8.0
