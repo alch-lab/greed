@@ -38,6 +38,7 @@ impl TradeMode {
     }
 }
 
+#[derive(Clone)]
 pub struct TradeArgs {
     pub config: String,
     pub strategy: String,

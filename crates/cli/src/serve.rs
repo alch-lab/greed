@@ -324,15 +324,42 @@ async fn trade_start(
     drop(guard);
 
     tokio::spawn(async move {
-        let r = run_trade(args, sd_rx, Some(st_tx)).await;
-        running.store(false, Ordering::SeqCst);
-        if let Err(e) = r {
-            let msg = format!("{:#}", e);
-            warn!(error = %msg, "交易任务退出（异常）");
-            *error.lock().await = Some(msg);
-        } else {
-            info!("交易任务已停止");
+        let mut sd_rx = sd_rx;
+        let mut restart_count = 0u32;
+        let mut backoff_secs = 2u64;
+        loop {
+            if *sd_rx.borrow() {
+                break;
+            }
+            *error.lock().await = None;
+            match run_trade(args.clone(), sd_rx.clone(), Some(st_tx.clone())).await {
+                Ok(()) => {
+                    info!("交易任务已停止");
+                    break;
+                }
+                Err(e) => {
+                    let msg = format!("{:#}", e);
+                    restart_count += 1;
+                    warn!(error = %msg, restart_count, backoff_secs, "交易任务异常退出，等待自动重启");
+                    *error.lock().await = Some(msg.clone());
+                    let _ = st_tx.send(serde_json::json!({
+                        "state": "restarting",
+                        "mode": args.mode.map(|m| m.as_str()),
+                        "restart_count": restart_count,
+                        "retry_in_s": backoff_secs,
+                        "error": msg,
+                    }));
+                    tokio::select! {
+                        _ = tokio::time::sleep(std::time::Duration::from_secs(backoff_secs)) => {}
+                        changed = sd_rx.changed() => {
+                            if changed.is_err() || *sd_rx.borrow() { break; }
+                        }
+                    }
+                    backoff_secs = (backoff_secs * 2).min(300);
+                }
+            }
         }
+        running.store(false, Ordering::SeqCst);
     });
     Ok(Json(
         serde_json::json!({ "ok": true, "mode": req.mode.as_str() }),
