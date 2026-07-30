@@ -17,6 +17,9 @@ pub struct DualTfMeanReversion {
     /// 并受 dev_min_pct 下限约束；0 = 使用固定 deviation_threshold
     dev_atr_mult: f64,
     dev_min_pct: f64,
+    /// 1h 趋势中性带（如 0.005 = 1h 价偏离 EMA ±0.5% 以内视为无趋势，双向都允许）；
+    /// 0 = 硬过滤（v1 行为：价>EMA 只多 / 价<EMA 只空）
+    slow_neutral_pct: f64,
 
     // 可选过滤器（路径 A）：ATR 爆发抑制 + RSI 动量守卫；0 = 关闭
     atr_period: usize,
@@ -71,6 +74,7 @@ impl DualTfMeanReversion {
         Self {
             fast_bar_ms, slow_bar_ms, fast_ema_p, slow_ema_p, deviation_threshold: deviation,
             dev_atr_mult: 0.0, dev_min_pct: 0.006,
+            slow_neutral_pct: 0.0,
             atr_period: 0, atr_avg_period: 20, atr_max_mult: 1.3,
             rsi_period: 0, rsi_no_long_above: 70.0, rsi_no_short_below: 30.0,
             fast_cur_idx: None, fast_open: 0.0, fast_high: 0.0, fast_low: 0.0, fast_close: 0.0,
@@ -355,7 +359,16 @@ impl DualTfMeanReversion {
         }
 
         let deviation = (self.fast_close - self.fast_ema) / self.fast_ema;
-        let trend = if self.slow_close > self.slow_ema { 1 } else if self.slow_close < self.slow_ema { -1 } else { 0 };
+        // 1h 趋势：slow_neutral_pct=0 时为硬过滤（价>EMA=多/价<EMA=空）；
+        // >0 时偏离在 ±band 内视为中性（trend=0，双向都允许）
+        let slow_dev = (self.slow_close - self.slow_ema) / self.slow_ema;
+        let trend = if slow_dev > self.slow_neutral_pct {
+            1
+        } else if slow_dev < -self.slow_neutral_pct {
+            -1
+        } else {
+            0
+        };
         let trend_text = match trend { 1 => "向上", -1 => "向下", _ => "持平" };
         let thr = self.eff_threshold();
         let dev_pct = deviation * 100.0;
@@ -495,6 +508,8 @@ impl DualTfMeanReversion {
         // 自适应阈值（不配 = 固定阈值，保持定稿行为）
         s.dev_atr_mult = g("dev_atr_mult", 0.0);
         s.dev_min_pct = g("dev_min_pct", 0.006);
+        // 1h 趋势中性带（不配 = 0，硬过滤，保持定稿行为）
+        s.slow_neutral_pct = g("slow_neutral_pct", 0.0);
         s
     }
 }

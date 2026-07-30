@@ -1410,7 +1410,9 @@ pub struct PyramidMrFollow {
     pub add_size_frac: f64,
     /// 最大加仓次数（总层数 = 1 + max_adds）
     pub max_adds: u32,
-    /// 首层限价偏移（如 0.002 = 朝有利方向让价 0.2% 挂限价单）；<0 表示市价入场（默认）
+    /// 首层限价偏移（如 0.002 = 朝有利方向让价 0.2% 挂限价单）；
+    /// 负值（如 -0.0005）= 朝市场方向更积极的限价单（提高成交率，吃跨价成本）；
+    /// ≤ -1.0 = 市价入场（旧行为兜底）
     pub limit_offset_pct: f64,
 
     last_fire_ts: i64,
@@ -1494,9 +1496,9 @@ impl TriggerPlugin for PyramidMrFollow {
             self.adds_done = 0;
             self.last_layer_price = price;
 
-            // 首层限价入场：朝有利方向让价 limit_offset_pct，吃 maker 费率；
-            // offset < 0 时保持市价（行为与历史版本一致）
-            let limit_price = if self.limit_offset_pct >= 0.0 {
+            // 首层限价入场：正 offset 朝有利方向让价（maker），负 offset 朝市场
+            // 方向更积极（提高成交率）；≤ -1.0 保持市价（行为与历史版本一致）
+            let limit_price = if self.limit_offset_pct > -1.0 {
                 let lp = if side == Side::Buy {
                     price * (1.0 - self.limit_offset_pct)
                 } else {
