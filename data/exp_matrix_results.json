@@ -12340,5 +12340,710 @@
    "sample_note": "\u26a0\ufe0f \u6837\u672c\u4e0d\u8db3\uff08n=14 < 100\uff09\uff1a\u6309 7.7-\u2464 \u53ea\u7ed9\u533a\u95f4\u2014\u2014\u80dc\u7387 57.1%\uff0c95%CI [32.6%, 78.6%]\uff0c\u4e0d\u505a\u6709\u6548\u6027\u7ed3\u8bba"
   },
   "stderr_tail": ""
+ },
+ "exp-probe-2025": {
+  "rc": 0,
+  "duration_s": 658,
+  "report": {
+   "overall": {
+    "n": 18,
+    "wins": 9,
+    "winrate": 0.5,
+    "winrate_ci_lo": 0.2903070395897999,
+    "winrate_ci_hi": 0.7096929604102,
+    "gross_profit": 15534.321531112571,
+    "gross_loss": 10325.27570432643,
+    "profit_factor": 1.5044945990743357,
+    "expectancy": 289.3914348214523,
+    "total_fees": 1539.0243726431163,
+    "fees_per_trade": 85.50135403572868,
+    "maker_share": 1.0
+   },
+   "max_drawdown_usd": 1693.5348757780157,
+   "max_drawdown_pct": 0.01610311660669191,
+   "sharpe": 0.930945748852573,
+   "sortino": 0.2542529582940484,
+   "dsr": 1.0,
+   "pbo": null,
+   "n_trials": 1,
+   "gate_verdict": "\u6837\u672c\u4e0d\u8db3\uff087.7-\u2464\uff1a\u53ea\u62a5\u533a\u95f4\uff09",
+   "gate_baseline": 0.605,
+   "min_sample_needed": 3693.691536304796,
+   "maker_winrate": 0.5,
+   "taker_winrate": null,
+   "attribution": [
+    {
+     "group": "pyramid_base(overbought s=m price=106367.80 ema=104795.79)",
+     "metrics": {
+      "n": 1,
+      "wins": 1,
+      "winrate": 1.0,
+      "winrate_ci_lo": 0.2065432914738929,
+      "winrate_ci_hi": 1.0,
+      "gross_profit": 1095.561469977361,
+      "gross_loss": 0.0,
+      "profit_factor": null,
+      "expectancy": 1095.561469977361,
+      "total_fees": 46.19595117033932,
+      "fees_per_trade": 46.19595117033932,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": 806.1700351559086,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=m price=77472.20 ema=76327.27)",
+     "metrics": {
+      "n": 1,
+      "wins": 1,
+      "winrate": 1.0,
+      "winrate_ci_lo": 0.2065432914738929,
+      "winrate_ci_hi": 1.0,
+      "gross_profit": 1097.3957614516294,
+      "gross_loss": 0.0,
+      "profit_factor": null,
+      "expectancy": 1097.3957614516294,
+      "total_fees": 46.28382733665228,
+      "fees_per_trade": 46.28382733665228,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": 808.004326630177,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=m price=79330.30 ema=78157.85)",
+     "metrics": {
+      "n": 1,
+      "wins": 0,
+      "winrate": 0.0,
+      "winrate_ci_lo": 0.0,
+      "winrate_ci_hi": 0.7934567085261071,
+      "gross_profit": -0.0,
+      "gross_loss": 1298.589568689334,
+      "profit_factor": -0.0,
+      "expectancy": -1298.589568689334,
+      "total_fees": 111.22716150405165,
+      "fees_per_trade": 111.22716150405165,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": -1587.9810035107864,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=m price=84294.60 ema=83048.71)",
+     "metrics": {
+      "n": 1,
+      "wins": 1,
+      "winrate": 1.0,
+      "winrate_ci_lo": 0.2065432914738929,
+      "winrate_ci_hi": 1.0,
+      "gross_profit": 2538.7949680475954,
+      "gross_loss": 0.0,
+      "profit_factor": null,
+      "expectancy": 2538.7949680475954,
+      "total_fees": 106.52489306435348,
+      "fees_per_trade": 106.52489306435348,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": 2249.403533226143,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=m price=88539.50 ema=87231.03)",
+     "metrics": {
+      "n": 1,
+      "wins": 1,
+      "winrate": 1.0,
+      "winrate_ci_lo": 0.2065432914738929,
+      "winrate_ci_hi": 1.0,
+      "gross_profit": 1762.6735465950119,
+      "gross_loss": 0.0,
+      "profit_factor": null,
+      "expectancy": 1762.6735465950119,
+      "total_fees": 76.92373059780772,
+      "fees_per_trade": 76.92373059780772,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": 1473.2821117735596,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=s price=80306.50 ema=79119.32)",
+     "metrics": {
+      "n": 1,
+      "wins": 0,
+      "winrate": 0.0,
+      "winrate_ci_lo": 0.0,
+      "winrate_ci_hi": 0.7934567085261071,
+      "gross_profit": -0.0,
+      "gross_loss": 1276.6163050332693,
+      "profit_factor": -0.0,
+      "expectancy": -1276.6163050332693,
+      "total_fees": 109.39443704201716,
+      "fees_per_trade": 109.39443704201716,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": -1566.0077398547216,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=s price=84066.00 ema=82823.58)",
+     "metrics": {
+      "n": 1,
+      "wins": 0,
+      "winrate": 0.0,
+      "winrate_ci_lo": 0.0,
+      "winrate_ci_hi": 0.7934567085261071,
+      "gross_profit": -0.0,
+      "gross_loss": 1277.0718209964512,
+      "profit_factor": -0.0,
+      "expectancy": -1277.0718209964512,
+      "total_fees": 109.43558031157872,
+      "fees_per_trade": 109.43558031157872,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": -1566.4632558179035,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=w price=100725.30 ema=99236.50)",
+     "metrics": {
+      "n": 1,
+      "wins": 0,
+      "winrate": 0.0,
+      "winrate_ci_lo": 0.0,
+      "winrate_ci_hi": 0.7934567085261071,
+      "gross_profit": -0.0,
+      "gross_loss": 1279.2938886815753,
+      "profit_factor": -0.0,
+      "expectancy": -1279.2938886815753,
+      "total_fees": 109.60370633614397,
+      "fees_per_trade": 109.60370633614397,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": -1568.6853235030276,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=w price=84318.70 ema=83072.21)",
+     "metrics": {
+      "n": 1,
+      "wins": 0,
+      "winrate": 0.0,
+      "winrate_ci_lo": 0.0,
+      "winrate_ci_hi": 0.7934567085261071,
+      "gross_profit": -0.0,
+      "gross_loss": 1292.2836572108017,
+      "profit_factor": -0.0,
+      "expectancy": -1292.2836572108017,
+      "total_fees": 110.72925029196088,
+      "fees_per_trade": 110.72925029196088,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": -1581.675092032254,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=w price=84719.00 ema=83466.87)",
+     "metrics": {
+      "n": 2,
+      "wins": 1,
+      "winrate": 0.5,
+      "winrate_ci_lo": 0.09452865480086614,
+      "winrate_ci_hi": 0.9054713451991339,
+      "gross_profit": 2582.7938127370967,
+      "gross_loss": 15.978384588408847,
+      "profit_factor": 161.64298702703184,
+      "expectancy": 1283.4077140743439,
+      "total_fees": 124.3603483990722,
+      "fees_per_trade": 62.1801741995361,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": 994.0162792528915,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=w price=84966.20 ema=83710.54)",
+     "metrics": {
+      "n": 1,
+      "wins": 1,
+      "winrate": 1.0,
+      "winrate_ci_lo": 0.2065432914738929,
+      "winrate_ci_hi": 1.0,
+      "gross_profit": 1742.233279591339,
+      "gross_loss": 0.0,
+      "profit_factor": null,
+      "expectancy": 1742.233279591339,
+      "total_fees": 76.02508696681122,
+      "fees_per_trade": 76.02508696681122,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": 1452.8418447698866,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=w price=88491.10 ema=87183.33)",
+     "metrics": {
+      "n": 1,
+      "wins": 1,
+      "winrate": 1.0,
+      "winrate_ci_lo": 0.2065432914738929,
+      "winrate_ci_hi": 1.0,
+      "gross_profit": 1081.4254343754578,
+      "gross_loss": 0.0,
+      "profit_factor": null,
+      "expectancy": 1081.4254343754578,
+      "total_fees": 45.60855387884968,
+      "fees_per_trade": 45.60855387884968,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": 792.0339995540055,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=w price=90682.30 ema=89342.09)",
+     "metrics": {
+      "n": 1,
+      "wins": 0,
+      "winrate": 0.0,
+      "winrate_ci_lo": 0.0,
+      "winrate_ci_hi": 0.7934567085261071,
+      "gross_profit": -0.0,
+      "gross_loss": 1293.5170834841554,
+      "profit_factor": -0.0,
+      "expectancy": -1293.5170834841554,
+      "total_fees": 110.80374669067014,
+      "fees_per_trade": 110.80374669067014,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": -1582.9085183056077,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=w price=92768.00 ema=91396.29)",
+     "metrics": {
+      "n": 1,
+      "wins": 1,
+      "winrate": 1.0,
+      "winrate_ci_lo": 0.2065432914738929,
+      "winrate_ci_hi": 1.0,
+      "gross_profit": 1057.1085786879353,
+      "gross_loss": 0.0,
+      "profit_factor": null,
+      "expectancy": 1057.1085786879353,
+      "total_fees": 44.55933298048464,
+      "fees_per_trade": 44.55933298048464,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": 767.717143866483,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(oversold s=m price=106559.80 ema=108182.58)",
+     "metrics": {
+      "n": 1,
+      "wins": 1,
+      "winrate": 1.0,
+      "winrate_ci_lo": 0.2065432914738929,
+      "winrate_ci_hi": 1.0,
+      "gross_profit": 2576.3346796491455,
+      "gross_loss": 0.0,
+      "profit_factor": null,
+      "expectancy": 2576.3346796491455,
+      "total_fees": 106.8712834397401,
+      "fees_per_trade": 106.8712834397401,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": 2286.943244827693,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(oversold s=w price=107245.40 ema=108878.61)",
+     "metrics": {
+      "n": 1,
+      "wins": 0,
+      "winrate": 0.0,
+      "winrate_ci_lo": 0.0,
+      "winrate_ci_hi": 0.7934567085261071,
+      "gross_profit": -0.0,
+      "gross_loss": 1294.385455036265,
+      "profit_factor": -0.0,
+      "expectancy": -1294.385455036265,
+      "total_fees": 109.4171573525289,
+      "fees_per_trade": 109.4171573525289,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": -1583.7768898577174,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(oversold s=w price=87346.70 ema=88676.91)",
+     "metrics": {
+      "n": 1,
+      "wins": 0,
+      "winrate": 0.0,
+      "winrate_ci_lo": 0.0,
+      "winrate_ci_hi": 0.7934567085261071,
+      "gross_profit": -0.0,
+      "gross_loss": 1297.5395406061705,
+      "profit_factor": -0.0,
+      "expectancy": -1297.5395406061705,
+      "total_fees": 95.0603252800546,
+      "fees_per_trade": 95.0603252800546,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": -1586.9309754276228,
+     "gate": "Insufficient"
+    }
+   ],
+   "streak_table": [
+    [
+     5,
+     3.69417029534177
+    ],
+    [
+     10,
+     7.251871648973696
+    ],
+    [
+     15,
+     10.678145456002763
+    ],
+    [
+     20,
+     13.977846873815503
+    ],
+    [
+     30,
+     20.216063008210007
+    ]
+   ],
+   "sample_note": "\u26a0\ufe0f \u6837\u672c\u4e0d\u8db3\uff08n=18 < 100\uff09\uff1a\u6309 7.7-\u2464 \u53ea\u7ed9\u533a\u95f4\u2014\u2014\u80dc\u7387 50.0%\uff0c95%CI [29.0%, 71.0%]\uff0c\u4e0d\u505a\u6709\u6548\u6027\u7ed3\u8bba"
+  },
+  "stderr_tail": ""
+ },
+ "exp-probe-2026H1": {
+  "rc": 0,
+  "duration_s": 239,
+  "report": {
+   "overall": {
+    "n": 14,
+    "wins": 8,
+    "winrate": 0.5714285714285714,
+    "winrate_ci_lo": 0.3259026690286936,
+    "winrate_ci_hi": 0.7861949006959948,
+    "gross_profit": 12118.756974991129,
+    "gross_loss": 6505.311459994488,
+    "profit_factor": 1.8629018840246885,
+    "expectancy": 400.9603939283315,
+    "total_fees": 1164.1535492309108,
+    "fees_per_trade": 83.15382494506505,
+    "maker_share": 1.0
+   },
+   "max_drawdown_usd": 1422.7715860124154,
+   "max_drawdown_pct": 0.014227715860124154,
+   "sharpe": 1.7877897459154253,
+   "sortino": 0.7404360886278106,
+   "dsr": 1.0,
+   "pbo": null,
+   "n_trials": 1,
+   "gate_verdict": "\u6837\u672c\u4e0d\u8db3\uff087.7-\u2464\uff1a\u53ea\u62a5\u533a\u95f4\uff09",
+   "gate_baseline": 0.605,
+   "min_sample_needed": 3693.691536304796,
+   "maker_winrate": 0.5714285714285714,
+   "taker_winrate": null,
+   "attribution": [
+    {
+     "group": "pyramid_base(overbought s=m price=60675.60 ema=59778.42)",
+     "metrics": {
+      "n": 1,
+      "wins": 0,
+      "winrate": 0.0,
+      "winrate_ci_lo": 0.0,
+      "winrate_ci_hi": 0.7934567085261071,
+      "gross_profit": -0.0,
+      "gross_loss": 199.19044610579692,
+      "profit_factor": -0.0,
+      "expectancy": -199.19044610579692,
+      "total_fees": 111.46575985373886,
+      "fees_per_trade": 111.46575985373886,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": -600.1508400341284,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=m price=60854.70 ema=59955.34)",
+     "metrics": {
+      "n": 1,
+      "wins": 0,
+      "winrate": 0.0,
+      "winrate_ci_lo": 0.0,
+      "winrate_ci_hi": 0.7934567085261071,
+      "gross_profit": -0.0,
+      "gross_loss": 1290.5896088175623,
+      "profit_factor": -0.0,
+      "expectancy": -1290.5896088175623,
+      "total_fees": 110.56000047480681,
+      "fees_per_trade": 110.56000047480681,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": -1691.5500027458938,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=m price=63613.80 ema=62673.54)",
+     "metrics": {
+      "n": 1,
+      "wins": 0,
+      "winrate": 0.0,
+      "winrate_ci_lo": 0.0,
+      "winrate_ci_hi": 0.7934567085261071,
+      "gross_profit": -0.0,
+      "gross_loss": 1306.4162762955223,
+      "profit_factor": -0.0,
+      "expectancy": -1306.4162762955223,
+      "total_fees": 111.94160293872449,
+      "fees_per_trade": 111.94160293872449,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": -1707.3766702238538,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=m price=64355.20 ema=63404.07)",
+     "metrics": {
+      "n": 1,
+      "wins": 1,
+      "winrate": 1.0,
+      "winrate_ci_lo": 0.2065432914738929,
+      "winrate_ci_hi": 1.0,
+      "gross_profit": 1774.2337952714315,
+      "gross_loss": 0.0,
+      "profit_factor": null,
+      "expectancy": 1774.2337952714315,
+      "total_fees": 77.41791185585008,
+      "fees_per_trade": 77.41791185585008,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": 1373.2734013431,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=m price=70847.40 ema=69800.20)",
+     "metrics": {
+      "n": 1,
+      "wins": 1,
+      "winrate": 1.0,
+      "winrate_ci_lo": 0.2065432914738929,
+      "winrate_ci_hi": 1.0,
+      "gross_profit": 1041.702140448383,
+      "gross_loss": 0.0,
+      "profit_factor": null,
+      "expectancy": 1041.702140448383,
+      "total_fees": 43.925501644089,
+      "fees_per_trade": 43.925501644089,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": 640.7417465200515,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=m price=75941.40 ema=74818.93)",
+     "metrics": {
+      "n": 1,
+      "wins": 0,
+      "winrate": 0.0,
+      "winrate_ci_lo": 0.0,
+      "winrate_ci_hi": 0.7934567085261071,
+      "gross_profit": -0.0,
+      "gross_loss": 1219.1323916030715,
+      "profit_factor": -0.0,
+      "expectancy": -1219.1323916030715,
+      "total_fees": 104.45535899810261,
+      "fees_per_trade": 104.45535899810261,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": -1620.092785531403,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=m price=76648.30 ema=75515.08)",
+     "metrics": {
+      "n": 1,
+      "wins": 0,
+      "winrate": 0.0,
+      "winrate_ci_lo": 0.0,
+      "winrate_ci_hi": 0.7934567085261071,
+      "gross_profit": -0.0,
+      "gross_loss": 1234.345690581414,
+      "profit_factor": -0.0,
+      "expectancy": -1234.345690581414,
+      "total_fees": 105.76086893829341,
+      "fees_per_trade": 105.76086893829341,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": -1635.3060845097455,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=s price=63509.90 ema=62571.13)",
+     "metrics": {
+      "n": 1,
+      "wins": 1,
+      "winrate": 1.0,
+      "winrate_ci_lo": 0.2065432914738929,
+      "winrate_ci_hi": 1.0,
+      "gross_profit": 1063.9129237361483,
+      "gross_loss": 0.0,
+      "profit_factor": null,
+      "expectancy": 1063.9129237361483,
+      "total_fees": 44.8587019180953,
+      "fees_per_trade": 44.8587019180953,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": 662.9525298078167,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=s price=64126.30 ema=63178.55)",
+     "metrics": {
+      "n": 1,
+      "wins": 0,
+      "winrate": 0.0,
+      "winrate_ci_lo": 0.0,
+      "winrate_ci_hi": 0.7934567085261071,
+      "gross_profit": -0.0,
+      "gross_loss": 1255.6370465911225,
+      "profit_factor": -0.0,
+      "expectancy": -1255.6370465911225,
+      "total_fees": 107.59627720262031,
+      "fees_per_trade": 107.59627720262031,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": -1656.597440519454,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=s price=64769.50 ema=63812.23)",
+     "metrics": {
+      "n": 1,
+      "wins": 1,
+      "winrate": 1.0,
+      "winrate_ci_lo": 0.2065432914738929,
+      "winrate_ci_hi": 1.0,
+      "gross_profit": 1052.6483497532427,
+      "gross_loss": 0.0,
+      "profit_factor": null,
+      "expectancy": 1052.6483497532427,
+      "total_fees": 44.38970359017364,
+      "fees_per_trade": 44.38970359017364,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": 651.6879558249111,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=s price=65251.60 ema=64284.55)",
+     "metrics": {
+      "n": 1,
+      "wins": 1,
+      "winrate": 1.0,
+      "winrate_ci_lo": 0.2065432914738929,
+      "winrate_ci_hi": 1.0,
+      "gross_profit": 1064.719481907164,
+      "gross_loss": 0.0,
+      "profit_factor": null,
+      "expectancy": 1064.719481907164,
+      "total_fees": 44.7721380090719,
+      "fees_per_trade": 44.7721380090719,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": 663.7590879788324,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=w price=61532.10 ema=60622.75)",
+     "metrics": {
+      "n": 1,
+      "wins": 1,
+      "winrate": 1.0,
+      "winrate_ci_lo": 0.2065432914738929,
+      "winrate_ci_hi": 1.0,
+      "gross_profit": 2565.535699931601,
+      "gross_loss": 0.0,
+      "profit_factor": null,
+      "expectancy": 2565.535699931601,
+      "total_fees": 107.65983966710647,
+      "fees_per_trade": 107.65983966710647,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": 2164.5753060032694,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=w price=66258.00 ema=65278.25)",
+     "metrics": {
+      "n": 1,
+      "wins": 1,
+      "winrate": 1.0,
+      "winrate_ci_lo": 0.2065432914738929,
+      "winrate_ci_hi": 1.0,
+      "gross_profit": 2525.298087771063,
+      "gross_loss": 0.0,
+      "profit_factor": null,
+      "expectancy": 2525.298087771063,
+      "total_fees": 105.88361858160641,
+      "fees_per_trade": 105.88361858160641,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": 2124.3376938427314,
+     "gate": "Insufficient"
+    },
+    {
+     "group": "pyramid_base(overbought s=w price=76780.70 ema=75645.88)",
+     "metrics": {
+      "n": 1,
+      "wins": 1,
+      "winrate": 1.0,
+      "winrate_ci_lo": 0.2065432914738929,
+      "winrate_ci_hi": 1.0,
+      "gross_profit": 1030.7064961720953,
+      "gross_loss": 0.0,
+      "profit_factor": null,
+      "expectancy": 1030.7064961720953,
+      "total_fees": 43.466265558631704,
+      "fees_per_trade": 43.466265558631704,
+      "maker_share": 1.0
+     },
+     "expectancy_lift": 629.7461022437637,
+     "gate": "Insufficient"
+    }
+   ],
+   "streak_table": [
+    [
+     5,
+     3.69417029534177
+    ],
+    [
+     10,
+     7.251871648973696
+    ],
+    [
+     15,
+     10.678145456002763
+    ],
+    [
+     20,
+     13.977846873815503
+    ],
+    [
+     30,
+     20.216063008210007
+    ]
+   ],
+   "sample_note": "\u26a0\ufe0f \u6837\u672c\u4e0d\u8db3\uff08n=14 < 100\uff09\uff1a\u6309 7.7-\u2464 \u53ea\u7ed9\u533a\u95f4\u2014\u2014\u80dc\u7387 57.1%\uff0c95%CI [32.6%, 78.6%]\uff0c\u4e0d\u505a\u6709\u6548\u6027\u7ed3\u8bba"
+  },
+  "stderr_tail": ""
  }
 }

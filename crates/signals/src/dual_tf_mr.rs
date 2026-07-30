@@ -406,7 +406,7 @@ impl DualTfMeanReversion {
                     reason = format!("5m 超买 {:+.2}% + 1h 趋势{} → 逢高做空", dev_pct, trend_text);
                     sigs.push(Signal::new(
                         SignalKind::TrendRegime, t.ts, self.name(),
-                        serde_json::json!({"regime": "overbought", "price": self.fast_close, "ema": self.fast_ema, "trend": trend}),
+                        serde_json::json!({"regime": "overbought", "price": self.fast_close, "ema": self.fast_ema, "trend": trend, "slow_dev_pct": slow_dev * 100.0}),
                     ));
                     self.last_signal_dir = Some("overbought".to_string());
                 }
@@ -425,7 +425,7 @@ impl DualTfMeanReversion {
                     reason = format!("5m 超卖 {:+.2}% + 1h 趋势{} → 逢低做多", dev_pct, trend_text);
                     sigs.push(Signal::new(
                         SignalKind::TrendRegime, t.ts, self.name(),
-                        serde_json::json!({"regime": "oversold", "price": self.fast_close, "ema": self.fast_ema, "trend": trend}),
+                        serde_json::json!({"regime": "oversold", "price": self.fast_close, "ema": self.fast_ema, "trend": trend, "slow_dev_pct": slow_dev * 100.0}),
                     ));
                     self.last_signal_dir = Some("oversold".to_string());
                 }

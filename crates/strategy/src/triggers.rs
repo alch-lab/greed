@@ -1483,6 +1483,9 @@ impl TriggerPlugin for PyramidMrFollow {
 
             let side = if regime == "oversold" { Side::Buy } else { Side::Sell };
             let sl_dist = price * self.sl_pct;
+            // 趋势强度分桶（记录用，进 reason → 归因按桶统计期望，不改变任何行为）
+            let sd = p.get("slow_dev_pct").and_then(|v| v.as_f64()).unwrap_or(0.0).abs();
+            let strength = if sd < 0.5 { "w" } else if sd < 1.5 { "m" } else { "s" };
             let sl = if side == Side::Buy {
                 Price::from_f64(price - sl_dist)
             } else {
@@ -1518,7 +1521,7 @@ impl TriggerPlugin for PyramidMrFollow {
                 limit_price,
                 stop_price: sl,
                 tp1_price: Some(tp),
-                reason: format!("pyramid_base({} price={:.2} ema={:.2})", regime, price, ema),
+                reason: format!("pyramid_base({} s={} price={:.2} ema={:.2})", regime, strength, price, ema),
                 ts: sig.ts,
             });
         }

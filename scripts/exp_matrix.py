@@ -16,12 +16,7 @@ ROOT = "/Users/wonder/Code/greed"
 BIN = f"{ROOT}/target/release/greed"
 
 CONFIGS = [
-    "exp-t1-03",     # T1 软趋势过滤：中性带 0.3%
-    "exp-t1-05",     # 中性带 0.5%
-    "exp-t1-08",     # 中性带 0.8%
-    "exp-t2-n03",    # T2 积极限价：offset -0.03%
-    "exp-t2-n05",    # offset -0.05%
-    "exp-t2-n08",    # offset -0.08%
+    "exp-probe",     # 趋势强度分桶探针（=strategy-final 内容）
 ]
 PERIODS = {
     "2025": ("2025-01-01", "2025-12-31"),
