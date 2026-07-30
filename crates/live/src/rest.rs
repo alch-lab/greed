@@ -78,6 +78,18 @@ pub struct UserTrade {
     pub time: i64,
 }
 
+/// 合约账户收入流水；资金费必须以此处实际入账为准。
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct IncomeRecord {
+    pub symbol: String,
+    pub income_type: String,
+    pub income: String,
+    pub asset: String,
+    pub time: i64,
+    pub tran_id: i64,
+}
+
 pub struct RestClient {
     http: reqwest::Client,
     base: String,
@@ -363,6 +375,27 @@ impl RestClient {
             .unwrap_or(0.0);
         Ok((mark, funding))
     }
+
+    /// 查询账户真实资金费入账（GET /fapi/v1/income）。
+    pub async fn funding_income_since(
+        &self,
+        symbol: &str,
+        start_time_ms: i64,
+    ) -> Result<Vec<IncomeRecord>, RestError> {
+        let v = self
+            .signed(
+                reqwest::Method::GET,
+                "/fapi/v1/income",
+                &[
+                    ("symbol", symbol.to_string()),
+                    ("incomeType", "FUNDING_FEE".into()),
+                    ("startTime", start_time_ms.to_string()),
+                    ("limit", "1000".into()),
+                ],
+            )
+            .await?;
+        Ok(serde_json::from_value(v)?)
+    }
 }
 
 #[cfg(test)]
@@ -392,5 +425,15 @@ mod tests {
         assert_eq!(fmt_step(0.012, 0.001), "0.012");
         assert_eq!(fmt_step(67000.0, 0.1), "67000");
         assert_eq!(fmt_step(67000.1, 0.1), "67000.1");
+    }
+
+    #[test]
+    fn parses_funding_income() {
+        let rows: Vec<IncomeRecord> = serde_json::from_str(
+            r#"[{"symbol":"BTCUSDT","incomeType":"FUNDING_FEE","income":"1.25","asset":"USDT","time":1700000000000,"tranId":42,"tradeId":""}]"#,
+        )
+        .unwrap();
+        assert_eq!(rows[0].tran_id, 42);
+        assert_eq!(rows[0].income, "1.25");
     }
 }

@@ -15,7 +15,7 @@
 
 use std::path::PathBuf;
 
-use backtest::{Account, EquityPoint, FillRequest, Journal, JournalEval, JournalIntent, JournalMeta};use strategy::Strategy;
+use backtest::{Account, EquityPoint, FillRequest, Journal, JournalEval, JournalIntent, JournalMeta, JournalSleeve};use strategy::Strategy;
 use tcore::plugin::{Ctx, ExitAction, OrderIntent, Signal, Verdict};
 use tcore::types::{Price, Qty, Symbol, Timestamp};
 use tcore::{Event, EventClock, Trade};
@@ -124,6 +124,8 @@ pub struct LiveEngine {
     last_fill_poll_ms: i64,
     last_funding_poll_ms: i64,
     last_reconcile_ms: i64,
+    sleeves: Vec<JournalSleeve>,
+    sleeve_pnl: f64,
 }
 
 impl LiveEngine {
@@ -162,11 +164,19 @@ impl LiveEngine {
             last_fill_poll_ms: 0,
             last_funding_poll_ms: 0,
             last_reconcile_ms: 0,
+            sleeves: Vec::new(),
+            sleeve_pnl: 0.0,
         }
     }
 
     pub fn account(&self) -> &Account {
         &self.account
+    }
+
+    pub fn set_sleeves(&mut self, sleeves: Vec<JournalSleeve>) {
+        self.sleeve_pnl = sleeves.iter().map(|row| row.pnl).sum();
+        self.sleeves = sleeves;
+        self.persist_journal();
     }
 
     /// 预热专用：只推进时钟/价格并喂信号插件，**不做撮合/持仓管理/开仓评估**。
@@ -332,7 +342,7 @@ impl LiveEngine {
     pub fn snapshot(&self) -> EngineSnapshot {        let px = self.latest_price;
         EngineSnapshot {
             last_price: px.map(|p| p.to_f64()),
-            equity: self.account.equity(px.unwrap_or(Price::ZERO)),
+            equity: self.account.equity(px.unwrap_or(Price::ZERO)) + self.sleeve_pnl,
             cash: self.account.cash(),
             position: self.account.position().map(|p| PositionSnap {
                 side: format!("{:?}", p.side),
@@ -464,7 +474,7 @@ impl LiveEngine {
                 self.last_equity_sample_ms = now_ms;
                 self.equity_curve.push(EquityPoint {
                     ts_ms: now_ms,
-                    equity: self.account.equity(px),
+                    equity: self.account.equity(px) + self.sleeve_pnl,
                 });
                 self.persist_journal();
             }
@@ -857,12 +867,13 @@ impl LiveEngine {
                 to: "live".into(),
                 strategy: self.config.strategy_name.clone(),
                 initial_cash: self.account.initial_cash(),
-                final_equity: self.account.equity(px),
+                final_equity: self.account.equity(px) + self.sleeve_pnl,
             },
             intents: self.intents.clone(),
             fills: self.account.fills().to_vec(),
             equity_curve: self.equity_curve.clone(),
             evals: self.evals.clone(),
+            sleeves: self.sleeves.clone(),
         };
         let path = &self.config.journal_path;
         let tmp = path.with_extension("tmp");

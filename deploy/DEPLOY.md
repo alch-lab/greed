@@ -11,6 +11,8 @@ greed serve ──> 币安 testnet/主网（交易）+ 本地 data/（journal、
 
 安全要点：控制面只绑 `127.0.0.1` 不直接暴露；HTTPS 由 Caddy 终结；
 `GREED_WEB_PASSWORD` 必须设置（登录鉴权 + 按 IP 限流 + token 7 天过期）。
+四层组合模拟盘还必须设置 Futures Testnet 与 Spot Testnet 两套 API 凭证；两套
+测试网的 key 不通用。
 
 ## 1. 服务器准备（Ubuntu/Debian 示例）
 
@@ -37,7 +39,8 @@ cp target/release/greed /opt/greed/greed
 cp config/base.toml config/strategy-final.toml /opt/greed/config/   # 随源码已有
 cp deploy/greed.env.example /opt/greed/greed.env
 chmod 600 /opt/greed/greed.env
-# 编辑 greed.env：GREED_WEB_PASSWORD、BINANCE_API_KEY/SECRET（testnet）
+# 编辑 greed.env：GREED_WEB_PASSWORD、BINANCE_API_KEY/SECRET（Futures Testnet）、
+# BINANCE_SPOT_API_KEY/SECRET（Spot Testnet）
 
 # systemd
 sudo cp deploy/greed-serve.service /etc/systemd/system/
@@ -72,6 +75,10 @@ sudo systemctl reload caddy
 ## 5. 数据说明
 
 - **交易（模拟盘/实盘）不需要数据湖**——实时行情走 WebSocket，开箱即用。
+- **组合模拟盘账户必须专用**：执行器管理该 Futures Testnet 账户的全部
+  `BTCUSDT` 净仓位；Spot Testnet 只管理首次启动时 BTC 基线之上的 carry 数量。
+  更换 Spot Testnet 账户时先停止策略，再删除
+  `data/state/portfolio-paper.json`，让系统重新记录基线。
 - **回测页需要数据湖**（`data/lake/`，约 135 MB/天/交易对）：
   - 方式 A：从本机 rsync 已有的湖 `rsync -avz data/lake/ server:/opt/greed/data/lake/`
   - 方式 B：服务器上自行采集——`greed ingest` 回补历史 + `greed collect` 持续采集
@@ -89,5 +96,5 @@ sudo systemctl restart greed-serve    # 重启（交易任务不会自动恢复�
 2 秒到 5 分钟的指数退避自动重启，前端会显示恢复状态与错误原因，无需人工重启。
 只有整个 systemd 服务被重启时，才需要重新点击“启动策略”。
 
-注意：**重启 serve 会停掉正在运行的交易策略**（优雅退出、不撤保护性止损单），
-重启后需要在前端手动重新启动策略。
+注意：**重启 serve 会停掉正在运行的交易策略**。四层组合收到正常关停信号时会
+撤回受管永续净仓并把 carry 现货腿恢复到启动基线；重启后需要在前端手动重新启动。

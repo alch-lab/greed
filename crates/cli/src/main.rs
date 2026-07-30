@@ -504,6 +504,7 @@ async fn main() -> Result<()> {
                     fills: result.fills.clone(),
                     equity_curve: result.equity_curve.clone(),
                     evals: Vec::new(),
+                    sleeves: Vec::new(),
                 };
                 if let Some(parent) = std::path::Path::new(jpath).parent() {
                     std::fs::create_dir_all(parent)?;

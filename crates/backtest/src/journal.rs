@@ -7,6 +7,21 @@
 
 use serde::Serialize;
 
+#[derive(Debug, Clone, Serialize)]
+pub struct JournalSleeve {
+    pub key: String,
+    pub label: String,
+    pub state: String,
+    pub pnl: f64,
+    pub fees: f64,
+    pub trades: u64,
+    pub wins: u64,
+    pub target_qty: f64,
+    pub actual_source: String,
+    pub last_action_ms: Option<i64>,
+    pub detail: String,
+}
+
 /// 一条下单意图记录（扳机扣扳机时产生）。
 #[derive(Debug, Clone, Serialize)]
 pub struct JournalIntent {
@@ -39,6 +54,7 @@ pub struct Journal {
     pub equity_curve: Vec<crate::report::EquityPoint>,
     /// 策略评估流水（为什么下单/不下单）；回测不收集则为空
     pub evals: Vec<JournalEval>,
+    pub sleeves: Vec<JournalSleeve>,
 }
 
 #[derive(Debug, Serialize)]

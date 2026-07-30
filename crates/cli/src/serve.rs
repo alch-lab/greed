@@ -645,6 +645,7 @@ fn exec_backtest(
         fills: result.fills.clone(),
         equity_curve: result.equity_curve.clone(),
         evals: Vec::new(),
+        sleeves: Vec::new(),
     };
     std::fs::write(journal_path, serde_json::to_string_pretty(&j)?)?;
 
@@ -703,15 +704,35 @@ pub async fn run_serve(
         .route("/api/backtest/jobs/{id}/journal", get(backtest_journal))
         .layer(axum::middleware::from_fn_with_state(state.clone(), auth_mw))
         .layer(CorsLayer::permissive())
-        .with_state(state);
+        .with_state(state.clone());
 
     let addr = format!("{}:{}", host, port);
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     info!(addr, "控制面已启动（前端 /api 代理目标）");
+    let shutdown_state = state.clone();
     axum::serve(
         listener,
         app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
     )
+    .with_graceful_shutdown(async move {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let mut term = signal(SignalKind::terminate()).expect("安装 SIGTERM handler 失败");
+            tokio::select! { _ = tokio::signal::ctrl_c() => {}, _ = term.recv() => {} }
+        }
+        #[cfg(not(unix))]
+        let _ = tokio::signal::ctrl_c().await;
+
+        info!("控制面收到退出信号，正在停止交易任务");
+        if let Some(handle) = shutdown_state.trade.lock().await.as_ref() {
+            let _ = handle.shutdown.send(true);
+            for _ in 0..300 {
+                if !handle.running.load(Ordering::SeqCst) { break; }
+                tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+            }
+        }
+    })
     .await?;
     Ok(())
 }

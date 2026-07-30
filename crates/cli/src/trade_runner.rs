@@ -11,6 +11,12 @@ use strategy::{assemble_from_toml, builtin_registry};
 use tcore::types::Exchange;
 use tracing::{info, warn};
 
+#[derive(serde::Deserialize)]
+struct PortfolioFile {
+    #[serde(default)]
+    portfolio: live::PortfolioConfig,
+}
+
 /// 运行模式：干跑 / 模拟盘（testnet）/ 实盘（主网）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -92,6 +98,12 @@ pub async fn run_trade(
 
     let toml_str = std::fs::read_to_string(&args.strategy)
         .with_context(|| format!("读策略配置失败: {}", args.strategy))?;
+    let portfolio_cfg = toml::from_str::<PortfolioFile>(&toml_str)
+        .with_context(|| format!("解析 [portfolio] 失败: {}", args.strategy))?
+        .portfolio;
+    if mode == TradeMode::Live && portfolio_cfg.enabled {
+        anyhow::bail!("四层组合当前只允许 paper 模式；完成模拟盘验收前禁止连接主网");
+    }
     let strat = assemble_from_toml(&toml_str, &builtin_registry())
         .map_err(|e| anyhow::anyhow!("装配策略失败: {}", e))?;
     info!(strategy = %args.strategy, mode = mode.as_str(), "{}", strat.describe());
@@ -109,13 +121,13 @@ pub async fn run_trade(
     let http = data::live::build_http_client(collector.effective_proxy().as_deref());
 
     // 经纪层：dry（模拟撮合）或 testnet/主网（真实下单）
-    let (broker, initial_cash, qty_step, min_notional) = if mode == TradeMode::Dry {
+    let (broker, initial_cash, qty_step, min_notional, mut portfolio) = if mode == TradeMode::Dry {
         info!(
             cash = args.cash,
             ws = %ws_base,
             "dry-run：模拟撮合，不下真实订单"
         );
-        (live::AnyBroker::dry(FeeModel::default()), args.cash, 1e-8, 0.0)
+        (live::AnyBroker::dry(FeeModel::default()), args.cash, 1e-8, 0.0, None)
     } else {
         let (key, secret) = match (account.api_key(), account.api_secret()) {
             (Some(k), Some(s)) => (k, s),
@@ -128,9 +140,8 @@ pub async fn run_trade(
         let mut rest = live::RestClient::new(http.clone(), account.rest_base(), key, secret);
         rest.sync_time().await?;
 
-        // 启动安全：必须空仓启动（避免接管外部持仓）
         let amt = rest.position_amt(&collector.symbol).await?;
-        if amt.abs() > 1e-9 {
+        if !portfolio_cfg.enabled && amt.abs() > 1e-9 {
             anyhow::bail!(
                 "启动检查失败：{} 存在持仓 {} —— 请先手动平仓（本引擎不接管外部持仓）",
                 collector.symbol,
@@ -151,17 +162,36 @@ pub async fn run_trade(
             step = filters.step_size,
             min_notional = filters.min_notional,
             mode = mode.as_str(),
-            "账户就绪（空仓启动）"
+            "账户就绪"
         );
         if mode == TradeMode::Paper {
             info!(ws = %ws_base, "行情=主网公共 WS，执行=testnet（信号价格与回测同环境）");
         }
-        (
-            live::AnyBroker::testnet(rest, &collector.symbol, filters),
-            wallet,
-            filters.step_size,
-            filters.min_notional,
-        )
+        if portfolio_cfg.enabled {
+            let spot = match (account.spot_api_key(), account.spot_api_secret()) {
+                (Some(k), Some(s)) => Some(live::SpotRestClient::new(http.clone(), account.spot_rest_base(), k, s)),
+                _ if portfolio_cfg.carry_enabled => anyhow::bail!(
+                    "carry 已启用：请设置 {} 与 {}（Spot Testnet 凭证）",
+                    account.spot_api_key_env, account.spot_api_secret_env
+                ),
+                _ => None,
+            };
+            let market_base = match mode { TradeMode::Paper => live::MAINNET_FAPI, _ => account.rest_base() }.to_string();
+            let executor = live::PortfolioExecutor::new(
+                portfolio_cfg.clone(), collector.symbol.clone(), wallet, rest, filters,
+                spot, http.clone(), market_base,
+                std::path::PathBuf::from(format!("data/state/portfolio-{}.json", mode.as_str())),
+            ).await?;
+            (
+                live::AnyBroker::dry(FeeModel::default()), wallet,
+                filters.step_size, filters.min_notional, Some(executor),
+            )
+        } else {
+            (
+                live::AnyBroker::testnet(rest, &collector.symbol, filters), wallet,
+                filters.step_size, filters.min_notional, None,
+            )
+        }
     };
 
     let started_at = chrono::Utc::now().format("%Y-%m-%d").to_string();
@@ -214,17 +244,40 @@ pub async fn run_trade(
     info!(symbol = %collector.symbol, journal = %journal_path, mode = mode.as_str(), "进入交易主循环");
     let mut timer = tokio::time::interval(std::time::Duration::from_secs(1));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let mut portfolio_error: Option<String> = None;
     loop {
         tokio::select! {
             maybe = rx.recv() => {
                 match maybe {
                     Some(t) => engine.on_trade(&t).await,
-                    None => anyhow::bail!("行情通道关闭"),
+                    None => {
+                        if let (Some(executor), Some(price)) = (&mut portfolio, engine.snapshot().last_price) {
+                            let sleeves = executor.shutdown(chrono::Utc::now().timestamp_millis(), price).await?;
+                            engine.set_sleeves(sleeves);
+                        }
+                        anyhow::bail!("行情通道关闭")
+                    },
                 }
             }
             _ = timer.tick() => {
                 let now_ms = chrono::Utc::now().timestamp_millis();
                 engine.on_timer(now_ms).await;
+                if let Some(executor) = &mut portfolio {
+                    let snap = engine.snapshot();
+                    if let Some(price) = snap.last_price {
+                        let mr_qty = snap.position.as_ref().map_or(0.0, |p| {
+                            if p.side == "Buy" { p.qty } else { -p.qty }
+                        });
+                        match executor.reconcile(now_ms, price, mr_qty).await {
+                            Ok(sleeves) => { portfolio_error = None; engine.set_sleeves(sleeves); },
+                            Err(e) => {
+                                let message = e.to_string();
+                                warn!(error = %message, "组合账户对齐失败，下周期重试");
+                                portfolio_error = Some(message);
+                            },
+                        }
+                    }
+                }
                 if let Some(tx) = &status_tx {
                     let snap = engine.snapshot();
                     let _ = tx.send(serde_json::json!({
@@ -237,6 +290,8 @@ pub async fn run_trade(
                         "equity": snap.equity,
                         "cash": snap.cash,
                         "position": snap.position,
+                        "account_net_qty": portfolio.as_ref().map(|p| p.actual_qty()),
+                        "portfolio_error": portfolio_error.clone(),
                         "n_intents": snap.n_intents,
                         "n_fills": snap.n_fills,
                         "last_eval": snap.last_eval,
@@ -245,11 +300,19 @@ pub async fn run_trade(
             }
             _ = shutdown.changed() => {
                 info!("收到外部关停信号，优雅退出");
+                if let (Some(executor), Some(price)) = (&mut portfolio, engine.snapshot().last_price) {
+                    let sleeves = executor.shutdown(chrono::Utc::now().timestamp_millis(), price).await?;
+                    engine.set_sleeves(sleeves);
+                }
                 engine.shutdown().await;
                 break;
             }
             _ = tokio::signal::ctrl_c() => {
                 info!("收到 SIGINT，优雅退出");
+                if let (Some(executor), Some(price)) = (&mut portfolio, engine.snapshot().last_price) {
+                    let sleeves = executor.shutdown(chrono::Utc::now().timestamp_millis(), price).await?;
+                    engine.set_sleeves(sleeves);
+                }
                 engine.shutdown().await;
                 break;
             }

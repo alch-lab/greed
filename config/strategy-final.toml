@@ -42,3 +42,18 @@ max_hours = 6.0
 [strategy.plugins.CircuitBreaker]
 max_daily_loss = 5
 drawdown_pct = 8.0
+
+# 单账户组合：各 sleeve 先生成目标敞口，执行器向币安提交合并后的永续净仓位；
+# carry 同时维护 Spot Testnet 的 BTC 现货腿。
+[portfolio]
+enabled = true
+ema_enabled = true
+ema_fast = 10
+ema_slow = 100
+ema_notional_x = 0.10
+carry_enabled = true
+carry_notional_x = 0.25
+probe_enabled = true
+# 若低于交易所 minNotional，执行器自动提升到 minNotional × 1.05。
+probe_notional_usdt = 10.0
+reconcile_secs = 5
