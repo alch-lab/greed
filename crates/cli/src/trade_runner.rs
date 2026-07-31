@@ -132,7 +132,7 @@ pub async fn run_trade(
         let (key, secret) = match (account.api_key(), account.api_secret()) {
             (Some(k), Some(s)) => (k, s),
             _ => anyhow::bail!(
-                "缺少 API 凭证：请 export {} 与 {}（testnet 申请：https://testnet.binancefuture.com）",
+                "缺少 API 凭证：请 export {} 与 {}（Demo Trading 创建：https://demo.binance.com → API 管理）",
                 account.api_key_env,
                 account.api_secret_env
             ),

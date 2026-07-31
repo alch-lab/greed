@@ -86,13 +86,14 @@ impl CollectorConfig {
 /// 账户/下单凭证配置：对应 `config/base.toml [account]`（模拟盘/实盘）。
 ///
 /// 安全约定：**密钥不写入任何文件**，TOML 里只配环境变量名，
-/// 运行时从环境变量读取。模拟盘用币安合约 testnet：
-/// 在 https://testnet.binancefuture.com 申请 key，然后
+/// 运行时从环境变量读取。模拟盘用币安新 Demo Trading（旧合约 testnet
+/// testnet.binancefuture.com 已于 2026-07 停用并跳转 demo）：
+/// 在 https://demo.binance.com 的 API 管理创建 key，然后
 /// `export BINANCE_API_KEY=... BINANCE_API_SECRET=...`。
 #[derive(Debug, Clone, Deserialize)]
 #[serde(default)]
 pub struct AccountConfig {
-    /// true = 币安合约 testnet（模拟盘）；false = 主网（实盘，慎用）
+    /// true = 币安 Demo Trading 模拟盘（demo-fapi.binance.com）；false = 主网（实盘，慎用）
     pub testnet: bool,
     /// API key 所在环境变量名
     pub api_key_env: String,
@@ -139,7 +140,8 @@ impl AccountConfig {
         if !self.rest_base.is_empty() {
             &self.rest_base
         } else if self.testnet {
-            "https://testnet.binancefuture.com"
+            // 新 Demo Trading（旧 testnet.binancefuture.com 已停用）
+            "https://demo-fapi.binance.com"
         } else {
             "https://fapi.binance.com"
         }
@@ -149,7 +151,8 @@ impl AccountConfig {
         if !self.ws_base.is_empty() {
             &self.ws_base
         } else if self.testnet {
-            "wss://fstream.binancefuture.com"
+            // 新 Demo Trading 合约 WS（裸 host，路径由使用方拼接 /ws/...）
+            "wss://demo-fapi.binance.com"
         } else {
             // 旧版裸路径已于 2026-04-23 退役，市场数据走 /market
             "wss://fstream.binance.com/market"
@@ -160,7 +163,8 @@ impl AccountConfig {
         if !self.spot_rest_base.is_empty() {
             &self.spot_rest_base
         } else if self.testnet {
-            "https://testnet.binance.vision"
+            // 新 Demo Trading 现货（旧 testnet.binance.vision 已停用）
+            "https://demo-api.binance.com"
         } else {
             "https://api.binance.com"
         }
@@ -227,8 +231,8 @@ book_snapshot_ms = 10000
     fn account_defaults_to_testnet() {
         let acc = AccountConfig::from_toml_str("").unwrap();
         assert!(acc.testnet);
-        assert_eq!(acc.rest_base(), "https://testnet.binancefuture.com");
-        assert_eq!(acc.ws_base(), "wss://fstream.binancefuture.com");
+        assert_eq!(acc.rest_base(), "https://demo-fapi.binance.com");
+        assert_eq!(acc.ws_base(), "wss://demo-fapi.binance.com");
     }
 
     #[test]

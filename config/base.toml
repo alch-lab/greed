@@ -19,13 +19,14 @@ book_flush_rows = 2000
 flush_tick_secs = 60
 max_buffer_secs = 300
 
-# 模拟盘账户（币安合约 testnet）。密钥不写在此文件：
-# 在 https://testnet.binancefuture.com 申请后 export 到环境变量即可。
+# 模拟盘账户（币安新 Demo Trading：demo-fapi.binance.com；旧合约 testnet
+# testnet.binancefuture.com 已于 2026-07 停用并跳转 demo.binance.com）。
+# 密钥不写在此文件：在 https://demo.binance.com → API 管理创建后 export 到环境变量。
 # 上实盘时把 testnet 改为 false（⚠️ 先用模拟盘充分验证）。
 [account]
 testnet = true
 api_key_env = "BINANCE_API_KEY"
 api_secret_env = "BINANCE_API_SECRET"
-# 资金费套利的现货腿。Spot Testnet 与 Futures Testnet 的 key 不通用。
+# 资金费套利的现货腿（demo-api.binance.com）。Demo 的现货/合约 key 通用（同一对）。
 spot_api_key_env = "BINANCE_SPOT_API_KEY"
 spot_api_secret_env = "BINANCE_SPOT_API_SECRET"
