@@ -81,7 +81,10 @@ impl AnyBroker {
                 };
                 // 平仓市价单（止损之外的 market_close）也加 reduceOnly 由 reason 判断
                 let reduce_only = reduce_only
-                    || matches!(order.reason.as_str(), "close_all" | "tp_partial" | "reverse_out");
+                    || matches!(
+                        order.reason.as_str(),
+                        "close_all" | "tp_partial" | "reverse_out"
+                    );
                 let order_id = b
                     .rest
                     .place_order(

@@ -13,15 +13,10 @@
 pub mod broker;
 pub mod engine;
 pub mod feed;
-pub mod portfolio;
 pub mod rest;
-pub mod spot;
-pub mod warmup;
 
 pub use broker::AnyBroker;
 pub use engine::{EngineSnapshot, LiveConfig, LiveEngine, PositionSnap};
 pub use feed::MAINNET_WS;
-pub use portfolio::{PortfolioConfig, PortfolioExecutor};
 pub use rest::{IncomeRecord, RestClient, SymbolFilters};
-pub use spot::{SpotExecution, SpotRestClient};
-pub use warmup::{warmup_engine, MAINNET_FAPI};
+pub const MAINNET_FAPI: &str = "https://fapi.binance.com";

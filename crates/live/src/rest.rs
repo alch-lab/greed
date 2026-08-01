@@ -120,8 +120,8 @@ impl RestClient {
 
     /// HMAC-SHA256 签名（hex）。
     pub fn sign(&self, query: &str) -> String {
-        let mut mac = HmacSha256::new_from_slice(self.api_secret.as_bytes())
-            .expect("HMAC 接受任意长度密钥");
+        let mut mac =
+            HmacSha256::new_from_slice(self.api_secret.as_bytes()).expect("HMAC 接受任意长度密钥");
         mac.update(query.as_bytes());
         let out = mac.finalize().into_bytes();
         out.iter().map(|b| format!("{:02x}", b)).collect()
@@ -135,7 +135,9 @@ impl RestClient {
 
     /// 与服务器对时（漂移 >1s 时签名会被拒）。
     pub async fn sync_time(&mut self) -> Result<(), RestError> {
-        let v = self.get_json(&format!("{}/fapi/v1/time", self.base)).await?;
+        let v = self
+            .get_json(&format!("{}/fapi/v1/time", self.base))
+            .await?;
         let server = v["serverTime"]
             .as_i64()
             .ok_or_else(|| RestError::Data("serverTime 缺失".into()))?;
@@ -254,7 +256,9 @@ impl RestClient {
 
     /// USDT 钱包余额（GET /fapi/v2/balance，取 asset=USDT 的 balance）。
     pub async fn wallet_balance_usdt(&self) -> Result<f64, RestError> {
-        let v = self.signed(reqwest::Method::GET, "/fapi/v2/balance", &[]).await?;
+        let v = self
+            .signed(reqwest::Method::GET, "/fapi/v2/balance", &[])
+            .await?;
         v.as_array()
             .and_then(|a| {
                 a.iter()
@@ -268,7 +272,9 @@ impl RestClient {
     /// 合约账户真实权益：钱包余额 + 全仓未实现盈亏（GET /fapi/v2/account）。
     /// 返回 (wallet_balance, unrealized_pnl)。策略收益仍使用本地 sleeve 记账。
     pub async fn account_equity(&self) -> Result<(f64, f64), RestError> {
-        let v = self.signed(reqwest::Method::GET, "/fapi/v2/account", &[]).await?;
+        let v = self
+            .signed(reqwest::Method::GET, "/fapi/v2/account", &[])
+            .await?;
         let wallet = v["totalWalletBalance"]
             .as_str()
             .and_then(|s| s.parse().ok())
@@ -338,7 +344,8 @@ impl RestClient {
             ));
         }
         if kind == "STOP_MARKET" {
-            let sp = stop_price.ok_or_else(|| RestError::Data("STOP_MARKET 缺 stopPrice".into()))?;
+            let sp =
+                stop_price.ok_or_else(|| RestError::Data("STOP_MARKET 缺 stopPrice".into()))?;
             params.push((
                 "stopPrice",
                 fmt_step(floor_to_step(sp, filters.tick_size), filters.tick_size),
@@ -347,7 +354,9 @@ impl RestClient {
         if reduce_only {
             params.push(("reduceOnly", "true".into()));
         }
-        let v = self.signed(reqwest::Method::POST, "/fapi/v1/order", &params).await?;
+        let v = self
+            .signed(reqwest::Method::POST, "/fapi/v1/order", &params)
+            .await?;
         v["orderId"]
             .as_i64()
             .ok_or_else(|| RestError::Data(format!("order 响应无 orderId: {}", v)))

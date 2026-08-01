@@ -15,7 +15,10 @@
 
 use std::path::PathBuf;
 
-use backtest::{Account, EquityPoint, FillRequest, Journal, JournalEval, JournalIntent, JournalMeta, JournalSleeve};use strategy::Strategy;
+use backtest::{
+    Account, EquityPoint, FillRequest, Journal, JournalEval, JournalIntent, JournalMeta,
+};
+use strategy::Strategy;
 use tcore::plugin::{Ctx, ExitAction, OrderIntent, Signal, Verdict};
 use tcore::types::{Price, Qty, Symbol, Timestamp};
 use tcore::{Event, EventClock, Trade};
@@ -30,6 +33,7 @@ pub struct LiveConfig {
     /// 固定风险百分比（同回测）
     pub risk_pct: f64,
     pub max_risk_pct: f64,
+    pub max_leverage: f64,
     pub entry_ttl_ms: i64,
     pub cb_max_daily_losses: u32,
     pub cb_daily_dd_pct: f64,
@@ -150,8 +154,6 @@ pub struct LiveEngine {
     last_funding_poll_ms: i64,
     last_reconcile_ms: i64,
     last_time_sync_ms: i64,
-    sleeves: Vec<JournalSleeve>,
-    sleeve_pnl: f64,
     /// 重启恢复持仓后，首个行情节拍按 journal 止损价重挂保护性止损
     needs_stop_rearm: bool,
 }
@@ -193,20 +195,12 @@ impl LiveEngine {
             last_funding_poll_ms: 0,
             last_reconcile_ms: 0,
             last_time_sync_ms: 0,
-            sleeves: Vec::new(),
-            sleeve_pnl: 0.0,
             needs_stop_rearm: false,
         }
     }
 
     pub fn account(&self) -> &Account {
         &self.account
-    }
-
-    pub fn set_sleeves(&mut self, sleeves: Vec<JournalSleeve>) {
-        self.sleeve_pnl = sleeves.iter().map(|row| row.pnl).sum();
-        self.sleeves = sleeves;
-        self.persist_journal();
     }
 
     /// 从既有 journal 恢复引擎状态（进程重启续跑）。
@@ -270,12 +264,7 @@ impl LiveEngine {
         let position = if allow_position { state.position } else { None };
         let needs_rearm = position.and_then(|p| p.stop_price).is_some();
 
-        self.account = Account::from_parts(
-            state.initial_cash,
-            state.cash,
-            position,
-            journal.fills,
-        );
+        self.account = Account::from_parts(state.initial_cash, state.cash, position, journal.fills);
         self.intents = journal.intents;
         self.equity_curve = journal.equity_curve;
         self.evals = journal.evals;
@@ -299,22 +288,17 @@ impl LiveEngine {
         true
     }
 
-    /// 预热专用：只推进时钟/价格并喂信号插件，**不做撮合/持仓管理/开仓评估**。
-    /// 用于启动时用历史 K 线合成逐笔重建信号状态（EMA/ATR/RSI），
-    /// 避免基于陈旧价格触发交易。
-    pub fn warmup_trade(&mut self, trade: &Trade) {
-        self.clock.advance_to(trade.ts);
-        self.latest_price = Some(trade.price);
-        self.update_env_flags(trade.ts, trade.price);
-        let ev = Event::Trade(trade.clone());
-        self.ctx.now = Some(trade.ts);
+    /// 喂入订单簿/OI 等公共市场上下文；它们只更新信号状态，不直接触发下单。
+    pub fn on_context_event(&mut self, ev: Event) {
+        let ts = ev.ts();
+        self.clock.advance_to(ts);
+        self.ctx.now = Some(ts);
         for sp in self.strategy.signals.iter_mut() {
             for sig in sp.on_event(&ev, &self.ctx) {
                 self.ctx.set_latest(sig);
             }
         }
-        // 预热只刷新最新评估（不入流水，避免历史 K 线刷屏）
-        self.refresh_eval_notes(false);
+        self.refresh_eval_notes(true);
     }
 
     /// 评估记录入环形流水（journal 展示，cap 300）并追加全量 JSONL（分析用）。
@@ -389,7 +373,11 @@ impl LiveEngine {
                 // 建档即记录当前偏离（首根 K 线可能就是峰值，不能漏）
                 let px = price.to_f64();
                 let entry = p.entry_price.to_f64();
-                let sign = if format!("{:?}", p.side) == "Buy" { 1.0 } else { -1.0 };
+                let sign = if format!("{:?}", p.side) == "Buy" {
+                    1.0
+                } else {
+                    -1.0
+                };
                 let dev = (px - entry) / entry * 100.0 * sign;
                 self.pos_track = Some(PosTrack {
                     side: format!("{:?}", p.side),
@@ -459,10 +447,11 @@ impl LiveEngine {
     }
 
     /// 状态快照（控制面轮询用）。
-    pub fn snapshot(&self) -> EngineSnapshot {        let px = self.latest_price;
+    pub fn snapshot(&self) -> EngineSnapshot {
+        let px = self.latest_price;
         EngineSnapshot {
             last_price: px.map(|p| p.to_f64()),
-            equity: self.account.equity(px.unwrap_or(Price::ZERO)) + self.sleeve_pnl,
+            equity: self.account.equity(px.unwrap_or(Price::ZERO)),
             cash: self.account.cash(),
             position: self.account.position().map(|p| PositionSnap {
                 side: format!("{:?}", p.side),
@@ -510,7 +499,8 @@ impl LiveEngine {
             if let Some(p) = self.account.position().copied() {
                 if let Some(stop) = p.stop_price {
                     info!(stop = stop.to_f64(), "恢复持仓：重挂保护性止损");
-                    self.place_protective_stop(trade.ts, trade.price, stop).await;
+                    self.place_protective_stop(trade.ts, trade.price, stop)
+                        .await;
                 }
             }
         }
@@ -606,7 +596,7 @@ impl LiveEngine {
                 self.last_equity_sample_ms = now_ms;
                 self.equity_curve.push(EquityPoint {
                     ts_ms: now_ms,
-                    equity: self.account.equity(px) + self.sleeve_pnl,
+                    equity: self.account.equity(px),
                 });
                 self.persist_journal();
             }
@@ -699,9 +689,7 @@ impl LiveEngine {
                     if let Some(p) = self.account.position().copied() {
                         let close_qty = Qty::from_f64(p.qty.to_f64() * frac);
                         self.market_close(trade, close_qty, "tp_partial").await;
-                        if let Some(pp) = self.account.position_mut() {
-                            pp.closed_frac = (pp.closed_frac + frac).min(1.0);
-                        }
+                        // closed_frac 由 Account::apply_fill 按原始仓位口径维护。
                     }
                 }
                 ExitAction::CloseAll => {
@@ -775,11 +763,16 @@ impl LiveEngine {
 
     /// 开仓：仓位计算（与回测同式）→ 精度约束 → 记录意图 → 下单。
     async fn enter(&mut self, trade: &Trade, intent: OrderIntent) {
-        let stop_dist = (intent.stop_price.to_f64() - trade.price.to_f64()).abs();
+        let entry_ref = intent.limit_price.unwrap_or(trade.price);
+        let stop_dist = (intent.stop_price.to_f64() - entry_ref.to_f64()).abs();
         let qty = if stop_dist > 1e-9 {
             let risk_frac = self.config.risk_pct.min(self.config.max_risk_pct);
-            let risk_usd = self.account.equity(trade.price) * risk_frac;
-            let q = risk_usd / stop_dist;
+            let risk_usd =
+                self.account.equity(trade.price) * risk_frac * intent.risk_scale.clamp(0.0, 1.0);
+            let q = (risk_usd / stop_dist).min(
+                self.account.equity(trade.price).max(0.0) * self.config.max_leverage
+                    / entry_ref.to_f64(),
+            );
             if intent.qty.to_f64() > 1e-9 {
                 q.min(intent.qty.to_f64())
             } else {
@@ -793,8 +786,7 @@ impl LiveEngine {
         if qty <= 1e-9 {
             return;
         }
-        if self.config.min_notional > 0.0 && qty * trade.price.to_f64() < self.config.min_notional
-        {
+        if self.config.min_notional > 0.0 && qty * trade.price.to_f64() < self.config.min_notional {
             warn!(
                 qty,
                 notional = qty * trade.price.to_f64(),
@@ -818,7 +810,11 @@ impl LiveEngine {
 
         let is_limit = intent.limit_price.is_some();
         // 市价单成交回报也应很快到达：testnet 给 120s 兜底窗口；限价用 entry_ttl
-        let ttl = if is_limit { self.config.entry_ttl_ms } else { 120_000 };
+        let ttl = if is_limit {
+            self.config.entry_ttl_ms
+        } else {
+            120_000
+        };
         let expire_ts = Timestamp::from_millis(trade.ts.as_millis() + ttl);
 
         let order = backtest::Order {
@@ -863,6 +859,9 @@ impl LiveEngine {
     async fn place_protective_stop(&mut self, ts: Timestamp, ref_price: Price, stop: Price) {
         if let Some(p) = self.account.position_mut() {
             p.stop_price = Some(stop);
+            if p.initial_stop_price.is_none() {
+                p.initial_stop_price = Some(stop);
+            }
             let side = p.side;
             let q = p.qty;
             self.broker.cancel_all().await;
@@ -894,13 +893,16 @@ impl LiveEngine {
                 p.tp1_price = pe.tp1_price;
             }
             let ref_price = self.latest_price.unwrap_or(pe.stop_price);
-            self.place_protective_stop(now, ref_price, pe.stop_price).await;
+            self.place_protective_stop(now, ref_price, pe.stop_price)
+                .await;
             self.pending_entry = None;
         }
     }
 
     async fn market_close(&mut self, trade: &Trade, qty: Qty, reason: &str) {
-        let Some(p) = self.account.position() else { return };
+        let Some(p) = self.account.position() else {
+            return;
+        };
         let side = p.side.opposite();
         self.broker.cancel_all().await; // 清掉止损单
         let order = backtest::Order {
@@ -1020,13 +1022,12 @@ impl LiveEngine {
                 to: "live".into(),
                 strategy: self.config.strategy_name.clone(),
                 initial_cash: self.account.initial_cash(),
-                final_equity: self.account.equity(px) + self.sleeve_pnl,
+                final_equity: self.account.equity(px),
             },
             intents: self.intents.clone(),
             fills: self.account.fills().to_vec(),
             equity_curve: self.equity_curve.clone(),
             evals: self.evals.clone(),
-            sleeves: self.sleeves.clone(),
             engine: serde_json::to_value(engine_state).ok(),
         };
         let path = &self.config.journal_path;
@@ -1045,7 +1046,6 @@ impl LiveEngine {
         }
     }
 }
-
 
 #[cfg(test)]
 mod tests {
@@ -1068,7 +1068,7 @@ mod tests {
     fn noop_strategy() -> Strategy {
         let toml = r#"
 [strategy]
-trigger = "NoopTrigger"
+trigger = "OrderFlowEntry"
 "#;
         assemble_from_toml(toml, &builtin_registry()).unwrap()
     }
@@ -1078,6 +1078,7 @@ trigger = "NoopTrigger"
             symbol: "BTCUSDT".into(),
             risk_pct: 0.0075,
             max_risk_pct: 0.015,
+            max_leverage: 3.0,
             entry_ttl_ms: 4 * 3_600_000,
             cb_max_daily_losses: 0,
             cb_daily_dd_pct: 0.0,
@@ -1106,11 +1107,7 @@ trigger = "NoopTrigger"
                 .await;
         }
         assert!(eng.account().fills().is_empty());
-        assert!(
-            eng.account()
-                .conservation_error(Price::from_f64(67200.0))
-                < 1e-9
-        );
+        assert!(eng.account().conservation_error(Price::from_f64(67200.0)) < 1e-9);
         // journal 已落盘且契约完整（前端三要素：intents/fills/equity_curve）
         let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
         let j: serde_json::Value = serde_json::from_str(&text).unwrap();
@@ -1140,6 +1137,7 @@ trigger = "NoopTrigger"
             symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             qty: Qty::from_f64(0.1),
+            risk_scale: 1.0,
             limit_price: None,
             stop_price: Price::from_f64(66800.0),
             tp1_price: None,
@@ -1204,6 +1202,7 @@ trigger = "NoopTrigger"
             symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             qty: Qty::from_f64(0.1),
+            risk_scale: 1.0,
             limit_price: None,
             stop_price: Price::from_f64(66800.0),
             tp1_price: None,
@@ -1227,7 +1226,11 @@ trigger = "NoopTrigger"
             .collect();
         assert_eq!(trips.len(), 1, "应恰好一条 trip 记录");
         let note = &trips[0]["note"];
-        assert!(note["mfe_pct"].as_f64().unwrap() > 0.9, "MFE 应约 +1%: {}", note["mfe_pct"]);
+        assert!(
+            note["mfe_pct"].as_f64().unwrap() > 0.9,
+            "MFE 应约 +1%: {}",
+            note["mfe_pct"]
+        );
         assert!(note["mae_pct"].as_f64().unwrap() < 0.0, "MAE 应为负");
         assert_eq!(note["exit_reason"], "stop");
         assert_eq!(note["side"], "Buy");
@@ -1241,21 +1244,19 @@ trigger = "NoopTrigger"
         let _ = std::fs::remove_file(&cfg.eval_log_path);
     }
 
-    /// 评估流水：真实 MR 策略跑 260 根 5m bar，
-    /// journal.evals 应有「为什么观望」的评估记录，快照带 last_eval。
+    /// 评估流水：订单流模型积累真实成交桶后，journal 与快照均可解释。
     #[tokio::test]
     async fn eval_notes_flow_to_journal() {
         let toml = r#"
 [strategy]
-signals = ["DualTfMeanReversion"]
-trigger = "NoopTrigger"
+signals = ["OrderFlowExhaustion"]
+trigger = "OrderFlowEntry"
 
-[strategy.plugins.DualTfMeanReversion]
-fast_bar_ms = 300000
-slow_bar_ms = 3600000
-fast_ema_p = 20
-slow_ema_p = 20
-deviation_threshold = 0.015
+[strategy.plugins.OrderFlowExhaustion]
+bucket_ms = 10000
+min_baseline_buckets = 5
+baseline_buckets = 10
+location_buckets = 10
 "#;
         let strat = assemble_from_toml(toml, &builtin_registry()).unwrap();
         let cfg = test_config("evals");
@@ -1267,21 +1268,21 @@ deviation_threshold = 0.015
             100_000.0,
             "2026-07-26".into(),
         );
-        for i in 0..260i64 {
-            let price = 67000.0 + ((i % 8) as f64 - 4.0) * 5.0;
-            eng.on_trade(&trade(i * 300_000, price)).await;
+        for i in 0..30i64 {
+            let price = 67000.0 + ((i % 3) as f64 - 1.0);
+            eng.on_trade(&trade(i * 10_000, price)).await;
         }
         // 快照带最新评估
         let snap = eng.snapshot();
         let eval = snap.last_eval.expect("快照应带 last_eval");
         assert_eq!(eval["decision"], "none");
-        assert!(eval["reason"].as_str().unwrap().contains("观望"));
-        // journal 落盘含评估流水（warmup 进度 + 攒满后的逐 bar 评估）
+        assert!(eval["reason"].as_str().unwrap().contains("等待"));
+        // journal 落盘含预热与逐桶评估。
         let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
         let j: serde_json::Value = serde_json::from_str(&text).unwrap();
         let evals = j["evals"].as_array().unwrap();
-        assert!(evals.len() > 200, "evals={}", evals.len());
-        assert_eq!(evals[0]["source"], "DualTfMeanReversion");
+        assert!(evals.len() >= 20, "evals={}", evals.len());
+        assert_eq!(evals[0]["source"], "OrderFlowExhaustion");
         assert_eq!(evals[0]["note"]["decision"], "warmup");
         let _ = std::fs::remove_file(&cfg.journal_path);
     }

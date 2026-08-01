@@ -190,9 +190,7 @@ async fn connect_ws(url: &str, proxy: Option<&str>) -> Result<WsStream, CollectE
         }
         Some(px) => {
             // 目标 host:port（wss 默认 443）
-            let no_scheme = url
-                .trim_start_matches("wss://")
-                .trim_start_matches("ws://");
+            let no_scheme = url.trim_start_matches("wss://").trim_start_matches("ws://");
             let hostport = no_scheme.split('/').next().unwrap_or("");
             let (host, port) = match hostport.split_once(':') {
                 Some((h, p)) => (h.to_string(), p.parse::<u16>().unwrap_or(443)),

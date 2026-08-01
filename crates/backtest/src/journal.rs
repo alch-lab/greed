@@ -7,21 +7,6 @@
 
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JournalSleeve {
-    pub key: String,
-    pub label: String,
-    pub state: String,
-    pub pnl: f64,
-    pub fees: f64,
-    pub trades: u64,
-    pub wins: u64,
-    pub target_qty: f64,
-    pub actual_source: String,
-    pub last_action_ms: Option<i64>,
-    pub detail: String,
-}
-
 /// 一条下单意图记录（扳机扣扳机时产生）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalIntent {
@@ -54,8 +39,6 @@ pub struct Journal {
     pub equity_curve: Vec<crate::report::EquityPoint>,
     /// 策略评估流水（为什么下单/不下单）；回测不收集则为空
     pub evals: Vec<JournalEval>,
-    #[serde(default)]
-    pub sleeves: Vec<JournalSleeve>,
     /// 实盘引擎私有状态（持仓/熔断计数等），进程重启续跑用。
     /// 由 live 引擎序列化；回测与前端忽略此字段。
     #[serde(default, skip_serializing_if = "Option::is_none")]

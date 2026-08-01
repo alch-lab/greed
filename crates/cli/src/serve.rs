@@ -167,7 +167,9 @@ async fn auth_login(
             .lock()
             .await
             .insert(t.clone(), std::time::Instant::now());
-        Ok(Json(serde_json::json!({ "auth_required": true, "token": t })))
+        Ok(Json(
+            serde_json::json!({ "auth_required": true, "token": t }),
+        ))
     } else {
         st.auth.rate.lock().await.note_fail(&ip);
         warn!(ip, "登录失败（密码错误）");
@@ -284,18 +286,14 @@ async fn trade_status(State(st): State<Arc<AppState>>) -> Json<serde_json::Value
 /// 匹配 run_trade 启动阶段的配置/凭证/持仓检查报错与币安鉴权错误码。
 fn is_fatal_trade_error(msg: &str) -> bool {
     const FATAL_MARKERS: &[&str] = &[
-        "-2015",          // 币安：Invalid API-key, IP, or permissions
+        "-2015", // 币安：Invalid API-key, IP, or permissions
         "Invalid API-key",
         "缺少 API 凭证",
-        "缺少现货 Demo 凭证",
-        "carry 已启用",
         "启动检查失败",
         "读取配置失败",
         "读策略配置失败",
         "解析配置",
-        "解析 [portfolio] 失败",
         "装配策略失败",
-        "只允许 paper",
     ];
     FATAL_MARKERS.iter().any(|m| msg.contains(m))
 }
@@ -319,9 +317,9 @@ async fn trade_start(
         journal: None, // data/journal/{mode}.json
         mode: Some(req.mode),
         cash: req.cash.unwrap_or(100_000.0),
-        risk_pct: req.risk_pct.unwrap_or(0.0075),
-        max_risk_pct: req.max_risk_pct.unwrap_or(0.015),
-        entry_ttl_ms: 4 * 3_600_000,
+        risk_pct: req.risk_pct.unwrap_or(0.002),
+        max_risk_pct: req.max_risk_pct.unwrap_or(0.005),
+        entry_ttl_ms: 10 * 60_000,
         cb_max_daily_losses: 0,
         cb_daily_dd_pct: 0.0,
         leverage: req.leverage.unwrap_or(3),
@@ -404,7 +402,9 @@ async fn trade_stop(
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
     let h = {
         let guard = st.trade.lock().await;
-        guard.as_ref().map(|h| (h.shutdown.clone(), h.running.clone()))
+        guard
+            .as_ref()
+            .map(|h| (h.shutdown.clone(), h.running.clone()))
     };
     let Some((shutdown, running)) = h else {
         return Err((StatusCode::CONFLICT, "当前没有运行中的交易".into()));
@@ -515,7 +515,9 @@ async fn backtest_jobs(State(st): State<Arc<AppState>>) -> Json<serde_json::Valu
         if let Ok(entries) = std::fs::read_dir(dir) {
             for e in entries.flatten() {
                 let name = e.file_name().to_string_lossy().to_string();
-                let Some(id) = name.strip_suffix(".json") else { continue };
+                let Some(id) = name.strip_suffix(".json") else {
+                    continue;
+                };
                 let meta = std::fs::read_to_string(e.path())
                     .ok()
                     .and_then(|t| serde_json::from_str::<serde_json::Value>(&t).ok())
@@ -572,8 +574,12 @@ async fn read_json_file(path: &str) -> Result<serde_json::Value, (StatusCode, St
     let text = tokio::fs::read_to_string(path)
         .await
         .map_err(|_| (StatusCode::NOT_FOUND, format!("文件不存在: {}", path)))?;
-    serde_json::from_str(&text)
-        .map_err(|e| (StatusCode::INTERNAL_SERVER_ERROR, format!("JSON 解析失败: {}", e)))
+    serde_json::from_str(&text).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("JSON 解析失败: {}", e),
+        )
+    })
 }
 
 // ============================================================================
@@ -604,7 +610,11 @@ fn exec_backtest(
         chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
             .with_context(|| format!("日期格式错误: {}", s))
     };
-    let from_ms = parse(from)?.and_hms_opt(0, 0, 0).unwrap().and_utc().timestamp_millis();
+    let from_ms = parse(from)?
+        .and_hms_opt(0, 0, 0)
+        .unwrap()
+        .and_utc()
+        .timestamp_millis();
     let to_ms = (parse(to)? + chrono::Duration::days(1))
         .and_hms_opt(0, 0, 0)
         .unwrap()
@@ -640,7 +650,8 @@ fn exec_backtest(
         Timestamp::from_millis(from_ms),
         Timestamp::from_millis(to_ms),
     )?;
-    let mut events: Vec<tcore::Event> = Vec::with_capacity(trades.len() + ois.len() + fundings.len());
+    let mut events: Vec<tcore::Event> =
+        Vec::with_capacity(trades.len() + ois.len() + fundings.len());
     events.extend(trades.into_iter().map(tcore::Event::Trade));
     events.extend(ois.into_iter().map(tcore::Event::Oi));
     events.extend(fundings.into_iter().map(tcore::Event::Funding));
@@ -678,7 +689,6 @@ fn exec_backtest(
         fills: result.fills.clone(),
         equity_curve: result.equity_curve.clone(),
         evals: Vec::new(),
-        sleeves: Vec::new(),
         engine: None,
     };
     std::fs::write(journal_path, serde_json::to_string_pretty(&j)?)?;
@@ -725,7 +735,10 @@ pub async fn run_serve(
     });
 
     let app = Router::new()
-        .route("/api/health", get(|| async { Json(serde_json::json!({"ok": true})) }))
+        .route(
+            "/api/health",
+            get(|| async { Json(serde_json::json!({"ok": true})) }),
+        )
         .route("/api/auth/login", post(auth_login))
         .route("/api/auth/check", get(auth_check))
         .route("/api/strategies", get(list_strategies))
@@ -762,7 +775,9 @@ pub async fn run_serve(
         if let Some(handle) = shutdown_state.trade.lock().await.as_ref() {
             let _ = handle.shutdown.send(true);
             for _ in 0..300 {
-                if !handle.running.load(Ordering::SeqCst) { break; }
+                if !handle.running.load(Ordering::SeqCst) {
+                    break;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
         }

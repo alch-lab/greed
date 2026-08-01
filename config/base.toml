@@ -27,6 +27,3 @@ max_buffer_secs = 300
 testnet = true
 api_key_env = "BINANCE_API_KEY"
 api_secret_env = "BINANCE_API_SECRET"
-# 资金费套利的现货腿（demo-api.binance.com）。Demo 的现货/合约 key 通用（同一对）。
-spot_api_key_env = "BINANCE_SPOT_API_KEY"
-spot_api_secret_env = "BINANCE_SPOT_API_SECRET"

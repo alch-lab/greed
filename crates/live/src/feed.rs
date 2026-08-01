@@ -19,7 +19,7 @@
 use futures_util::StreamExt;
 use serde::Deserialize;
 use tcore::types::{Exchange, Price, Qty, Symbol, Timestamp};
-use tcore::Trade;
+use tcore::{BookSnapshot, Event, OiTick, Trade};
 use tokio::sync::mpsc;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 use tracing::{info, warn};
@@ -40,6 +40,90 @@ struct RawAggTrade {
     trade_time: i64,
     #[serde(rename = "m")]
     is_buyer_maker: bool,
+}
+
+/// 轮询主网公共 depth 与 OI，为订单流信号补充位置上下文。
+/// 失败只跳过当前快照，不影响逐笔成交主链路。
+pub async fn run_context_feed(
+    rest_base: &str,
+    symbol: &str,
+    client: reqwest::Client,
+    tx: mpsc::Sender<Event>,
+) {
+    let sym = Symbol::new(symbol);
+    let depth_url = format!(
+        "{}/fapi/v1/depth?symbol={}&limit=100",
+        rest_base.trim_end_matches('/'),
+        symbol
+    );
+    let oi_url = format!(
+        "{}/fapi/v1/openInterest?symbol={}",
+        rest_base.trim_end_matches('/'),
+        symbol
+    );
+    let mut timer = tokio::time::interval(std::time::Duration::from_secs(5));
+    timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    loop {
+        timer.tick().await;
+        let (depth, oi) = tokio::join!(client.get(&depth_url).send(), client.get(&oi_url).send());
+        let now = Timestamp::from_millis(chrono::Utc::now().timestamp_millis());
+        let mut mid = None;
+        if let Ok(resp) = depth {
+            if let Ok(text) = resp.text().await {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    let parse = |key: &str| -> Vec<(Price, Qty)> {
+                        v.get(key)
+                            .and_then(|x| x.as_array())
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|row| {
+                                let a = row.as_array()?;
+                                Some((
+                                    Price::from_f64(a.first()?.as_str()?.parse().ok()?),
+                                    Qty::from_f64(a.get(1)?.as_str()?.parse().ok()?),
+                                ))
+                            })
+                            .collect()
+                    };
+                    let book = BookSnapshot {
+                        ts: now,
+                        exchange: Exchange::BinanceFutures,
+                        symbol: sym.clone(),
+                        bids: parse("bids"),
+                        asks: parse("asks"),
+                    };
+                    mid = book.mid_price().map(Price::to_f64);
+                    if !book.bids.is_empty()
+                        && !book.asks.is_empty()
+                        && tx.send(Event::Book(book)).await.is_err()
+                    {
+                        return;
+                    }
+                }
+            }
+        }
+        if let (Ok(resp), Some(price)) = (oi, mid) {
+            if let Ok(text) = resp.text().await {
+                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
+                    if let Some(qty) = v
+                        .get("openInterest")
+                        .and_then(|x| x.as_str())
+                        .and_then(|x| x.parse::<f64>().ok())
+                    {
+                        let event = Event::Oi(OiTick {
+                            ts: now,
+                            exchange: Exchange::BinanceFutures,
+                            symbol: sym.clone(),
+                            oi_usd: qty * price,
+                        });
+                        if tx.send(event).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// 解析一条 WS 文本为 Trade；非 aggTrade 帧（订阅确认/ping）返回 None。

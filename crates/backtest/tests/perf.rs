@@ -17,7 +17,7 @@ fn replay_1m_synthetic_trades_under_2s() {
         })
         .collect();
 
-    let toml = "[strategy]\ntrigger = \"NoopTrigger\"\n";
+    let toml = "[strategy]\ntrigger = \"OrderFlowEntry\"\n";
     let strat = strategy::assemble_from_toml(toml, &strategy::builtin_registry()).unwrap();
     let mut eng = backtest::BacktestEngine::new(strat, symbol, backtest::BacktestConfig::default());
     let t0 = std::time::Instant::now();

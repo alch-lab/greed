@@ -11,13 +11,12 @@ mod trade_runner;
 
 use anyhow::{Context, Result};
 use backtest::{
-    build_report, pair_round_trips, to_json, to_markdown, BacktestConfig, BacktestEngine,
-    Journal, JournalMeta, ReportConfig,
+    build_report, pair_round_trips, to_json, to_markdown, BacktestConfig, BacktestEngine, Journal,
+    JournalMeta, ReportConfig,
 };
 use clap::{Parser, Subcommand};
 use data::live::{run_collector, CollectorConfig};
 use data::{ingest_day, Lake, Market};
-use signals::renko::{brick_stats, bricks_to_csv, stats_to_markdown, RenkoConfig, RenkoEngine};
 use strategy::{assemble_from_toml, builtin_registry};
 use tcore::types::{Exchange, Symbol, Timestamp};
 use tracing::{error, info};
@@ -83,19 +82,19 @@ enum Command {
         #[arg(long, default_value_t = 100_000.0)]
         cash: f64,
         /// 风险分数
-        #[arg(long, default_value_t = 0.0075)]
+        #[arg(long, default_value_t = 0.002)]
         risk_pct: f64,
-        /// 几何自然反转率
-        #[arg(long, default_value_t = 0.605)]
-        geo_baseline: f64,
+        /// 随机方向胜率基线
+        #[arg(long, default_value_t = 0.5)]
+        winrate_baseline: f64,
         /// 试验次数（DSR 用）
         #[arg(long, default_value_t = 1)]
         trials: usize,
         /// 限价入场单有效期（毫秒）
-        #[arg(long, default_value_t = 4 * 3_600_000)]
+        #[arg(long, default_value_t = 10 * 60_000)]
         entry_ttl_ms: i64,
         /// 单笔最大风险（占 equity 比例，封顶 risk_pct）
-        #[arg(long, default_value_t = 0.015)]
+        #[arg(long, default_value_t = 0.005)]
         max_risk_pct: f64,
         /// 熔断：日连亏笔数上限（0 = 关闭）
         #[arg(long, default_value_t = 0)]
@@ -132,33 +131,6 @@ enum Command {
         to: Option<String>,
     },
 
-    /// 跑 renko 砖序列并导出统计（砖 CSV + 马尔可夫基线统计）
-    Renko {
-        /// 交易对，如 BTCUSDT
-        #[arg(long, default_value = "BTCUSDT")]
-        symbol: String,
-        /// 市场：perp（USDT永续）或 spot
-        #[arg(long, default_value = "perp")]
-        market: String,
-        /// 起始日期 yyyy-mm-dd（含）
-        #[arg(long)]
-        from: String,
-        /// 结束日期 yyyy-mm-dd（含）
-        #[arg(long)]
-        to: String,
-        /// 数据湖目录
-        #[arg(long, default_value = "data/lake")]
-        lake: String,
-        /// 趋势砖尺寸（美元）
-        #[arg(long, default_value_t = 100.0)]
-        trend: f64,
-        /// 反转砖尺寸（美元）
-        #[arg(long, default_value_t = 62.0)]
-        reversal: f64,
-        /// 输出前缀（生成 {out}-bricks.csv 与 {out}-stats.md）
-        #[arg(long, default_value = "out/renko")]
-        out: String,
-    },
     /// 模拟盘/实盘执行（PR-12）：实时行情 → 策略决策 → testnet 下单 → journal 落盘
     Trade {
         /// 配置文件路径（读 [collector] 的 symbol/proxy 与 [account]）
@@ -174,13 +146,13 @@ enum Command {
         #[arg(long, default_value_t = 100_000.0)]
         cash: f64,
         /// 风险分数（同回测）
-        #[arg(long, default_value_t = 0.0075)]
+        #[arg(long, default_value_t = 0.002)]
         risk_pct: f64,
         /// 单笔最大风险（占 equity 比例上限）
-        #[arg(long, default_value_t = 0.015)]
+        #[arg(long, default_value_t = 0.005)]
         max_risk_pct: f64,
         /// 限价入场单有效期（毫秒）
-        #[arg(long, default_value_t = 4 * 3_600_000)]
+        #[arg(long, default_value_t = 10 * 60_000)]
         entry_ttl_ms: i64,
         /// 熔断：日连亏笔数上限（0 = 关闭）
         #[arg(long, default_value_t = 0)]
@@ -310,76 +282,6 @@ async fn main() -> Result<()> {
             Ok(())
         }
 
-        Command::Renko {
-            symbol,
-            market,
-            from,
-            to,
-            lake,
-            trend,
-            reversal,
-            out,
-        } => {
-            let exchange = match market.as_str() {
-                "perp" | "um" | "futures" => Exchange::BinanceFutures,
-                "spot" => Exchange::BinanceSpot,
-                other => anyhow::bail!("未知市场: {}（用 perp 或 spot）", other),
-            };
-            // [from 00:00, to+1d 00:00) UTC
-            let parse = |s: &str| -> Result<chrono::NaiveDate> {
-                chrono::NaiveDate::parse_from_str(s, "%Y-%m-%d")
-                    .with_context(|| format!("日期格式错误（应 yyyy-mm-dd）: {}", s))
-            };
-            let from_ms = parse(&from)?
-                .and_hms_opt(0, 0, 0)
-                .unwrap()
-                .and_utc()
-                .timestamp_millis();
-            let to_ms = (parse(&to)? + chrono::Duration::days(1))
-                .and_hms_opt(0, 0, 0)
-                .unwrap()
-                .and_utc()
-                .timestamp_millis();
-
-            let lake = Lake::new(&lake);
-            let sym = Symbol::new(&symbol);
-            info!(%symbol, %from, %to, trend, reversal, "读取数据湖");
-            let trades = data::lake::read_range(
-                &lake,
-                exchange,
-                &sym,
-                Timestamp::from_millis(from_ms),
-                Timestamp::from_millis(to_ms),
-            )?;
-            info!(rows = trades.len(), "回放逐笔 → renko 引擎");
-
-            let mut engine = RenkoEngine::new(RenkoConfig::trend_reversal_usd(trend, reversal));
-            let mut bricks = Vec::new();
-            for t in &trades {
-                bricks.extend(engine.on_trade(t));
-            }
-            let stats = brick_stats(&bricks);
-
-            if let Some(parent) = std::path::Path::new(&out).parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            let csv_path = format!("{}-bricks.csv", out);
-            let md_path = format!("{}-stats.md", out);
-            bricks_to_csv(std::fs::File::create(&csv_path)?, &bricks)?;
-            std::fs::write(&md_path, stats_to_markdown(&stats))?;
-
-            info!(
-                bricks = stats.n_bricks,
-                chains = stats.n_chains,
-                max_run = stats.max_run,
-                p_continue = ?stats.p_continue_after_reversal,
-                csv = %csv_path,
-                md = %md_path,
-                "renko 导出完成"
-            );
-            println!("{}", stats_to_markdown(&stats));
-            Ok(())
-        }
         Command::Backtest {
             symbol,
             market,
@@ -389,7 +291,7 @@ async fn main() -> Result<()> {
             strategy,
             cash,
             risk_pct,
-            geo_baseline,
+            winrate_baseline,
             trials,
             entry_ttl_ms,
             max_risk_pct,
@@ -451,8 +353,14 @@ async fn main() -> Result<()> {
                 Timestamp::from_millis(from_ms),
                 Timestamp::from_millis(to_ms),
             )?;
-            info!(trades = trades.len(), oi = ois.len(), funding = fundings.len(), "回放事件流 → 回测引擎");
-            let mut events: Vec<tcore::Event> = Vec::with_capacity(trades.len() + ois.len() + fundings.len());
+            info!(
+                trades = trades.len(),
+                oi = ois.len(),
+                funding = fundings.len(),
+                "回放事件流 → 回测引擎"
+            );
+            let mut events: Vec<tcore::Event> =
+                Vec::with_capacity(trades.len() + ois.len() + fundings.len());
             events.extend(trades.into_iter().map(tcore::Event::Trade));
             events.extend(ois.into_iter().map(tcore::Event::Oi));
             events.extend(fundings.into_iter().map(tcore::Event::Funding));
@@ -479,7 +387,7 @@ async fn main() -> Result<()> {
             // PR-7 报告
             let trips = pair_round_trips(&result.fills);
             let rc = ReportConfig {
-                geometric_baseline: geo_baseline,
+                null_winrate_baseline: winrate_baseline,
                 n_trials: trials,
                 risk_pct,
                 ..Default::default()
@@ -504,7 +412,6 @@ async fn main() -> Result<()> {
                     fills: result.fills.clone(),
                     equity_curve: result.equity_curve.clone(),
                     evals: Vec::new(),
-                    sleeves: Vec::new(),
                     engine: None,
                 };
                 if let Some(parent) = std::path::Path::new(jpath).parent() {
@@ -578,7 +485,13 @@ async fn main() -> Result<()> {
                 days.sort();
                 match (days.first(), days.last()) {
                     (Some(f), Some(l)) => {
-                        println!("✅ 数据湖: {} 共 {} 天（{} → {}）", dir.display(), days.len(), f, l);
+                        println!(
+                            "✅ 数据湖: {} 共 {} 天（{} → {}）",
+                            dir.display(),
+                            days.len(),
+                            f,
+                            l
+                        );
                     }
                     _ => {
                         println!("❌ 数据湖为空: {}", dir.display());
@@ -589,8 +502,7 @@ async fn main() -> Result<()> {
                 if let (Some(f), Some(t)) = (&from, &to) {
                     let want = date_range(f, t)?;
                     let have: std::collections::HashSet<&String> = days.iter().collect();
-                    let missing: Vec<&String> =
-                        want.iter().filter(|d| !have.contains(d)).collect();
+                    let missing: Vec<&String> = want.iter().filter(|d| !have.contains(d)).collect();
                     if missing.is_empty() {
                         println!("✅ 区间 {} → {} 覆盖完整（{} 天）", f, t, want.len());
                     } else {

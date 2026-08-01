@@ -74,6 +74,9 @@ pub struct OrderIntent {
     pub side: Side,
     /// 数量（定点）。执行前会再乘过滤器降权系数。
     pub qty: Qty,
+    /// 相对于账户单笔风险预算的仓位系数。极值试仓小于确认入场。
+    #[serde(default = "default_risk_scale")]
+    pub risk_scale: f64,
     /// 限价；None 表示市价。
     pub limit_price: Option<Price>,
     /// 止损价（结构锚定：针尖下/墙外/蓝带下）。
@@ -83,6 +86,10 @@ pub struct OrderIntent {
     /// 触发原因（扳机名 + 关键上下文，便于复盘）。
     pub reason: String,
     pub ts: Timestamp,
+}
+
+fn default_risk_scale() -> f64 {
+    1.0
 }
 
 /// 过滤器加载
@@ -106,6 +113,8 @@ pub struct Position {
     pub qty: Qty,
     pub entry_ts: Timestamp,
     pub stop_price: Price,
+    /// 开仓时的结构止损；移动到保本后仍用它计算 R 倍数目标。
+    pub initial_stop_price: Price,
     pub tp1_price: Option<Price>,
     /// 是否已推保本
     pub breakeven_moved: bool,
@@ -230,6 +239,7 @@ mod tests {
             symbol: sym(),
             side: Side::Buy,
             qty: Qty::from_f64(0.1),
+            risk_scale: 1.0,
             limit_price: None,
             stop_price: Price::from_f64(66000.0),
             tp1_price: Some(Price::from_f64(67600.0)),
@@ -283,6 +293,7 @@ mod tests {
             qty: Qty::from_f64(0.1),
             entry_ts: Timestamp::from_millis(1000),
             stop_price: Price::from_f64(66000.0),
+            initial_stop_price: Price::from_f64(66000.0),
             tp1_price: Some(Price::from_f64(67600.0)),
             breakeven_moved: false,
             closed_frac: 0.0,

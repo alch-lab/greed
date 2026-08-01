@@ -11,9 +11,9 @@
 //! trend/event/circuit_breaker 标志由后续的信号与风控模块维护。
 
 use crate::account::{Account, Fill, FillRequest};
-use crate::journal::JournalIntent;
 use crate::broker::{Broker, Order, OrderKind};
 use crate::fees::FeeModel;
+use crate::journal::JournalIntent;
 use crate::report::EquityPoint;
 use strategy::Strategy;
 use tcore::plugin::{Ctx, ExitAction, OrderIntent, Signal, Verdict};
@@ -29,6 +29,8 @@ pub struct BacktestConfig {
     pub risk_pct: f64,
     /// 单笔最大风险（占 equity 比例上限）
     pub max_risk_pct: f64,
+    /// 名义仓位上限（equity 倍数），与实盘杠杆约束对齐。
+    pub max_leverage: f64,
     /// 限价入场单的有效期（毫秒），超时未成交自动撤单
     pub entry_ttl_ms: i64,
     /// 熔断：日连亏笔数上限（0 = 关闭）。触发后当日不再开仓
@@ -44,6 +46,7 @@ impl Default for BacktestConfig {
             fee_model: FeeModel::default(),
             risk_pct: 0.0075,
             max_risk_pct: 0.015,
+            max_leverage: 3.0,
             entry_ttl_ms: 4 * 3_600_000, // 默认 4 小时
             cb_max_daily_losses: 0,
             cb_daily_dd_pct: 0.0,
@@ -130,6 +133,7 @@ impl BacktestEngine {
         for ev in events {
             match ev {
                 Event::Trade(t) => self.on_trade(t),
+                Event::Book(b) => self.on_context_event(b.ts, ev),
                 Event::Oi(o) => self.on_oi(o, ev),
                 Event::Funding(f) => self.on_funding(f, ev),
                 _ => {}
@@ -142,6 +146,16 @@ impl BacktestEngine {
             final_equity: self.account.equity(final_px),
             initial_cash: self.config.initial_cash,
             equity_curve: std::mem::take(&mut self.equity_curve),
+        }
+    }
+
+    fn on_context_event(&mut self, ts: Timestamp, ev: &Event) {
+        self.clock.advance_to(ts);
+        self.ctx.now = Some(ts);
+        for sp in self.strategy.signals.iter_mut() {
+            for sig in sp.on_event(ev, &self.ctx) {
+                self.ctx.set_latest(sig);
+            }
         }
     }
 
@@ -313,9 +327,7 @@ impl BacktestEngine {
                     if let Some(p) = self.account.position().copied() {
                         let close_qty = Qty::from_f64(p.qty.to_f64() * frac);
                         self.market_close(trade, close_qty, "tp_partial");
-                        if let Some(pp) = self.account.position_mut() {
-                            pp.closed_frac = (pp.closed_frac + frac).min(1.0);
-                        }
+                        // closed_frac 由 Account::apply_fill 按原始仓位口径维护。
                     }
                 }
                 ExitAction::CloseAll => {
@@ -400,11 +412,16 @@ impl BacktestEngine {
     fn enter(&mut self, trade: &Trade, intent: OrderIntent) {
         // 仓位计算：equity × risk_pct / 止损距离，风险比例封顶 max_risk_pct；
         // 若扳机已指定数量（网格/蓝带等），取较小者。
-        let stop_dist = (intent.stop_price.to_f64() - trade.price.to_f64()).abs();
+        let entry_ref = intent.limit_price.unwrap_or(trade.price);
+        let stop_dist = (intent.stop_price.to_f64() - entry_ref.to_f64()).abs();
         let qty = if stop_dist > 1e-9 {
             let risk_frac = self.config.risk_pct.min(self.config.max_risk_pct);
-            let risk_usd = self.account.equity(trade.price) * risk_frac;
-            let q = risk_usd / stop_dist;
+            let risk_usd =
+                self.account.equity(trade.price) * risk_frac * intent.risk_scale.clamp(0.0, 1.0);
+            let q = (risk_usd / stop_dist).min(
+                self.account.equity(trade.price).max(0.0) * self.config.max_leverage
+                    / entry_ref.to_f64(),
+            );
             if intent.qty.to_f64() > 1e-9 {
                 q.min(intent.qty.to_f64())
             } else {
@@ -468,6 +485,9 @@ impl BacktestEngine {
         // 设置持仓止损/止盈并挂止损单（加仓时先撤旧止损单，按新总仓重挂）
         if let Some(p) = self.account.position_mut() {
             p.stop_price = Some(intent.stop_price);
+            if p.initial_stop_price.is_none() {
+                p.initial_stop_price = Some(intent.stop_price);
+            }
             p.tp1_price = intent.tp1_price;
             let side = p.side;
             let q = p.qty;
@@ -495,6 +515,9 @@ impl BacktestEngine {
             // 延迟成交：补挂止损单与 TP 参考
             if let Some(p) = self.account.position_mut() {
                 p.stop_price = Some(pe.stop_price);
+                if p.initial_stop_price.is_none() {
+                    p.initial_stop_price = Some(pe.stop_price);
+                }
                 p.tp1_price = pe.tp1_price;
                 let side = p.side;
                 let q = p.qty;
@@ -592,7 +615,7 @@ mod tests {
     fn noop_strategy() -> Strategy {
         let toml = r#"
 [strategy]
-trigger = "NoopTrigger"
+trigger = "OrderFlowEntry"
 "#;
         assemble_from_toml(toml, &builtin_registry()).unwrap()
     }
@@ -633,6 +656,7 @@ trigger = "NoopTrigger"
             symbol: Symbol::new("BTCUSDT"),
             side: Side::Buy,
             qty: Qty::from_f64(0.1),
+            risk_scale: 1.0,
             limit_price: None,
             stop_price: Price::from_f64(66800.0),
             tp1_price: None,

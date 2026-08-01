@@ -1,14 +1,7 @@
-pub mod agg_delta;
-pub mod bollinger_mr;
-pub mod dual_tf_mr;
-pub mod ema_cross;
-pub mod ema_mean_reversion;
-pub mod ema_mean_reversion_v2;
-pub mod large_trade_flow;
-pub mod large_trade_impulse;
-pub mod oi_regime;
-pub mod oi_tracker;
-pub mod regime_switch_mr;
-pub mod renko;
-pub mod squeeze_completion;
-pub mod vol_adaptive_mr;
+//! 原始订单流信号。
+//!
+//! 生产策略只保留一条可解释链路：位置（扫流动性/VWAP 偏离）→ 主动成交
+//! 力竭（大量 effort、很少 result）→ Delta 反转确认。旧的 EMA/MR/Renko
+//! 近似模型已退出装配入口，避免同名概念对应不同实现。
+
+pub mod orderflow_exhaustion;

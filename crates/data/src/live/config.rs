@@ -103,11 +103,6 @@ pub struct AccountConfig {
     pub rest_base: String,
     /// WS 基础地址（留空按 testnet 自动选择）
     pub ws_base: String,
-    /// 现货腿使用独立凭证变量（测试网与合约测试网的 key 不通用）。
-    pub spot_api_key_env: String,
-    pub spot_api_secret_env: String,
-    /// 现货 REST 地址；空值按 testnet 自动选择。
-    pub spot_rest_base: String,
 }
 
 impl Default for AccountConfig {
@@ -118,9 +113,6 @@ impl Default for AccountConfig {
             api_secret_env: "BINANCE_API_SECRET".into(),
             rest_base: String::new(),
             ws_base: String::new(),
-            spot_api_key_env: "BINANCE_SPOT_API_KEY".into(),
-            spot_api_secret_env: "BINANCE_SPOT_API_SECRET".into(),
-            spot_rest_base: String::new(),
         }
     }
 }
@@ -159,17 +151,6 @@ impl AccountConfig {
         }
     }
 
-    pub fn spot_rest_base(&self) -> &str {
-        if !self.spot_rest_base.is_empty() {
-            &self.spot_rest_base
-        } else if self.testnet {
-            // 新 Demo Trading 现货（旧 testnet.binance.vision 已停用）
-            "https://demo-api.binance.com"
-        } else {
-            "https://api.binance.com"
-        }
-    }
-
     /// 从环境变量读 API key；未设置时返回 None（调用方应报明确错误）。
     pub fn api_key(&self) -> Option<String> {
         std::env::var(&self.api_key_env)
@@ -179,19 +160,6 @@ impl AccountConfig {
 
     pub fn api_secret(&self) -> Option<String> {
         std::env::var(&self.api_secret_env)
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-    }
-
-
-    pub fn spot_api_key(&self) -> Option<String> {
-        std::env::var(&self.spot_api_key_env)
-            .ok()
-            .filter(|s| !s.trim().is_empty())
-    }
-
-    pub fn spot_api_secret(&self) -> Option<String> {
-        std::env::var(&self.spot_api_secret_env)
             .ok()
             .filter(|s| !s.trim().is_empty())
     }

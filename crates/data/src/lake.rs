@@ -683,13 +683,11 @@ pub fn read_oi_metrics(
 
     let mut out = Vec::new();
     for path in entries {
-        let mut rdr =
-            csv::Reader::from_path(&path).map_err(|e| LakeError::Data(e.to_string()))?;
+        let mut rdr = csv::Reader::from_path(&path).map_err(|e| LakeError::Data(e.to_string()))?;
         for rec in rdr.records() {
             let rec = rec.map_err(|e| LakeError::Data(e.to_string()))?;
             let Some(ts_str) = rec.get(0) else { continue };
-            let Ok(dt) = chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S")
-            else {
+            let Ok(dt) = chrono::NaiveDateTime::parse_from_str(ts_str, "%Y-%m-%d %H:%M:%S") else {
                 continue;
             };
             let ts = Timestamp::from_millis(dt.and_utc().timestamp_millis());

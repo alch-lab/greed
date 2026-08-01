@@ -7,12 +7,13 @@ fn main() {
         eprintln!("用法: {} <binlog文件> <输出csv>", args[0]);
         std::process::exit(1);
     }
-    
+
     let trades = read_trade_log(Path::new(&args[1])).expect("读取失败");
-    
+
     let mut w = csv::Writer::from_path(&args[2]).expect("创建CSV失败");
-    w.write_record(&["ts_ms", "price", "qty", "is_buyer_maker", "taker_side"]).unwrap();
-    
+    w.write_record(&["ts_ms", "price", "qty", "is_buyer_maker", "taker_side"])
+        .unwrap();
+
     let mut count = 0;
     for t in trades {
         let price = t.price_raw as f64 / 100_000_000.0;
@@ -24,10 +25,11 @@ fn main() {
             format!("{:.8}", qty),
             t.is_buyer_maker.to_string(),
             taker_side.to_string(),
-        ]).unwrap();
+        ])
+        .unwrap();
         count += 1;
     }
     w.flush().unwrap();
-    
+
     println!("导出 {} 条记录到 {}", count, args[2]);
 }

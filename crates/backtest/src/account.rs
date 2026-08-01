@@ -50,6 +50,8 @@ pub struct OpenPosition {
     pub entry_ts: Timestamp,
     /// 当前止损价（出场插件移动）
     pub stop_price: Option<Price>,
+    #[serde(default)]
+    pub initial_stop_price: Option<Price>,
     /// 第一止盈参考位
     pub tp1_price: Option<Price>,
     pub breakeven_moved: bool,
@@ -102,6 +104,10 @@ impl Account {
             qty: p.qty,
             entry_ts: p.entry_ts,
             stop_price: p.stop_price.unwrap_or(p.entry_price),
+            initial_stop_price: p
+                .initial_stop_price
+                .or(p.stop_price)
+                .unwrap_or(p.entry_price),
             tp1_price: p.tp1_price,
             breakeven_moved: p.breakeven_moved,
             closed_frac: p.closed_frac,
@@ -173,9 +179,10 @@ impl Account {
                 if rest < 1e-9 {
                     self.position = None;
                 } else {
+                    let original_qty = pos.qty.to_f64() / (1.0 - pos.closed_frac).max(1e-9);
                     self.position = Some(OpenPosition {
                         qty: Qty::from_f64(rest),
-                        closed_frac: pos.closed_frac + close_qty / pos.qty.to_f64(),
+                        closed_frac: (pos.closed_frac + close_qty / original_qty).min(1.0),
                         ..pos
                     });
                 }
@@ -203,6 +210,7 @@ impl Account {
                         qty: Qty::from_f64(remaining),
                         entry_ts: ts,
                         stop_price: None,
+                        initial_stop_price: None,
                         tp1_price: None,
                         breakeven_moved: false,
                         closed_frac: 0.0,

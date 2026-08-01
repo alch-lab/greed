@@ -1,236 +1,87 @@
-//! 出场插件（暂时提供基础实现；后续 补齐 TieredTakeProfit/ReverseOnSignal 等）。
-//!
-//! 出场插件在持仓期间每个事件后被调用，产出保本/止盈/反手/时间止损动作。
+//! 订单流交易管理：TP1 → 保本 → TP2 → runner，外加时间止损。
 
 use crate::registry::PluginBuildError;
 use serde_json::Value as Json;
-use tcore::plugin::{Ctx, ExitAction, ExitPlugin, Position};
-use tcore::types::Side;
+use tcore::{Ctx, ExitAction, ExitPlugin, Position, Price, Side};
 
-/// 保本：价格离开入场价 `trigger_usd` 美元后，把止损推到入场价。
-///
-/// 教程规则（BreakevenAt300）：离开 300 美元推保本，统计约 90% 至少不亏，
-/// 代价约 1/3 被二探打掉。`trigger_usd` 默认 300。
-pub struct BreakevenAt {
-    pub trigger_usd: f64,
+pub struct OrderFlowTradeManagement {
+    tp1_close: f64,
+    tp2_original_close: f64,
+    tp2_r: f64,
+    runner_trail_pct: f64,
+    max_hold_ms: i64,
 }
 
-impl ExitPlugin for BreakevenAt {
+impl ExitPlugin for OrderFlowTradeManagement {
     fn name(&self) -> &'static str {
-        "BreakevenAt300"
+        "OrderFlowTradeManagement"
     }
+
     fn manage(&self, pos: &Position, ctx: &Ctx) -> Vec<ExitAction> {
-        if pos.breakeven_moved {
+        let Some(now) = ctx.now else { return vec![] };
+        if now.as_millis() - pos.entry_ts.as_millis() >= self.max_hold_ms {
+            return vec![ExitAction::CloseAll];
+        }
+        let Some(last) = ctx.flag("last_price").and_then(|v| v.parse::<f64>().ok()) else {
+            return vec![];
+        };
+        let favorable = |target: f64| match pos.side {
+            Side::Buy => last >= target,
+            Side::Sell => last <= target,
+        };
+        let entry = pos.entry_price.to_f64();
+        let initial_stop = pos.initial_stop_price.to_f64();
+        let risk = (entry - initial_stop).abs();
+        if risk <= 1e-9 {
             return vec![];
         }
-        let now_px = match current_price(ctx) {
-            Some(p) => p,
-            None => return vec![],
-        };
-        let moved = match pos.side {
-            Side::Buy => now_px.to_f64() >= pos.entry_price.to_f64() + self.trigger_usd,
-            Side::Sell => now_px.to_f64() <= pos.entry_price.to_f64() - self.trigger_usd,
-        };
-        if moved {
-            vec![ExitAction::MoveStop(pos.entry_price)]
-        } else {
-            vec![]
+
+        if pos.closed_frac < 0.49 {
+            if let Some(tp1) = pos.tp1_price.map(Price::to_f64) {
+                if favorable(tp1) {
+                    return vec![
+                        ExitAction::ClosePartial(self.tp1_close),
+                        ExitAction::MoveStop(pos.entry_price),
+                    ];
+                }
+            }
+            return vec![];
         }
-    }
-}
 
-pub fn build_breakeven(p: &Json) -> Result<Box<dyn ExitPlugin>, PluginBuildError> {
-    let trigger = p
-        .get("trigger_usd")
-        .and_then(|v| v.as_f64())
-        .unwrap_or(300.0);
-    Ok(Box::new(BreakevenAt {
-        trigger_usd: trigger,
-    }))
-}
+        let tp2 = match pos.side {
+            Side::Buy => entry + risk * self.tp2_r,
+            Side::Sell => entry - risk * self.tp2_r,
+        };
+        let tp2_done = self.tp1_close + self.tp2_original_close;
+        if pos.closed_frac + 1e-6 < tp2_done && favorable(tp2) {
+            let frac_remaining = self.tp2_original_close / (1.0 - pos.closed_frac).max(1e-9);
+            return vec![ExitAction::ClosePartial(frac_remaining.clamp(0.0, 1.0))];
+        }
 
-/// 时间止损：持仓超过 `max_hours` 未达 TP1 且未触损 → 全部平仓。
-pub struct TimeStop {
-    pub max_hours: f64,
-}
-
-impl ExitPlugin for TimeStop {
-    fn name(&self) -> &'static str {
-        "TimeStop"
-    }
-    fn manage(&self, pos: &Position, ctx: &Ctx) -> Vec<ExitAction> {
-        if let Some(now) = ctx.now {
-            let held_h = now.diff_ms(pos.entry_ts) as f64 / 3_600_000.0;
-            if held_h >= self.max_hours {
-                return vec![ExitAction::CloseAll];
+        if pos.closed_frac + 1e-6 >= tp2_done {
+            let candidate = match pos.side {
+                Side::Buy => last * (1.0 - self.runner_trail_pct),
+                Side::Sell => last * (1.0 + self.runner_trail_pct),
+            };
+            let improves = match pos.side {
+                Side::Buy => candidate > pos.stop_price.to_f64(),
+                Side::Sell => candidate < pos.stop_price.to_f64(),
+            };
+            if improves {
+                return vec![ExitAction::MoveStop(Price::from_f64(candidate))];
             }
         }
         vec![]
     }
 }
 
-pub fn build_time_stop(p: &Json) -> Result<Box<dyn ExitPlugin>, PluginBuildError> {
-    let h = p.get("max_hours").and_then(|v| v.as_f64()).unwrap_or(36.0);
-    Ok(Box::new(TimeStop { max_hours: h }))
-}
-
-/// 分级止盈：到达 TP1（首个反向色带/参考位）平 `tp1_pct`% 仓位。
-///
-/// 简化实现（PR-4）：当现价触及 `pos.tp1_price` 时平掉剩余仓位的 tp1_pct，
-/// 并由状态机配合 BreakevenAt 推保本。完整版（Phase 3）接反向色带与 AccDelta。
-pub struct TieredTakeProfit {
-    pub tp1_frac: f64, // 0.5 = 平 50%
-}
-
-impl ExitPlugin for TieredTakeProfit {
-    fn name(&self) -> &'static str {
-        "TieredTakeProfit"
-    }
-    fn manage(&self, pos: &Position, ctx: &Ctx) -> Vec<ExitAction> {
-        let tp1 = match pos.tp1_price {
-            Some(p) => p,
-            None => return vec![],
-        };
-        if pos.closed_frac >= self.tp1_frac {
-            return vec![]; // TP1 已执行过
-        }
-        let now_px = match current_price(ctx) {
-            Some(p) => p,
-            None => return vec![],
-        };
-        let hit = match pos.side {
-            Side::Buy => now_px >= tp1,
-            Side::Sell => now_px <= tp1,
-        };
-        if hit {
-            vec![ExitAction::ClosePartial(self.tp1_frac)]
-        } else {
-            vec![]
-        }
-    }
-}
-
-pub fn build_tiered_tp(p: &Json) -> Result<Box<dyn ExitPlugin>, PluginBuildError> {
-    let pct = p.get("tp1_pct").and_then(|v| v.as_f64()).unwrap_or(50.0);
-    Ok(Box::new(TieredTakeProfit {
-        tp1_frac: pct / 100.0,
+pub fn build_orderflow_management(p: &Json) -> Result<Box<dyn ExitPlugin>, PluginBuildError> {
+    let f = |k: &str, d: f64| p.get(k).and_then(Json::as_f64).unwrap_or(d);
+    Ok(Box::new(OrderFlowTradeManagement {
+        tp1_close: f("tp1_close", 0.50).clamp(0.05, 0.90),
+        tp2_original_close: f("tp2_original_close", 0.25).clamp(0.05, 0.45),
+        tp2_r: f("tp2_r", 4.0).max(0.2),
+        runner_trail_pct: f("runner_trail_pct", 0.006).clamp(0.001, 0.05),
+        max_hold_ms: (f("max_hold_hours", 4.0).max(0.1) * 3_600_000.0) as i64,
     }))
-}
-
-/// 从 Ctx 取当前价（由状态机写入 flags["last_price"]）。
-fn current_price(ctx: &Ctx) -> Option<tcore::types::Price> {
-    ctx.flag("last_price")
-        .and_then(|s| s.parse::<f64>().ok())
-        .map(tcore::types::Price::from_f64)
-}
-
-/// 百分比移动止损：价格从持仓极值回撤 `trail_pct` 时触发。
-///
-/// 无状态实现：候选止损 = 现价 × (1 ∓ trail_pct)，只在比当前止损更有利时上移/下移。
-/// 价格未走出 trail_pct 之前候选值劣于原止损，自然不会触发——
-/// 即"浮盈超过 trail_pct 后开始锁定利润"。用于 TP1 部分止盈后的 runner 仓位。
-pub struct PercentTrail {
-    pub trail_pct: f64, // 如 0.01 = 1%
-}
-
-impl ExitPlugin for PercentTrail {
-    fn name(&self) -> &'static str {
-        "PercentTrail"
-    }
-    fn manage(&self, pos: &Position, ctx: &Ctx) -> Vec<ExitAction> {
-        let now_px = match current_price(ctx) {
-            Some(p) => p.to_f64(),
-            None => return vec![],
-        };
-        let cur_stop = pos.stop_price.to_f64();
-        match pos.side {
-            Side::Buy => {
-                let candidate = now_px * (1.0 - self.trail_pct);
-                if candidate > cur_stop {
-                    vec![ExitAction::MoveStop(tcore::types::Price::from_f64(candidate))]
-                } else {
-                    vec![]
-                }
-            }
-            Side::Sell => {
-                let candidate = now_px * (1.0 + self.trail_pct);
-                if candidate < cur_stop {
-                    vec![ExitAction::MoveStop(tcore::types::Price::from_f64(candidate))]
-                } else {
-                    vec![]
-                }
-            }
-        }
-    }
-}
-
-pub fn build_percent_trail(p: &Json) -> Result<Box<dyn ExitPlugin>, PluginBuildError> {
-    let pct = p.get("trail_pct").and_then(|v| v.as_f64()).unwrap_or(0.01);
-    Ok(Box::new(PercentTrail { trail_pct: pct }))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use tcore::types::{Price, Qty, Symbol, Timestamp};
-
-    fn pos(side: Side, entry: f64) -> Position {
-        Position {
-            symbol: Symbol::new("BTCUSDT"),
-            side,
-            entry_price: Price::from_f64(entry),
-            qty: Qty::from_f64(0.1),
-            entry_ts: Timestamp::from_millis(0),
-            stop_price: Price::from_f64(entry - 150.0),
-            tp1_price: None,
-            breakeven_moved: false,
-            closed_frac: 0.0,
-        }
-    }
-    fn ctx_at(price: f64, now_ms: i64) -> Ctx {
-        let mut c = Ctx {
-            now: Some(Timestamp::from_millis(now_ms)),
-            ..Default::default()
-        };
-        c.flags.insert("last_price".into(), price.to_string());
-        c
-    }
-
-    #[test]
-    fn breakeven_triggers_for_long() {
-        let e = BreakevenAt { trigger_usd: 300.0 };
-        let p = pos(Side::Buy, 67000.0);
-        // 价格未到 67300：不动
-        assert!(e.manage(&p, &ctx_at(67200.0, 1000)).is_empty());
-        // 价格到 67300：推保本到入场价
-        let acts = e.manage(&p, &ctx_at(67350.0, 1000));
-        assert_eq!(acts.len(), 1);
-        assert!(matches!(acts[0], ExitAction::MoveStop(_)));
-    }
-
-    #[test]
-    fn breakeven_triggers_for_short() {
-        let e = BreakevenAt { trigger_usd: 300.0 };
-        let p = pos(Side::Sell, 67000.0);
-        assert!(e.manage(&p, &ctx_at(66800.0, 1000)).is_empty());
-        assert_eq!(e.manage(&p, &ctx_at(66650.0, 1000)).len(), 1);
-    }
-
-    #[test]
-    fn breakeven_not_repeat() {
-        let e = BreakevenAt { trigger_usd: 300.0 };
-        let mut p = pos(Side::Buy, 67000.0);
-        p.breakeven_moved = true; // 已推过
-        assert!(e.manage(&p, &ctx_at(68000.0, 1000)).is_empty());
-    }
-
-    #[test]
-    fn time_stop_closes_after_max() {
-        let t = TimeStop { max_hours: 36.0 };
-        let p = pos(Side::Buy, 67000.0);
-        let before = ctx_at(67000.0, 35 * 3_600_000);
-        let after = ctx_at(67000.0, 37 * 3_600_000);
-        assert!(t.manage(&p, &before).is_empty());
-        assert!(matches!(t.manage(&p, &after)[0], ExitAction::CloseAll));
-    }
 }

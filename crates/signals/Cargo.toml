@@ -1,6 +1,6 @@
 [package]
 name = "signals"
-description = "Signal engines: renko bricks, OBI bands, aggregated delta, OI regime, exhaustion"
+description = "Raw order-flow exhaustion signal engine"
 version.workspace = true
 edition.workspace = true
 license.workspace = true

@@ -6,7 +6,7 @@
 //!
 //! 报告必含（对应手册条款）：
 //! - 总览：胜率/盈亏比/expectancy/最大回撤/Sharpe/Sortino
-//! - **可行性窗口**：实测胜率 vs 盈亏平衡胜率 vs 几何自然反转率
+//! - **可行性窗口**：实测胜率 vs 盈亏平衡胜率 vs 随机方向基线
 //! - **无效性基线判定**：CI 下沿 > max（几何基线， 盈亏平衡） 才计 Edge
 //! - **多重检验校正**：DSR + PBO；凡报 Sharpe 必附 DSR
 //! - **插件级归因**：按成交 reason 前缀分组的胜率/期望/费用
@@ -25,8 +25,8 @@ use crate::stats::{
 /// 报告配置。
 #[derive(Debug, Clone)]
 pub struct ReportConfig {
-    /// 几何自然反转率（7.3.2；100/62 → 0.605；换参数须用对称对照重标定）
-    pub geometric_baseline: f64,
+    /// 随机方向胜率基线；订单流二元方向默认 50%。
+    pub null_winrate_baseline: f64,
     /// maker/taker 盈亏平衡胜率（7.5-① 表格；由报告者按实际执行方式填）
     pub breakeven_maker: f64,
     pub breakeven_taker: f64,
@@ -41,7 +41,7 @@ pub struct ReportConfig {
 impl Default for ReportConfig {
     fn default() -> Self {
         Self {
-            geometric_baseline: 0.605,
+            null_winrate_baseline: 0.5,
             breakeven_maker: 0.51,
             breakeven_taker: 0.54,
             n_trials: 1,
@@ -90,6 +90,9 @@ pub fn pair_round_trips(fills: &[Fill]) -> Vec<RoundTrip> {
         qty: f64,
         entry_cost: f64, // Σ(price×qty)
         fees: f64,
+        closed_qty: f64,
+        exit_notional: f64,
+        realized_gross: f64,
         entry_maker: bool,
         reason: String,
     }
@@ -107,6 +110,9 @@ pub fn pair_round_trips(fills: &[Fill]) -> Vec<RoundTrip> {
                     qty,
                     entry_cost: px * qty,
                     fees: f.fee,
+                    closed_qty: 0.0,
+                    exit_notional: 0.0,
+                    realized_gross: 0.0,
                     entry_maker: f.is_maker,
                     reason: f.reason.clone(),
                 });
@@ -125,26 +131,28 @@ pub fn pair_round_trips(fills: &[Fill]) -> Vec<RoundTrip> {
                     tcore::types::Side::Buy => (px - entry_px) * close_qty,
                     tcore::types::Side::Sell => (entry_px - px) * close_qty,
                 };
-                // 费用按量比例分摊（开仓费用按 close_qty/o.qty，平仓费用全额归于本段）
-                let open_fee_share = o.fees * (close_qty / o.qty);
-                let pnl_net = gross - open_fee_share - f.fee;
-                trips.push(RoundTrip {
-                    open_ts: o.ts,
-                    close_ts: f.ts.as_millis(),
-                    side: match o.side {
-                        tcore::types::Side::Buy => "long",
-                        tcore::types::Side::Sell => "short",
-                    },
-                    qty: close_qty,
-                    entry: entry_px,
-                    exit: px,
-                    pnl_net,
-                    fees: open_fee_share + f.fee,
-                    entry_maker: o.entry_maker,
-                    exit_reason: f.reason.clone(),
-                    entry_reason: o.reason.clone(),
-                });
+                o.closed_qty += close_qty;
+                o.exit_notional += px * close_qty;
+                o.realized_gross += gross;
+                o.fees += f.fee;
                 if qty >= o.qty {
+                    let total_fees = o.fees;
+                    trips.push(RoundTrip {
+                        open_ts: o.ts,
+                        close_ts: f.ts.as_millis(),
+                        side: match o.side {
+                            tcore::types::Side::Buy => "long",
+                            tcore::types::Side::Sell => "short",
+                        },
+                        qty: o.closed_qty,
+                        entry: entry_px,
+                        exit: o.exit_notional / o.closed_qty.max(1e-12),
+                        pnl_net: o.realized_gross - total_fees,
+                        fees: total_fees,
+                        entry_maker: o.entry_maker,
+                        exit_reason: f.reason.clone(),
+                        entry_reason: o.reason.clone(),
+                    });
                     // 完全平仓或翻仓
                     if qty > o.qty + 1e-12 {
                         let rem = qty - o.qty;
@@ -154,6 +162,9 @@ pub fn pair_round_trips(fills: &[Fill]) -> Vec<RoundTrip> {
                             qty: rem,
                             entry_cost: px * rem,
                             fees: 0.0,
+                            closed_qty: 0.0,
+                            exit_notional: 0.0,
+                            realized_gross: 0.0,
                             entry_maker: f.is_maker,
                             reason: f.reason.clone(),
                         });
@@ -164,7 +175,6 @@ pub fn pair_round_trips(fills: &[Fill]) -> Vec<RoundTrip> {
                     // 部分平仓：缩减开仓
                     let frac = close_qty / o.qty;
                     o.entry_cost *= 1.0 - frac;
-                    o.fees -= open_fee_share;
                     o.qty -= close_qty;
                 }
             }
@@ -355,7 +365,7 @@ pub fn build_report(
     let (verdict, baseline, (p, lo, hi)) = ineffectiveness_gate(
         overall.wins,
         overall.n,
-        cfg.geometric_baseline,
+        cfg.null_winrate_baseline,
         be,
         cfg.min_n,
     );
@@ -379,7 +389,7 @@ pub fn build_report(
         .map(|(g, ts)| {
             let m = metrics_of(&ts);
             let (v, _, _) =
-                ineffectiveness_gate(m.wins, m.n, cfg.geometric_baseline, be, cfg.min_n);
+                ineffectiveness_gate(m.wins, m.n, cfg.null_winrate_baseline, be, cfg.min_n);
             Attribution {
                 group: g,
                 expectancy_lift: m.expectancy - overall.expectancy,
@@ -465,7 +475,7 @@ pub fn to_markdown(r: &Report) -> String {
         r.taker_winrate * 100.0
     ));
     md.push_str(&format!(
-        "- 无效性基线：**{:.1}%**（= max(几何自然反转率, 盈亏平衡胜率)）\n",
+        "- 无效性基线：**{:.1}%**（= max(随机方向基线, 盈亏平衡胜率)）\n",
         r.gate_baseline * 100.0
     ));
     md.push_str(&format!("- **判定：{}**\n", r.gate_verdict));
@@ -570,12 +580,9 @@ mod tests {
             fill(20, Side::Sell, 120.0, 1.0, 0.024, false, "reverse"),
         ];
         let trips = pair_round_trips(&fills);
-        assert_eq!(trips.len(), 2);
-        // 第一段：0.5 × (110−100) − 费用
+        assert_eq!(trips.len(), 1);
         assert!(trips[0].pnl_net > 0.0);
-        // 第二段：0.5 × (120−100) − 费用（翻仓的平仓段）
-        assert!(trips[1].pnl_net > 0.0);
-        assert_eq!(trips[1].exit_reason, "reverse");
+        assert_eq!(trips[0].exit_reason, "reverse");
     }
 
     #[test]
@@ -635,7 +642,7 @@ mod tests {
 
     #[test]
     fn report_gate_noedge_for_coinflip() {
-        // 合成：55% 胜率、300 笔、几何基线 0.605 → NoEdge（点估计高但 CI 下沿 < 0.605）
+        // 合成：55% 胜率、300 笔、基线 0.605 → NoEdge（点估计高但 CI 下沿不足）
         let trips: Vec<RoundTrip> = (0..300)
             .map(|i| rt(if i % 20 < 11 { 100.0 } else { -100.0 }))
             .collect();

@@ -74,24 +74,36 @@ fn main() {
 
         if delta > threshold {
             total_buy += 1;
-            if ret > 0.0 { wins_buy += 1; }
+            if ret > 0.0 {
+                wins_buy += 1;
+            }
             buy_pnl += ret;
         } else if delta < -threshold {
             total_sell += 1;
-            if ret < 0.0 { wins_sell += 1; }
+            if ret < 0.0 {
+                wins_sell += 1;
+            }
             sell_pnl += -ret;
         }
     }
 
     if total_buy > 0 {
         let wr = wins_buy as f64 / total_buy as f64;
-        println!("买方信号 (delta > 1M):  {}笔, 胜率={:.1}%, 总收益={}%", 
-                 total_buy, wr * 100.0, pct(buy_pnl));
+        println!(
+            "买方信号 (delta > 1M):  {}笔, 胜率={:.1}%, 总收益={}%",
+            total_buy,
+            wr * 100.0,
+            pct(buy_pnl)
+        );
     }
     if total_sell > 0 {
         let wr = wins_sell as f64 / total_sell as f64;
-        println!("卖方信号 (delta < -1M): {}笔, 胜率={:.1}%, 总收益={}%", 
-                 total_sell, wr * 100.0, pct(sell_pnl));
+        println!(
+            "卖方信号 (delta < -1M): {}笔, 胜率={:.1}%, 总收益={}%",
+            total_sell,
+            wr * 100.0,
+            pct(sell_pnl)
+        );
     }
 
     // === 2. 大单冲击分析 ===
@@ -107,8 +119,10 @@ fn main() {
         let price = t.price_raw as f64 / 100_000_000.0;
         let qty = t.qty_raw as f64 / 100_000_000.0;
         let usd = price * qty;
-        if usd < 100_000.0 { continue; }
-        
+        if usd < 100_000.0 {
+            continue;
+        }
+
         let t_end = t.ts_ms + 30_000;
         let mut future_px = price;
         for j in (i + 1)..trades.len() {
@@ -122,28 +136,40 @@ fn main() {
                 future_px = trades[j].price_raw as f64 / 100_000_000.0;
             }
         }
-        
+
         let ret = future_px / price - 1.0;
         if t.is_buyer_maker {
             large_sell_total += 1;
-            if ret < 0.0 { large_sell_wins += 1; }
+            if ret < 0.0 {
+                large_sell_wins += 1;
+            }
             large_sell_pnl += -ret;
         } else {
             large_buy_total += 1;
-            if ret > 0.0 { large_buy_wins += 1; }
+            if ret > 0.0 {
+                large_buy_wins += 1;
+            }
             large_buy_pnl += ret;
         }
     }
 
     if large_buy_total > 0 {
         let wr = large_buy_wins as f64 / large_buy_total as f64;
-        println!("大买单冲击 (>100K):   {}笔, 胜率={:.1}%, 总收益={}%", 
-                 large_buy_total, wr * 100.0, pct(large_buy_pnl));
+        println!(
+            "大买单冲击 (>100K):   {}笔, 胜率={:.1}%, 总收益={}%",
+            large_buy_total,
+            wr * 100.0,
+            pct(large_buy_pnl)
+        );
     }
     if large_sell_total > 0 {
         let wr = large_sell_wins as f64 / large_sell_total as f64;
-        println!("大卖单冲击 (>100K):   {}笔, 胜率={:.1}%, 总收益={}%", 
-                 large_sell_total, wr * 100.0, pct(large_sell_pnl));
+        println!(
+            "大卖单冲击 (>100K):   {}笔, 胜率={:.1}%, 总收益={}%",
+            large_sell_total,
+            wr * 100.0,
+            pct(large_sell_pnl)
+        );
     }
 
     // === 3. 时段效应 ===
@@ -159,8 +185,20 @@ fn main() {
     for h in 0..24 {
         if hour_ret[h].1 > 0 {
             let avg = hour_ret[h].0 / hour_ret[h].1 as f64;
-            let session = if h < 7 { "asia" } else if h < 13 { "europe" } else { "us" };
-            println!("  {:02}:00 ({:>6}): 秒均收益={} (n={})", h, session, pct(avg), hour_ret[h].1);
+            let session = if h < 7 {
+                "asia"
+            } else if h < 13 {
+                "europe"
+            } else {
+                "us"
+            };
+            println!(
+                "  {:02}:00 ({:>6}): 秒均收益={} (n={})",
+                h,
+                session,
+                pct(avg),
+                hour_ret[h].1
+            );
         }
     }
 
@@ -170,7 +208,7 @@ fn main() {
     let mut low_vol_total = 0u32;
     let mut high_vol_wins = 0u32;
     let mut high_vol_total = 0u32;
-    
+
     for i in 60..sec_data.len().saturating_sub(60) {
         let mut px_min = f64::MAX;
         let mut px_max = 0.0_f64;
@@ -180,23 +218,33 @@ fn main() {
         }
         let range = (px_max - px_min) / sec_data[i].2;
         let ret = (sec_data[i + 60].2 - sec_data[i].2).abs() / sec_data[i].2;
-        
+
         if range < 0.0005 {
             low_vol_total += 1;
-            if ret > 0.001 { low_vol_wins += 1; }
+            if ret > 0.001 {
+                low_vol_wins += 1;
+            }
         }
         if range > 0.002 {
             high_vol_total += 1;
-            if ret > 0.001 { high_vol_wins += 1; }
+            if ret > 0.001 {
+                high_vol_wins += 1;
+            }
         }
     }
-    
+
     if low_vol_total > 0 {
-        println!("  低波动期 (range<0.05%): {}次, 显著移动率={:.1}%", 
-                 low_vol_total, low_vol_wins as f64 / low_vol_total as f64 * 100.0);
+        println!(
+            "  低波动期 (range<0.05%): {}次, 显著移动率={:.1}%",
+            low_vol_total,
+            low_vol_wins as f64 / low_vol_total as f64 * 100.0
+        );
     }
     if high_vol_total > 0 {
-        println!("  高波动期 (range>0.20%): {}次, 显著移动率={:.1}%", 
-                 high_vol_total, high_vol_wins as f64 / high_vol_total as f64 * 100.0);
+        println!(
+            "  高波动期 (range>0.20%): {}次, 显著移动率={:.1}%",
+            high_vol_total,
+            high_vol_wins as f64 / high_vol_total as f64 * 100.0
+        );
     }
 }
