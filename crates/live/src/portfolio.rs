@@ -209,7 +209,8 @@ impl Ledger {
 pub struct PortfolioExecutor {
     cfg: PortfolioConfig,
     symbol: String,
-    initial_equity: f64,
+    /// 仓位规模基准权益（启动=钱包余额，运行中每 5min 跟随真实钱包刷新）
+    sizing_equity: f64,
     futures: RestClient,
     futures_filters: SymbolFilters,
     spot: Option<SpotRestClient>,
@@ -221,10 +222,14 @@ pub struct PortfolioExecutor {
     ema: Ledger,
     carry: Ledger,
     probe: Ledger,
+    /// MR 腿镜像到真实净仓的成交费用承接账本（fee_weights 无法分摊时的残余）
+    mr_mirror: Ledger,
     probe_day: Option<i64>,
     probe_open: bool,
     last_reconcile_ms: i64,
     last_daily_refresh_ms: i64,
+    last_equity_refresh_ms: i64,
+    last_time_sync_ms: i64,
     last_trade_id: i64,
     funding_cursor_ms: i64,
     funding_ids: HashSet<i64>,
@@ -259,6 +264,7 @@ struct PersistedState {
     ema: LedgerState,
     carry: LedgerState,
     probe: LedgerState,
+    mr_mirror: LedgerState,
 }
 
 impl PortfolioExecutor {
@@ -266,7 +272,7 @@ impl PortfolioExecutor {
     pub async fn new(
         cfg: PortfolioConfig,
         symbol: String,
-        initial_equity: f64,
+        sizing_equity: f64,
         mut futures: RestClient,
         futures_filters: SymbolFilters,
         mut spot: Option<SpotRestClient>,
@@ -307,7 +313,7 @@ impl PortfolioExecutor {
         let mut out = Self {
             cfg,
             symbol,
-            initial_equity,
+            sizing_equity,
             futures,
             futures_filters,
             spot,
@@ -322,11 +328,18 @@ impl PortfolioExecutor {
                 "资金费 Carry",
                 "真实现货多 + 永续空 · FUNDING_FEE 入账",
             ),
-            probe: Ledger::new("execution_probe", "执行探针", "每日一次测试网真实往返"),
+            probe: Ledger::new("execution_probe", "执行探针", "每日一次模拟环境真实往返"),
+            mr_mirror: Ledger::new(
+                "mr_mirror",
+                "MR 镜像净仓",
+                "MR 腿镜像成交的真实费用（引擎内为模拟撮合）",
+            ),
             probe_day: None,
             probe_open: false,
             last_reconcile_ms: 0,
             last_daily_refresh_ms: 0,
+            last_equity_refresh_ms: 0,
+            last_time_sync_ms: now,
             last_trade_id,
             funding_cursor_ms,
             funding_ids: HashSet::new(),
@@ -343,6 +356,7 @@ impl PortfolioExecutor {
             out.ema.restore(&state.ema);
             out.carry.restore(&state.carry);
             out.probe.restore(&state.probe);
+            out.mr_mirror.restore(&state.mr_mirror);
         }
         out.persist_state();
         out.refresh_ema(now).await?;
@@ -360,6 +374,7 @@ impl PortfolioExecutor {
             ema: self.ema.state(),
             carry: self.carry.state(),
             probe: self.probe.state(),
+            mr_mirror: self.mr_mirror.state(),
         };
         if let Some(parent) = self.state_path.parent() {
             let _ = std::fs::create_dir_all(parent);
@@ -422,6 +437,10 @@ impl PortfolioExecutor {
                         self.ema.fee(fee * weights[0] / total);
                         self.carry.fee(fee * weights[1] / total);
                         self.probe.fee(fee * weights[2] / total);
+                    } else {
+                        // 三条腿目标都未变化时，这笔净仓成交是 MR 腿镜像驱动的
+                        // （含重启强平等场景）——费用归入 MR 镜像账本，不再静默丢弃。
+                        self.mr_mirror.fee(fee);
                     }
                 }
             }
@@ -462,6 +481,22 @@ impl PortfolioExecutor {
             return Ok(self.snapshots());
         }
         self.last_reconcile_ms = now_ms;
+        // 仓位规模跟随真实权益（5min 刷新）：复利/亏损都反映到 EMA/carry 名义敞口
+        if now_ms - self.last_equity_refresh_ms >= 300_000 {
+            self.last_equity_refresh_ms = now_ms;
+            match self.futures.wallet_balance_usdt().await {
+                Ok(w) if w > 0.0 => self.sizing_equity = w,
+                Ok(_) => {}
+                Err(e) => warn!(error = %e, "权益刷新失败（沿用上值）"),
+            }
+        }
+        // 长跑时钟漂移防护（6h 重对时，防 -1021）
+        if now_ms - self.last_time_sync_ms >= 6 * 3_600_000 {
+            self.last_time_sync_ms = now_ms;
+            if let Err(e) = self.futures.sync_time().await {
+                warn!(error = %e, "组合定期对时失败（下周期重试）");
+            }
+        }
         if now_ms - self.last_daily_refresh_ms >= 3_600_000 {
             self.refresh_ema(now_ms).await?;
         }
@@ -473,7 +508,7 @@ impl PortfolioExecutor {
         let ema_qty = if self.ema.target_qty.abs() < 1e-10 || self.applied_ema_side != self.ema_side
         {
             self.applied_ema_side = self.ema_side;
-            self.ema_side as f64 * self.initial_equity * self.cfg.ema_notional_x / price
+            self.ema_side as f64 * self.sizing_equity * self.cfg.ema_notional_x / price
         } else {
             self.ema.target_qty
         };
@@ -489,11 +524,11 @@ impl PortfolioExecutor {
             let spot = self
                 .spot
                 .as_ref()
-                .ok_or_else(|| RestError::Data("carry 已启用但缺少 Spot Testnet 凭证".into()))?;
+                .ok_or_else(|| RestError::Data("carry 已启用但缺少现货 Demo 凭证".into()))?;
             let base_asset = self.symbol.strip_suffix("USDT").unwrap_or("BTC");
             let actual_spot = spot.free_balance(base_asset).await?;
             let target_spot =
-                self.spot_baseline_qty + self.initial_equity * self.cfg.carry_notional_x / price;
+                self.spot_baseline_qty + self.sizing_equity * self.cfg.carry_notional_x / price;
             let spot_delta = floor_to_step((target_spot - actual_spot).abs(), self.spot_step);
             let mut managed_spot = actual_spot - self.spot_baseline_qty;
             if spot_delta * price >= 10.0 && spot_delta > 0.0 {
@@ -671,8 +706,9 @@ impl PortfolioExecutor {
             );
         }
         if self.cfg.probe_enabled {
-            rows.push(self.probe.snapshot("币安 Futures Testnet 实际往返成交"));
+            rows.push(self.probe.snapshot("币安模拟盘（Demo）实际往返成交"));
         }
+        rows.push(self.mr_mirror.snapshot("组合净仓真实成交（MR 镜像归因）"));
         rows
     }
 }

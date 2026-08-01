@@ -215,4 +215,13 @@ impl AnyBroker {
             AnyBroker::Testnet(b) => Some(&b.rest),
         }
     }
+
+    /// 定期重对时（防长跑时钟漂移触发 -1021）。Dry 无操作。
+    pub async fn resync_time(&mut self) {
+        if let AnyBroker::Testnet(b) = self {
+            if let Err(e) = b.rest.sync_time().await {
+                warn!(error = %e, "定期对时失败（下周期重试）");
+            }
+        }
+    }
 }

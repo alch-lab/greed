@@ -171,7 +171,7 @@ pub async fn run_trade(
             let spot = match (account.spot_api_key(), account.spot_api_secret()) {
                 (Some(k), Some(s)) => Some(live::SpotRestClient::new(http.clone(), account.spot_rest_base(), k, s)),
                 _ if portfolio_cfg.carry_enabled => anyhow::bail!(
-                    "carry 已启用：请设置 {} 与 {}（Spot Testnet 凭证）",
+                    "carry 已启用：请设置 {} 与 {}（现货 Demo 凭证，https://demo.binance.com → API 管理）",
                     account.spot_api_key_env, account.spot_api_secret_env
                 ),
                 _ => None,
@@ -217,6 +217,10 @@ pub async fn run_trade(
     }
     std::fs::create_dir_all("data/evals")?;
     let mut engine = live::LiveEngine::new(strat, broker, cfg, initial_cash, started_at);
+    // 重启续跑：从既有 journal 恢复账户/持仓/熔断状态（组合模式恢复持仓镜像，
+    // 避免重启把 MR 仓位市价强平且费用无人认领）。
+    // 必须在任何 persist_journal 之前调用，否则空状态会先覆盖 journal。
+    engine.try_restore(portfolio.is_some());
     engine.persist_journal();
 
     // 启动预热：历史 K 线重建信号状态（免去 ~20h 实时攒线）。
@@ -251,10 +255,10 @@ pub async fn run_trade(
                 match maybe {
                     Some(t) => engine.on_trade(&t).await,
                     None => {
-                        if let (Some(executor), Some(price)) = (&mut portfolio, engine.snapshot().last_price) {
-                            let sleeves = executor.shutdown(chrono::Utc::now().timestamp_millis(), price).await?;
-                            engine.set_sleeves(sleeves);
-                        }
+                        // feed 任务退出（如 panic）：不主动清仓——组合持仓由重启后的
+                        // 执行器按磁盘状态接管（不重复开仓），引擎持仓从 journal 恢复。
+                        // 直接报错退出，交给外层监督循环重启整个交易任务。
+                        warn!("行情通道关闭（feed 任务退出），等待监督循环重启");
                         anyhow::bail!("行情通道关闭")
                     },
                 }

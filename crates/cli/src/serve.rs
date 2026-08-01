@@ -23,7 +23,7 @@ use axum::{
 use serde::Deserialize;
 use tokio::sync::{watch, Mutex};
 use tower_http::cors::CorsLayer;
-use tracing::{info, warn};
+use tracing::{error, info, warn};
 
 use crate::trade_runner::{run_trade, TradeArgs, TradeMode};
 
@@ -280,6 +280,26 @@ async fn trade_status(State(st): State<Arc<AppState>>) -> Json<serde_json::Value
     }
 }
 
+/// 交易任务错误是否致命（重试无意义，需人工介入）。
+/// 匹配 run_trade 启动阶段的配置/凭证/持仓检查报错与币安鉴权错误码。
+fn is_fatal_trade_error(msg: &str) -> bool {
+    const FATAL_MARKERS: &[&str] = &[
+        "-2015",          // 币安：Invalid API-key, IP, or permissions
+        "Invalid API-key",
+        "缺少 API 凭证",
+        "缺少现货 Demo 凭证",
+        "carry 已启用",
+        "启动检查失败",
+        "读取配置失败",
+        "读策略配置失败",
+        "解析配置",
+        "解析 [portfolio] 失败",
+        "装配策略失败",
+        "只允许 paper",
+    ];
+    FATAL_MARKERS.iter().any(|m| msg.contains(m))
+}
+
 async fn trade_start(
     State(st): State<Arc<AppState>>,
     Json(req): Json<StartReq>,
@@ -339,6 +359,19 @@ async fn trade_start(
                 }
                 Err(e) => {
                     let msg = format!("{:#}", e);
+                    // 配置/凭证类致命错误重试无意义（key 失效、缺凭证、配置错误、
+                    // 持仓检查失败），直接停在错误状态等人工处理，不空转重启。
+                    if is_fatal_trade_error(&msg) {
+                        error!(error = %msg, "交易任务致命错误，不自动重启");
+                        *error.lock().await = Some(msg.clone());
+                        let _ = st_tx.send(serde_json::json!({
+                            "state": "error",
+                            "mode": args.mode.map(|m| m.as_str()),
+                            "fatal": true,
+                            "error": msg,
+                        }));
+                        break;
+                    }
                     restart_count += 1;
                     warn!(error = %msg, restart_count, backoff_secs, "交易任务异常退出，等待自动重启");
                     *error.lock().await = Some(msg.clone());
@@ -646,6 +679,7 @@ fn exec_backtest(
         equity_curve: result.equity_curve.clone(),
         evals: Vec::new(),
         sleeves: Vec::new(),
+        engine: None,
     };
     std::fs::write(journal_path, serde_json::to_string_pretty(&j)?)?;
 

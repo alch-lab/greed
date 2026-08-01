@@ -5,9 +5,9 @@
 //! - 成交：直接用 [`crate::account::Fill`]（含实际成交价、费用、已实现盈亏）
 //! - 权益曲线：[`crate::report::EquityPoint`]（按 UTC 日采样）
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalSleeve {
     pub key: String,
     pub label: String,
@@ -23,7 +23,7 @@ pub struct JournalSleeve {
 }
 
 /// 一条下单意图记录（扳机扣扳机时产生）。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalIntent {
     pub ts_ms: i64,
     pub side: String,
@@ -38,7 +38,7 @@ pub struct JournalIntent {
 
 /// 一条策略评估记录（信号插件每次评估后产生，可观测性用）。
 /// `note` 为插件自定义 JSON（偏离/阈值/趋势/决策/原因等）。
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JournalEval {
     pub ts_ms: i64,
     pub source: String,
@@ -46,7 +46,7 @@ pub struct JournalEval {
 }
 
 /// 完整流水（CLI `--journal` 导出 JSON 的顶层结构）。
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct Journal {
     pub meta: JournalMeta,
     pub intents: Vec<JournalIntent>,
@@ -54,10 +54,15 @@ pub struct Journal {
     pub equity_curve: Vec<crate::report::EquityPoint>,
     /// 策略评估流水（为什么下单/不下单）；回测不收集则为空
     pub evals: Vec<JournalEval>,
+    #[serde(default)]
     pub sleeves: Vec<JournalSleeve>,
+    /// 实盘引擎私有状态（持仓/熔断计数等），进程重启续跑用。
+    /// 由 live 引擎序列化；回测与前端忽略此字段。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine: Option<serde_json::Value>,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct JournalMeta {
     pub symbol: String,
     pub from: String,

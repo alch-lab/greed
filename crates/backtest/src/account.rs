@@ -25,7 +25,7 @@ pub struct FillRequest {
 }
 
 /// 一笔成交记录（含盈亏与费用），供绩效报告与对账
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Fill {
     pub ts: Timestamp,
     pub side: Side,
@@ -42,7 +42,7 @@ pub struct Fill {
 }
 
 /// 内部持仓
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
 pub struct OpenPosition {
     pub side: Side,
     pub entry_price: Price,
@@ -112,6 +112,22 @@ impl Account {
     }
     pub fn fills(&self) -> &[Fill] {
         &self.fills
+    }
+
+    /// 从持久化状态整体恢复账户（进程重启续跑用）。
+    /// 调用方负责保证 fills 与 position/cash 来自同一次原子落盘。
+    pub fn from_parts(
+        initial_cash: f64,
+        cash: f64,
+        position: Option<OpenPosition>,
+        fills: Vec<Fill>,
+    ) -> Self {
+        Account {
+            initial_cash,
+            cash,
+            position,
+            fills,
+        }
     }
 
     /// 权益 = 现金 + 未实现盈亏（无持仓即现金）。

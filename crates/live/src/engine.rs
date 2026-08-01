@@ -76,7 +76,7 @@ pub struct PositionSnap {
 }
 
 /// 一笔持仓的绩效追踪：开仓建立、平仓结算成 trip 记录。
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct PosTrack {
     side: String,
     entry_price: f64,
@@ -91,6 +91,31 @@ struct PosTrack {
     last_qty: f64,
     adds: u32,
 }
+
+/// 引擎持久化状态（写进 journal 的 `engine` 字段，进程重启续跑用）。
+///
+/// 设计约束：出场/扳机插件全部无状态（从 `Position` 视图推导），
+/// 因此只要恢复 Account（cash/position/fills）+ 熔断计数，
+/// 策略即可无缝接管重启前的持仓，不会因重启被强平。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct EngineState {
+    version: u32,
+    symbol: String,
+    strategy: String,
+    initial_cash: f64,
+    cash: f64,
+    position: Option<backtest::OpenPosition>,
+    /// 一致性哨兵：必须等于同一 journal 的 fills 长度，否则放弃恢复
+    fills_len: usize,
+    cb_day: i64,
+    cb_day_start_equity: f64,
+    cb_consec_losses: u32,
+    cb_on: bool,
+    cb_noted_fills: usize,
+    pos_track: Option<PosTrack>,
+}
+
+const ENGINE_STATE_VERSION: u32 = 1;
 
 pub struct LiveEngine {
     strategy: Strategy,
@@ -124,8 +149,11 @@ pub struct LiveEngine {
     last_fill_poll_ms: i64,
     last_funding_poll_ms: i64,
     last_reconcile_ms: i64,
+    last_time_sync_ms: i64,
     sleeves: Vec<JournalSleeve>,
     sleeve_pnl: f64,
+    /// 重启恢复持仓后，首个行情节拍按 journal 止损价重挂保护性止损
+    needs_stop_rearm: bool,
 }
 
 impl LiveEngine {
@@ -164,8 +192,10 @@ impl LiveEngine {
             last_fill_poll_ms: 0,
             last_funding_poll_ms: 0,
             last_reconcile_ms: 0,
+            last_time_sync_ms: 0,
             sleeves: Vec::new(),
             sleeve_pnl: 0.0,
+            needs_stop_rearm: false,
         }
     }
 
@@ -177,6 +207,96 @@ impl LiveEngine {
         self.sleeve_pnl = sleeves.iter().map(|row| row.pnl).sum();
         self.sleeves = sleeves;
         self.persist_journal();
+    }
+
+    /// 从既有 journal 恢复引擎状态（进程重启续跑）。
+    ///
+    /// 返回 true 表示完成恢复。恢复内容：账户（cash/持仓/fills）、熔断计数、
+    /// MFE/MAE 追踪、journal 流水（intents/权益曲线/评估）。挂起的入场单不恢复
+    /// （broker 是新建的，挂单已不存在；信号会重新评估）。
+    ///
+    /// `allow_position`：仅组合模式（dry 撮合 + 执行器镜像真实净仓）传 true。
+    /// 非组合模式的持仓是交易所真实仓位，启动前的持仓检查已保证交易所为空，
+    /// 此时 journal 里的持仓是人工平仓后的残留，必须丢弃。
+    pub fn try_restore(&mut self, allow_position: bool) -> bool {
+        let path = &self.config.journal_path;
+        let text = match std::fs::read_to_string(path) {
+            Ok(t) => t,
+            Err(_) => return false, // 首次启动，无 journal
+        };
+        let journal: Journal = match serde_json::from_str(&text) {
+            Ok(j) => j,
+            Err(e) => {
+                warn!(error = %e, "journal 解析失败，全新开局");
+                return false;
+            }
+        };
+        let Some(engine_value) = journal.engine else {
+            info!("journal 无引擎状态（旧版本或回测产物），全新开局");
+            return false;
+        };
+        let state: EngineState = match serde_json::from_value(engine_value) {
+            Ok(s) => s,
+            Err(e) => {
+                warn!(error = %e, "引擎状态解析失败，全新开局");
+                return false;
+            }
+        };
+        if state.version != ENGINE_STATE_VERSION {
+            warn!(version = state.version, "引擎状态版本不匹配，全新开局");
+            return false;
+        }
+        if state.symbol != self.config.symbol || state.strategy != self.config.strategy_name {
+            warn!(
+                state_symbol = %state.symbol,
+                state_strategy = %state.strategy,
+                "引擎状态与当前配置不匹配，全新开局"
+            );
+            return false;
+        }
+        if state.fills_len != journal.fills.len() {
+            warn!(
+                state_fills = state.fills_len,
+                journal_fills = journal.fills.len(),
+                "引擎状态与 journal fills 不一致（上次落盘不完整？），全新开局"
+            );
+            return false;
+        }
+
+        let dropped_position = state.position.is_some() && !allow_position;
+        if dropped_position {
+            warn!("非组合模式恢复：丢弃 journal 中的持仓（交易所侧已由人工/启动检查处理）");
+        }
+        let position = if allow_position { state.position } else { None };
+        let needs_rearm = position.and_then(|p| p.stop_price).is_some();
+
+        self.account = Account::from_parts(
+            state.initial_cash,
+            state.cash,
+            position,
+            journal.fills,
+        );
+        self.intents = journal.intents;
+        self.equity_curve = journal.equity_curve;
+        self.evals = journal.evals;
+        self.started_at = journal.meta.from;
+        self.cb_day = state.cb_day;
+        self.cb_day_start_equity = state.cb_day_start_equity;
+        self.cb_consec_losses = state.cb_consec_losses;
+        self.cb_on = state.cb_on;
+        self.cb_noted_fills = state.cb_noted_fills;
+        self.pos_track = state.pos_track;
+        self.needs_stop_rearm = needs_rearm;
+        self.sync_position_flag();
+
+        info!(
+            fills = self.account.fills().len(),
+            cash = self.account.cash(),
+            has_position = position.is_some(),
+            needs_stop_rearm = self.needs_stop_rearm,
+            "已从 journal 恢复引擎状态（重启续跑）"
+        );
+        true
     }
 
     /// 预热专用：只推进时钟/价格并喂信号插件，**不做撮合/持仓管理/开仓评估**。
@@ -383,6 +503,18 @@ impl LiveEngine {
         }
         self.settle_pending_entry(trade.ts).await;
 
+        // 重启恢复：broker 是新建的（模拟/交易所挂单均不存在），
+        // 首个行情节拍按 journal 记录的止损价重挂保护性止损
+        if self.needs_stop_rearm {
+            self.needs_stop_rearm = false;
+            if let Some(p) = self.account.position().copied() {
+                if let Some(stop) = p.stop_price {
+                    info!(stop = stop.to_f64(), "恢复持仓：重挂保护性止损");
+                    self.place_protective_stop(trade.ts, trade.price, stop).await;
+                }
+            }
+        }
+
         // 2) 信号插件
         let ev = Event::Trade(trade.clone());
         self.ctx.now = Some(trade.ts);
@@ -478,6 +610,12 @@ impl LiveEngine {
                 });
                 self.persist_journal();
             }
+        }
+
+        // 时钟漂移防护（6h）：长跑后本地时钟可能漂出 recvWindow（-1021）
+        if now_ms - self.last_time_sync_ms >= 6 * 3_600_000 {
+            self.last_time_sync_ms = now_ms;
+            self.broker.resync_time().await;
         }
 
         // 钱包对账（1h）：本地记账 vs testnet 钱包，漂移告警
@@ -860,6 +998,21 @@ impl LiveEngine {
     /// 原子重写 journal（tmp + rename）。
     pub fn persist_journal(&self) {
         let px = self.latest_price.unwrap_or(Price::ZERO);
+        let engine_state = EngineState {
+            version: ENGINE_STATE_VERSION,
+            symbol: self.config.symbol.clone(),
+            strategy: self.config.strategy_name.clone(),
+            initial_cash: self.account.initial_cash(),
+            cash: self.account.cash(),
+            position: self.account.position().copied(),
+            fills_len: self.account.fills().len(),
+            cb_day: self.cb_day,
+            cb_day_start_equity: self.cb_day_start_equity,
+            cb_consec_losses: self.cb_consec_losses,
+            cb_on: self.cb_on,
+            cb_noted_fills: self.cb_noted_fills,
+            pos_track: self.pos_track.clone(),
+        };
         let journal = Journal {
             meta: JournalMeta {
                 symbol: self.config.symbol.clone(),
@@ -874,6 +1027,7 @@ impl LiveEngine {
             equity_curve: self.equity_curve.clone(),
             evals: self.evals.clone(),
             sleeves: self.sleeves.clone(),
+            engine: serde_json::to_value(engine_state).ok(),
         };
         let path = &self.config.journal_path;
         let tmp = path.with_extension("tmp");
@@ -1129,6 +1283,90 @@ deviation_threshold = 0.015
         assert!(evals.len() > 200, "evals={}", evals.len());
         assert_eq!(evals[0]["source"], "DualTfMeanReversion");
         assert_eq!(evals[0]["note"]["decision"], "warmup");
+        let _ = std::fs::remove_file(&cfg.journal_path);
+    }
+
+    /// 重启续跑（P1-1 回归）：持仓/现金/fills/熔断计数从 journal 恢复；
+    /// 恢复后首个行情节拍按 journal 止损价重挂保护性止损；
+    /// 非组合模式恢复时丢弃持仓（交易所侧已由启动检查保证为空）。
+    #[tokio::test]
+    async fn restore_resumes_position_and_account() {
+        let cfg = test_config("restore");
+        let _ = std::fs::remove_file(&cfg.journal_path);
+
+        // 第一段进程：注入两笔成交（开仓 + 部分止盈），制造非平凡账户状态
+        let mut eng = LiveEngine::new(
+            noop_strategy(),
+            AnyBroker::dry(FeeModel::default()),
+            cfg.clone(),
+            10_000.0,
+            "2026-08-01".into(),
+        );
+        eng.account.apply_fill(FillRequest {
+            ts: Timestamp::from_millis(1000),
+            side: Side::Buy,
+            price: Price::from_f64(60_000.0),
+            qty: Qty::from_f64(0.2),
+            fee: 1.0,
+            is_maker: false,
+            reason: "open".into(),
+        });
+        eng.account.position_mut().unwrap().stop_price = Some(Price::from_f64(59_000.0));
+        eng.account.apply_fill(FillRequest {
+            ts: Timestamp::from_millis(2000),
+            side: Side::Sell,
+            price: Price::from_f64(61_000.0),
+            qty: Qty::from_f64(0.1),
+            fee: 1.0,
+            is_maker: false,
+            reason: "tp_partial".into(),
+        });
+        eng.cb_day = 42;
+        eng.cb_consec_losses = 2;
+        eng.persist_journal();
+
+        // 第二段进程：新引擎从 journal 恢复（组合模式，allow_position=true）
+        let mut eng2 = LiveEngine::new(
+            noop_strategy(),
+            AnyBroker::dry(FeeModel::default()),
+            cfg.clone(),
+            10_000.0,
+            "2026-08-01".into(),
+        );
+        assert!(eng2.try_restore(true));
+        assert_eq!(eng2.account().fills().len(), 2);
+        // cash = 10000 - 1(开仓费) + 100(止盈 0.1 × $1000) - 1(平仓费)
+        assert!((eng2.account().cash() - 10_098.0).abs() < 1e-6);
+        let pos = eng2.account().position().expect("持仓应恢复");
+        assert_eq!(pos.side, Side::Buy);
+        assert!((pos.qty.to_f64() - 0.1).abs() < 1e-9);
+        assert!((pos.closed_frac - 0.5).abs() < 1e-9);
+        assert_eq!(pos.stop_price, Some(Price::from_f64(59_000.0)));
+        assert!(eng2.needs_stop_rearm);
+        assert_eq!(eng2.cb_day, 42);
+        assert_eq!(eng2.cb_consec_losses, 2);
+
+        // 恢复后首个行情节拍：重挂保护性止损且不丢失止损价
+        eng2.on_trade(&trade(3000, 60_500.0)).await;
+        assert!(!eng2.needs_stop_rearm);
+        assert_eq!(
+            eng2.account().position().unwrap().stop_price,
+            Some(Price::from_f64(59_000.0))
+        );
+
+        // 非组合模式恢复：持仓丢弃，现金/fills 保留（人工已平仓的场景）
+        let mut eng3 = LiveEngine::new(
+            noop_strategy(),
+            AnyBroker::dry(FeeModel::default()),
+            cfg.clone(),
+            10_000.0,
+            "2026-08-01".into(),
+        );
+        assert!(eng3.try_restore(false));
+        assert!(eng3.account().position().is_none());
+        assert_eq!(eng3.account().fills().len(), 2);
+        assert!((eng3.account().cash() - 10_098.0).abs() < 1e-6);
+
         let _ = std::fs::remove_file(&cfg.journal_path);
     }
 }
