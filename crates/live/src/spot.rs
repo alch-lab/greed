@@ -119,6 +119,27 @@ impl SpotRestClient {
             .ok_or_else(|| RestError::Data(format!("spot account 无 {} 余额", asset)))
     }
 
+    /// 一次账户查询返回现货 USDT 与基础币总余额（free + locked）。
+    pub async fn equity_balances(&self, base_asset: &str) -> Result<(f64, f64), RestError> {
+        let value = self
+            .signed(reqwest::Method::GET, "/api/v3/account", &[])
+            .await?;
+        let total = |asset: &str| -> Option<f64> {
+            let row = value["balances"]
+                .as_array()?
+                .iter()
+                .find(|row| row["asset"].as_str() == Some(asset))?;
+            let free = row["free"].as_str()?.parse::<f64>().ok()?;
+            let locked = row["locked"].as_str()?.parse::<f64>().ok()?;
+            Some(free + locked)
+        };
+        let usdt =
+            total("USDT").ok_or_else(|| RestError::Data("spot account 无 USDT 余额".into()))?;
+        let base = total(base_asset)
+            .ok_or_else(|| RestError::Data(format!("spot account 无 {} 余额", base_asset)))?;
+        Ok((usdt, base))
+    }
+
     pub async fn lot_step(&self, symbol: &str) -> Result<f64, RestError> {
         let value = self
             .public_get(&format!("/api/v3/exchangeInfo?symbol={}", symbol))

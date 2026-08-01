@@ -265,6 +265,21 @@ impl RestClient {
             .ok_or_else(|| RestError::Data("balance 响应无 USDT".into()))
     }
 
+    /// 合约账户真实权益：钱包余额 + 全仓未实现盈亏（GET /fapi/v2/account）。
+    /// 返回 (wallet_balance, unrealized_pnl)。策略收益仍使用本地 sleeve 记账。
+    pub async fn account_equity(&self) -> Result<(f64, f64), RestError> {
+        let v = self.signed(reqwest::Method::GET, "/fapi/v2/account", &[]).await?;
+        let wallet = v["totalWalletBalance"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .ok_or_else(|| RestError::Data("account 响应无 totalWalletBalance".into()))?;
+        let unrealized = v["totalUnrealizedProfit"]
+            .as_str()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0.0);
+        Ok((wallet, unrealized))
+    }
+
     /// 当前持仓数量（带符号：多正空负；0 = 空仓）。GET /fapi/v2/positionRisk。
     pub async fn position_amt(&self, symbol: &str) -> Result<f64, RestError> {
         let v = self

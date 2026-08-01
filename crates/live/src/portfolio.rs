@@ -1,6 +1,6 @@
 //! 单账户组合执行器：各策略生成目标敞口，执行层只向币安提交合并后的净仓位。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
 use backtest::JournalSleeve;
@@ -235,8 +235,12 @@ pub struct PortfolioExecutor {
     funding_ids: HashSet<i64>,
     spot_baseline_qty: f64,
     state_path: PathBuf,
-    fee_weights: [f64; 3],
+    /// 每个真实永续订单对应的 sleeve 目标变化，用 orderId 精确归因成交费用。
+    fee_weights_by_order: HashMap<i64, [f64; 3]>,
     last_actual_qty: f64,
+    /// 真实账户权益（合约钱包+未实现盈亏；现货 USDT+BTC 市值），reconcile 周期刷新
+    real_futures_equity: f64,
+    real_spot_equity: f64,
 }
 
 #[derive(Default, serde::Serialize, serde::Deserialize)]
@@ -328,7 +332,11 @@ impl PortfolioExecutor {
                 "资金费 Carry",
                 "真实现货多 + 永续空 · FUNDING_FEE 入账",
             ),
-            probe: Ledger::new("execution_probe", "执行探针", "每日一次模拟环境真实往返"),
+            probe: Ledger::new(
+                "execution_probe",
+                "执行探针（健康检查）",
+                "非盈利策略 · 每日 UTC 00:00 一次真实往返",
+            ),
             mr_mirror: Ledger::new(
                 "mr_mirror",
                 "MR 镜像净仓",
@@ -345,8 +353,10 @@ impl PortfolioExecutor {
             funding_ids: HashSet::new(),
             spot_baseline_qty,
             state_path,
-            fee_weights: [0.0; 3],
+            fee_weights_by_order: HashMap::new(),
             last_actual_qty,
+            real_futures_equity: sizing_equity,
+            real_spot_equity: 0.0,
         };
         if let Some(state) = saved {
             out.ema_side = state.ema_side;
@@ -431,7 +441,11 @@ impl PortfolioExecutor {
                 for row in rows {
                     self.last_trade_id = self.last_trade_id.max(row.trade_id);
                     let fee = row.commission.parse::<f64>().unwrap_or(0.0);
-                    let weights = self.fee_weights;
+                    let weights = self
+                        .fee_weights_by_order
+                        .get(&row.order_id)
+                        .copied()
+                        .unwrap_or([0.0; 3]);
                     let total: f64 = weights.iter().sum();
                     if total > 0.0 {
                         self.ema.fee(fee * weights[0] / total);
@@ -576,13 +590,13 @@ impl PortfolioExecutor {
         let actual = self.futures.position_amt(&self.symbol).await?;
         let delta = floor_to_step((target - actual).abs(), self.futures_filters.step_size);
         if delta * price >= self.futures_filters.min_notional && delta > 0.0 {
-            self.fee_weights = [
+            let fee_weights = [
                 (self.ema.target_qty - old_targets[0]).abs(),
                 (self.carry.target_qty - old_targets[1]).abs(),
                 (self.probe.target_qty - old_targets[2]).abs(),
             ];
             let side = if target > actual { "BUY" } else { "SELL" };
-            if let Err(error) = self
+            match self
                 .futures
                 .place_order(
                     &self.symbol,
@@ -596,40 +610,61 @@ impl PortfolioExecutor {
                 )
                 .await
             {
-                // 超时不代表订单一定失败：先查询实际净仓。若确实未对齐，撤回本轮
-                // 新增的现货数量，避免 carry 单腿暴露。
-                let after = self
-                    .futures
-                    .position_amt(&self.symbol)
-                    .await
-                    .unwrap_or(actual);
-                if (target - after).abs() * price >= self.futures_filters.min_notional {
-                    if spot_change.abs() > 0.0 {
-                        if let Some(spot) = &self.spot {
-                            let rollback_side = if spot_change > 0.0 { "SELL" } else { "BUY" };
-                            if let Ok(fill) = spot
-                                .market_order(
-                                    &self.symbol,
-                                    rollback_side,
-                                    spot_change.abs(),
-                                    self.spot_step,
-                                )
-                                .await
-                            {
-                                self.carry.fee(fill.fee_usdt);
-                                warn!(
-                                    rollback_side,
-                                    qty = fill.qty,
-                                    "永续腿失败，已回滚本轮现货变化"
-                                );
+                Ok(order_id) => {
+                    self.fee_weights_by_order.insert(order_id, fee_weights);
+                }
+                Err(error) => {
+                    // 超时不代表订单一定失败：先查询实际净仓。若确实未对齐，撤回本轮
+                    // 新增的现货数量，避免 carry 单腿暴露。
+                    let after = self
+                        .futures
+                        .position_amt(&self.symbol)
+                        .await
+                        .unwrap_or(actual);
+                    if (target - after).abs() * price >= self.futures_filters.min_notional {
+                        if spot_change.abs() > 0.0 {
+                            if let Some(spot) = &self.spot {
+                                let rollback_side = if spot_change > 0.0 { "SELL" } else { "BUY" };
+                                if let Ok(fill) = spot
+                                    .market_order(
+                                        &self.symbol,
+                                        rollback_side,
+                                        spot_change.abs(),
+                                        self.spot_step,
+                                    )
+                                    .await
+                                {
+                                    self.carry.fee(fill.fee_usdt);
+                                    warn!(
+                                        rollback_side,
+                                        qty = fill.qty,
+                                        "永续腿失败，已回滚本轮现货变化"
+                                    );
+                                }
                             }
                         }
+                        return Err(error);
                     }
-                    return Err(error);
+                    warn!(error = %error, "永续下单响应异常，但持仓查询确认已成交");
                 }
-                warn!(error = %error, "永续下单响应异常，但持仓查询确认已成交");
             }
             info!(target, actual, delta, side, "组合永续净仓位已对齐");
+        }
+
+        // 真实账户权益（总资产口径）：合约钱包+未实现盈亏，现货 USDT+BTC 市值。
+        // 查询失败沿用旧值，不阻塞交易。
+        match self.futures.account_equity().await {
+            Ok((wallet, unrealized)) => self.real_futures_equity = wallet + unrealized,
+            Err(e) => warn!(error = %e, "合约真实权益查询失败（沿用上值）"),
+        }
+        if let Some(spot) = &self.spot {
+            let base_asset = self.symbol.strip_suffix("USDT").unwrap_or("BTC");
+            match spot.equity_balances(base_asset).await {
+                Ok((usdt, base_qty)) => {
+                    self.real_spot_equity = usdt + base_qty * price;
+                }
+                Err(e) => warn!(error = %e, "现货真实权益查询失败（沿用上值）"),
+            }
         }
 
         self.actual_fees_and_funding().await;
@@ -639,6 +674,15 @@ impl PortfolioExecutor {
             .await
             .unwrap_or(target);
         Ok(self.snapshots())
+    }
+
+    /// 真实账户权益分解：(合约, 现货, 总计)。
+    pub fn real_equity(&self) -> (f64, f64, f64) {
+        (
+            self.real_futures_equity,
+            self.real_spot_equity,
+            self.real_futures_equity + self.real_spot_equity,
+        )
     }
 
     pub fn actual_qty(&self) -> f64 {
