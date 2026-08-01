@@ -383,6 +383,7 @@ dependencies = [
  "reqwest",
  "serde",
  "serde_json",
+ "sha2",
  "signals",
  "strategy",
  "thiserror 1.0.69",

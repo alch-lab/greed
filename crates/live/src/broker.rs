@@ -37,6 +37,7 @@ pub struct TestnetBroker {
     open: HashMap<i64, OrderMeta>,
     /// userTrades 游标（最后处理过的 trade id）
     last_trade_id: i64,
+    last_submitted_order_id: Option<i64>,
 }
 
 /// 经纪层统一入口（枚举分发，避免 async trait 对象安全问题）。
@@ -59,6 +60,7 @@ impl AnyBroker {
             filters,
             open: HashMap::new(),
             last_trade_id: 0,
+            last_submitted_order_id: None,
         })
     }
 
@@ -101,6 +103,7 @@ impl AnyBroker {
                         &b.filters,
                     )
                     .await?;
+                b.last_submitted_order_id = Some(order_id);
                 info!(
                     order_id,
                     side = ?order.side,
@@ -185,6 +188,8 @@ impl AnyBroker {
                 "testnet 成交"
             );
             out.push(Execution {
+                order_id: Some(ut.order_id),
+                trade_id: Some(ut.trade_id),
                 ts: Timestamp::from_millis(ut.time),
                 side,
                 price: Price::from_f64(price),
@@ -196,6 +201,13 @@ impl AnyBroker {
         }
         out.sort_by_key(|e| e.ts);
         out
+    }
+
+    pub fn last_submitted_order_id(&self) -> Option<i64> {
+        match self {
+            AnyBroker::Dry(_) => None,
+            AnyBroker::Testnet(b) => b.last_submitted_order_id,
+        }
     }
 
     /// 撤销全部挂单。

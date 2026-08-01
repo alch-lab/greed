@@ -7,6 +7,7 @@ use anyhow::{Context, Result};
 use backtest::FeeModel;
 use data::live::config::AccountConfig;
 use data::live::CollectorConfig;
+use sha2::{Digest, Sha256};
 use strategy::{assemble_from_toml, builtin_registry};
 use tcore::types::Exchange;
 use tracing::{info, warn};
@@ -164,6 +165,20 @@ pub async fn run_trade(
 
     let started_at = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let started_ms = chrono::Utc::now().timestamp_millis();
+    let run_id = format!("{}-{}-{}", mode.as_str(), started_ms, std::process::id());
+    let strategy_hash = format!("{:x}", Sha256::digest(toml_str.as_bytes()));
+    let git_commit = std::env::var("GREED_GIT_COMMIT").unwrap_or_else(|_| {
+        std::process::Command::new("git")
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .ok()
+            .filter(|x| x.status.success())
+            .map(|x| String::from_utf8_lossy(&x.stdout).trim().to_string())
+            .filter(|x| !x.is_empty())
+            .unwrap_or_else(|| "unknown".into())
+    });
+    let eval_dir = format!("data/evals/{}", mode.as_str());
+    let research_dir = format!("data/research/{}", mode.as_str());
     let cfg = live::LiveConfig {
         symbol: collector.symbol.clone(),
         risk_pct: args.risk_pct,
@@ -175,13 +190,21 @@ pub async fn run_trade(
         qty_step,
         min_notional,
         journal_path: std::path::PathBuf::from(&journal_path),
-        eval_log_path: std::path::PathBuf::from(format!("data/evals/{}.jsonl", mode.as_str())),
+        eval_log_path: std::path::PathBuf::from(format!("{eval_dir}/{run_id}.jsonl")),
+        research_log_dir: std::path::PathBuf::from(&research_dir),
         strategy_name: args.strategy.clone(),
+        strategy_hash,
+        strategy_snapshot: toml_str.clone(),
+        git_commit,
+        run_id,
+        mode: mode.as_str().into(),
+        estimated_roundtrip_fee_bps: 6.0,
     };
     if let Some(parent) = std::path::Path::new(&journal_path).parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::create_dir_all("data/evals")?;
+    std::fs::create_dir_all(&eval_dir)?;
+    std::fs::create_dir_all(&research_dir)?;
     let mut engine = live::LiveEngine::new(strat, broker, cfg, initial_cash, started_at);
     // 重启续跑：从既有 journal 恢复单账户持仓、现金、成交与熔断状态。
     // 必须在任何 persist_journal 之前调用，否则空状态会先覆盖 journal。
@@ -264,6 +287,14 @@ pub async fn run_trade(
                         "n_intents": snap.n_intents,
                         "n_fills": snap.n_fills,
                         "last_eval": snap.last_eval,
+                        "run_id": snap.run_id,
+                        "strategy_name": snap.strategy_name,
+                        "strategy_hash": snap.strategy_hash,
+                        "git_commit": snap.git_commit,
+                        "research_log_dir": snap.research_log_dir,
+                        "active_shadow_signals": snap.active_shadow_signals,
+                        "confirmed_signals_run": snap.confirmed_signals_run,
+                        "shadow_outcomes_run": snap.shadow_outcomes_run,
                     }));
                 }
             }

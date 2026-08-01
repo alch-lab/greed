@@ -28,7 +28,7 @@ pub fn register_builtin(r: &mut PluginRegistry) {
 mod tests {
     use super::*;
     #[test]
-    fn builtin_registry_has_core_plugins() {
+    fn builtin_registry_has_layered_orderflow_plugins() {
         let r = builtin_registry();
         assert!(r.filter_names().contains(&"SessionFilter"));
         assert!(r.filter_names().contains(&"CircuitBreaker"));

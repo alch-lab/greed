@@ -45,16 +45,49 @@ pub struct LiveConfig {
     pub journal_path: PathBuf,
     /// 评估流水全量落盘路径（JSONL append；journal 只留环形 300 条，分析用全量）
     pub eval_log_path: PathBuf,
+    /// 每日滚动的研究事件目录（运行、信号、影子结果、订单生命周期）。
+    pub research_log_dir: PathBuf,
     /// 策略描述（写进 journal meta，前端展示）
     pub strategy_name: String,
+    pub strategy_hash: String,
+    pub strategy_snapshot: String,
+    pub git_commit: String,
+    pub run_id: String,
+    pub mode: String,
+    /// 影子信号估算净收益时采用的往返费用（bps）。
+    pub estimated_roundtrip_fee_bps: f64,
 }
 
 /// 挂起中的入场（testnet：已下单待成交；dry：限价单待触发）。
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct PendingEntry {
     stop_price: Price,
     tp1_price: Option<Price>,
     expire_ts: Timestamp,
+    intent_id: String,
+    event_id: Option<i64>,
+    order_id: Option<i64>,
+    submitted_ts_ms: i64,
+    qty: f64,
+    reason: String,
+}
+
+/// 每一个已确认信号都跟踪到 4 小时，不论其是否获准交易。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+struct ShadowSignal {
+    event_id: i64,
+    signal_ts_ms: i64,
+    side: String,
+    profile: String,
+    strength: String,
+    event_price: f64,
+    confirm_price: f64,
+    stop_anchor: Option<f64>,
+    context_score: Option<u64>,
+    location_confirmed: Option<bool>,
+    mfe_pct: f64,
+    mae_pct: f64,
+    next_horizon: usize,
 }
 
 /// 引擎状态快照（控制面 `/api/trade/status` 的数据源）。
@@ -68,6 +101,14 @@ pub struct EngineSnapshot {
     pub n_fills: usize,
     /// 最近一次策略评估说明（信号插件 eval_note）
     pub last_eval: Option<serde_json::Value>,
+    pub run_id: String,
+    pub strategy_name: String,
+    pub strategy_hash: String,
+    pub git_commit: String,
+    pub research_log_dir: String,
+    pub active_shadow_signals: usize,
+    pub confirmed_signals_run: usize,
+    pub shadow_outcomes_run: usize,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -106,6 +147,7 @@ struct EngineState {
     version: u32,
     symbol: String,
     strategy: String,
+    strategy_hash: String,
     initial_cash: f64,
     cash: f64,
     position: Option<backtest::OpenPosition>,
@@ -117,9 +159,16 @@ struct EngineState {
     cb_on: bool,
     cb_noted_fills: usize,
     pos_track: Option<PosTrack>,
+    #[serde(default)]
+    shadow_signals: Vec<ShadowSignal>,
+    #[serde(default)]
+    confirmed_signals_run: usize,
+    #[serde(default)]
+    shadow_outcomes_run: usize,
 }
 
-const ENGINE_STATE_VERSION: u32 = 1;
+const ENGINE_STATE_VERSION: u32 = 2;
+const SHADOW_HORIZONS_MIN: [i64; 6] = [5, 15, 30, 60, 120, 240];
 
 pub struct LiveEngine {
     strategy: Strategy,
@@ -141,6 +190,9 @@ pub struct LiveEngine {
     latest_eval: Option<serde_json::Value>,
     // ---- 持仓绩效追踪（MFE/MAE，优化止盈止损的核心数据）----
     pos_track: Option<PosTrack>,
+    shadow_signals: Vec<ShadowSignal>,
+    confirmed_signals_run: usize,
+    shadow_outcomes_run: usize,
     // ---- 入场挂起 ----
     pending_entry: Option<PendingEntry>,
     // ---- 熔断状态（同回测）----
@@ -168,7 +220,7 @@ impl LiveEngine {
     ) -> Self {
         let symbol = Symbol::new(&config.symbol);
         let n_signals = strategy.signals.len();
-        LiveEngine {
+        let engine = LiveEngine {
             strategy,
             broker,
             account: Account::new(initial_cash),
@@ -185,6 +237,9 @@ impl LiveEngine {
             last_eval_keys: vec![None; n_signals],
             latest_eval: None,
             pos_track: None,
+            shadow_signals: Vec::new(),
+            confirmed_signals_run: 0,
+            shadow_outcomes_run: 0,
             pending_entry: None,
             cb_day: i64::MIN,
             cb_day_start_equity: 0.0,
@@ -196,11 +251,63 @@ impl LiveEngine {
             last_reconcile_ms: 0,
             last_time_sync_ms: 0,
             needs_stop_rearm: false,
-        }
+        };
+        engine.append_research(
+            "run_start",
+            chrono::Utc::now().timestamp_millis(),
+            serde_json::json!({
+                "strategy_snapshot": engine.config.strategy_snapshot,
+                "risk_pct": engine.config.risk_pct,
+                "max_risk_pct": engine.config.max_risk_pct,
+                "max_leverage": engine.config.max_leverage,
+                "entry_ttl_ms": engine.config.entry_ttl_ms,
+                "estimated_roundtrip_fee_bps": engine.config.estimated_roundtrip_fee_bps,
+                "initial_cash": initial_cash,
+            }),
+        );
+        engine
     }
 
     pub fn account(&self) -> &Account {
         &self.account
+    }
+
+    /// 追加一条可长期分析的结构化事件。按 UTC 日期滚动，写入失败不影响交易。
+    fn append_research(&self, event_type: &str, ts_ms: i64, data: serde_json::Value) {
+        use std::io::Write;
+
+        let date = chrono::DateTime::from_timestamp_millis(ts_ms)
+            .unwrap_or_else(chrono::Utc::now)
+            .format("%Y-%m-%d");
+        if let Err(e) = std::fs::create_dir_all(&self.config.research_log_dir) {
+            warn!(error = %e, "research 日志目录创建失败");
+            return;
+        }
+        let path = self.config.research_log_dir.join(format!("{date}.jsonl"));
+        let line = serde_json::json!({
+            "schema_version": 1,
+            "event_type": event_type,
+            "ts_ms": ts_ms,
+            "run_id": self.config.run_id,
+            "mode": self.config.mode,
+            "symbol": self.config.symbol,
+            "strategy_name": self.config.strategy_name,
+            "strategy_hash": self.config.strategy_hash,
+            "git_commit": self.config.git_commit,
+            "data": data,
+        });
+        match std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            Ok(mut file) => {
+                if let Err(e) = writeln!(file, "{line}") {
+                    warn!(error = %e, "research JSONL 写入失败");
+                }
+            }
+            Err(e) => warn!(error = %e, "research JSONL 打开失败"),
+        }
     }
 
     /// 从既有 journal 恢复引擎状态（进程重启续跑）。
@@ -240,11 +347,16 @@ impl LiveEngine {
             warn!(version = state.version, "引擎状态版本不匹配，全新开局");
             return false;
         }
-        if state.symbol != self.config.symbol || state.strategy != self.config.strategy_name {
+        if state.symbol != self.config.symbol
+            || state.strategy != self.config.strategy_name
+            || state.strategy_hash != self.config.strategy_hash
+        {
             warn!(
                 state_symbol = %state.symbol,
                 state_strategy = %state.strategy,
-                "引擎状态与当前配置不匹配，全新开局"
+                state_strategy_hash = %state.strategy_hash,
+                current_strategy_hash = %self.config.strategy_hash,
+                "引擎状态与当前配置/版本不匹配，全新开局"
             );
             return false;
         }
@@ -275,6 +387,9 @@ impl LiveEngine {
         self.cb_on = state.cb_on;
         self.cb_noted_fills = state.cb_noted_fills;
         self.pos_track = state.pos_track;
+        self.shadow_signals = state.shadow_signals;
+        self.confirmed_signals_run = state.confirmed_signals_run;
+        self.shadow_outcomes_run = state.shadow_outcomes_run;
         self.needs_stop_rearm = needs_rearm;
         self.sync_position_flag();
 
@@ -312,6 +427,11 @@ impl LiveEngine {
         // 全量 JSONL（append-only；失败不阻塞交易）
         let line = serde_json::json!({
             "ts_ms": entry.ts_ms,
+            "run_id": self.config.run_id,
+            "mode": self.config.mode,
+            "symbol": self.config.symbol,
+            "strategy_hash": self.config.strategy_hash,
+            "git_commit": self.config.git_commit,
             "source": entry.source,
             "note": entry.note,
         });
@@ -363,6 +483,114 @@ impl LiveEngine {
         for entry in pending {
             self.push_eval(entry);
         }
+    }
+
+    fn track_new_shadow_signals(&mut self, signals: &[Signal]) {
+        for signal in signals {
+            let p = &signal.payload;
+            if p.get("stage").and_then(|v| v.as_str()) != Some("confirmed") {
+                continue;
+            }
+            let Some(event_id) = p.get("event_id").and_then(|v| v.as_i64()) else {
+                continue;
+            };
+            let confirm_price = p.get("price").and_then(|v| v.as_f64()).unwrap_or(0.0);
+            if confirm_price <= 0.0
+                || self
+                    .shadow_signals
+                    .iter()
+                    .any(|existing| existing.event_id == event_id)
+            {
+                continue;
+            }
+            let shadow = ShadowSignal {
+                event_id,
+                signal_ts_ms: signal.ts.as_millis(),
+                side: p
+                    .get("side")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                profile: p
+                    .get("profile")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                strength: p
+                    .get("strength")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("unknown")
+                    .to_string(),
+                event_price: p
+                    .get("zone")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(confirm_price),
+                confirm_price,
+                stop_anchor: p.get("stop_anchor").and_then(|v| v.as_f64()),
+                context_score: p.get("context_score").and_then(|v| v.as_u64()),
+                location_confirmed: p.get("location_confirmed").and_then(|v| v.as_bool()),
+                mfe_pct: 0.0,
+                mae_pct: 0.0,
+                next_horizon: 0,
+            };
+            self.append_research(
+                "signal_confirmed",
+                signal.ts.as_millis(),
+                serde_json::json!({ "signal": p }),
+            );
+            self.shadow_signals.push(shadow);
+            self.confirmed_signals_run += 1;
+        }
+    }
+
+    fn update_shadow_outcomes(&mut self, ts: Timestamp, price: Price) {
+        let now_ms = ts.as_millis();
+        let px = price.to_f64();
+        let fee_pct = self.config.estimated_roundtrip_fee_bps / 100.0;
+        let mut completed = Vec::new();
+        let mut events = Vec::new();
+        for shadow in &mut self.shadow_signals {
+            let sign = if shadow.side == "buy" { 1.0 } else { -1.0 };
+            let gross = sign * (px / shadow.confirm_price - 1.0) * 100.0;
+            shadow.mfe_pct = shadow.mfe_pct.max(gross);
+            shadow.mae_pct = shadow.mae_pct.min(gross);
+            while shadow.next_horizon < SHADOW_HORIZONS_MIN.len()
+                && now_ms - shadow.signal_ts_ms >= SHADOW_HORIZONS_MIN[shadow.next_horizon] * 60_000
+            {
+                let horizon_min = SHADOW_HORIZONS_MIN[shadow.next_horizon];
+                events.push((
+                    now_ms,
+                    serde_json::json!({
+                        "event_id": shadow.event_id,
+                        "signal_ts_ms": shadow.signal_ts_ms,
+                        "horizon_min": horizon_min,
+                        "side": shadow.side,
+                        "profile": shadow.profile,
+                        "strength": shadow.strength,
+                        "event_price": shadow.event_price,
+                        "confirm_price": shadow.confirm_price,
+                        "mark_price": px,
+                        "stop_anchor": shadow.stop_anchor,
+                        "context_score": shadow.context_score,
+                        "location_confirmed": shadow.location_confirmed,
+                        "gross_return_pct": gross,
+                        "estimated_net_return_pct": gross - fee_pct,
+                        "mfe_pct": shadow.mfe_pct,
+                        "mae_pct": shadow.mae_pct,
+                    }),
+                ));
+                shadow.next_horizon += 1;
+            }
+            if shadow.next_horizon == SHADOW_HORIZONS_MIN.len() {
+                completed.push(shadow.event_id);
+            }
+        }
+        for (event_ts, data) in events {
+            self.append_research("shadow_outcome", event_ts, data);
+            self.shadow_outcomes_run += 1;
+        }
+        self.shadow_signals
+            .retain(|shadow| !completed.contains(&shadow.event_id));
     }
 
     /// 持仓绩效追踪：开仓建档 → 持仓中更新 MFE/MAE → 平仓写 trip 记录。
@@ -463,6 +691,14 @@ impl LiveEngine {
             n_intents: self.intents.len(),
             n_fills: self.account.fills().len(),
             last_eval: self.latest_eval.clone(),
+            run_id: self.config.run_id.clone(),
+            strategy_name: self.config.strategy_name.clone(),
+            strategy_hash: self.config.strategy_hash.clone(),
+            git_commit: self.config.git_commit.clone(),
+            research_log_dir: self.config.research_log_dir.display().to_string(),
+            active_shadow_signals: self.shadow_signals.len(),
+            confirmed_signals_run: self.confirmed_signals_run,
+            shadow_outcomes_run: self.shadow_outcomes_run,
         }
     }
 
@@ -474,12 +710,14 @@ impl LiveEngine {
     pub async fn on_trade(&mut self, trade: &Trade) {
         self.clock.advance_to(trade.ts);
         self.latest_price = Some(trade.price);
+        self.update_shadow_outcomes(trade.ts, trade.price);
         self.update_env_flags(trade.ts, trade.price);
         self.cb_update(trade.ts, trade.price);
 
         // 1) 撮合/成交回报（dry：本地模拟撮合；testnet：本地挂单不消费价格）
         let execs = self.broker.on_trade_price(trade.ts, trade.price).await;
         for ex in execs {
+            self.log_execution(&ex, None, None);
             self.account.apply_fill(FillRequest {
                 ts: ex.ts,
                 side: ex.side,
@@ -516,6 +754,7 @@ impl LiveEngine {
                 new_signals.push(sig);
             }
         }
+        self.track_new_shadow_signals(&new_signals);
         // 2.1) 评估说明入流水（为什么下单/不下单，前端展示）
         self.refresh_eval_notes(true);
 
@@ -546,6 +785,12 @@ impl LiveEngine {
             let mut got_fill = false;
             for ex in execs {
                 got_fill = true;
+                let pending = self.pending_entry.as_ref();
+                self.log_execution(
+                    &ex,
+                    pending.map(|p| p.intent_id.as_str()),
+                    pending.and_then(|p| p.event_id),
+                );
                 self.account.apply_fill(FillRequest {
                     ts: ex.ts,
                     side: ex.side,
@@ -567,10 +812,27 @@ impl LiveEngine {
         }
 
         // 过期限价入场：撤单 + 清挂起
-        if let Some(pe) = self.pending_entry {
+        if let Some(pe) = self.pending_entry.clone() {
             if now_ms > pe.expire_ts.as_millis() && self.account.position().is_none() {
                 info!("限价入场单过期，撤单");
+                self.append_research(
+                    "order_expired",
+                    now_ms,
+                    serde_json::json!({
+                        "intent_id": pe.intent_id, "event_id": pe.event_id,
+                        "order_id": pe.order_id, "submitted_ts_ms": pe.submitted_ts_ms,
+                        "qty": pe.qty, "reason": pe.reason,
+                    }),
+                );
                 self.broker.cancel_all().await;
+                self.append_research(
+                    "order_canceled",
+                    now_ms,
+                    serde_json::json!({
+                        "intent_id": pe.intent_id, "event_id": pe.event_id,
+                        "order_id": pe.order_id, "cause": "entry_ttl_expired",
+                    }),
+                );
                 self.pending_entry = None;
             }
         }
@@ -635,6 +897,15 @@ impl LiveEngine {
     /// 优雅退出：落盘（不撤交易所挂单——止损单是保护）。
     pub async fn shutdown(&mut self) {
         self.persist_journal();
+        self.append_research(
+            "run_stop",
+            chrono::Utc::now().timestamp_millis(),
+            serde_json::json!({
+                "fills": self.account.fills().len(),
+                "intents": self.intents.len(),
+                "cash": self.account.cash(),
+            }),
+        );
         info!(
             fills = self.account.fills().len(),
             intents = self.intents.len(),
@@ -701,7 +972,7 @@ impl LiveEngine {
                     if let Some(p) = self.account.position().copied() {
                         self.market_close(trade, p.qty, "reverse_out").await;
                     }
-                    self.enter(trade, *intent).await;
+                    self.enter(trade, *intent, None).await;
                 }
             }
         }
@@ -721,17 +992,30 @@ impl LiveEngine {
                     .on_signals(signals, &self.ctx, &self.symbol)
             });
         let Some(intent) = intent else { return };
+        let event_id = signals
+            .iter()
+            .find_map(|signal| signal.payload.get("event_id").and_then(|v| v.as_i64()));
         let mut scale = 1.0f64;
         for fp in self.strategy.filters.iter() {
             match fp.check(&intent, &self.ctx) {
                 Verdict::Allow => {}
                 Verdict::Scale(s) => scale = scale.min(s),
-                Verdict::Veto(_) => return,
+                Verdict::Veto(reason) => {
+                    self.append_research(
+                        "order_skipped",
+                        trade.ts.as_millis(),
+                        serde_json::json!({
+                            "event_id": event_id, "cause": "filter_veto", "detail": reason,
+                            "strategy_reason": intent.reason,
+                        }),
+                    );
+                    return;
+                }
             }
         }
         let mut intent = intent;
         intent.qty = Qty::from_f64(intent.qty.to_f64() * scale);
-        self.enter(trade, intent).await;
+        self.enter(trade, intent, event_id).await;
     }
 
     async fn try_add(&mut self, trade: &Trade, signals: &[Signal]) {
@@ -748,21 +1032,34 @@ impl LiveEngine {
         else {
             return;
         };
+        let event_id = signals
+            .iter()
+            .find_map(|signal| signal.payload.get("event_id").and_then(|v| v.as_i64()));
         let mut scale = 1.0f64;
         for fp in self.strategy.filters.iter() {
             match fp.check(&intent, &self.ctx) {
                 Verdict::Allow => {}
                 Verdict::Scale(s) => scale = scale.min(s),
-                Verdict::Veto(_) => return,
+                Verdict::Veto(reason) => {
+                    self.append_research(
+                        "order_skipped",
+                        trade.ts.as_millis(),
+                        serde_json::json!({
+                            "event_id": event_id, "cause": "filter_veto", "detail": reason,
+                            "strategy_reason": intent.reason, "is_add": true,
+                        }),
+                    );
+                    return;
+                }
             }
         }
         let mut intent = intent;
         intent.qty = Qty::from_f64(intent.qty.to_f64() * scale);
-        self.enter(trade, intent).await;
+        self.enter(trade, intent, event_id).await;
     }
 
     /// 开仓：仓位计算（与回测同式）→ 精度约束 → 记录意图 → 下单。
-    async fn enter(&mut self, trade: &Trade, intent: OrderIntent) {
+    async fn enter(&mut self, trade: &Trade, intent: OrderIntent, event_id: Option<i64>) {
         let entry_ref = intent.limit_price.unwrap_or(trade.price);
         let stop_dist = (intent.stop_price.to_f64() - entry_ref.to_f64()).abs();
         let qty = if stop_dist > 1e-9 {
@@ -784,6 +1081,14 @@ impl LiveEngine {
         // 精度约束：数量向下取整到步长；名义价值过低放弃
         let qty = floor_to_step(qty, self.config.qty_step);
         if qty <= 1e-9 {
+            self.append_research(
+                "order_skipped",
+                trade.ts.as_millis(),
+                serde_json::json!({
+                    "event_id": event_id, "cause": "quantity_zero", "raw_qty": qty,
+                    "strategy_reason": intent.reason,
+                }),
+            );
             return;
         }
         if self.config.min_notional > 0.0 && qty * trade.price.to_f64() < self.config.min_notional {
@@ -793,9 +1098,19 @@ impl LiveEngine {
                 min = self.config.min_notional,
                 "名义价值低于最小约束，放弃下单"
             );
+            self.append_research(
+                "order_skipped",
+                trade.ts.as_millis(),
+                serde_json::json!({
+                    "event_id": event_id, "cause": "min_notional", "qty": qty,
+                    "notional": qty * trade.price.to_f64(), "minimum": self.config.min_notional,
+                    "strategy_reason": intent.reason,
+                }),
+            );
             return;
         }
         let qty = Qty::from_f64(qty);
+        let intent_id = format!("{}-{}", self.config.run_id, self.intents.len() + 1);
 
         self.intents.push(JournalIntent {
             ts_ms: trade.ts.as_millis(),
@@ -807,6 +1122,19 @@ impl LiveEngine {
             reason: intent.reason.clone(),
         });
         self.persist_journal();
+        self.append_research(
+            "order_intent",
+            trade.ts.as_millis(),
+            serde_json::json!({
+                "intent_id": intent_id, "event_id": event_id,
+                "side": format!("{:?}", intent.side), "qty": qty.to_f64(),
+                "limit_price": intent.limit_price.map(|p| p.to_f64()),
+                "stop_price": intent.stop_price.to_f64(),
+                "tp1_price": intent.tp1_price.map(|p| p.to_f64()),
+                "reason": intent.reason, "risk_scale": intent.risk_scale,
+                "mark_price": trade.price.to_f64(),
+            }),
+        );
 
         let is_limit = intent.limit_price.is_some();
         // 市价单成交回报也应很快到达：testnet 给 120s 兜底窗口；限价用 entry_ttl
@@ -830,6 +1158,7 @@ impl LiveEngine {
         match self.broker.submit(trade.ts, trade.price, order).await {
             Ok(Some(ex)) => {
                 // dry 市价单立即成交
+                self.log_execution(&ex, Some(&intent_id), event_id);
                 self.account.apply_fill(FillRequest {
                     ts: ex.ts,
                     side: ex.side,
@@ -843,14 +1172,38 @@ impl LiveEngine {
                     .await;
             }
             Ok(None) => {
+                let order_id = self.broker.last_submitted_order_id();
+                self.append_research(
+                    "order_accepted",
+                    trade.ts.as_millis(),
+                    serde_json::json!({
+                        "intent_id": intent_id, "event_id": event_id, "order_id": order_id,
+                        "qty": qty.to_f64(), "reason": intent.reason,
+                        "expires_ts_ms": expire_ts.as_millis(),
+                    }),
+                );
                 self.pending_entry = Some(PendingEntry {
                     stop_price: intent.stop_price,
                     tp1_price: intent.tp1_price,
                     expire_ts,
+                    intent_id,
+                    event_id,
+                    order_id,
+                    submitted_ts_ms: trade.ts.as_millis(),
+                    qty: qty.to_f64(),
+                    reason: intent.reason.clone(),
                 });
             }
             Err(e) => {
                 error!(error = %e, reason = %intent.reason, "下单失败");
+                self.append_research(
+                    "order_rejected",
+                    trade.ts.as_millis(),
+                    serde_json::json!({
+                        "intent_id": intent_id, "event_id": event_id,
+                        "reason": intent.reason, "error": e.to_string(),
+                    }),
+                );
             }
         }
     }
@@ -865,7 +1218,7 @@ impl LiveEngine {
             let side = p.side;
             let q = p.qty;
             self.broker.cancel_all().await;
-            if let Err(e) = self
+            match self
                 .broker
                 .submit(
                     ts,
@@ -880,15 +1233,45 @@ impl LiveEngine {
                 )
                 .await
             {
-                error!(error = %e, "保护性止损挂单失败");
+                Ok(_) => self.append_research(
+                    "protective_stop_accepted",
+                    ts.as_millis(),
+                    serde_json::json!({
+                        "order_id": self.broker.last_submitted_order_id(),
+                        "side": format!("{:?}", side.opposite()), "qty": q.to_f64(),
+                        "stop_price": stop.to_f64(),
+                    }),
+                ),
+                Err(e) => {
+                    error!(error = %e, "保护性止损挂单失败");
+                    self.append_research(
+                        "protective_stop_rejected",
+                        ts.as_millis(),
+                        serde_json::json!({
+                            "side": format!("{:?}", side.opposite()), "qty": q.to_f64(),
+                            "stop_price": stop.to_f64(), "error": e.to_string(),
+                        }),
+                    );
+                }
             }
         }
     }
 
     /// 挂起入场的善后：成交 → 补挂止损；过期由 on_timer 处理。
     async fn settle_pending_entry(&mut self, now: Timestamp) {
-        let Some(pe) = self.pending_entry else { return };
+        let Some(pe) = self.pending_entry.clone() else {
+            return;
+        };
         if self.account.position().is_some() {
+            self.append_research(
+                "entry_settled",
+                now.as_millis(),
+                serde_json::json!({
+                    "intent_id": pe.intent_id, "event_id": pe.event_id,
+                    "order_id": pe.order_id, "latency_ms": now.as_millis() - pe.submitted_ts_ms,
+                    "qty": pe.qty, "reason": pe.reason,
+                }),
+            );
             if let Some(p) = self.account.position_mut() {
                 p.tp1_price = pe.tp1_price;
             }
@@ -914,6 +1297,7 @@ impl LiveEngine {
         };
         match self.broker.submit(trade.ts, trade.price, order).await {
             Ok(Some(ex)) => {
+                self.log_execution(&ex, None, None);
                 self.account.apply_fill(FillRequest {
                     ts: ex.ts,
                     side: ex.side,
@@ -924,14 +1308,56 @@ impl LiveEngine {
                     reason: ex.reason,
                 });
             }
-            Ok(None) => {} // testnet：成交经 poll_fills 回报
-            Err(e) => error!(error = %e, reason, "平仓下单失败"),
+            Ok(None) => {
+                self.append_research(
+                    "exit_order_accepted",
+                    trade.ts.as_millis(),
+                    serde_json::json!({
+                        "order_id": self.broker.last_submitted_order_id(), "reason": reason,
+                        "side": format!("{:?}", side), "qty": qty.to_f64(),
+                    }),
+                );
+            }
+            Err(e) => {
+                error!(error = %e, reason, "平仓下单失败");
+                self.append_research(
+                    "exit_order_rejected",
+                    trade.ts.as_millis(),
+                    serde_json::json!({
+                        "reason": reason, "error": e.to_string(), "qty": qty.to_f64(),
+                    }),
+                );
+            }
         }
     }
 
     // ==================================================================
     // 环境/熔断/流水（与回测同逻辑）
     // ==================================================================
+
+    fn log_execution(
+        &self,
+        ex: &backtest::Execution,
+        intent_id: Option<&str>,
+        event_id: Option<i64>,
+    ) {
+        self.append_research(
+            "order_filled",
+            ex.ts.as_millis(),
+            serde_json::json!({
+                "intent_id": intent_id,
+                "event_id": event_id,
+                "order_id": ex.order_id,
+                "trade_id": ex.trade_id,
+                "side": format!("{:?}", ex.side),
+                "price": ex.price.to_f64(),
+                "qty": ex.qty.to_f64(),
+                "fee": ex.fee,
+                "is_maker": ex.is_maker,
+                "reason": ex.reason,
+            }),
+        );
+    }
 
     fn sync_position_flag(&mut self) {
         self.ctx.position = self.account.position_view(&self.symbol);
@@ -1004,6 +1430,7 @@ impl LiveEngine {
             version: ENGINE_STATE_VERSION,
             symbol: self.config.symbol.clone(),
             strategy: self.config.strategy_name.clone(),
+            strategy_hash: self.config.strategy_hash.clone(),
             initial_cash: self.account.initial_cash(),
             cash: self.account.cash(),
             position: self.account.position().copied(),
@@ -1014,6 +1441,9 @@ impl LiveEngine {
             cb_on: self.cb_on,
             cb_noted_fills: self.cb_noted_fills,
             pos_track: self.pos_track.clone(),
+            shadow_signals: self.shadow_signals.clone(),
+            confirmed_signals_run: self.confirmed_signals_run,
+            shadow_outcomes_run: self.shadow_outcomes_run,
         };
         let journal = Journal {
             meta: JournalMeta {
@@ -1052,6 +1482,7 @@ mod tests {
     use super::*;
     use backtest::FeeModel;
     use strategy::{assemble_from_toml, builtin_registry};
+    use tcore::plugin::SignalKind;
     use tcore::types::{Exchange, Side};
 
     fn trade(ts_ms: i64, price: f64) -> Trade {
@@ -1086,7 +1517,14 @@ trigger = "OrderFlowEntry"
             min_notional: 0.0,
             journal_path: std::env::temp_dir().join(format!("greed-live-test-{}.json", tag)),
             eval_log_path: std::env::temp_dir().join(format!("greed-live-test-{}.jsonl", tag)),
+            research_log_dir: std::env::temp_dir().join(format!("greed-live-research-{tag}")),
             strategy_name: "test".into(),
+            strategy_hash: "test-hash".into(),
+            strategy_snapshot: "[strategy]".into(),
+            git_commit: "test-commit".into(),
+            run_id: format!("test-{tag}"),
+            mode: "dry".into(),
+            estimated_roundtrip_fee_bps: 6.0,
         }
     }
 
@@ -1144,7 +1582,7 @@ trigger = "OrderFlowEntry"
             reason: "manual".into(),
             ts: t0.ts,
         };
-        eng.enter(&t0, intent).await;
+        eng.enter(&t0, intent, None).await;
         assert!(eng.account().position().is_some());
         // 意图已入流水（含止损价与原因）
         let text = std::fs::read_to_string(&cfg.journal_path).unwrap();
@@ -1209,7 +1647,7 @@ trigger = "OrderFlowEntry"
             reason: "manual".into(),
             ts: t0.ts,
         };
-        eng.enter(&t0, intent).await;
+        eng.enter(&t0, intent, None).await;
         // 先涨 1%（MFE 峰值），再回落击穿止损
         eng.on_trade(&trade(1000, 67670.0)).await;
         eng.on_trade(&trade(2000, 67200.0)).await;
@@ -1369,5 +1807,43 @@ location_buckets = 10
         assert!((eng3.account().cash() - 10_098.0).abs() < 1e-6);
 
         let _ = std::fs::remove_file(&cfg.journal_path);
+    }
+
+    #[test]
+    fn confirmed_signal_records_all_shadow_horizons() {
+        let cfg = test_config("shadow");
+        let _ = std::fs::remove_dir_all(&cfg.research_log_dir);
+        let mut eng = LiveEngine::new(
+            noop_strategy(),
+            AnyBroker::dry(FeeModel::default()),
+            cfg.clone(),
+            100_000.0,
+            "1970-01-01".into(),
+        );
+        let signal = Signal::new(
+            SignalKind::Other,
+            Timestamp::from_millis(1_000),
+            "OrderFlowExhaustion",
+            serde_json::json!({
+                "stage": "confirmed", "event_id": 1, "side": "buy",
+                "profile": "observation", "strength": "weak",
+                "price": 100.0, "zone": 99.5, "stop_anchor": 98.0,
+                "context_score": 1, "location_confirmed": false,
+            }),
+        );
+        eng.track_new_shadow_signals(&[signal]);
+        for (i, horizon) in SHADOW_HORIZONS_MIN.iter().enumerate() {
+            eng.update_shadow_outcomes(
+                Timestamp::from_millis(1_000 + horizon * 60_000),
+                Price::from_f64(101.0 + i as f64),
+            );
+        }
+        assert!(eng.shadow_signals.is_empty());
+        let text = std::fs::read_to_string(cfg.research_log_dir.join("1970-01-01.jsonl"))
+            .expect("shadow research log");
+        assert_eq!(text.matches("\"event_type\":\"shadow_outcome\"").count(), 6);
+        assert!(text.contains("\"estimated_net_return_pct\""));
+        assert!(text.contains("\"profile\":\"observation\""));
+        let _ = std::fs::remove_dir_all(&cfg.research_log_dir);
     }
 }

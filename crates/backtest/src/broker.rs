@@ -31,6 +31,8 @@ pub enum OrderKind {
 /// 一笔成交。
 #[derive(Debug, Clone)]
 pub struct Execution {
+    pub order_id: Option<i64>,
+    pub trade_id: Option<i64>,
     pub ts: Timestamp,
     pub side: Side,
     pub price: Price,
@@ -82,6 +84,8 @@ impl Broker {
                 let px = self.fee_model.market_fill_price(ref_price, order.side);
                 let notional = px.to_f64() * order.qty.to_f64();
                 Some(Execution {
+                    order_id: None,
+                    trade_id: None,
                     ts,
                     side: order.side,
                     price: px,
@@ -100,6 +104,8 @@ impl Broker {
                 if immediate {
                     let notional = limit.to_f64() * order.qty.to_f64();
                     Some(Execution {
+                        order_id: None,
+                        trade_id: None,
                         ts,
                         side: order.side,
                         price: limit,
@@ -152,6 +158,8 @@ impl Broker {
                     hit.then(|| {
                         let notional = limit.to_f64() * po.qty.to_f64();
                         Execution {
+                            order_id: None,
+                            trade_id: None,
                             ts,
                             side: po.side,
                             price: limit,
@@ -173,6 +181,8 @@ impl Broker {
                         let px = self.fee_model.market_fill_price(price, po.side);
                         let notional = px.to_f64() * po.qty.to_f64();
                         Execution {
+                            order_id: None,
+                            trade_id: None,
                             ts,
                             side: po.side,
                             price: px,

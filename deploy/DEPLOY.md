@@ -79,6 +79,10 @@ sudo systemctl reload caddy
   - 方式 A：从本机 rsync 已有的湖 `rsync -avz data/lake/ server:/opt/greed/data/lake/`
   - 方式 B：服务器上自行采集——`greed ingest` 回补历史 + `greed collect` 持续采集
     （可再加一个 `greed-collect.service`，照抄 serve 的 unit 改 ExecStart）
+- **研究日志必须持久化**：`data/evals/<mode>/` 按每次运行分文件，
+  `data/research/<mode>/` 按 UTC 日期滚动，保存信号影子结果和订单生命周期。它们应与
+  `data/journal/` 一起定期备份。部署时建议把环境变量 `GREED_GIT_COMMIT` 设置为本次
+  二进制对应的 commit，方便样本精确追溯。
 
 ## 6. 日常运维
 
