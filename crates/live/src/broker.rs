@@ -26,6 +26,20 @@ struct OrderMeta {
     filled_qty: f64,
 }
 
+fn register_fill_reason(
+    open: &mut HashMap<i64, OrderMeta>,
+    order_id: i64,
+    fill_qty: f64,
+) -> Option<String> {
+    let meta = open.get_mut(&order_id)?;
+    meta.filled_qty += fill_qty;
+    let reason = meta.reason.clone();
+    if meta.filled_qty >= meta.qty * 0.999 {
+        open.remove(&order_id);
+    }
+    Some(reason)
+}
+
 pub struct DryBroker {
     inner: Broker,
 }
@@ -62,6 +76,25 @@ impl AnyBroker {
             last_trade_id: 0,
             last_submitted_order_id: None,
         })
+    }
+
+    /// 把成交游标定位到启动时账户的最新成交。
+    ///
+    /// Binance `userTrades` 未给 `fromId` 时返回最近成交；若从 0 开始轮询，旧成交会在
+    /// 每次进程启动时被重复记账。引擎尚未下单时做一次基线定位，可保证后续只消费本次
+    /// 进程启动以后产生的成交。
+    pub async fn prime_fill_cursor(&mut self) -> Result<(), RestError> {
+        let AnyBroker::Testnet(b) = self else {
+            return Ok(());
+        };
+        let trades = b.rest.user_trades(&b.symbol, 0).await?;
+        b.last_trade_id = trades.iter().map(|trade| trade.trade_id).max().unwrap_or(0);
+        info!(
+            last_trade_id = b.last_trade_id,
+            ignored_history = trades.len(),
+            "成交游标已定位，历史成交不会重复导入"
+        );
+        Ok(())
     }
 
     /// 提交订单。Dry：市价单立即成交（与回测一致）；
@@ -164,17 +197,16 @@ impl AnyBroker {
                     continue;
                 }
             };
-            let reason = match b.open.get_mut(&ut.order_id) {
-                Some(meta) => {
-                    meta.filled_qty += qty;
-                    let r = meta.reason.clone();
-                    // 全部成交后从登记表移除
-                    if meta.filled_qty >= meta.qty * 0.999 {
-                        b.open.remove(&ut.order_id);
-                    }
-                    r
-                }
-                None => "external".to_string(), // 非本引擎下的单（手动/遗留）
+            let Some(reason) = register_fill_reason(&mut b.open, ut.order_id, qty) else {
+                warn!(
+                    trade_id = ut.trade_id,
+                    order_id = ut.order_id,
+                    side = %ut.side,
+                    price = %ut.price,
+                    qty = %ut.qty,
+                    "忽略非本次引擎订单的 external 成交（不进入本地账户）"
+                );
+                continue;
             };
             info!(
                 trade_id = ut.trade_id,
@@ -238,5 +270,39 @@ impl AnyBroker {
                 warn!(error = %e, "定期对时失败（下周期重试）");
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn external_fill_is_not_registered_or_accounted() {
+        let mut open = HashMap::new();
+        assert_eq!(register_fill_reason(&mut open, 99, 0.1), None);
+        assert!(open.is_empty());
+    }
+
+    #[test]
+    fn registered_partial_fills_keep_reason_until_complete() {
+        let mut open = HashMap::from([(
+            42,
+            OrderMeta {
+                qty: 0.1,
+                reason: "orderflow_balanced".into(),
+                filled_qty: 0.0,
+            },
+        )]);
+        assert_eq!(
+            register_fill_reason(&mut open, 42, 0.04).as_deref(),
+            Some("orderflow_balanced")
+        );
+        assert!(open.contains_key(&42));
+        assert_eq!(
+            register_fill_reason(&mut open, 42, 0.06).as_deref(),
+            Some("orderflow_balanced")
+        );
+        assert!(!open.contains_key(&42));
     }
 }

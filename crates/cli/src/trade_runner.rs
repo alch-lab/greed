@@ -107,7 +107,7 @@ pub async fn run_trade(
     let http = data::live::build_http_client(collector.effective_proxy().as_deref());
 
     // 经纪层：dry（模拟撮合）或 testnet/主网（真实下单）
-    let (broker, initial_cash, qty_step, min_notional, exchange_position_amt) = if mode
+    let (mut broker, initial_cash, qty_step, min_notional, exchange_position_amt) = if mode
         == TradeMode::Dry
     {
         info!(
@@ -162,6 +162,9 @@ pub async fn run_trade(
             amt,
         )
     };
+    // 必须在引擎提交任何订单之前定位 userTrades 游标；否则进程重启会把账户历史成交
+    // 重新当成新 fill 导入，污染本地持仓、盈亏与 Journal。
+    broker.prime_fill_cursor().await?;
 
     let started_at = chrono::Utc::now().format("%Y-%m-%d").to_string();
     let started_ms = chrono::Utc::now().timestamp_millis();
