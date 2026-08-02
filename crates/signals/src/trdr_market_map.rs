@@ -112,10 +112,13 @@ struct FlowBucket {
     perp_volume: f64,
     perp_delta: f64,
     source_volume: HashMap<Exchange, f64>,
+    source_delta: HashMap<Exchange, f64>,
     clusters: BTreeMap<i64, PriceCluster>,
     long_liquidation_usd: f64,
     short_liquidation_usd: f64,
     liquidation_sources: HashSet<Exchange>,
+    long_liquidation_by_source: HashMap<Exchange, f64>,
+    short_liquidation_by_source: HashMap<Exchange, f64>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -134,6 +137,7 @@ impl FlowBucket {
         self.volume += notional;
         self.delta += signed;
         *self.source_volume.entry(exchange).or_default() += notional;
+        *self.source_delta.entry(exchange).or_default() += signed;
         let cluster = self
             .clusters
             .entry((price / bin_usd).floor() as i64)
@@ -156,8 +160,17 @@ impl FlowBucket {
     fn add_liquidation(&mut self, exchange: Exchange, side: Side, notional: f64) {
         self.liquidation_sources.insert(exchange);
         match side {
-            Side::Sell => self.long_liquidation_usd += notional,
-            Side::Buy => self.short_liquidation_usd += notional,
+            Side::Sell => {
+                self.long_liquidation_usd += notional;
+                *self.long_liquidation_by_source.entry(exchange).or_default() += notional;
+            }
+            Side::Buy => {
+                self.short_liquidation_usd += notional;
+                *self
+                    .short_liquidation_by_source
+                    .entry(exchange)
+                    .or_default() += notional;
+            }
         }
     }
 }
@@ -225,6 +238,7 @@ struct FlowState {
     perp_source_count: usize,
     source_coverage_complete: bool,
     trade_sources: Vec<&'static str>,
+    source_stats: Vec<Json>,
     footprint_price: Option<f64>,
     footprint_delta_usd: f64,
     footprint_volume_usd: f64,
@@ -234,6 +248,7 @@ struct FlowState {
     long_liquidation_usd: f64,
     short_liquidation_usd: f64,
     liquidation_sources: Vec<&'static str>,
+    liquidation_stats: Vec<Json>,
     oi_change_pct: Option<f64>,
     oi_quadrant: &'static str,
     regime: &'static str,
@@ -371,14 +386,30 @@ impl TrdrMarketMap {
         Some((side, ratio, grade_rank))
     }
 
-    fn coverage(book: &BookSnapshot) -> Json {
+    fn coverage(&self, book: &BookSnapshot, now_ms: i64) -> Json {
         let (down, up) = Self::coverage_values(book);
+        let bands = self
+            .cfg
+            .book_bands
+            .iter()
+            .map(|band| {
+                json!({
+                    "band_pct":band,
+                    "bid_usd":book.bid_qty_within(*band),
+                    "ask_usd":book.ask_qty_within(*band),
+                    "depth_complete":down >= *band * 0.98 && up >= *band * 0.98
+                })
+            })
+            .collect::<Vec<_>>();
         json!({
             "exchange":book.exchange.as_str(),
+            "snapshot_ts_ms":book.ts.as_millis(),
+            "age_ms":(now_ms - book.ts.as_millis()).max(0),
             "levels_bid":book.bids.len(),
             "levels_ask":book.asks.len(),
             "coverage_down_pct":down,
-            "coverage_up_pct":up
+            "coverage_up_pct":up,
+            "bands":bands
         })
     }
 
@@ -407,7 +438,10 @@ impl TrdrMarketMap {
             .iter()
             .map(|band| self.metric_for_books(&books, *band))
             .collect::<Vec<_>>();
-        self.latest_coverage = books.iter().map(|b| Self::coverage(&b.book)).collect();
+        self.latest_coverage = books
+            .iter()
+            .map(|b| self.coverage(&b.book, now_ms))
+            .collect();
         self.latest_bands = metrics
             .iter()
             .map(|m| {
@@ -578,10 +612,14 @@ impl TrdrMarketMap {
         let mut perp_volume = 0.0;
         let mut perp_delta = 0.0;
         let mut sources = HashSet::new();
+        let mut source_volume = HashMap::<Exchange, f64>::new();
+        let mut source_delta = HashMap::<Exchange, f64>::new();
         let mut clusters = BTreeMap::<i64, PriceCluster>::new();
         let mut long_liquidation_usd = 0.0;
         let mut short_liquidation_usd = 0.0;
         let mut liquidation_sources = HashSet::new();
+        let mut long_liquidation_by_source = HashMap::<Exchange, f64>::new();
+        let mut short_liquidation_by_source = HashMap::<Exchange, f64>::new();
         let mut trend = Vec::new();
         for (start, b) in &self.flows {
             if *start >= delta_from {
@@ -597,6 +635,12 @@ impl TrdrMarketMap {
                         .filter(|(_, volume)| **volume > 0.0)
                         .map(|(exchange, _)| *exchange),
                 );
+                for (exchange, value) in &b.source_volume {
+                    *source_volume.entry(*exchange).or_default() += value;
+                }
+                for (exchange, value) in &b.source_delta {
+                    *source_delta.entry(*exchange).or_default() += value;
+                }
                 for (price_bin, cluster) in &b.clusters {
                     let target = clusters.entry(*price_bin).or_default();
                     target.volume_usd += cluster.volume_usd;
@@ -606,6 +650,12 @@ impl TrdrMarketMap {
                 long_liquidation_usd += b.long_liquidation_usd;
                 short_liquidation_usd += b.short_liquidation_usd;
                 liquidation_sources.extend(b.liquidation_sources.iter().copied());
+                for (exchange, value) in &b.long_liquidation_by_source {
+                    *long_liquidation_by_source.entry(*exchange).or_default() += value;
+                }
+                for (exchange, value) in &b.short_liquidation_by_source {
+                    *short_liquidation_by_source.entry(*exchange).or_default() += value;
+                }
             }
             if *start >= trend_from && b.open > 0.0 {
                 trend.push(b);
@@ -656,11 +706,44 @@ impl TrdrMarketMap {
             && perp_source_count >= self.cfg.min_perp_sources;
         let mut trade_sources = sources.iter().map(|x| x.as_str()).collect::<Vec<_>>();
         trade_sources.sort_unstable();
+        let source_stats = trade_sources
+            .iter()
+            .map(|name| {
+                let exchange = sources
+                    .iter()
+                    .find(|exchange| exchange.as_str() == *name)
+                    .copied()
+                    .expect("trade source exists");
+                let volume = source_volume.get(&exchange).copied().unwrap_or(0.0);
+                let delta = source_delta.get(&exchange).copied().unwrap_or(0.0);
+                json!({
+                    "exchange":name,
+                    "volume_usd":volume,
+                    "delta_usd":delta,
+                    "delta_share":if volume > 0.0 { delta / volume } else { 0.0 }
+                })
+            })
+            .collect::<Vec<_>>();
         let mut liquidation_sources = liquidation_sources
             .iter()
             .map(|x| x.as_str())
             .collect::<Vec<_>>();
         liquidation_sources.sort_unstable();
+        let liquidation_stats = [
+            Exchange::BinanceFutures,
+            Exchange::BybitFutures,
+            Exchange::OkxFutures,
+        ]
+            .into_iter()
+            .filter(|exchange| liquidation_sources.contains(&exchange.as_str()))
+            .map(|exchange| {
+                json!({
+                    "exchange":exchange.as_str(),
+                    "long_liquidation_usd":long_liquidation_by_source.get(&exchange).copied().unwrap_or(0.0),
+                    "short_liquidation_usd":short_liquidation_by_source.get(&exchange).copied().unwrap_or(0.0)
+                })
+            })
+            .collect::<Vec<_>>();
         let first = trend.first().map(|b| b.open).unwrap_or(0.0);
         let last = trend.last().map(|b| b.close).unwrap_or(first);
         let trend_return = if first > 0.0 { last / first - 1.0 } else { 0.0 };
@@ -723,6 +806,7 @@ impl TrdrMarketMap {
             perp_source_count,
             source_coverage_complete,
             trade_sources,
+            source_stats,
             footprint_price,
             footprint_delta_usd,
             footprint_volume_usd,
@@ -738,6 +822,7 @@ impl TrdrMarketMap {
             long_liquidation_usd,
             short_liquidation_usd,
             liquidation_sources,
+            liquidation_stats,
             oi_change_pct: oi_change,
             oi_quadrant,
             regime,
@@ -774,6 +859,7 @@ impl TrdrMarketMap {
                 "trade_source_count":f.trade_source_count,
                 "spot_source_count":f.spot_source_count,"perp_source_count":f.perp_source_count,
                 "source_coverage_complete":f.source_coverage_complete,"trade_sources":f.trade_sources,
+                "source_stats":f.source_stats,
                 "footprint_price":f.footprint_price,"footprint_delta_usd":f.footprint_delta_usd,
                 "footprint_volume_usd":f.footprint_volume_usd,
                 "footprint_delta_share":f.footprint_delta_share,
@@ -782,6 +868,7 @@ impl TrdrMarketMap {
                 "short_liquidation_usd":f.short_liquidation_usd,
                 "liquidation_source_count":f.liquidation_sources.len(),
                 "liquidation_sources":f.liquidation_sources,
+                "liquidation_stats":f.liquidation_stats,
                 "oi_change_pct":f.oi_change_pct, "oi_quadrant":f.oi_quadrant,
                 "regime":f.regime, "trend_return_pct":f.trend_return_pct,
                 "trend_efficiency":f.trend_efficiency
@@ -983,7 +1070,7 @@ fn side_cn(side: Side) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use tcore::{Price, Qty, Symbol, Trade};
+    use tcore::{LiquidationTick, Price, Qty, Symbol, Trade};
 
     fn book(exchange: Exchange, ts_ms: i64, bid_qty: f64, ask_qty: f64) -> BookSnapshot {
         BookSnapshot {
@@ -1022,6 +1109,8 @@ mod tests {
         assert_eq!(out[0].payload["side"], "buy");
         assert_eq!(out[0].payload["grade"], "blue");
         assert_eq!(out[0].payload["spot_perp_confluence"], true);
+        assert!(out[0].payload["coverage"][0]["bands"].is_array());
+        assert!(out[0].payload["coverage"][0]["age_ms"].is_number());
     }
 
     #[test]
@@ -1031,6 +1120,7 @@ mod tests {
         cfg.trend_efficiency = 0.2;
         let mut map = TrdrMarketMap::new(cfg);
         let ctx = Ctx::default();
+        let mut last = vec![];
         for (ts, px) in [(1_000, 100.0), (11_000, 101.0), (21_000, 102.0)] {
             let trade = Trade {
                 ts: Timestamp::from_millis(ts),
@@ -1040,9 +1130,49 @@ mod tests {
                 qty: Qty::from_f64(100.0),
                 is_buyer_maker: false,
             };
-            let out = map.on_event(&Event::Trade(trade), &ctx);
-            assert!(out.iter().any(|s| s.kind == SignalKind::DeltaTier));
+            last = map.on_event(&Event::Trade(trade), &ctx);
+            assert!(last.iter().any(|s| s.kind == SignalKind::DeltaTier));
         }
         assert_eq!(map.latest_flow.as_ref().unwrap().regime, "trend_up");
+        let delta = last
+            .iter()
+            .find(|signal| signal.kind == SignalKind::DeltaTier)
+            .unwrap();
+        assert_eq!(
+            delta.payload["source_stats"][0]["exchange"],
+            "binance_futures"
+        );
+        assert!(
+            delta.payload["source_stats"][0]["volume_usd"]
+                .as_f64()
+                .unwrap()
+                > 0.0
+        );
+    }
+
+    #[test]
+    fn liquidation_payload_keeps_per_exchange_attribution() {
+        let mut map = TrdrMarketMap::new(Config::from_params(&json!({})));
+        let tick = LiquidationTick {
+            ts: Timestamp::from_millis(1_000),
+            exchange: Exchange::BybitFutures,
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Sell,
+            price: Price::from_f64(100.0),
+            qty: Qty::from_f64(2.0),
+        };
+        let out = map.on_event(&Event::Liquidation(tick), &Ctx::default());
+        let delta = out
+            .iter()
+            .find(|signal| signal.kind == SignalKind::DeltaTier)
+            .unwrap();
+        assert_eq!(
+            delta.payload["liquidation_stats"][0]["exchange"],
+            "bybit_futures"
+        );
+        assert_eq!(
+            delta.payload["liquidation_stats"][0]["long_liquidation_usd"],
+            200.0
+        );
     }
 }

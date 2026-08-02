@@ -152,6 +152,10 @@ struct Setup {
     trdr_delta_tier: u8,
     trdr_delta_usd: Option<f64>,
     trdr_delta_share: Option<f64>,
+    trdr_spot_volume_usd: Option<f64>,
+    trdr_perp_volume_usd: Option<f64>,
+    trdr_source_stats: Vec<Json>,
+    trdr_liquidation_stats: Vec<Json>,
     trdr_oi_quadrant: String,
     trdr_regime: String,
     trend_blocked: bool,
@@ -180,6 +184,10 @@ struct TrdrContext {
     delta_tier: u8,
     delta_usd: Option<f64>,
     delta_share: Option<f64>,
+    spot_volume_usd: Option<f64>,
+    perp_volume_usd: Option<f64>,
+    source_stats: Vec<Json>,
+    liquidation_stats: Vec<Json>,
     oi_quadrant: String,
     regime: String,
     trend_blocked: bool,
@@ -276,6 +284,16 @@ fn trdr_context(ctx: &Ctx, side: Side, cfg: &Config, now_ms: i64) -> TrdrContext
         delta_tier,
         delta_usd: delta.and_then(|d| d.get("delta_usd").and_then(Json::as_f64)),
         delta_share: delta.and_then(|d| d.get("delta_share").and_then(Json::as_f64)),
+        spot_volume_usd: delta.and_then(|d| d.get("spot_volume_usd").and_then(Json::as_f64)),
+        perp_volume_usd: delta.and_then(|d| d.get("perp_volume_usd").and_then(Json::as_f64)),
+        source_stats: delta
+            .and_then(|d| d.get("source_stats").and_then(Json::as_array))
+            .cloned()
+            .unwrap_or_default(),
+        liquidation_stats: delta
+            .and_then(|d| d.get("liquidation_stats").and_then(Json::as_array))
+            .cloned()
+            .unwrap_or_default(),
         oi_quadrant: oi
             .and_then(|o| o.get("quadrant").and_then(Json::as_str))
             .unwrap_or("neutral")
@@ -381,6 +399,33 @@ impl OrderFlowExhaustion {
 
     fn signal(&self, ts: Timestamp, setup: &Setup, price: f64, delta_share: f64) -> Signal {
         let profile = self.profile(setup);
+        let trdr = json!({
+            "zone_grade":setup.trdr_zone_grade,
+            "zone_band_pct":setup.trdr_zone_band_pct,
+            "zone_distance_pct":setup.trdr_zone_distance_pct,
+            "zone_low":setup.trdr_zone_low,
+            "zone_high":setup.trdr_zone_high,
+            "spot_perp_confluence":setup.trdr_spot_perp_confluence,
+            "delta_tier":setup.trdr_delta_tier,
+            "delta_usd":setup.trdr_delta_usd,
+            "delta_share":setup.trdr_delta_share,
+            "spot_volume_usd":setup.trdr_spot_volume_usd,
+            "perp_volume_usd":setup.trdr_perp_volume_usd,
+            "source_stats":setup.trdr_source_stats,
+            "liquidation_stats":setup.trdr_liquidation_stats,
+            "oi_quadrant":setup.trdr_oi_quadrant,
+            "regime":setup.trdr_regime,
+            "trend_blocked":setup.trend_blocked,
+            "production_ready":setup.production_ready,
+            "zone_persistence_ms":setup.trdr_zone_persistence_ms,
+            "source_coverage_complete":setup.trdr_source_coverage_complete,
+            "footprint_matches":setup.trdr_footprint_matches,
+            "footprint_price":setup.trdr_footprint_price,
+            "footprint_delta_usd":setup.trdr_footprint_delta_usd,
+            "stacked_imbalance":setup.trdr_stacked_imbalance,
+            "long_liquidation_usd":setup.trdr_long_liquidation_usd,
+            "short_liquidation_usd":setup.trdr_short_liquidation_usd
+        });
         Signal::new(
             SignalKind::Other,
             ts,
@@ -404,29 +449,7 @@ impl OrderFlowExhaustion {
                 "context_score":setup.context_score,
                 "context_reasons":setup.context_reasons,
                 "book_imbalance":self.book_imbalance,
-                "trdr":{
-                    "zone_grade":setup.trdr_zone_grade,
-                    "zone_band_pct":setup.trdr_zone_band_pct,
-                    "zone_distance_pct":setup.trdr_zone_distance_pct,
-                    "zone_low":setup.trdr_zone_low,
-                    "zone_high":setup.trdr_zone_high,
-                    "spot_perp_confluence":setup.trdr_spot_perp_confluence,
-                    "delta_tier":setup.trdr_delta_tier,
-                    "delta_usd":setup.trdr_delta_usd,
-                    "delta_share":setup.trdr_delta_share,
-                    "oi_quadrant":setup.trdr_oi_quadrant,
-                    "regime":setup.trdr_regime,
-                    "trend_blocked":setup.trend_blocked,
-                    "production_ready":setup.production_ready,
-                    "zone_persistence_ms":setup.trdr_zone_persistence_ms,
-                    "source_coverage_complete":setup.trdr_source_coverage_complete,
-                    "footprint_matches":setup.trdr_footprint_matches,
-                    "footprint_price":setup.trdr_footprint_price,
-                    "footprint_delta_usd":setup.trdr_footprint_delta_usd,
-                    "stacked_imbalance":setup.trdr_stacked_imbalance,
-                    "long_liquidation_usd":setup.trdr_long_liquidation_usd,
-                    "short_liquidation_usd":setup.trdr_short_liquidation_usd
-                }
+                "trdr":trdr
             }),
         )
     }
@@ -647,6 +670,10 @@ impl OrderFlowExhaustion {
                     trdr_delta_tier: trdr.delta_tier,
                     trdr_delta_usd: trdr.delta_usd,
                     trdr_delta_share: trdr.delta_share,
+                    trdr_spot_volume_usd: trdr.spot_volume_usd,
+                    trdr_perp_volume_usd: trdr.perp_volume_usd,
+                    trdr_source_stats: trdr.source_stats,
+                    trdr_liquidation_stats: trdr.liquidation_stats,
                     trdr_oi_quadrant: trdr.oi_quadrant,
                     trdr_regime: trdr.regime,
                     trend_blocked: trdr.trend_blocked,
@@ -688,6 +715,10 @@ impl OrderFlowExhaustion {
                 "trdr_delta_tier":s.trdr_delta_tier,
                 "trdr_delta_usd":s.trdr_delta_usd,
                 "trdr_delta_share":s.trdr_delta_share,
+                "trdr_spot_volume_usd":s.trdr_spot_volume_usd,
+                "trdr_perp_volume_usd":s.trdr_perp_volume_usd,
+                "trdr_source_stats":s.trdr_source_stats,
+                "trdr_liquidation_stats":s.trdr_liquidation_stats,
                 "trdr_oi_quadrant":s.trdr_oi_quadrant,
                 "trdr_regime":s.trdr_regime,
                 "trend_blocked":s.trend_blocked,
@@ -843,6 +874,10 @@ mod tests {
             trdr_delta_tier: 2,
             trdr_delta_usd: Some(-1_000_000.0),
             trdr_delta_share: Some(-0.10),
+            trdr_spot_volume_usd: Some(10_000_000.0),
+            trdr_perp_volume_usd: Some(20_000_000.0),
+            trdr_source_stats: vec![],
+            trdr_liquidation_stats: vec![],
             trdr_oi_quadrant: "price_down_oi_up".into(),
             trdr_regime: "range".into(),
             trend_blocked: false,
