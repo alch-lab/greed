@@ -254,21 +254,84 @@ pub async fn run_trade(
                 .await;
         });
     }
-    let (context_tx, mut context_rx) = tokio::sync::mpsc::channel::<tcore::Event>(64);
+    let (context_tx, mut context_rx) = tokio::sync::mpsc::channel::<tcore::Event>(16_384);
     {
         let sym = collector.symbol.clone();
         let client = http.clone();
+        let tx = context_tx.clone();
         tokio::spawn(async move {
             live::feed::run_context_feed(
                 live::MAINNET_FAPI,
                 live::MAINNET_SPOT_API,
                 &sym,
                 client,
-                context_tx,
+                tx,
             )
             .await;
         });
     }
+    let okx_contract_value = live::venue_feed::fetch_okx_swap_ct_val(&http)
+        .await
+        .unwrap_or_else(|| {
+            warn!(
+                fallback = live::venue_feed::OKX_BTC_SWAP_CT_VAL,
+                "OKX 合约规格获取失败，使用 BTC-USDT-SWAP 回退面值"
+            );
+            live::venue_feed::OKX_BTC_SWAP_CT_VAL
+        });
+    info!(okx_contract_value, "已加载 OKX BTC-USDT-SWAP 合约面值");
+    {
+        let sym = collector.symbol.clone();
+        let client = http.clone();
+        let tx = context_tx.clone();
+        tokio::spawn(async move {
+            live::venue_feed::run_external_context_feed(&sym, okx_contract_value, client, tx).await;
+        });
+    }
+    for (url, exchange) in [
+        (live::venue_feed::BYBIT_SPOT_WS, Exchange::BybitSpot),
+        (live::venue_feed::BYBIT_LINEAR_WS, Exchange::BybitFutures),
+    ] {
+        let sym = collector.symbol.clone();
+        let tx = context_tx.clone();
+        tokio::spawn(async move {
+            live::venue_feed::run_bybit_trade_feed(url, &sym, exchange, tx).await;
+        });
+    }
+    for (inst_id, exchange, multiplier) in [
+        ("BTC-USDT", Exchange::OkxSpot, 1.0),
+        (
+            "BTC-USDT-SWAP",
+            Exchange::OkxFutures,
+            live::venue_feed::OKX_BTC_SWAP_CT_VAL,
+        ),
+    ] {
+        let tx = context_tx.clone();
+        tokio::spawn(async move {
+            live::venue_feed::run_okx_trade_feed(inst_id, exchange, multiplier, tx).await;
+        });
+    }
+    {
+        let sym = collector.symbol.clone();
+        let tx = context_tx.clone();
+        tokio::spawn(async move {
+            live::venue_feed::run_binance_liquidation_feed(&sym, tx).await;
+        });
+    }
+    {
+        let sym = collector.symbol.clone();
+        let tx = context_tx.clone();
+        tokio::spawn(async move {
+            live::venue_feed::run_bybit_liquidation_feed(&sym, tx).await;
+        });
+    }
+    {
+        let tx = context_tx.clone();
+        tokio::spawn(async move {
+            live::venue_feed::run_okx_liquidation_feed(okx_contract_value, tx).await;
+        });
+    }
+    drop(context_tx);
     info!(symbol = %collector.symbol, journal = %journal_path, mode = mode.as_str(), "进入交易主循环");
     let mut timer = tokio::time::interval(std::time::Duration::from_secs(1));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);

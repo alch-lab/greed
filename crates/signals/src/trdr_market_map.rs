@@ -3,7 +3,7 @@
 //! 这一层不直接下单。它把现货/永续订单簿、滚动主动成交 Delta 与 OI
 //! 归一成四类上下文信号，供足迹/力竭模型在价格进入真实挂单区域后确认入场。
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 
 use serde_json::{json, Value as Json};
 use tcore::{
@@ -23,8 +23,12 @@ pub struct Config {
     pub red_ratio: f64,
     pub blue_ratio: f64,
     pub zone_bin_pct: f64,
-    pub author_delta_coverage: f64,
+    pub min_book_sources: usize,
+    pub min_spot_sources: usize,
+    pub min_perp_sources: usize,
     pub delta_share_levels: [f64; 4],
+    pub footprint_bin_usd: f64,
+    pub footprint_imbalance_share: f64,
     pub trend_return_pct: f64,
     pub trend_efficiency: f64,
     pub oi_change_threshold: f64,
@@ -34,6 +38,12 @@ impl Config {
     pub fn from_params(p: &Json) -> Self {
         let f = |key: &str, default: f64| p.get(key).and_then(Json::as_f64).unwrap_or(default);
         let i = |key: &str, default: i64| p.get(key).and_then(Json::as_i64).unwrap_or(default);
+        let u = |key: &str, default: usize| {
+            p.get(key)
+                .and_then(Json::as_u64)
+                .map(|v| v as usize)
+                .unwrap_or(default)
+        };
         let levels = p
             .get("delta_share_levels")
             .and_then(Json::as_array)
@@ -72,10 +82,12 @@ impl Config {
             red_ratio: f("red_ratio", 3.5).max(1.01),
             blue_ratio: f("blue_ratio", 5.0).max(1.01),
             zone_bin_pct: f("zone_bin_pct", 0.001).clamp(0.0001, 0.01),
-            // 作者阈值来自全网。当前实时覆盖 Binance 现货+永续，先按覆盖率折算，
-            // 同时保留 delta_share 自适应档位，日志中始终输出原始美元值。
-            author_delta_coverage: f("author_delta_coverage", 0.35).clamp(0.05, 1.0),
+            min_book_sources: u("min_book_sources", 4).clamp(1, 6),
+            min_spot_sources: u("min_spot_sources", 2).clamp(1, 3),
+            min_perp_sources: u("min_perp_sources", 2).clamp(1, 3),
             delta_share_levels: levels,
+            footprint_bin_usd: f("footprint_bin_usd", 10.0).clamp(0.5, 1_000.0),
+            footprint_imbalance_share: f("footprint_imbalance_share", 0.20).clamp(0.05, 0.95),
             trend_return_pct: f("trend_return_pct", 0.012).clamp(0.001, 0.10),
             trend_efficiency: f("trend_efficiency", 0.45).clamp(0.05, 1.0),
             oi_change_threshold: f("oi_change_threshold", 0.001).clamp(0.00001, 0.10),
@@ -99,18 +111,37 @@ struct FlowBucket {
     spot_delta: f64,
     perp_volume: f64,
     perp_delta: f64,
+    source_volume: HashMap<Exchange, f64>,
+    clusters: BTreeMap<i64, PriceCluster>,
+    long_liquidation_usd: f64,
+    short_liquidation_usd: f64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct PriceCluster {
+    volume_usd: f64,
+    delta_usd: f64,
+    trades: u64,
 }
 
 impl FlowBucket {
-    fn add(&mut self, exchange: Exchange, price: f64, notional: f64, signed: f64) {
+    fn add(&mut self, exchange: Exchange, price: f64, notional: f64, signed: f64, bin_usd: f64) {
         if self.open <= 0.0 {
             self.open = price;
         }
         self.close = price;
         self.volume += notional;
         self.delta += signed;
+        *self.source_volume.entry(exchange).or_default() += notional;
+        let cluster = self
+            .clusters
+            .entry((price / bin_usd).floor() as i64)
+            .or_default();
+        cluster.volume_usd += notional;
+        cluster.delta_usd += signed;
+        cluster.trades += 1;
         match exchange {
-            Exchange::BinanceSpot => {
+            Exchange::BinanceSpot | Exchange::BybitSpot | Exchange::OkxSpot => {
                 self.spot_volume += notional;
                 self.spot_delta += signed;
             }
@@ -118,6 +149,13 @@ impl FlowBucket {
                 self.perp_volume += notional;
                 self.perp_delta += signed;
             }
+        }
+    }
+
+    fn add_liquidation(&mut self, side: Side, notional: f64) {
+        match side {
+            Side::Sell => self.long_liquidation_usd += notional,
+            Side::Buy => self.short_liquidation_usd += notional,
         }
     }
 }
@@ -132,6 +170,7 @@ struct BandMetric {
     grade: &'static str,
     grade_rank: u8,
     complete: bool,
+    source_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -153,6 +192,8 @@ struct BookZone {
     spot_ratio: Option<f64>,
     perp_ratio: Option<f64>,
     spot_perp_confluence: bool,
+    spot_source_count: usize,
+    perp_source_count: usize,
     coverage: Vec<Json>,
     bands: Vec<Json>,
 }
@@ -177,7 +218,19 @@ struct FlowState {
     tier: u8,
     tier_name: &'static str,
     direction: &'static str,
-    author_equivalent_delta_usd: f64,
+    trade_source_count: usize,
+    spot_source_count: usize,
+    perp_source_count: usize,
+    source_coverage_complete: bool,
+    trade_sources: Vec<&'static str>,
+    footprint_price: Option<f64>,
+    footprint_delta_usd: f64,
+    footprint_volume_usd: f64,
+    footprint_delta_share: f64,
+    footprint_direction: &'static str,
+    stacked_imbalance: usize,
+    long_liquidation_usd: f64,
+    short_liquidation_usd: f64,
     oi_change_pct: Option<f64>,
     oi_quadrant: &'static str,
     regime: &'static str,
@@ -245,11 +298,18 @@ impl TrdrMarketMap {
     }
 
     fn metric_for_books(&self, books: &[BookState], band: f64) -> BandMetric {
-        let bid = books
+        let covered = books
+            .iter()
+            .filter(|b| {
+                let (down, up) = Self::coverage_values(&b.book);
+                down >= band * 0.98 && up >= band * 0.98
+            })
+            .collect::<Vec<_>>();
+        let bid = covered
             .iter()
             .map(|b| b.book.bid_qty_within(band))
             .sum::<f64>();
-        let ask = books
+        let ask = covered
             .iter()
             .map(|b| b.book.ask_qty_within(band))
             .sum::<f64>();
@@ -261,10 +321,8 @@ impl TrdrMarketMap {
             (None, 1.0)
         };
         let dominant = bid.max(ask);
-        let complete = books.iter().all(|b| {
-            let c = Self::coverage_values(&b.book);
-            c.0 >= band * 0.98 && c.1 >= band * 0.98
-        });
+        let source_count = covered.len();
+        let complete = source_count >= self.cfg.min_book_sources;
         let (grade, grade_rank) = if complete && dominant >= self.cfg.min_zone_depth_usd {
             self.grade(ratio)
         } else {
@@ -279,6 +337,7 @@ impl TrdrMarketMap {
             grade,
             grade_rank,
             complete,
+            source_count,
         }
     }
 
@@ -292,8 +351,21 @@ impl TrdrMarketMap {
         if now_ms - state.ts_ms > self.cfg.book_fresh_ms {
             return None;
         }
-        let m = self.metric_for_books(std::slice::from_ref(state), band);
-        Some((m.side?, m.ratio, m.grade_rank))
+        let (down, up) = Self::coverage_values(&state.book);
+        if down < band * 0.98 || up < band * 0.98 {
+            return None;
+        }
+        let bid = state.book.bid_qty_within(band);
+        let ask = state.book.ask_qty_within(band);
+        let (side, ratio) = if bid > ask && ask > 0.0 {
+            (Side::Buy, bid / ask)
+        } else if ask > bid && bid > 0.0 {
+            (Side::Sell, ask / bid)
+        } else {
+            return None;
+        };
+        let (_, grade_rank) = self.grade(ratio);
+        Some((side, ratio, grade_rank))
     }
 
     fn coverage(book: &BookSnapshot) -> Json {
@@ -339,7 +411,8 @@ impl TrdrMarketMap {
                 json!({
                     "band_pct":m.band_pct, "bid_usd":m.bid_usd, "ask_usd":m.ask_usd,
                     "ratio":m.ratio, "side":m.side.map(side_name), "grade":m.grade,
-                    "complete":m.complete
+                    "complete":m.complete, "source_count":m.source_count,
+                    "required_sources":self.cfg.min_book_sources
                 })
             })
             .collect();
@@ -360,7 +433,10 @@ impl TrdrMarketMap {
         let reference_mid = mids.iter().sum::<f64>() / mids.len() as f64;
         let bin_width = (reference_mid * self.cfg.zone_bin_pct).max(0.01);
         let mut bins = BTreeMap::<i64, f64>::new();
-        for state in &books {
+        for state in books.iter().filter(|state| {
+            let (down, up) = Self::coverage_values(&state.book);
+            down >= best.band_pct * 0.98 && up >= best.band_pct * 0.98
+        }) {
             let levels = match side {
                 Side::Buy => &state.book.bids,
                 Side::Sell => &state.book.asks,
@@ -401,10 +477,31 @@ impl TrdrMarketMap {
             .as_ref()
             .map(|z| now_ms - z.since_ms)
             .unwrap_or(0);
-        let spot = self.one_exchange_ratio(Exchange::BinanceSpot, best.band_pct, now_ms);
-        let perp = self.one_exchange_ratio(Exchange::BinanceFutures, best.band_pct, now_ms);
-        let confluence = spot.is_some_and(|x| x.0 == side && x.2 > 0)
-            && perp.is_some_and(|x| x.0 == side && x.2 > 0);
+        let spot_metrics = [
+            Exchange::BinanceSpot,
+            Exchange::BybitSpot,
+            Exchange::OkxSpot,
+        ]
+        .into_iter()
+        .filter_map(|ex| self.one_exchange_ratio(ex, best.band_pct, now_ms))
+        .filter(|x| x.0 == side && x.2 > 0)
+        .collect::<Vec<_>>();
+        let perp_metrics = [
+            Exchange::BinanceFutures,
+            Exchange::BybitFutures,
+            Exchange::OkxFutures,
+        ]
+        .into_iter()
+        .filter_map(|ex| self.one_exchange_ratio(ex, best.band_pct, now_ms))
+        .filter(|x| x.0 == side && x.2 > 0)
+        .collect::<Vec<_>>();
+        let spot_source_count = spot_metrics.len();
+        let perp_source_count = perp_metrics.len();
+        let confluence = spot_source_count >= self.cfg.min_spot_sources
+            && perp_source_count >= self.cfg.min_perp_sources;
+        let average_ratio = |xs: &[(Side, f64, u8)]| {
+            (!xs.is_empty()).then(|| xs.iter().map(|x| x.1).sum::<f64>() / xs.len() as f64)
+        };
         Some(BookZone {
             ts_ms: now_ms,
             side,
@@ -420,9 +517,11 @@ impl TrdrMarketMap {
             distance_pct: center / reference_mid - 1.0,
             wall_usd,
             persistence_ms,
-            spot_ratio: spot.filter(|x| x.0 == side).map(|x| x.1),
-            perp_ratio: perp.filter(|x| x.0 == side).map(|x| x.1),
+            spot_ratio: average_ratio(&spot_metrics),
+            perp_ratio: average_ratio(&perp_metrics),
             spot_perp_confluence: confluence,
+            spot_source_count,
+            perp_source_count,
             coverage: self.latest_coverage.clone(),
             bands: self.latest_bands.clone(),
         })
@@ -436,14 +535,14 @@ impl TrdrMarketMap {
     fn delta_tier(&self, delta: f64, volume: f64) -> (u8, &'static str) {
         let abs = delta.abs();
         let share = if volume > 0.0 { abs / volume } else { 0.0 };
-        let static_unit = 1_000_000_000.0 * self.cfg.author_delta_coverage;
-        let static_rank = if abs >= static_unit * 3.5 {
+        // 已接入三家现货+永续后直接使用作者的全市场美元档位，不再按猜测覆盖率缩放。
+        let static_rank = if abs >= 3_500_000_000.0 {
             4
-        } else if abs >= static_unit * 3.0 {
+        } else if abs >= 3_000_000_000.0 {
             3
-        } else if abs >= static_unit * 2.0 {
+        } else if abs >= 2_000_000_000.0 {
             2
-        } else if abs >= static_unit {
+        } else if abs >= 1_000_000_000.0 {
             1
         } else {
             0
@@ -475,6 +574,10 @@ impl TrdrMarketMap {
         let mut spot_delta = 0.0;
         let mut perp_volume = 0.0;
         let mut perp_delta = 0.0;
+        let mut sources = HashSet::new();
+        let mut clusters = BTreeMap::<i64, PriceCluster>::new();
+        let mut long_liquidation_usd = 0.0;
+        let mut short_liquidation_usd = 0.0;
         let mut trend = Vec::new();
         for (start, b) in &self.flows {
             if *start >= delta_from {
@@ -484,6 +587,20 @@ impl TrdrMarketMap {
                 spot_delta += b.spot_delta;
                 perp_volume += b.perp_volume;
                 perp_delta += b.perp_delta;
+                sources.extend(
+                    b.source_volume
+                        .iter()
+                        .filter(|(_, volume)| **volume > 0.0)
+                        .map(|(exchange, _)| *exchange),
+                );
+                for (price_bin, cluster) in &b.clusters {
+                    let target = clusters.entry(*price_bin).or_default();
+                    target.volume_usd += cluster.volume_usd;
+                    target.delta_usd += cluster.delta_usd;
+                    target.trades += cluster.trades;
+                }
+                long_liquidation_usd += b.long_liquidation_usd;
+                short_liquidation_usd += b.short_liquidation_usd;
             }
             if *start >= trend_from && b.open > 0.0 {
                 trend.push(b);
@@ -491,6 +608,49 @@ impl TrdrMarketMap {
         }
         let delta_share = if volume > 0.0 { delta / volume } else { 0.0 };
         let (tier, tier_name) = self.delta_tier(delta, volume);
+        let footprint = clusters
+            .iter()
+            .max_by(|a, b| a.1.delta_usd.abs().total_cmp(&b.1.delta_usd.abs()));
+        let (footprint_price, footprint_delta_usd, footprint_volume_usd) = footprint
+            .map(|(bin, cluster)| {
+                (
+                    Some((*bin as f64 + 0.5) * self.cfg.footprint_bin_usd),
+                    cluster.delta_usd,
+                    cluster.volume_usd,
+                )
+            })
+            .unwrap_or((None, 0.0, 0.0));
+        let footprint_delta_share = if footprint_volume_usd > 0.0 {
+            footprint_delta_usd / footprint_volume_usd
+        } else {
+            0.0
+        };
+        let footprint_sign = footprint_delta_usd.signum();
+        let mut stacked_imbalance = 0usize;
+        let mut current_stack = 0usize;
+        let mut previous_bin = None;
+        for (bin, cluster) in &clusters {
+            let share = if cluster.volume_usd > 0.0 {
+                cluster.delta_usd / cluster.volume_usd
+            } else {
+                0.0
+            };
+            let adjacent = previous_bin.is_some_and(|last| *bin == last + 1);
+            if share.abs() >= self.cfg.footprint_imbalance_share && share.signum() == footprint_sign
+            {
+                current_stack = if adjacent { current_stack + 1 } else { 1 };
+                stacked_imbalance = stacked_imbalance.max(current_stack);
+            } else {
+                current_stack = 0;
+            }
+            previous_bin = Some(*bin);
+        }
+        let spot_source_count = sources.iter().filter(|x| is_spot(**x)).count();
+        let perp_source_count = sources.iter().filter(|x| is_perp(**x)).count();
+        let source_coverage_complete = spot_source_count >= self.cfg.min_spot_sources
+            && perp_source_count >= self.cfg.min_perp_sources;
+        let mut trade_sources = sources.iter().map(|x| x.as_str()).collect::<Vec<_>>();
+        trade_sources.sort_unstable();
         let first = trend.first().map(|b| b.open).unwrap_or(0.0);
         let last = trend.last().map(|b| b.close).unwrap_or(first);
         let trend_return = if first > 0.0 { last / first - 1.0 } else { 0.0 };
@@ -548,7 +708,25 @@ impl TrdrMarketMap {
             } else {
                 "neutral"
             },
-            author_equivalent_delta_usd: delta / self.cfg.author_delta_coverage,
+            trade_source_count: sources.len(),
+            spot_source_count,
+            perp_source_count,
+            source_coverage_complete,
+            trade_sources,
+            footprint_price,
+            footprint_delta_usd,
+            footprint_volume_usd,
+            footprint_delta_share,
+            footprint_direction: if footprint_delta_usd > 0.0 {
+                "buy"
+            } else if footprint_delta_usd < 0.0 {
+                "sell"
+            } else {
+                "neutral"
+            },
+            stacked_imbalance,
+            long_liquidation_usd,
+            short_liquidation_usd,
             oi_change_pct: oi_change,
             oi_quadrant,
             regime,
@@ -567,6 +745,7 @@ impl TrdrMarketMap {
                 "distance_pct":z.distance_pct, "wall_usd":z.wall_usd,
                 "persistence_ms":z.persistence_ms, "spot_ratio":z.spot_ratio,
                 "perp_ratio":z.perp_ratio, "spot_perp_confluence":z.spot_perp_confluence,
+                "spot_source_count":z.spot_source_count,"perp_source_count":z.perp_source_count,
                 "coverage":z.coverage, "bands":z.bands
             }),
             None => json!({"active":false}),
@@ -581,7 +760,15 @@ impl TrdrMarketMap {
                 "spot_delta_usd":f.spot_delta_usd, "spot_volume_usd":f.spot_volume_usd,
                 "perp_delta_usd":f.perp_delta_usd, "perp_volume_usd":f.perp_volume_usd,
                 "tier":f.tier, "tier_name":f.tier_name, "direction":f.direction,
-                "author_equivalent_delta_usd":f.author_equivalent_delta_usd,
+                "trade_source_count":f.trade_source_count,
+                "spot_source_count":f.spot_source_count,"perp_source_count":f.perp_source_count,
+                "source_coverage_complete":f.source_coverage_complete,"trade_sources":f.trade_sources,
+                "footprint_price":f.footprint_price,"footprint_delta_usd":f.footprint_delta_usd,
+                "footprint_volume_usd":f.footprint_volume_usd,
+                "footprint_delta_share":f.footprint_delta_share,
+                "footprint_direction":f.footprint_direction,"stacked_imbalance":f.stacked_imbalance,
+                "long_liquidation_usd":f.long_liquidation_usd,
+                "short_liquidation_usd":f.short_liquidation_usd,
                 "oi_change_pct":f.oi_change_pct, "oi_quadrant":f.oi_quadrant,
                 "regime":f.regime, "trend_return_pct":f.trend_return_pct,
                 "trend_efficiency":f.trend_efficiency
@@ -619,28 +806,18 @@ impl TrdrMarketMap {
             }
             (None, None) => "等待现货/永续订单簿与 30m Delta 预热".to_string(),
         };
-        let mut trade_sources = Vec::new();
-        if self
+        let trade_sources = self
             .latest_flow
             .as_ref()
-            .is_some_and(|f| f.spot_volume_usd > 0.0)
-        {
-            trade_sources.push("binance_spot");
-        }
-        if self
-            .latest_flow
-            .as_ref()
-            .is_some_and(|f| f.perp_volume_usd > 0.0)
-        {
-            trade_sources.push("binance_futures");
-        }
+            .map(|f| f.trade_sources.clone())
+            .unwrap_or_default();
         self.eval = Some(json!({
             "ts_ms":ts_ms.div_euclid(self.cfg.bucket_ms) * self.cfg.bucket_ms,
             "decision":"market_map", "reason":reason, "regime":regime,
             "zone":zone, "flow":flow,
             "book_sources":self.books.keys().map(|x| x.as_str()).collect::<Vec<_>>(),
             "trade_sources":trade_sources,
-            "limitations":["当前实时覆盖 Binance 现货+永续；Bybit/OKX 尚未接入", "REST 深度覆盖不足的远端色带仅记录不作为近场位置"]
+            "limitations":["TRDR 专有热图由三所公开逐笔和订单簿等价重建，不依赖 TRDR 私有接口"]
         }));
     }
 
@@ -729,6 +906,7 @@ impl SignalPlugin for TrdrMarketMap {
                     trade.price.to_f64(),
                     trade.notional(),
                     trade.signed_notional(),
+                    self.cfg.footprint_bin_usd,
                 );
                 self.prune_flows(ts_ms);
                 if start == self.last_flow_bucket {
@@ -738,6 +916,18 @@ impl SignalPlugin for TrdrMarketMap {
                 self.latest_flow = Some(self.build_flow_state(ts_ms));
                 self.update_eval(ts_ms);
                 self.flow_signals(trade.ts)
+            }
+            Event::Liquidation(tick) => {
+                let ts_ms = tick.ts.as_millis();
+                let start = ts_ms.div_euclid(self.cfg.bucket_ms) * self.cfg.bucket_ms;
+                self.flows
+                    .entry(start)
+                    .or_default()
+                    .add_liquidation(tick.side, tick.notional());
+                self.prune_flows(ts_ms);
+                self.latest_flow = Some(self.build_flow_state(ts_ms));
+                self.update_eval(ts_ms);
+                self.flow_signals(tick.ts)
             }
             Event::Funding(_) | Event::Timer(_) => vec![],
         }
@@ -753,6 +943,20 @@ fn side_name(side: Side) -> &'static str {
         Side::Buy => "buy",
         Side::Sell => "sell",
     }
+}
+
+fn is_spot(exchange: Exchange) -> bool {
+    matches!(
+        exchange,
+        Exchange::BinanceSpot | Exchange::BybitSpot | Exchange::OkxSpot
+    )
+}
+
+fn is_perp(exchange: Exchange) -> bool {
+    matches!(
+        exchange,
+        Exchange::BinanceFutures | Exchange::BybitFutures | Exchange::OkxFutures
+    )
 }
 
 fn side_cn(side: Side) -> &'static str {
@@ -787,6 +991,9 @@ mod tests {
     fn aggregates_spot_and_perp_into_blue_support() {
         let mut cfg = Config::from_params(&json!({}));
         cfg.min_zone_depth_usd = 1.0;
+        cfg.min_book_sources = 2;
+        cfg.min_spot_sources = 1;
+        cfg.min_perp_sources = 1;
         let mut map = TrdrMarketMap::new(cfg);
         let ctx = Ctx::default();
         map.on_event(
@@ -805,9 +1012,7 @@ mod tests {
 
     #[test]
     fn emits_delta_and_regime_signals_on_bucket_change() {
-        let mut cfg = Config::from_params(
-            &json!({"author_delta_coverage":0.05,"delta_share_levels":[0.01,0.02,0.03,0.04]}),
-        );
+        let mut cfg = Config::from_params(&json!({"delta_share_levels":[0.01,0.02,0.03,0.04]}));
         cfg.trend_return_pct = 0.005;
         cfg.trend_efficiency = 0.2;
         let mut map = TrdrMarketMap::new(cfg);

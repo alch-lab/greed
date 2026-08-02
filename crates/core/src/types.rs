@@ -168,7 +168,13 @@ impl fmt::Display for Timestamp {
 pub enum Exchange {
     BinanceSpot,
     BinanceFutures,
+    BybitSpot,
+    BybitFutures,
+    OkxSpot,
+    OkxFutures,
+    /// 旧数据兼容标识；新实时数据必须区分现货/永续。
     Bybit,
+    /// 旧数据兼容标识；新实时数据必须区分现货/永续。
     Okx,
 }
 
@@ -177,6 +183,10 @@ impl Exchange {
         match self {
             Exchange::BinanceSpot => "binance_spot",
             Exchange::BinanceFutures => "binance_futures",
+            Exchange::BybitSpot => "bybit_spot",
+            Exchange::BybitFutures => "bybit_futures",
+            Exchange::OkxSpot => "okx_spot",
+            Exchange::OkxFutures => "okx_futures",
             Exchange::Bybit => "bybit",
             Exchange::Okx => "okx",
         }
@@ -187,6 +197,10 @@ impl Exchange {
         match s {
             "binance_spot" => Some(Exchange::BinanceSpot),
             "binance_futures" => Some(Exchange::BinanceFutures),
+            "bybit_spot" => Some(Exchange::BybitSpot),
+            "bybit_futures" => Some(Exchange::BybitFutures),
+            "okx_spot" => Some(Exchange::OkxSpot),
+            "okx_futures" => Some(Exchange::OkxFutures),
             "bybit" => Some(Exchange::Bybit),
             "okx" => Some(Exchange::Okx),
             _ => None,

@@ -136,6 +136,23 @@ pub struct FundingTick {
     pub rate: f64,
 }
 
+/// 公开市场强平成交；方向是强制订单的主动方向。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LiquidationTick {
+    pub ts: Timestamp,
+    pub exchange: Exchange,
+    pub symbol: Symbol,
+    pub side: Side,
+    pub price: Price,
+    pub qty: Qty,
+}
+
+impl LiquidationTick {
+    pub fn notional(&self) -> f64 {
+        notional_usd(self.price, self.qty)
+    }
+}
+
 /// 系统统一事件
 ///
 /// 信号引擎与策略只消费 `Event`，不关心其来着历史 Parquet（回测）
@@ -146,6 +163,7 @@ pub enum Event {
     Book(BookSnapshot),
     Oi(OiTick),
     Funding(FundingTick),
+    Liquidation(LiquidationTick),
     /// 逻辑时钟心跳
     Timer(Timestamp),
 }
@@ -158,6 +176,7 @@ impl Event {
             Event::Book(b) => b.ts,
             Event::Oi(o) => o.ts,
             Event::Funding(f) => f.ts,
+            Event::Liquidation(l) => l.ts,
             Event::Timer(ts) => *ts,
         }
     }
@@ -168,6 +187,7 @@ impl Event {
             Event::Book(b) => Some(b.exchange),
             Event::Oi(o) => Some(o.exchange),
             Event::Funding(f) => Some(f.exchange),
+            Event::Liquidation(l) => Some(l.exchange),
             Event::Timer(_) => None,
         }
     }
@@ -177,6 +197,7 @@ impl Event {
             Event::Book(b) => Some(&b.symbol),
             Event::Oi(o) => Some(&o.symbol),
             Event::Funding(f) => Some(&f.symbol),
+            Event::Liquidation(l) => Some(&l.symbol),
             Event::Timer(_) => None,
         }
     }

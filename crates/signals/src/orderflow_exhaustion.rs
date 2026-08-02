@@ -31,6 +31,11 @@ pub struct Config {
     pub min_trdr_delta_tier: u8,
     pub max_zone_distance_pct: f64,
     pub trdr_max_age_ms: i64,
+    pub min_zone_persistence_ms: i64,
+    pub require_spot_perp_confluence: bool,
+    pub require_source_coverage: bool,
+    pub min_stacked_imbalance: usize,
+    pub min_liquidation_usd: f64,
 }
 
 impl Config {
@@ -66,8 +71,8 @@ impl Config {
             weak_confirm_buckets: u("weak_confirm_buckets", 30).max(1),
             cluster_cooldown_buckets: u("cluster_cooldown_buckets", 60).max(1),
             stop_buffer_pct: f("stop_buffer_pct", 0.00035).max(0.0),
-            balanced_context_score: u("balanced_context_score", 4).min(6) as u8,
-            quality_context_score: u("quality_context_score", 5).min(6) as u8,
+            balanced_context_score: u("balanced_context_score", 6).min(8) as u8,
+            quality_context_score: u("quality_context_score", 7).min(8) as u8,
             require_trdr_location: b("require_trdr_location", true),
             block_countertrend: b("block_countertrend", true),
             min_trdr_grade_rank: u("min_trdr_grade_rank", 2).clamp(1, 4) as u8,
@@ -78,6 +83,15 @@ impl Config {
                 .and_then(Json::as_i64)
                 .unwrap_or(30_000)
                 .max(1_000),
+            min_zone_persistence_ms: p
+                .get("min_zone_persistence_ms")
+                .and_then(Json::as_i64)
+                .unwrap_or(30_000)
+                .max(0),
+            require_spot_perp_confluence: b("require_spot_perp_confluence", true),
+            require_source_coverage: b("require_source_coverage", true),
+            min_stacked_imbalance: u("min_stacked_imbalance", 2).clamp(1, 10),
+            min_liquidation_usd: f("min_liquidation_usd", 1_000_000.0).max(0.0),
         }
     }
 }
@@ -141,6 +155,15 @@ struct Setup {
     trdr_oi_quadrant: String,
     trdr_regime: String,
     trend_blocked: bool,
+    production_ready: bool,
+    trdr_zone_persistence_ms: i64,
+    trdr_source_coverage_complete: bool,
+    trdr_footprint_matches: bool,
+    trdr_footprint_price: Option<f64>,
+    trdr_footprint_delta_usd: Option<f64>,
+    trdr_stacked_imbalance: usize,
+    trdr_long_liquidation_usd: f64,
+    trdr_short_liquidation_usd: f64,
     expires_at: i64,
 }
 
@@ -160,6 +183,15 @@ struct TrdrContext {
     oi_quadrant: String,
     regime: String,
     trend_blocked: bool,
+    production_ready: bool,
+    zone_persistence_ms: i64,
+    source_coverage_complete: bool,
+    footprint_matches: bool,
+    footprint_price: Option<f64>,
+    footprint_delta_usd: Option<f64>,
+    stacked_imbalance: usize,
+    long_liquidation_usd: f64,
+    short_liquidation_usd: f64,
 }
 
 fn side_name(side: Side) -> &'static str {
@@ -178,11 +210,19 @@ fn trdr_context(ctx: &Ctx, side: Side, cfg: &Config, now_ms: i64) -> TrdrContext
         .and_then(|z| z.get("grade_rank").and_then(Json::as_u64))
         .unwrap_or(0) as u8;
     let zone_distance = zone.and_then(|z| z.get("distance_pct").and_then(Json::as_f64));
+    let zone_persistence_ms = zone
+        .and_then(|z| z.get("persistence_ms").and_then(Json::as_i64))
+        .unwrap_or(0);
+    let spot_perp_confluence = zone
+        .and_then(|z| z.get("spot_perp_confluence").and_then(Json::as_bool))
+        .unwrap_or(false);
     let zone_matches = zone_fresh
         && zone.and_then(|z| z.get("active").and_then(Json::as_bool)) == Some(true)
         && zone.and_then(|z| z.get("side").and_then(Json::as_str)) == Some(side_name(side))
         && zone_grade_rank >= cfg.min_trdr_grade_rank
-        && zone_distance.is_some_and(|v| v.abs() <= cfg.max_zone_distance_pct);
+        && zone_distance.is_some_and(|v| v.abs() <= cfg.max_zone_distance_pct)
+        && zone_persistence_ms >= cfg.min_zone_persistence_ms
+        && (!cfg.require_spot_perp_confluence || spot_perp_confluence);
 
     let delta = ctx.latest_of(SignalKind::DeltaTier).map(|s| &s.payload);
     let expected_pressure = side_name(side.opposite());
@@ -195,6 +235,21 @@ fn trdr_context(ctx: &Ctx, side: Side, cfg: &Config, now_ms: i64) -> TrdrContext
     let delta_matches = delta_fresh
         && delta_tier >= cfg.min_trdr_delta_tier
         && delta.and_then(|d| d.get("direction").and_then(Json::as_str)) == Some(expected_pressure);
+    let source_coverage_complete = delta
+        .and_then(|d| d.get("source_coverage_complete").and_then(Json::as_bool))
+        .unwrap_or(false);
+    let footprint_direction =
+        delta.and_then(|d| d.get("footprint_direction").and_then(Json::as_str));
+    let stacked_imbalance = delta
+        .and_then(|d| d.get("stacked_imbalance").and_then(Json::as_u64))
+        .unwrap_or(0) as usize;
+    let footprint_matches = delta_fresh
+        && footprint_direction == Some(expected_pressure)
+        && stacked_imbalance >= cfg.min_stacked_imbalance;
+    let production_ready = zone_matches
+        && delta_matches
+        && footprint_matches
+        && (!cfg.require_source_coverage || source_coverage_complete);
 
     let oi = ctx.latest_of(SignalKind::OiQuadrant).map(|s| &s.payload);
     let regime = ctx
@@ -216,9 +271,7 @@ fn trdr_context(ctx: &Ctx, side: Side, cfg: &Config, now_ms: i64) -> TrdrContext
         zone_distance_pct: zone_distance,
         zone_low: zone.and_then(|z| z.get("zone_low").and_then(Json::as_f64)),
         zone_high: zone.and_then(|z| z.get("zone_high").and_then(Json::as_f64)),
-        spot_perp_confluence: zone
-            .and_then(|z| z.get("spot_perp_confluence").and_then(Json::as_bool))
-            .unwrap_or(false),
+        spot_perp_confluence,
         delta_matches,
         delta_tier,
         delta_usd: delta.and_then(|d| d.get("delta_usd").and_then(Json::as_f64)),
@@ -229,6 +282,20 @@ fn trdr_context(ctx: &Ctx, side: Side, cfg: &Config, now_ms: i64) -> TrdrContext
             .to_string(),
         regime,
         trend_blocked: cfg.block_countertrend && blocked_side == Some(side_name(side)),
+        production_ready,
+        zone_persistence_ms,
+        source_coverage_complete,
+        footprint_matches,
+        footprint_price: delta.and_then(|d| d.get("footprint_price").and_then(Json::as_f64)),
+        footprint_delta_usd: delta
+            .and_then(|d| d.get("footprint_delta_usd").and_then(Json::as_f64)),
+        stacked_imbalance,
+        long_liquidation_usd: delta
+            .and_then(|d| d.get("long_liquidation_usd").and_then(Json::as_f64))
+            .unwrap_or(0.0),
+        short_liquidation_usd: delta
+            .and_then(|d| d.get("short_liquidation_usd").and_then(Json::as_f64))
+            .unwrap_or(0.0),
     }
 }
 
@@ -293,11 +360,13 @@ impl OrderFlowExhaustion {
         if setup.strength == "strong"
             && setup.event_volume_ratio >= self.cfg.quality_volume_ratio
             && setup.location_confirmed
+            && setup.production_ready
             && setup.context_score >= self.cfg.quality_context_score
         {
             "quality"
         } else if setup.context_score >= self.cfg.balanced_context_score
             && setup.location_confirmed
+            && setup.production_ready
             && setup.event_volume_ratio < self.cfg.balanced_max_volume_ratio
         {
             "balanced"
@@ -347,7 +416,16 @@ impl OrderFlowExhaustion {
                     "delta_share":setup.trdr_delta_share,
                     "oi_quadrant":setup.trdr_oi_quadrant,
                     "regime":setup.trdr_regime,
-                    "trend_blocked":setup.trend_blocked
+                    "trend_blocked":setup.trend_blocked,
+                    "production_ready":setup.production_ready,
+                    "zone_persistence_ms":setup.trdr_zone_persistence_ms,
+                    "source_coverage_complete":setup.trdr_source_coverage_complete,
+                    "footprint_matches":setup.trdr_footprint_matches,
+                    "footprint_price":setup.trdr_footprint_price,
+                    "footprint_delta_usd":setup.trdr_footprint_delta_usd,
+                    "stacked_imbalance":setup.trdr_stacked_imbalance,
+                    "long_liquidation_usd":setup.trdr_long_liquidation_usd,
+                    "short_liquidation_usd":setup.trdr_short_liquidation_usd
                 }
             }),
         )
@@ -500,6 +578,10 @@ impl OrderFlowExhaustion {
                     context_score += 1;
                     context_reasons.push("trdr_delta".to_string());
                 }
+                if trdr.footprint_matches {
+                    context_score += 1;
+                    context_reasons.push("footprint_cluster".to_string());
+                }
                 if oi_support {
                     context_score += 1;
                     context_reasons.push("oi".to_string());
@@ -511,6 +593,14 @@ impl OrderFlowExhaustion {
                 if local_location {
                     context_score += 1;
                     context_reasons.push("sweep_or_vwap".to_string());
+                }
+                let liquidation_support = match side {
+                    Side::Buy => trdr.long_liquidation_usd >= self.cfg.min_liquidation_usd,
+                    Side::Sell => trdr.short_liquidation_usd >= self.cfg.min_liquidation_usd,
+                };
+                if liquidation_support {
+                    context_score += 1;
+                    context_reasons.push("liquidation".to_string());
                 }
                 let strong = volume_ratio >= self.cfg.strong_volume_ratio
                     || delta_share.abs() >= self.cfg.strong_delta_share;
@@ -560,6 +650,15 @@ impl OrderFlowExhaustion {
                     trdr_oi_quadrant: trdr.oi_quadrant,
                     trdr_regime: trdr.regime,
                     trend_blocked: trdr.trend_blocked,
+                    production_ready: trdr.production_ready,
+                    trdr_zone_persistence_ms: trdr.zone_persistence_ms,
+                    trdr_source_coverage_complete: trdr.source_coverage_complete,
+                    trdr_footprint_matches: trdr.footprint_matches,
+                    trdr_footprint_price: trdr.footprint_price,
+                    trdr_footprint_delta_usd: trdr.footprint_delta_usd,
+                    trdr_stacked_imbalance: trdr.stacked_imbalance,
+                    trdr_long_liquidation_usd: trdr.long_liquidation_usd,
+                    trdr_short_liquidation_usd: trdr.short_liquidation_usd,
                     expires_at: b.start_ms + confirm_buckets as i64 * self.cfg.bucket_ms,
                 });
                 decision = "volume_event";
@@ -591,7 +690,16 @@ impl OrderFlowExhaustion {
                 "trdr_delta_share":s.trdr_delta_share,
                 "trdr_oi_quadrant":s.trdr_oi_quadrant,
                 "trdr_regime":s.trdr_regime,
-                "trend_blocked":s.trend_blocked
+                "trend_blocked":s.trend_blocked,
+                "production_ready":s.production_ready,
+                "trdr_zone_persistence_ms":s.trdr_zone_persistence_ms,
+                "trdr_source_coverage_complete":s.trdr_source_coverage_complete,
+                "trdr_footprint_matches":s.trdr_footprint_matches,
+                "trdr_footprint_price":s.trdr_footprint_price,
+                "trdr_footprint_delta_usd":s.trdr_footprint_delta_usd,
+                "trdr_stacked_imbalance":s.trdr_stacked_imbalance,
+                "trdr_long_liquidation_usd":s.trdr_long_liquidation_usd,
+                "trdr_short_liquidation_usd":s.trdr_short_liquidation_usd
             })
         });
         let confirmed_profile = out.first().and_then(|s| s.payload.get("profile")).cloned();
@@ -673,7 +781,7 @@ impl SignalPlugin for OrderFlowExhaustion {
                 b.add(t.price.to_f64(), notional, t.signed_notional());
                 signals
             }
-            Event::Funding(_) | Event::Timer(_) => vec![],
+            Event::Funding(_) | Event::Liquidation(_) | Event::Timer(_) => vec![],
         }
     }
 
@@ -738,6 +846,15 @@ mod tests {
             trdr_oi_quadrant: "price_down_oi_up".into(),
             trdr_regime: "range".into(),
             trend_blocked: false,
+            production_ready: true,
+            trdr_zone_persistence_ms: 60_000,
+            trdr_source_coverage_complete: true,
+            trdr_footprint_matches: true,
+            trdr_footprint_price: Some(100.0),
+            trdr_footprint_delta_usd: Some(-500_000.0),
+            trdr_stacked_imbalance: 3,
+            trdr_long_liquidation_usd: 2_000_000.0,
+            trdr_short_liquidation_usd: 0.0,
             expires_at: 10,
         }
     }
@@ -756,10 +873,10 @@ mod tests {
     #[test]
     fn profile_keeps_middle_volume_band_observational() {
         let s = test_signal();
-        assert_eq!(s.profile(&setup(2.2, true, 4)), "balanced");
-        assert_eq!(s.profile(&setup(2.7, true, 4)), "high_frequency");
-        assert_eq!(s.profile(&setup(3.2, true, 5)), "quality");
-        assert_eq!(s.profile(&setup(2.2, false, 4)), "high_frequency");
+        assert_eq!(s.profile(&setup(2.2, true, 6)), "balanced");
+        assert_eq!(s.profile(&setup(2.7, true, 6)), "high_frequency");
+        assert_eq!(s.profile(&setup(3.2, true, 7)), "quality");
+        assert_eq!(s.profile(&setup(2.2, false, 6)), "high_frequency");
     }
 
     #[test]

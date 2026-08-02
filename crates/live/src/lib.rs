@@ -14,6 +14,7 @@ pub mod broker;
 pub mod engine;
 pub mod feed;
 pub mod rest;
+pub mod venue_feed;
 
 pub use broker::AnyBroker;
 pub use engine::{EngineSnapshot, LiveConfig, LiveEngine, PositionSnap};

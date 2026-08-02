@@ -2,7 +2,7 @@
 # 订单流力竭再在有效区域内确认入场。每个事件簇只允许产生一次入场。
 
 [strategy]
-name = "trdr-orderflow-v1"
+name = "trdr-orderflow-v2-full-market"
 signals = ["TrdrMarketMap", "OrderFlowExhaustion"]
 trigger = "OrderFlowEntry"
 filters = ["CircuitBreaker"]
@@ -20,8 +20,12 @@ yellow_ratio = 2.50
 red_ratio = 3.50
 blue_ratio = 5.00
 zone_bin_pct = 0.001
-author_delta_coverage = 0.35
+min_book_sources = 4
+min_spot_sources = 2
+min_perp_sources = 2
 delta_share_levels = [0.04, 0.08, 0.12, 0.16]
+footprint_bin_usd = 10.0
+footprint_imbalance_share = 0.20
 trend_return_pct = 0.012
 trend_efficiency = 0.45
 oi_change_threshold = 0.001
@@ -45,26 +49,31 @@ strong_confirm_buckets = 18
 weak_confirm_buckets = 30
 cluster_cooldown_buckets = 60
 stop_buffer_pct = 0.00035
-balanced_context_score = 4
-quality_context_score = 5
+balanced_context_score = 6
+quality_context_score = 7
 require_trdr_location = true
 block_countertrend = true
 min_trdr_grade_rank = 2
 min_trdr_delta_tier = 1
 max_zone_distance_pct = 0.004
 trdr_max_age_ms = 30000
+min_zone_persistence_ms = 30000
+require_spot_perp_confluence = true
+require_source_coverage = true
+min_stacked_imbalance = 2
+min_liquidation_usd = 1000000
 
 [strategy.plugins.OrderFlowEntry]
 trade_classic = false
 trade_strength = false
 trade_high_frequency = false
 trade_balanced = true
-trade_quality = false
+trade_quality = true
 classic_risk_scale = 0.20
 strength_risk_scale = 0.35
 high_frequency_risk_scale = 0.15
 balanced_risk_scale = 0.60
-quality_risk_scale = 1.00
+quality_risk_scale = 0.80
 tp1_r = 1.50
 min_stop_pct = 0.0050
 max_stop_pct = 0.0100
