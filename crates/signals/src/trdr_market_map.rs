@@ -115,6 +115,7 @@ struct FlowBucket {
     clusters: BTreeMap<i64, PriceCluster>,
     long_liquidation_usd: f64,
     short_liquidation_usd: f64,
+    liquidation_sources: HashSet<Exchange>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -152,7 +153,8 @@ impl FlowBucket {
         }
     }
 
-    fn add_liquidation(&mut self, side: Side, notional: f64) {
+    fn add_liquidation(&mut self, exchange: Exchange, side: Side, notional: f64) {
+        self.liquidation_sources.insert(exchange);
         match side {
             Side::Sell => self.long_liquidation_usd += notional,
             Side::Buy => self.short_liquidation_usd += notional,
@@ -231,6 +233,7 @@ struct FlowState {
     stacked_imbalance: usize,
     long_liquidation_usd: f64,
     short_liquidation_usd: f64,
+    liquidation_sources: Vec<&'static str>,
     oi_change_pct: Option<f64>,
     oi_quadrant: &'static str,
     regime: &'static str,
@@ -578,6 +581,7 @@ impl TrdrMarketMap {
         let mut clusters = BTreeMap::<i64, PriceCluster>::new();
         let mut long_liquidation_usd = 0.0;
         let mut short_liquidation_usd = 0.0;
+        let mut liquidation_sources = HashSet::new();
         let mut trend = Vec::new();
         for (start, b) in &self.flows {
             if *start >= delta_from {
@@ -601,6 +605,7 @@ impl TrdrMarketMap {
                 }
                 long_liquidation_usd += b.long_liquidation_usd;
                 short_liquidation_usd += b.short_liquidation_usd;
+                liquidation_sources.extend(b.liquidation_sources.iter().copied());
             }
             if *start >= trend_from && b.open > 0.0 {
                 trend.push(b);
@@ -651,6 +656,11 @@ impl TrdrMarketMap {
             && perp_source_count >= self.cfg.min_perp_sources;
         let mut trade_sources = sources.iter().map(|x| x.as_str()).collect::<Vec<_>>();
         trade_sources.sort_unstable();
+        let mut liquidation_sources = liquidation_sources
+            .iter()
+            .map(|x| x.as_str())
+            .collect::<Vec<_>>();
+        liquidation_sources.sort_unstable();
         let first = trend.first().map(|b| b.open).unwrap_or(0.0);
         let last = trend.last().map(|b| b.close).unwrap_or(first);
         let trend_return = if first > 0.0 { last / first - 1.0 } else { 0.0 };
@@ -727,6 +737,7 @@ impl TrdrMarketMap {
             stacked_imbalance,
             long_liquidation_usd,
             short_liquidation_usd,
+            liquidation_sources,
             oi_change_pct: oi_change,
             oi_quadrant,
             regime,
@@ -769,6 +780,8 @@ impl TrdrMarketMap {
                 "footprint_direction":f.footprint_direction,"stacked_imbalance":f.stacked_imbalance,
                 "long_liquidation_usd":f.long_liquidation_usd,
                 "short_liquidation_usd":f.short_liquidation_usd,
+                "liquidation_source_count":f.liquidation_sources.len(),
+                "liquidation_sources":f.liquidation_sources,
                 "oi_change_pct":f.oi_change_pct, "oi_quadrant":f.oi_quadrant,
                 "regime":f.regime, "trend_return_pct":f.trend_return_pct,
                 "trend_efficiency":f.trend_efficiency
@@ -815,7 +828,7 @@ impl TrdrMarketMap {
             "ts_ms":ts_ms.div_euclid(self.cfg.bucket_ms) * self.cfg.bucket_ms,
             "decision":"market_map", "reason":reason, "regime":regime,
             "zone":zone, "flow":flow,
-            "book_sources":self.books.keys().map(|x| x.as_str()).collect::<Vec<_>>(),
+            "book_sources":self.fresh_books(ts_ms).iter().map(|x| x.book.exchange.as_str()).collect::<Vec<_>>(),
             "trade_sources":trade_sources,
             "limitations":["TRDR 专有热图由三所公开逐笔和订单簿等价重建，不依赖 TRDR 私有接口"]
         }));
@@ -920,10 +933,11 @@ impl SignalPlugin for TrdrMarketMap {
             Event::Liquidation(tick) => {
                 let ts_ms = tick.ts.as_millis();
                 let start = ts_ms.div_euclid(self.cfg.bucket_ms) * self.cfg.bucket_ms;
-                self.flows
-                    .entry(start)
-                    .or_default()
-                    .add_liquidation(tick.side, tick.notional());
+                self.flows.entry(start).or_default().add_liquidation(
+                    tick.exchange,
+                    tick.side,
+                    tick.notional(),
+                );
                 self.prune_flows(ts_ms);
                 self.latest_flow = Some(self.build_flow_state(ts_ms));
                 self.update_eval(ts_ms);
