@@ -16,6 +16,12 @@ pub fn register_builtin(r: &mut PluginRegistry) {
         exits::build_orderflow_management,
     );
     r.register_trigger("OrderFlowEntry", triggers::build_orderflow);
+    r.register_signal("TrdrMarketMap", |p| {
+        Ok(
+            Box::new(signals::trdr_market_map::TrdrMarketMap::from_params(p))
+                as Box<dyn tcore::SignalPlugin>,
+        )
+    });
     r.register_signal("OrderFlowExhaustion", |p| {
         Ok(
             Box::new(signals::orderflow_exhaustion::OrderFlowExhaustion::from_params(p))
@@ -32,7 +38,8 @@ mod tests {
         let r = builtin_registry();
         assert!(r.filter_names().contains(&"SessionFilter"));
         assert!(r.filter_names().contains(&"CircuitBreaker"));
-        assert_eq!(r.signal_names(), vec!["OrderFlowExhaustion"]);
+        assert!(r.signal_names().contains(&"TrdrMarketMap"));
+        assert!(r.signal_names().contains(&"OrderFlowExhaustion"));
         assert_eq!(r.trigger_names(), vec!["OrderFlowEntry"]);
     }
 }

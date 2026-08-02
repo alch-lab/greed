@@ -1,7 +1,7 @@
 use std::collections::VecDeque;
 
 use serde_json::{json, Value as Json};
-use tcore::{Ctx, Event, Side, Signal, SignalKind, SignalPlugin, Timestamp};
+use tcore::{Ctx, Event, Exchange, Side, Signal, SignalKind, SignalPlugin, Timestamp};
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -25,6 +25,12 @@ pub struct Config {
     pub stop_buffer_pct: f64,
     pub balanced_context_score: u8,
     pub quality_context_score: u8,
+    pub require_trdr_location: bool,
+    pub block_countertrend: bool,
+    pub min_trdr_grade_rank: u8,
+    pub min_trdr_delta_tier: u8,
+    pub max_zone_distance_pct: f64,
+    pub trdr_max_age_ms: i64,
 }
 
 impl Config {
@@ -36,6 +42,7 @@ impl Config {
                 .map(|v| v as usize)
                 .unwrap_or(default)
         };
+        let b = |key: &str, default: bool| p.get(key).and_then(Json::as_bool).unwrap_or(default);
         Self {
             bucket_ms: p
                 .get("bucket_ms")
@@ -59,8 +66,18 @@ impl Config {
             weak_confirm_buckets: u("weak_confirm_buckets", 30).max(1),
             cluster_cooldown_buckets: u("cluster_cooldown_buckets", 60).max(1),
             stop_buffer_pct: f("stop_buffer_pct", 0.00035).max(0.0),
-            balanced_context_score: u("balanced_context_score", 2).min(4) as u8,
-            quality_context_score: u("quality_context_score", 3).min(4) as u8,
+            balanced_context_score: u("balanced_context_score", 4).min(6) as u8,
+            quality_context_score: u("quality_context_score", 5).min(6) as u8,
+            require_trdr_location: b("require_trdr_location", true),
+            block_countertrend: b("block_countertrend", true),
+            min_trdr_grade_rank: u("min_trdr_grade_rank", 2).clamp(1, 4) as u8,
+            min_trdr_delta_tier: u("min_trdr_delta_tier", 1).min(4) as u8,
+            max_zone_distance_pct: f("max_zone_distance_pct", 0.004).clamp(0.0005, 0.05),
+            trdr_max_age_ms: p
+                .get("trdr_max_age_ms")
+                .and_then(Json::as_i64)
+                .unwrap_or(30_000)
+                .max(1_000),
         }
     }
 }
@@ -111,8 +128,108 @@ struct Setup {
     event_efficiency: f64,
     location_confirmed: bool,
     context_score: u8,
-    context_reasons: Vec<&'static str>,
+    context_reasons: Vec<String>,
+    trdr_zone_grade: String,
+    trdr_zone_band_pct: Option<f64>,
+    trdr_zone_distance_pct: Option<f64>,
+    trdr_zone_low: Option<f64>,
+    trdr_zone_high: Option<f64>,
+    trdr_spot_perp_confluence: bool,
+    trdr_delta_tier: u8,
+    trdr_delta_usd: Option<f64>,
+    trdr_delta_share: Option<f64>,
+    trdr_oi_quadrant: String,
+    trdr_regime: String,
+    trend_blocked: bool,
     expires_at: i64,
+}
+
+#[derive(Debug, Clone)]
+struct TrdrContext {
+    zone_matches: bool,
+    zone_grade: String,
+    zone_band_pct: Option<f64>,
+    zone_distance_pct: Option<f64>,
+    zone_low: Option<f64>,
+    zone_high: Option<f64>,
+    spot_perp_confluence: bool,
+    delta_matches: bool,
+    delta_tier: u8,
+    delta_usd: Option<f64>,
+    delta_share: Option<f64>,
+    oi_quadrant: String,
+    regime: String,
+    trend_blocked: bool,
+}
+
+fn side_name(side: Side) -> &'static str {
+    match side {
+        Side::Buy => "buy",
+        Side::Sell => "sell",
+    }
+}
+
+fn trdr_context(ctx: &Ctx, side: Side, cfg: &Config, now_ms: i64) -> TrdrContext {
+    let zone = ctx.latest_of(SignalKind::ObiZone).map(|s| &s.payload);
+    let zone_fresh = zone
+        .and_then(|z| z.get("ts_ms").and_then(Json::as_i64))
+        .is_some_and(|ts| now_ms - ts <= cfg.trdr_max_age_ms);
+    let zone_grade_rank = zone
+        .and_then(|z| z.get("grade_rank").and_then(Json::as_u64))
+        .unwrap_or(0) as u8;
+    let zone_distance = zone.and_then(|z| z.get("distance_pct").and_then(Json::as_f64));
+    let zone_matches = zone_fresh
+        && zone.and_then(|z| z.get("active").and_then(Json::as_bool)) == Some(true)
+        && zone.and_then(|z| z.get("side").and_then(Json::as_str)) == Some(side_name(side))
+        && zone_grade_rank >= cfg.min_trdr_grade_rank
+        && zone_distance.is_some_and(|v| v.abs() <= cfg.max_zone_distance_pct);
+
+    let delta = ctx.latest_of(SignalKind::DeltaTier).map(|s| &s.payload);
+    let expected_pressure = side_name(side.opposite());
+    let delta_tier = delta
+        .and_then(|d| d.get("tier").and_then(Json::as_u64))
+        .unwrap_or(0) as u8;
+    let delta_fresh = delta
+        .and_then(|d| d.get("ts_ms").and_then(Json::as_i64))
+        .is_some_and(|ts| now_ms - ts <= cfg.trdr_max_age_ms.max(cfg.bucket_ms * 2));
+    let delta_matches = delta_fresh
+        && delta_tier >= cfg.min_trdr_delta_tier
+        && delta.and_then(|d| d.get("direction").and_then(Json::as_str)) == Some(expected_pressure);
+
+    let oi = ctx.latest_of(SignalKind::OiQuadrant).map(|s| &s.payload);
+    let regime = ctx
+        .latest_of(SignalKind::TrendRegime)
+        .and_then(|s| s.payload.get("regime").and_then(Json::as_str))
+        .unwrap_or("warming")
+        .to_string();
+    let blocked_side = ctx
+        .latest_of(SignalKind::TrendRegime)
+        .and_then(|s| s.payload.get("blocked_side").and_then(Json::as_str));
+
+    TrdrContext {
+        zone_matches,
+        zone_grade: zone
+            .and_then(|z| z.get("grade").and_then(Json::as_str))
+            .unwrap_or("none")
+            .to_string(),
+        zone_band_pct: zone.and_then(|z| z.get("band_pct").and_then(Json::as_f64)),
+        zone_distance_pct: zone_distance,
+        zone_low: zone.and_then(|z| z.get("zone_low").and_then(Json::as_f64)),
+        zone_high: zone.and_then(|z| z.get("zone_high").and_then(Json::as_f64)),
+        spot_perp_confluence: zone
+            .and_then(|z| z.get("spot_perp_confluence").and_then(Json::as_bool))
+            .unwrap_or(false),
+        delta_matches,
+        delta_tier,
+        delta_usd: delta.and_then(|d| d.get("delta_usd").and_then(Json::as_f64)),
+        delta_share: delta.and_then(|d| d.get("delta_share").and_then(Json::as_f64)),
+        oi_quadrant: oi
+            .and_then(|o| o.get("quadrant").and_then(Json::as_str))
+            .unwrap_or("neutral")
+            .to_string(),
+        regime,
+        trend_blocked: cfg.block_countertrend && blocked_side == Some(side_name(side)),
+    }
 }
 
 /// 10 秒放量事件 -> 3/5 分钟 Delta 反转 -> context 分层。
@@ -217,12 +334,26 @@ impl OrderFlowExhaustion {
                 "location_confirmed":setup.location_confirmed,
                 "context_score":setup.context_score,
                 "context_reasons":setup.context_reasons,
-                "book_imbalance":self.book_imbalance
+                "book_imbalance":self.book_imbalance,
+                "trdr":{
+                    "zone_grade":setup.trdr_zone_grade,
+                    "zone_band_pct":setup.trdr_zone_band_pct,
+                    "zone_distance_pct":setup.trdr_zone_distance_pct,
+                    "zone_low":setup.trdr_zone_low,
+                    "zone_high":setup.trdr_zone_high,
+                    "spot_perp_confluence":setup.trdr_spot_perp_confluence,
+                    "delta_tier":setup.trdr_delta_tier,
+                    "delta_usd":setup.trdr_delta_usd,
+                    "delta_share":setup.trdr_delta_share,
+                    "oi_quadrant":setup.trdr_oi_quadrant,
+                    "regime":setup.trdr_regime,
+                    "trend_blocked":setup.trend_blocked
+                }
             }),
         )
     }
 
-    fn evaluate(&mut self, b: &Bucket) -> Vec<Signal> {
+    fn evaluate(&mut self, b: &Bucket, ctx: &Ctx) -> Vec<Signal> {
         let ts = Timestamp::from_millis(b.start_ms + self.cfg.bucket_ms);
         let observed = self.history.iter().filter(|x| x.volume > 0.0).count();
         if observed < self.cfg.min_baseline_buckets {
@@ -328,33 +459,58 @@ impl OrderFlowExhaustion {
                 reason = "同一放量事件簇仍在冷却，已去重";
             } else {
                 let side = exhausted_side.expect("volume event has pressure side");
-                let location = match side {
+                let trdr = trdr_context(ctx, side, &self.cfg, ts.as_millis());
+                if trdr.trend_blocked {
+                    decision = "trend_blocked";
+                    reason = "TRDR 判定为同向单边，禁止逆势抄底/摸顶";
+                    self.eval = Some(json!({
+                        "ts_ms":ts.as_millis(), "decision":decision, "reason":reason,
+                        "price":b.close, "bucket_ms":self.cfg.bucket_ms,
+                        "volume_ratio":volume_ratio, "delta_share":delta_share,
+                        "trdr_regime":trdr.regime, "trdr_zone_grade":trdr.zone_grade,
+                        "trdr_delta_tier":trdr.delta_tier,
+                        "trend_blocked":true
+                    }));
+                    return vec![];
+                }
+                let local_location = match side {
                     Side::Buy => swept_low || vwap_dev <= -self.cfg.min_vwap_deviation_pct,
                     Side::Sell => swept_high || vwap_dev >= self.cfg.min_vwap_deviation_pct,
                 };
-                let book_support = self.book_imbalance.is_some_and(|imbalance| match side {
-                    Side::Buy => imbalance > 0.10,
-                    Side::Sell => imbalance < -0.10,
-                });
-                let oi_support = oi_change.is_some_and(|v| v.abs() >= 0.0005);
+                let location =
+                    trdr.zone_matches || (!self.cfg.require_trdr_location && local_location);
+                let oi_support =
+                    trdr.oi_quadrant != "neutral" || oi_change.is_some_and(|v| v.abs() >= 0.0005);
                 let stalled = efficiency <= self.cfg.max_efficiency * 0.65;
                 let mut context_score = 0u8;
                 let mut context_reasons = Vec::new();
                 if location {
                     context_score += 1;
-                    context_reasons.push("location");
+                    context_reasons.push(if trdr.zone_matches {
+                        "trdr_zone".to_string()
+                    } else {
+                        "local_location".to_string()
+                    });
                 }
                 if stalled {
                     context_score += 1;
-                    context_reasons.push("absorption");
+                    context_reasons.push("absorption".to_string());
                 }
-                if book_support {
+                if trdr.delta_matches {
                     context_score += 1;
-                    context_reasons.push("book");
+                    context_reasons.push("trdr_delta".to_string());
                 }
                 if oi_support {
                     context_score += 1;
-                    context_reasons.push("oi");
+                    context_reasons.push("oi".to_string());
+                }
+                if trdr.spot_perp_confluence {
+                    context_score += 1;
+                    context_reasons.push("spot_perp_confluence".to_string());
+                }
+                if local_location {
+                    context_score += 1;
+                    context_reasons.push("sweep_or_vwap".to_string());
                 }
                 let strong = volume_ratio >= self.cfg.strong_volume_ratio
                     || delta_share.abs() >= self.cfg.strong_delta_share;
@@ -364,14 +520,26 @@ impl OrderFlowExhaustion {
                     self.cfg.weak_confirm_buckets
                 };
                 let stop_anchor = match side {
-                    Side::Buy => b.low * (1.0 - self.cfg.stop_buffer_pct),
-                    Side::Sell => b.high * (1.0 + self.cfg.stop_buffer_pct),
+                    Side::Buy => {
+                        b.low.min(trdr.zone_low.unwrap_or(b.low)) * (1.0 - self.cfg.stop_buffer_pct)
+                    }
+                    Side::Sell => {
+                        b.high.max(trdr.zone_high.unwrap_or(b.high))
+                            * (1.0 + self.cfg.stop_buffer_pct)
+                    }
                 };
                 self.setup = Some(Setup {
                     event_id: b.start_ms,
                     side,
                     strength: if strong { "strong" } else { "weak" },
-                    event_price: b.close,
+                    event_price: if trdr.zone_matches {
+                        match (trdr.zone_low, trdr.zone_high) {
+                            (Some(lo), Some(hi)) => (lo + hi) / 2.0,
+                            _ => b.close,
+                        }
+                    } else {
+                        b.close
+                    },
                     stop_anchor,
                     event_volume: b.volume,
                     event_volume_ratio: volume_ratio,
@@ -380,6 +548,18 @@ impl OrderFlowExhaustion {
                     location_confirmed: location,
                     context_score,
                     context_reasons,
+                    trdr_zone_grade: trdr.zone_grade,
+                    trdr_zone_band_pct: trdr.zone_band_pct,
+                    trdr_zone_distance_pct: trdr.zone_distance_pct,
+                    trdr_zone_low: trdr.zone_low,
+                    trdr_zone_high: trdr.zone_high,
+                    trdr_spot_perp_confluence: trdr.spot_perp_confluence,
+                    trdr_delta_tier: trdr.delta_tier,
+                    trdr_delta_usd: trdr.delta_usd,
+                    trdr_delta_share: trdr.delta_share,
+                    trdr_oi_quadrant: trdr.oi_quadrant,
+                    trdr_regime: trdr.regime,
+                    trend_blocked: trdr.trend_blocked,
                     expires_at: b.start_ms + confirm_buckets as i64 * self.cfg.bucket_ms,
                 });
                 decision = "volume_event";
@@ -401,7 +581,17 @@ impl OrderFlowExhaustion {
             "location_confirmed":s.location_confirmed,
                 "context_reasons":s.context_reasons,
                 "volume_ratio":s.event_volume_ratio,
-                "event_delta_share":s.event_delta_share
+                "event_delta_share":s.event_delta_share,
+                "trdr_zone_grade":s.trdr_zone_grade,
+                "trdr_zone_band_pct":s.trdr_zone_band_pct,
+                "trdr_zone_distance_pct":s.trdr_zone_distance_pct,
+                "trdr_spot_perp_confluence":s.trdr_spot_perp_confluence,
+                "trdr_delta_tier":s.trdr_delta_tier,
+                "trdr_delta_usd":s.trdr_delta_usd,
+                "trdr_delta_share":s.trdr_delta_share,
+                "trdr_oi_quadrant":s.trdr_oi_quadrant,
+                "trdr_regime":s.trdr_regime,
+                "trend_blocked":s.trend_blocked
             })
         });
         let confirmed_profile = out.first().and_then(|s| s.payload.get("profile")).cloned();
@@ -433,7 +623,7 @@ impl SignalPlugin for OrderFlowExhaustion {
         "OrderFlowExhaustion"
     }
 
-    fn on_event(&mut self, ev: &Event, _ctx: &Ctx) -> Vec<Signal> {
+    fn on_event(&mut self, ev: &Event, ctx: &Ctx) -> Vec<Signal> {
         match ev {
             Event::Oi(oi) => {
                 self.previous_oi = self.latest_oi;
@@ -441,12 +631,20 @@ impl SignalPlugin for OrderFlowExhaustion {
                 vec![]
             }
             Event::Book(book) => {
+                if book.exchange != Exchange::BinanceFutures {
+                    return vec![];
+                }
                 let bid = book.bid_qty_within(0.002);
                 let ask = book.ask_qty_within(0.002);
                 self.book_imbalance = (bid + ask > 0.0).then_some((bid - ask) / (bid + ask));
                 vec![]
             }
             Event::Trade(t) => {
+                // 现货逐笔成交只供 TrdrMarketMap 做跨市场 Delta 确认，不能推进
+                // 合约执行信号的桶，否则 context feed 会产生无法下单的幽灵信号。
+                if t.exchange != Exchange::BinanceFutures {
+                    return vec![];
+                }
                 let ms = t.ts.as_millis();
                 let day = ms.div_euclid(86_400_000);
                 if day != self.session_day {
@@ -461,7 +659,7 @@ impl SignalPlugin for OrderFlowExhaustion {
                 let mut signals = Vec::new();
                 if self.current.as_ref().is_some_and(|b| b.start_ms != start) {
                     let completed = self.current.take().expect("current bucket");
-                    signals = self.evaluate(&completed);
+                    signals = self.evaluate(&completed, ctx);
                     self.history.push_back(completed);
                     while self.history.len()
                         > self.cfg.location_buckets.max(self.cfg.baseline_buckets)
@@ -528,17 +726,40 @@ mod tests {
             location_confirmed,
             context_score,
             context_reasons: vec![],
+            trdr_zone_grade: "yellow".into(),
+            trdr_zone_band_pct: Some(0.025),
+            trdr_zone_distance_pct: Some(0.001),
+            trdr_zone_low: Some(99.5),
+            trdr_zone_high: Some(100.5),
+            trdr_spot_perp_confluence: true,
+            trdr_delta_tier: 2,
+            trdr_delta_usd: Some(-1_000_000.0),
+            trdr_delta_share: Some(-0.10),
+            trdr_oi_quadrant: "price_down_oi_up".into(),
+            trdr_regime: "range".into(),
+            trend_blocked: false,
             expires_at: 10,
         }
     }
 
     #[test]
+    fn spot_trades_are_context_only() {
+        let mut s = test_signal();
+        let mut ev = trade(1_000, 100.0, true, 1.0);
+        if let Event::Trade(t) = &mut ev {
+            t.exchange = Exchange::BinanceSpot;
+        }
+        assert!(s.on_event(&ev, &Ctx::default()).is_empty());
+        assert!(s.current.is_none());
+    }
+
+    #[test]
     fn profile_keeps_middle_volume_band_observational() {
         let s = test_signal();
-        assert_eq!(s.profile(&setup(2.2, true, 3)), "balanced");
-        assert_eq!(s.profile(&setup(2.7, true, 3)), "high_frequency");
-        assert_eq!(s.profile(&setup(3.2, true, 3)), "quality");
-        assert_eq!(s.profile(&setup(2.2, false, 3)), "high_frequency");
+        assert_eq!(s.profile(&setup(2.2, true, 4)), "balanced");
+        assert_eq!(s.profile(&setup(2.7, true, 4)), "high_frequency");
+        assert_eq!(s.profile(&setup(3.2, true, 5)), "quality");
+        assert_eq!(s.profile(&setup(2.2, false, 4)), "high_frequency");
     }
 
     #[test]

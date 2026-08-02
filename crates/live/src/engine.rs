@@ -101,6 +101,8 @@ pub struct EngineSnapshot {
     pub n_fills: usize,
     /// 最近一次策略评估说明（信号插件 eval_note）
     pub last_eval: Option<serde_json::Value>,
+    /// TRDR 市场地图的独立实时快照，避免被高频入场评估覆盖。
+    pub market_map: Option<serde_json::Value>,
     pub run_id: String,
     pub strategy_name: String,
     pub strategy_hash: String,
@@ -677,6 +679,13 @@ impl LiveEngine {
     /// 状态快照（控制面轮询用）。
     pub fn snapshot(&self) -> EngineSnapshot {
         let px = self.latest_price;
+        let plugin_note = |name: &str| {
+            self.strategy
+                .signals
+                .iter()
+                .find(|sp| sp.name() == name)
+                .and_then(|sp| sp.eval_note())
+        };
         EngineSnapshot {
             last_price: px.map(|p| p.to_f64()),
             equity: self.account.equity(px.unwrap_or(Price::ZERO)),
@@ -690,7 +699,8 @@ impl LiveEngine {
             }),
             n_intents: self.intents.len(),
             n_fills: self.account.fills().len(),
-            last_eval: self.latest_eval.clone(),
+            last_eval: plugin_note("OrderFlowExhaustion").or_else(|| self.latest_eval.clone()),
+            market_map: plugin_note("TrdrMarketMap"),
             run_id: self.config.run_id.clone(),
             strategy_name: self.config.strategy_name.clone(),
             strategy_hash: self.config.strategy_hash.clone(),

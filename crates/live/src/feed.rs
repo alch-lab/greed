@@ -29,6 +29,8 @@ use tracing::{info, warn};
 /// 信号与回测（主网历史数据）保持同一价格环境；订单仍由 testnet 撮合。
 /// 注意 `/market` 前缀：旧版 `/ws/...` 裸路径已于 2026-04-23 退役。
 pub const MAINNET_WS: &str = "wss://fstream.binance.com/market";
+/// 币安现货主网公共行情（只读，用于跨市场 Delta/订单簿确认）。
+pub const MAINNET_SPOT_WS: &str = "wss://stream.binance.com:9443";
 
 #[derive(Debug, Deserialize)]
 struct RawAggTrade {
@@ -45,58 +47,53 @@ struct RawAggTrade {
 /// 轮询主网公共 depth 与 OI，为订单流信号补充位置上下文。
 /// 失败只跳过当前快照，不影响逐笔成交主链路。
 pub async fn run_context_feed(
-    rest_base: &str,
+    futures_rest_base: &str,
+    spot_rest_base: &str,
     symbol: &str,
     client: reqwest::Client,
     tx: mpsc::Sender<Event>,
 ) {
     let sym = Symbol::new(symbol);
-    let depth_url = format!(
-        "{}/fapi/v1/depth?symbol={}&limit=100",
-        rest_base.trim_end_matches('/'),
+    let futures_depth_url = format!(
+        "{}/fapi/v1/depth?symbol={}&limit=1000",
+        futures_rest_base.trim_end_matches('/'),
+        symbol
+    );
+    let spot_depth_url = format!(
+        "{}/api/v3/depth?symbol={}&limit=1000",
+        spot_rest_base.trim_end_matches('/'),
         symbol
     );
     let oi_url = format!(
         "{}/fapi/v1/openInterest?symbol={}",
-        rest_base.trim_end_matches('/'),
+        futures_rest_base.trim_end_matches('/'),
         symbol
     );
     let mut timer = tokio::time::interval(std::time::Duration::from_secs(5));
     timer.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     loop {
         timer.tick().await;
-        let (depth, oi) = tokio::join!(client.get(&depth_url).send(), client.get(&oi_url).send());
+        let (futures_depth, spot_depth, oi) = tokio::join!(
+            client.get(&futures_depth_url).send(),
+            client.get(&spot_depth_url).send(),
+            client.get(&oi_url).send()
+        );
         let now = Timestamp::from_millis(chrono::Utc::now().timestamp_millis());
         let mut mid = None;
-        if let Ok(resp) = depth {
+        if let Ok(resp) = futures_depth {
             if let Ok(text) = resp.text().await {
-                if let Ok(v) = serde_json::from_str::<serde_json::Value>(&text) {
-                    let parse = |key: &str| -> Vec<(Price, Qty)> {
-                        v.get(key)
-                            .and_then(|x| x.as_array())
-                            .into_iter()
-                            .flatten()
-                            .filter_map(|row| {
-                                let a = row.as_array()?;
-                                Some((
-                                    Price::from_f64(a.first()?.as_str()?.parse().ok()?),
-                                    Qty::from_f64(a.get(1)?.as_str()?.parse().ok()?),
-                                ))
-                            })
-                            .collect()
-                    };
-                    let book = BookSnapshot {
-                        ts: now,
-                        exchange: Exchange::BinanceFutures,
-                        symbol: sym.clone(),
-                        bids: parse("bids"),
-                        asks: parse("asks"),
-                    };
+                if let Some(book) = parse_book(&text, now, Exchange::BinanceFutures, sym.clone()) {
                     mid = book.mid_price().map(Price::to_f64);
-                    if !book.bids.is_empty()
-                        && !book.asks.is_empty()
-                        && tx.send(Event::Book(book)).await.is_err()
-                    {
+                    if tx.send(Event::Book(book)).await.is_err() {
+                        return;
+                    }
+                }
+            }
+        }
+        if let Ok(resp) = spot_depth {
+            if let Ok(text) = resp.text().await {
+                if let Some(book) = parse_book(&text, now, Exchange::BinanceSpot, sym.clone()) {
+                    if tx.send(Event::Book(book)).await.is_err() {
                         return;
                     }
                 }
@@ -124,6 +121,37 @@ pub async fn run_context_feed(
             }
         }
     }
+}
+
+fn parse_book(
+    text: &str,
+    ts: Timestamp,
+    exchange: Exchange,
+    symbol: Symbol,
+) -> Option<BookSnapshot> {
+    let v: serde_json::Value = serde_json::from_str(text).ok()?;
+    let parse = |key: &str| -> Vec<(Price, Qty)> {
+        v.get(key)
+            .and_then(|x| x.as_array())
+            .into_iter()
+            .flatten()
+            .filter_map(|row| {
+                let a = row.as_array()?;
+                Some((
+                    Price::from_f64(a.first()?.as_str()?.parse().ok()?),
+                    Qty::from_f64(a.get(1)?.as_str()?.parse().ok()?),
+                ))
+            })
+            .collect()
+    };
+    let book = BookSnapshot {
+        ts,
+        exchange,
+        symbol,
+        bids: parse("bids"),
+        asks: parse("asks"),
+    };
+    (!book.bids.is_empty() && !book.asks.is_empty()).then_some(book)
 }
 
 /// 解析一条 WS 文本为 Trade；非 aggTrade 帧（订阅确认/ping）返回 None。
@@ -209,6 +237,21 @@ mod tests {
         assert!((t.qty.to_f64() - 0.5).abs() < 1e-9);
         assert!(t.is_buyer_maker);
         assert_eq!(t.ts.as_millis(), 1704067200038);
+    }
+
+    #[test]
+    fn parses_spot_depth_snapshot() {
+        let text = r#"{"lastUpdateId":1,"bids":[["99900.0","2.0"]],"asks":[["100100.0","3.0"]]}"#;
+        let book = parse_book(
+            text,
+            Timestamp::from_millis(1),
+            Exchange::BinanceSpot,
+            Symbol::new("BTCUSDT"),
+        )
+        .unwrap();
+        assert_eq!(book.exchange, Exchange::BinanceSpot);
+        assert_eq!(book.bids.len(), 1);
+        assert_eq!(book.asks.len(), 1);
     }
 
     #[test]

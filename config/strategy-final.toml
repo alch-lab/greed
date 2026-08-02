@@ -1,12 +1,30 @@
-# 订单流力竭 v3：10 秒放量事件 → 3/5 分钟 Delta 翻转 → context 分层。
-# 五个 profile 是同一事件的质量层级；每个事件簇只允许产生一次入场。
+# TRDR 市场地图先标注流动性区域、跨市场 Delta、趋势与 OI 象限，
+# 订单流力竭再在有效区域内确认入场。每个事件簇只允许产生一次入场。
 
 [strategy]
-name = "orderflow-exhaustion-v3"
-signals = ["OrderFlowExhaustion"]
+name = "trdr-orderflow-v1"
+signals = ["TrdrMarketMap", "OrderFlowExhaustion"]
 trigger = "OrderFlowEntry"
 filters = ["CircuitBreaker"]
 exits = ["OrderFlowTradeManagement"]
+
+[strategy.plugins.TrdrMarketMap]
+bucket_ms = 10000
+delta_window_ms = 1800000
+trend_window_ms = 1800000
+book_fresh_ms = 20000
+book_bands_pct = [0.01, 0.025, 0.05]
+min_zone_depth_usd = 1000000
+green_ratio = 1.80
+yellow_ratio = 2.50
+red_ratio = 3.50
+blue_ratio = 5.00
+zone_bin_pct = 0.001
+author_delta_coverage = 0.35
+delta_share_levels = [0.04, 0.08, 0.12, 0.16]
+trend_return_pct = 0.012
+trend_efficiency = 0.45
+oi_change_threshold = 0.001
 
 [strategy.plugins.OrderFlowExhaustion]
 bucket_ms = 10000
@@ -27,8 +45,14 @@ strong_confirm_buckets = 18
 weak_confirm_buckets = 30
 cluster_cooldown_buckets = 60
 stop_buffer_pct = 0.00035
-balanced_context_score = 3
-quality_context_score = 3
+balanced_context_score = 4
+quality_context_score = 5
+require_trdr_location = true
+block_countertrend = true
+min_trdr_grade_rank = 2
+min_trdr_delta_tier = 1
+max_zone_distance_pct = 0.004
+trdr_max_age_ms = 30000
 
 [strategy.plugins.OrderFlowEntry]
 trade_classic = false

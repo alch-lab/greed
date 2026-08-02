@@ -245,12 +245,28 @@ pub async fn run_trade(
             live::feed::run_trade_feed(&ws, &sym, Exchange::BinanceFutures, tx).await;
         });
     }
+    // 现货成交仅作为 TRDR 跨市场订单流上下文；执行和仓位仍全部在 USDⓈ-M 合约。
+    let (spot_tx, mut spot_rx) = tokio::sync::mpsc::channel::<tcore::Trade>(4096);
+    {
+        let sym = collector.symbol.clone();
+        tokio::spawn(async move {
+            live::feed::run_trade_feed(live::MAINNET_SPOT_WS, &sym, Exchange::BinanceSpot, spot_tx)
+                .await;
+        });
+    }
     let (context_tx, mut context_rx) = tokio::sync::mpsc::channel::<tcore::Event>(64);
     {
         let sym = collector.symbol.clone();
         let client = http.clone();
         tokio::spawn(async move {
-            live::feed::run_context_feed(live::MAINNET_FAPI, &sym, client, context_tx).await;
+            live::feed::run_context_feed(
+                live::MAINNET_FAPI,
+                live::MAINNET_SPOT_API,
+                &sym,
+                client,
+                context_tx,
+            )
+            .await;
         });
     }
     info!(symbol = %collector.symbol, journal = %journal_path, mode = mode.as_str(), "进入交易主循环");
@@ -259,6 +275,7 @@ pub async fn run_trade(
     loop {
         tokio::select! {
             Some(ev) = context_rx.recv() => engine.on_context_event(ev),
+            Some(t) = spot_rx.recv() => engine.on_context_event(tcore::Event::Trade(t)),
             maybe = rx.recv() => {
                 match maybe {
                     Some(t) => engine.on_trade(&t).await,
@@ -290,6 +307,7 @@ pub async fn run_trade(
                         "n_intents": snap.n_intents,
                         "n_fills": snap.n_fills,
                         "last_eval": snap.last_eval,
+                        "market_map": snap.market_map,
                         "run_id": snap.run_id,
                         "strategy_name": snap.strategy_name,
                         "strategy_hash": snap.strategy_hash,

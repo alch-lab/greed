@@ -17,6 +17,7 @@ pub mod rest;
 
 pub use broker::AnyBroker;
 pub use engine::{EngineSnapshot, LiveConfig, LiveEngine, PositionSnap};
-pub use feed::MAINNET_WS;
+pub use feed::{MAINNET_SPOT_WS, MAINNET_WS};
 pub use rest::{IncomeRecord, RestClient, SymbolFilters};
 pub const MAINNET_FAPI: &str = "https://fapi.binance.com";
+pub const MAINNET_SPOT_API: &str = "https://api.binance.com";

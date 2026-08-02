@@ -1,18 +1,18 @@
 # greed
 
-BTCUSDT 永续订单流力竭交易系统（Rust）。生产路径只有一个模型：
+BTCUSDT 永续 TRDR 市场地图 + 订单流力竭交易系统（Rust）。生产路径只有一个模型：
 
-`10 秒放量 → effort/result 背离 → 3/5 分钟 Delta 翻转 → context 分层 → 结构风控`
+`现货/合约流动性区域 → 30m 跨市场 Delta + OI + 趋势 → 10 秒力竭 → 3/5 分钟确认 → 结构风控`
 
-模型直接消费 Binance 主网逐笔成交，并轮询公共订单簿与 OI。模拟盘/实盘只使用一个
-USDⓈ-M 合约账户；没有 EMA、资金费 carry、每日执行探针或旧 MR 旁路。
+模型同时消费 Binance 主网现货和永续逐笔成交及 1000 档订单簿，并轮询永续 OI。现货
+只提供确认数据；模拟盘/实盘仍只使用一个 USDⓈ-M 合约账户执行，不会建立现货腿。
 
 ## 代码结构
 
 ```text
 crates/core       事件、类型和插件接口
 crates/data       Binance 导入、采集和本地数据湖
-crates/signals    OrderFlowExhaustion 原始订单流信号
+crates/signals    TrdrMarketMap 上游地图 + OrderFlowExhaustion 入场确认
 crates/strategy   OrderFlowEntry、账户保护和分批出场
 crates/backtest   逐笔回测、撮合、账户和 Journal
 crates/live       主网公共行情 + dry/testnet/live 执行
@@ -67,8 +67,9 @@ paper/dry 的信号来自主网公共行情，订单在 Demo Futures 执行。�
 设置逐仓和杠杆并清理遗留挂单。若交易所已有仓位，只有它与同一策略 Journal 中可恢复
 仓位完全一致时才会接管；否则拒绝启动。进程退出保留保护性止损。
 
-订单流基线只用真实逐笔成交，默认需要 120 个 10 秒桶（约 20 分钟）。不会用 K 线合成
-Delta。公共 depth/OI 暂时不可用时，核心成交模型仍运行，前端相应字段显示为空。
+订单流基线只用真实逐笔成交，默认需要 120 个 10 秒桶（约 20 分钟）；TRDR Delta/趋势
+窗口为 30 分钟。不会用 K 线合成 Delta。公共 depth 不完整或区域不满足时不会建立生产
+待确认事件，前端会明确显示缺失的数据源和被拦截环节。
 
 ## 控制面与前端
 
@@ -80,8 +81,8 @@ npm run build
 npm run dev
 ```
 
-前端展示每个 10 秒桶的五步漏斗、五个质量层级的独立收益/胜率/费用、真实意图和成交、
-持仓、权益与自动重启状态。设置 `GREED_WEB_PASSWORD` 可启用登录。
+前端分别展示 TRDR 市场地图和入场确认漏斗：色带区域、盘口覆盖、跨市场 Delta、OI 象限、
+趋势过滤、五个质量层级、真实意图和成交、持仓、权益与自动重启状态。
 
 ## 数据
 
