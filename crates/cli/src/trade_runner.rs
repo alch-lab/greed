@@ -387,6 +387,7 @@ pub async fn run_trade(
                         "active_shadow_signals": snap.active_shadow_signals,
                         "confirmed_signals_run": snap.confirmed_signals_run,
                         "shadow_outcomes_run": snap.shadow_outcomes_run,
+                        "execution_healthy": snap.execution_healthy,
                     }));
                 }
             }
