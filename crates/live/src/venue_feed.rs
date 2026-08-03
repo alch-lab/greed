@@ -306,22 +306,32 @@ pub async fn run_bybit_liquidation_feed(symbol: &str, tx: mpsc::Sender<Event>) {
                 if ws.send(Message::Text(subscribe.clone())).await.is_err() {
                     continue;
                 }
-                while let Some(message) = ws.next().await {
-                    match message {
-                        Ok(Message::Text(text)) => {
+                loop {
+                    match tokio::time::timeout(std::time::Duration::from_secs(20), ws.next()).await
+                    {
+                        Ok(Some(Ok(Message::Text(text)))) => {
                             for tick in parse_bybit_liquidations(&text, &sym) {
                                 if tx.send(Event::Liquidation(tick)).await.is_err() {
                                     return;
                                 }
                             }
                         }
-                        Ok(Message::Ping(data)) => {
+                        Ok(Some(Ok(Message::Ping(data)))) => {
                             let _ = ws.send(Message::Pong(data)).await;
                         }
-                        Ok(_) => {}
-                        Err(e) => {
+                        Ok(Some(Ok(_))) => {}
+                        Ok(Some(Err(e))) => {
                             warn!(error = %e, "Bybit 强平流中断");
                             break;
+                        }
+                        Ok(None) => break,
+                        Err(_) => {
+                            // 强平可能长时间无消息；Bybit 要求客户端定期发送 JSON ping，
+                            // 否则空闲连接约一分钟后会被服务端关闭。
+                            let ping = json!({"op":"ping"}).to_string();
+                            if ws.send(Message::Text(ping)).await.is_err() {
+                                break;
+                            }
                         }
                     }
                 }

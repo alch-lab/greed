@@ -135,8 +135,16 @@ pub async fn run_trade(
         rest.sync_time().await?;
 
         let amt = rest.position_amt(&collector.symbol).await?;
-        // 清掉遗留挂单，设置杠杆与逐仓
-        rest.cancel_all_open_orders(&collector.symbol).await?;
+        // 空仓才可在恢复检查前清遗留单。有仓时先保留交易所保护性止损；若后续确认
+        // journal 与仓位一致，首个行情节拍会安全撤旧并重挂。若不一致则原止损不受影响。
+        if amt.abs() <= 1e-12 {
+            rest.cancel_all_open_orders(&collector.symbol).await?;
+        } else {
+            info!(
+                position_amt = amt,
+                "检测到交易所持仓，恢复校验前保留现有保护单"
+            );
+        }
         rest.set_leverage(&collector.symbol, args.leverage).await?;
         rest.set_margin_isolated(&collector.symbol).await?;
 

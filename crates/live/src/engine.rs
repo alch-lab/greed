@@ -111,6 +111,8 @@ pub struct EngineSnapshot {
     pub active_shadow_signals: usize,
     pub confirmed_signals_run: usize,
     pub shadow_outcomes_run: usize,
+    /// userTrades 最近一次轮询是否成功；false 时引擎禁止新开仓。
+    pub execution_healthy: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -462,8 +464,10 @@ impl LiveEngine {
                     .unwrap_or("")
                     .to_string(),
             );
+            // 多路盘口/OI 的事件时间并不严格同序。只接受每个插件单调前进的新桶，
+            // 避免不同来源在相邻/旧桶之间跳动时每秒写十几条重复市场地图。
             let changed = match self.last_eval_keys.get(i) {
-                Some(Some(k)) => k != &key,
+                Some(Some(k)) => key.0 > k.0,
                 _ => true,
             };
             if !changed {
@@ -709,6 +713,7 @@ impl LiveEngine {
             active_shadow_signals: self.shadow_signals.len(),
             confirmed_signals_run: self.confirmed_signals_run,
             shadow_outcomes_run: self.shadow_outcomes_run,
+            execution_healthy: self.broker.execution_healthy(),
         }
     }
 
@@ -1005,6 +1010,18 @@ impl LiveEngine {
         let event_id = signals
             .iter()
             .find_map(|signal| signal.payload.get("event_id").and_then(|v| v.as_i64()));
+        if !self.broker.execution_healthy() {
+            warn!(event_id, "成交回报通道不健康，禁止新开仓");
+            self.append_research(
+                "order_skipped",
+                trade.ts.as_millis(),
+                serde_json::json!({
+                    "event_id": event_id, "cause": "execution_unhealthy",
+                    "strategy_reason": intent.reason,
+                }),
+            );
+            return;
+        }
         let mut scale = 1.0f64;
         for fp in self.strategy.filters.iter() {
             match fp.check(&intent, &self.ctx) {
@@ -1045,6 +1062,18 @@ impl LiveEngine {
         let event_id = signals
             .iter()
             .find_map(|signal| signal.payload.get("event_id").and_then(|v| v.as_i64()));
+        if !self.broker.execution_healthy() {
+            warn!(event_id, "成交回报通道不健康，禁止加仓");
+            self.append_research(
+                "order_skipped",
+                trade.ts.as_millis(),
+                serde_json::json!({
+                    "event_id": event_id, "cause": "execution_unhealthy",
+                    "strategy_reason": intent.reason, "is_add": true,
+                }),
+            );
+            return;
+        }
         let mut scale = 1.0f64;
         for fp in self.strategy.filters.iter() {
             match fp.check(&intent, &self.ctx) {

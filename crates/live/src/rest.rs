@@ -45,6 +45,14 @@ pub fn floor_to_step(x: f64, step: f64) -> f64 {
     (x / step).floor() * step
 }
 
+/// 向上取整到步长的整数倍。保护性止损按方向选择更保守的 tick。
+pub fn ceil_to_step(x: f64, step: f64) -> f64 {
+    if step <= 0.0 {
+        return x;
+    }
+    (x / step).ceil() * step
+}
+
 /// 把 f64 格式化成币安接受的十进制字符串（按步长推小数位，去尾零）。
 pub fn fmt_step(x: f64, step: f64) -> String {
     let decimals = if step >= 1.0 {
@@ -310,10 +318,17 @@ impl RestClient {
             &[("symbol", symbol.to_string())],
         )
         .await?;
+        // 条件单已迁移到独立 Algo API，普通 allOpenOrders 不会清理这些止损单。
+        self.signed(
+            reqwest::Method::DELETE,
+            "/fapi/v1/algoOpenOrders",
+            &[("symbol", symbol.to_string())],
+        )
+        .await?;
         Ok(())
     }
 
-    /// 下单。返回 orderId。
+    /// 下单。返回交易所订单标识（普通单为 orderId，条件单为 algoId）。
     ///
     /// - `kind`："MARKET" / "LIMIT" / "STOP_MARKET"
     /// - LIMIT 需 `price`；STOP_MARKET 需 `stop_price`；止损平仓用 `reduce_only`。
@@ -345,21 +360,28 @@ impl RestClient {
         }
         if kind == "STOP_MARKET" {
             let sp =
-                stop_price.ok_or_else(|| RestError::Data("STOP_MARKET 缺 stopPrice".into()))?;
-            params.push((
-                "stopPrice",
-                fmt_step(floor_to_step(sp, filters.tick_size), filters.tick_size),
-            ));
+                stop_price.ok_or_else(|| RestError::Data("STOP_MARKET 缺 triggerPrice".into()))?;
+            let aligned = if side == "SELL" {
+                ceil_to_step(sp, filters.tick_size)
+            } else {
+                floor_to_step(sp, filters.tick_size)
+            };
+            params.push(("triggerPrice", fmt_step(aligned, filters.tick_size)));
+            params.push(("algoType", "CONDITIONAL".into()));
+            params.push(("workingType", "CONTRACT_PRICE".into()));
         }
         if reduce_only {
             params.push(("reduceOnly", "true".into()));
         }
-        let v = self
-            .signed(reqwest::Method::POST, "/fapi/v1/order", &params)
-            .await?;
-        v["orderId"]
+        let (path, id_field) = if kind == "STOP_MARKET" {
+            ("/fapi/v1/algoOrder", "algoId")
+        } else {
+            ("/fapi/v1/order", "orderId")
+        };
+        let v = self.signed(reqwest::Method::POST, path, &params).await?;
+        v[id_field]
             .as_i64()
-            .ok_or_else(|| RestError::Data(format!("order 响应无 orderId: {}", v)))
+            .ok_or_else(|| RestError::Data(format!("order 响应无 {id_field}: {v}")))
     }
 
     /// 账户成交流水（fill 检测数据源），from_id 之后（含）的成交，升序。
@@ -449,6 +471,7 @@ mod tests {
         assert_eq!(fmt_step(0.012, 0.001), "0.012");
         assert_eq!(fmt_step(67000.0, 0.1), "67000");
         assert_eq!(fmt_step(67000.1, 0.1), "67000.1");
+        assert!((ceil_to_step(100.01, 0.1) - 100.1).abs() < 1e-9);
     }
 
     #[test]

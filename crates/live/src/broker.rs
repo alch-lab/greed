@@ -22,6 +22,9 @@ use crate::rest::{RestClient, RestError, SymbolFilters};
 struct OrderMeta {
     qty: f64,
     reason: String,
+    side: Side,
+    /// Algo 条件单触发后的真实 orderId 与 algoId 不同。
+    is_algo: bool,
     /// 已成交量（部分成交累计）
     filled_qty: f64,
 }
@@ -40,6 +43,27 @@ fn register_fill_reason(
     Some(reason)
 }
 
+/// Algo STOP_MARKET 的成交使用新的 orderId。系统每个 symbol 只管理一个仓位和一个
+/// 保护止损；仅在方向一致且候选唯一时回退映射，避免误收普通 external 成交。
+fn register_unique_algo_fill_reason(
+    open: &mut HashMap<i64, OrderMeta>,
+    side: Side,
+    fill_qty: f64,
+) -> Option<(i64, String)> {
+    let candidates = open
+        .iter()
+        .filter(|(_, meta)| {
+            meta.is_algo && meta.side == side && meta.filled_qty + fill_qty <= meta.qty * 1.001
+        })
+        .map(|(id, _)| *id)
+        .collect::<Vec<_>>();
+    if candidates.len() != 1 {
+        return None;
+    }
+    let algo_id = candidates[0];
+    register_fill_reason(open, algo_id, fill_qty).map(|reason| (algo_id, reason))
+}
+
 pub struct DryBroker {
     inner: Broker,
 }
@@ -52,6 +76,8 @@ pub struct TestnetBroker {
     /// userTrades 游标（最后处理过的 trade id）
     last_trade_id: i64,
     last_submitted_order_id: Option<i64>,
+    /// 最近一次 userTrades 轮询是否成功；失败期间禁止新增风险。
+    execution_healthy: bool,
 }
 
 /// 经纪层统一入口（枚举分发，避免 async trait 对象安全问题）。
@@ -75,6 +101,7 @@ impl AnyBroker {
             open: HashMap::new(),
             last_trade_id: 0,
             last_submitted_order_id: None,
+            execution_healthy: true,
         })
     }
 
@@ -150,6 +177,8 @@ impl AnyBroker {
                     OrderMeta {
                         qty: order.qty.to_f64(),
                         reason: order.reason,
+                        side: order.side,
+                        is_algo: kind == "STOP_MARKET",
                         filled_qty: 0.0,
                     },
                 );
@@ -173,9 +202,13 @@ impl AnyBroker {
             return Vec::new();
         };
         let trades = match b.rest.user_trades(&b.symbol, b.last_trade_id + 1).await {
-            Ok(t) => t,
+            Ok(t) => {
+                b.execution_healthy = true;
+                t
+            }
             Err(e) => {
-                warn!(error = %e, "userTrades 轮询失败（下周期重试）");
+                b.execution_healthy = false;
+                warn!(error = %e, "userTrades 轮询失败（禁止新开仓，下周期重试）");
                 return Vec::new();
             }
         };
@@ -197,7 +230,18 @@ impl AnyBroker {
                     continue;
                 }
             };
-            let Some(reason) = register_fill_reason(&mut b.open, ut.order_id, qty) else {
+            let reason = register_fill_reason(&mut b.open, ut.order_id, qty).or_else(|| {
+                register_unique_algo_fill_reason(&mut b.open, side, qty).map(|(algo_id, reason)| {
+                    warn!(
+                        algo_id,
+                        actual_order_id = ut.order_id,
+                        trade_id = ut.trade_id,
+                        "Algo 止损成交通过唯一方向/数量候选完成映射"
+                    );
+                    reason
+                })
+            });
+            let Some(reason) = reason else {
                 warn!(
                     trade_id = ut.trade_id,
                     order_id = ut.order_id,
@@ -242,16 +286,22 @@ impl AnyBroker {
         }
     }
 
+    /// 成交回报通道失效时禁止新增风险；Dry 模式始终健康。
+    pub fn execution_healthy(&self) -> bool {
+        match self {
+            AnyBroker::Dry(_) => true,
+            AnyBroker::Testnet(b) => b.execution_healthy,
+        }
+    }
+
     /// 撤销全部挂单。
     pub async fn cancel_all(&mut self) {
         match self {
             AnyBroker::Dry(b) => b.inner.cancel_all(),
-            AnyBroker::Testnet(b) => {
-                if let Err(e) = b.rest.cancel_all_open_orders(&b.symbol).await {
-                    warn!(error = %e, "testnet 全部撤单失败");
-                }
-                b.open.clear();
-            }
+            AnyBroker::Testnet(b) => match b.rest.cancel_all_open_orders(&b.symbol).await {
+                Ok(()) => b.open.clear(),
+                Err(e) => warn!(error = %e, "testnet 普通单/Algo 条件单全部撤单失败"),
+            },
         }
     }
 
@@ -291,6 +341,8 @@ mod tests {
             OrderMeta {
                 qty: 0.1,
                 reason: "orderflow_balanced".into(),
+                side: Side::Buy,
+                is_algo: false,
                 filled_qty: 0.0,
             },
         )]);
@@ -304,5 +356,38 @@ mod tests {
             Some("orderflow_balanced")
         );
         assert!(!open.contains_key(&42));
+    }
+
+    #[test]
+    fn unique_algo_fill_maps_triggered_child_order() {
+        let mut open = HashMap::from([(
+            4001,
+            OrderMeta {
+                qty: 0.1,
+                reason: "stop".into(),
+                side: Side::Sell,
+                is_algo: true,
+                filled_qty: 0.0,
+            },
+        )]);
+        let mapped = register_unique_algo_fill_reason(&mut open, Side::Sell, 0.1);
+        assert_eq!(mapped, Some((4001, "stop".into())));
+        assert!(open.is_empty());
+    }
+
+    #[test]
+    fn ambiguous_algo_fill_is_not_mapped() {
+        let meta = OrderMeta {
+            qty: 0.1,
+            reason: "stop".into(),
+            side: Side::Sell,
+            is_algo: true,
+            filled_qty: 0.0,
+        };
+        let mut open = HashMap::from([(4001, meta.clone()), (4002, meta)]);
+        assert_eq!(
+            register_unique_algo_fill_reason(&mut open, Side::Sell, 0.1),
+            None
+        );
     }
 }

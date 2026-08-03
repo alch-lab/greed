@@ -2,7 +2,7 @@
 # 订单流力竭再在有效区域内确认入场。每个事件簇只允许产生一次入场。
 
 [strategy]
-name = "trdr-orderflow-v2-full-market"
+name = "trdr-orderflow-v3-depth-compatible"
 signals = ["TrdrMarketMap", "OrderFlowExhaustion"]
 trigger = "OrderFlowEntry"
 filters = ["CircuitBreaker"]
@@ -13,7 +13,9 @@ bucket_ms = 10000
 delta_window_ms = 1800000
 trend_window_ms = 1800000
 book_fresh_ms = 20000
-book_bands_pct = [0.01, 0.025, 0.05]
+# 三所公开快照的共同完整覆盖约为 ±0.25%；更宽档位继续展示，但不会错误地
+# 把截断盘口当成完整深度。首档可满足 2 现货 + 2 永续的硬覆盖要求。
+book_bands_pct = [0.0025, 0.005, 0.01]
 min_zone_depth_usd = 1000000
 green_ratio = 1.80
 yellow_ratio = 2.50
