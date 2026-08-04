@@ -72,6 +72,22 @@ struct PendingEntry {
     reason: String,
 }
 
+/// 已提交、等待交易所成交回报的减仓单。
+///
+/// testnet 的 REST 下单只返回“已受理”，真实成交由 userTrades 异步回传。
+/// 在回报到达前必须阻止同一止盈条件重复下单；部分成交完成后，再按剩余仓位
+/// 撤换保护性止损，避免旧止损数量大于实际持仓。
+#[derive(Debug, Clone)]
+struct PendingExit {
+    order_id: Option<i64>,
+    reason: String,
+    requested_qty: f64,
+    filled_qty: f64,
+    submitted_ts_ms: i64,
+    rearm_stop: Option<Price>,
+    timeout_noted: bool,
+}
+
 /// 每一个已确认信号都跟踪到 4 小时，不论其是否获准交易。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ShadowSignal {
@@ -199,6 +215,8 @@ pub struct LiveEngine {
     shadow_outcomes_run: usize,
     // ---- 入场挂起 ----
     pending_entry: Option<PendingEntry>,
+    // ---- 减仓挂起（等待 userTrades 确认后重挂剩余仓位止损）----
+    pending_exit: Option<PendingExit>,
     // ---- 熔断状态（同回测）----
     cb_day: i64,
     cb_day_start_equity: f64,
@@ -245,6 +263,7 @@ impl LiveEngine {
             confirmed_signals_run: 0,
             shadow_outcomes_run: 0,
             pending_entry: None,
+            pending_exit: None,
             cb_day: i64::MIN,
             cb_day_start_equity: 0.0,
             cb_consec_losses: 0,
@@ -800,6 +819,14 @@ impl LiveEngine {
             let mut got_fill = false;
             for ex in execs {
                 got_fill = true;
+                let exit_match = self.pending_exit.as_ref().is_some_and(|pending| {
+                    pending
+                        .order_id
+                        .zip(ex.order_id)
+                        .map(|(expected, actual)| expected == actual)
+                        .unwrap_or_else(|| pending.reason == ex.reason)
+                });
+                let exit_fill_qty = ex.qty.to_f64();
                 let pending = self.pending_entry.as_ref();
                 self.log_execution(
                     &ex,
@@ -815,14 +842,46 @@ impl LiveEngine {
                     is_maker: ex.is_maker,
                     reason: ex.reason,
                 });
+                if exit_match {
+                    if let Some(pending) = self.pending_exit.as_mut() {
+                        pending.filled_qty += exit_fill_qty;
+                    }
+                }
             }
             if got_fill {
                 self.settle_pending_entry(now).await;
+                self.settle_pending_exit(now).await;
                 self.cb_note_fills();
                 if let Some(px) = self.latest_price {
                     self.track_position(now, px);
                 }
                 self.persist_journal();
+            }
+        }
+
+        // 市价减仓通常数秒内成交。超时不盲目重发（否则可能重复减仓），且旧保护
+        // 止损仍留在交易所；只记录一次明确告警，等待 userTrades 恢复后自动收敛。
+        if let Some(pending) = self.pending_exit.as_mut() {
+            if !pending.timeout_noted && now_ms - pending.submitted_ts_ms >= 30_000 {
+                pending.timeout_noted = true;
+                let note = pending.clone();
+                warn!(
+                    order_id = note.order_id,
+                    reason = %note.reason,
+                    requested_qty = note.requested_qty,
+                    filled_qty = note.filled_qty,
+                    "减仓成交回报超过 30 秒，保留原保护止损并停止重复减仓"
+                );
+                self.append_research(
+                    "exit_fill_timeout",
+                    now_ms,
+                    serde_json::json!({
+                        "order_id": note.order_id, "reason": note.reason,
+                        "requested_qty": note.requested_qty, "filled_qty": note.filled_qty,
+                        "submitted_ts_ms": note.submitted_ts_ms,
+                        "protective_stop_preserved": true,
+                    }),
+                );
             }
         }
 
@@ -933,6 +992,11 @@ impl LiveEngine {
     // ==================================================================
 
     async fn manage_position(&mut self, trade: &Trade) {
+        // REST 已受理但 userTrades 尚未确认时，账户仍显示旧仓位。此时再次运行
+        // ExitPlugin 会重复触发同一 TP，因此必须等成交状态收敛后再评估。
+        if self.pending_exit.is_some() {
+            return;
+        }
         let pos_view = match self.account.position_view(&self.symbol) {
             Some(p) => p,
             None => return,
@@ -941,53 +1005,53 @@ impl LiveEngine {
         for ep in self.strategy.exits.iter() {
             actions.extend(ep.manage(&pos_view, &self.ctx));
         }
-        for act in actions {
+        let mut actions = actions.into_iter().peekable();
+        while let Some(act) = actions.next() {
             match act {
                 ExitAction::MoveStop(px) => {
-                    if let Some(p) = self.account.position_mut() {
-                        p.stop_price = Some(px);
-                        if (px.to_f64() - p.entry_price.to_f64()).abs() < 1e-9 {
-                            p.breakeven_moved = true;
-                        }
-                        let side = p.side;
-                        let qty = p.qty;
-                        self.broker.cancel_all().await;
-                        if let Err(e) = self
-                            .broker
-                            .submit(
-                                trade.ts,
-                                trade.price,
-                                backtest::Order {
-                                    side: side.opposite(),
-                                    qty,
-                                    kind: backtest::OrderKind::StopMarket(px),
-                                    reason: "stop".into(),
-                                    expire_ts: None,
-                                },
-                            )
-                            .await
-                        {
-                            error!(error = %e, "移动止损挂单失败");
-                        }
-                    }
+                    self.place_protective_stop(trade.ts, trade.price, px).await;
                 }
                 ExitAction::ClosePartial(frac) => {
                     if let Some(p) = self.account.position().copied() {
                         let close_qty = Qty::from_f64(p.qty.to_f64() * frac);
-                        self.market_close(trade, close_qty, "tp_partial").await;
+                        // TP1 同一批动作中的 MoveStop(entry) 必须延后到部分成交确认后；
+                        // TP2 没有 MoveStop，则沿用当前止损并按剩余数量重挂。
+                        let rearm_stop = match actions.peek() {
+                            Some(ExitAction::MoveStop(px)) => {
+                                let px = *px;
+                                actions.next();
+                                Some(px)
+                            }
+                            _ => p.stop_price,
+                        };
+                        self.market_close(trade, close_qty, "tp_partial", rearm_stop)
+                            .await;
                         // closed_frac 由 Account::apply_fill 按原始仓位口径维护。
                     }
+                    return;
                 }
                 ExitAction::CloseAll => {
                     if let Some(p) = self.account.position().copied() {
-                        self.market_close(trade, p.qty, "close_all").await;
+                        self.market_close(trade, p.qty, "close_all", None).await;
                     }
+                    return;
                 }
                 ExitAction::Reverse(intent) => {
                     if let Some(p) = self.account.position().copied() {
-                        self.market_close(trade, p.qty, "reverse_out").await;
+                        self.market_close(trade, p.qty, "reverse_out", None).await;
                     }
-                    self.enter(trade, *intent, None).await;
+                    // 异步实盘不能在旧仓成交确认前反向开仓。当前模型不使用 Reverse；
+                    // 若将来启用，应把 intent 持久化为成交后的 deferred entry。
+                    self.append_research(
+                        "reverse_entry_deferred",
+                        trade.ts.as_millis(),
+                        serde_json::json!({
+                            "side": format!("{:?}", intent.side),
+                            "reason": intent.reason,
+                            "cause": "wait_exit_fill",
+                        }),
+                    );
+                    return;
                 }
             }
         }
@@ -1254,6 +1318,9 @@ impl LiveEngine {
             if p.initial_stop_price.is_none() {
                 p.initial_stop_price = Some(stop);
             }
+            if (stop.to_f64() - p.entry_price.to_f64()).abs() < 1e-9 {
+                p.breakeven_moved = true;
+            }
             let side = p.side;
             let q = p.qty;
             self.broker.cancel_all().await;
@@ -1321,12 +1388,19 @@ impl LiveEngine {
         }
     }
 
-    async fn market_close(&mut self, trade: &Trade, qty: Qty, reason: &str) {
+    async fn market_close(
+        &mut self,
+        trade: &Trade,
+        qty: Qty,
+        reason: &str,
+        rearm_stop: Option<Price>,
+    ) {
         let Some(p) = self.account.position() else {
             return;
         };
         let side = p.side.opposite();
-        self.broker.cancel_all().await; // 清掉止损单
+        // 不在提交市价减仓前撤保护止损。交易所成交回报可能延迟；先撤会制造一个
+        // 无保护窗口。成交确认后 settle_pending_exit 会撤旧止损并按剩余数量重挂。
         let order = backtest::Order {
             side,
             qty,
@@ -1346,16 +1420,36 @@ impl LiveEngine {
                     is_maker: ex.is_maker,
                     reason: ex.reason,
                 });
+                if self.account.position().is_some() {
+                    if let Some(stop) = rearm_stop {
+                        self.place_protective_stop(trade.ts, trade.price, stop)
+                            .await;
+                    }
+                } else {
+                    self.broker.cancel_all().await;
+                }
             }
             Ok(None) => {
+                let order_id = self.broker.last_submitted_order_id();
                 self.append_research(
                     "exit_order_accepted",
                     trade.ts.as_millis(),
                     serde_json::json!({
-                        "order_id": self.broker.last_submitted_order_id(), "reason": reason,
+                        "order_id": order_id, "reason": reason,
                         "side": format!("{:?}", side), "qty": qty.to_f64(),
+                        "rearm_stop": rearm_stop.map(|x| x.to_f64()),
+                        "protective_stop_preserved": true,
                     }),
                 );
+                self.pending_exit = Some(PendingExit {
+                    order_id,
+                    reason: reason.to_string(),
+                    requested_qty: qty.to_f64(),
+                    filled_qty: 0.0,
+                    submitted_ts_ms: trade.ts.as_millis(),
+                    rearm_stop,
+                    timeout_noted: false,
+                });
             }
             Err(e) => {
                 error!(error = %e, reason, "平仓下单失败");
@@ -1367,6 +1461,50 @@ impl LiveEngine {
                     }),
                 );
             }
+        }
+    }
+
+    /// userTrades 已确认减仓数量后，撤掉旧总仓止损，并按真实剩余仓位重新挂单。
+    async fn settle_pending_exit(&mut self, now: Timestamp) {
+        let Some(pending) = self.pending_exit.as_ref() else {
+            return;
+        };
+        let complete =
+            self.account.position().is_none() || pending.filled_qty + 1e-9 >= pending.requested_qty;
+        if !complete {
+            return;
+        }
+        let pending = self
+            .pending_exit
+            .take()
+            .expect("pending exit checked above");
+        let remaining_qty = self
+            .account
+            .position()
+            .map(|position| position.qty.to_f64())
+            .unwrap_or(0.0);
+        self.append_research(
+            "exit_settled",
+            now.as_millis(),
+            serde_json::json!({
+                "order_id": pending.order_id, "reason": pending.reason,
+                "requested_qty": pending.requested_qty, "filled_qty": pending.filled_qty,
+                "remaining_qty": remaining_qty,
+                "latency_ms": now.as_millis() - pending.submitted_ts_ms,
+                "rearm_stop": pending.rearm_stop.map(|x| x.to_f64()),
+            }),
+        );
+        if remaining_qty > 1e-9 {
+            if let Some(stop) = pending.rearm_stop {
+                let ref_price = self.latest_price.unwrap_or(stop);
+                self.place_protective_stop(now, ref_price, stop).await;
+            } else {
+                // 理论上部分减仓始终携带当前止损；若状态缺失，保留旧保护单并告警。
+                warn!("部分减仓完成但缺少重挂止损价格，保留交易所原保护单");
+            }
+        } else {
+            // 全平后清掉仍挂在交易所的旧保护止损。
+            self.broker.cancel_all().await;
         }
     }
 
@@ -1635,6 +1773,66 @@ trigger = "OrderFlowEntry"
         assert!(eng.account().position().is_none());
         assert_eq!(eng.account().fills().len(), 2);
         assert_eq!(eng.account().fills()[1].reason, "stop");
+        let _ = std::fs::remove_file(&cfg.journal_path);
+    }
+
+    /// testnet 异步部分止盈的状态机回归：只有实际成交确认后才按剩余数量重挂止损，
+    /// 且新的止损触发时不会使用减仓前的旧数量反向开仓。
+    #[tokio::test]
+    async fn async_partial_exit_rearms_stop_for_remaining_qty() {
+        let cfg = test_config("partial-exit");
+        let _ = std::fs::remove_file(&cfg.journal_path);
+        let mut eng = LiveEngine::new(
+            noop_strategy(),
+            AnyBroker::dry(FeeModel::default()),
+            cfg.clone(),
+            100_000.0,
+            "2026-08-04".into(),
+        );
+        eng.latest_price = Some(Price::from_f64(101.0));
+        eng.account.apply_fill(FillRequest {
+            ts: Timestamp::from_millis(1_000),
+            side: Side::Buy,
+            price: Price::from_f64(100.0),
+            qty: Qty::from_f64(1.0),
+            fee: 0.0,
+            is_maker: false,
+            reason: "open".into(),
+        });
+        eng.place_protective_stop(
+            Timestamp::from_millis(1_000),
+            Price::from_f64(100.0),
+            Price::from_f64(99.0),
+        )
+        .await;
+        eng.pending_exit = Some(PendingExit {
+            order_id: Some(42),
+            reason: "tp_partial".into(),
+            requested_qty: 0.5,
+            filled_qty: 0.5,
+            submitted_ts_ms: 1_500,
+            rearm_stop: Some(Price::from_f64(100.0)),
+            timeout_noted: false,
+        });
+        eng.account.apply_fill(FillRequest {
+            ts: Timestamp::from_millis(2_000),
+            side: Side::Sell,
+            price: Price::from_f64(101.5),
+            qty: Qty::from_f64(0.5),
+            fee: 0.0,
+            is_maker: false,
+            reason: "tp_partial".into(),
+        });
+        eng.settle_pending_exit(Timestamp::from_millis(2_000)).await;
+        let remaining = eng.account.position().expect("应保留一半仓位");
+        assert!((remaining.qty.to_f64() - 0.5).abs() < 1e-9);
+        assert_eq!(remaining.stop_price, Some(Price::from_f64(100.0)));
+        assert!(eng.pending_exit.is_none());
+
+        // 重挂后的止损只平剩余 0.5，不会按原始 1.0 数量形成反向仓位。
+        eng.on_trade(&trade(3_000, 99.9)).await;
+        assert!(eng.account.position().is_none());
+        assert!((eng.account.fills().last().unwrap().qty.to_f64() - 0.5).abs() < 1e-9);
         let _ = std::fs::remove_file(&cfg.journal_path);
     }
 

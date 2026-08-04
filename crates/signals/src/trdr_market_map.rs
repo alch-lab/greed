@@ -270,6 +270,9 @@ pub struct TrdrMarketMap {
     latest_zone: Option<BookZone>,
     latest_coverage: Vec<Json>,
     latest_bands: Vec<Json>,
+    /// 当前完整价格带内，每个来源、每个镜像距离档的原始派生值。
+    /// 即使没有达到色带门槛也保留，供后续离线重放和阈值优化。
+    latest_local_bins: Json,
     zone_tracker: Option<ZoneTracker>,
     latest_flow: Option<FlowState>,
     eval: Option<Json>,
@@ -291,6 +294,7 @@ impl TrdrMarketMap {
             latest_zone: None,
             latest_coverage: Vec::new(),
             latest_bands: Vec::new(),
+            latest_local_bins: json!({}),
             zone_tracker: None,
             latest_flow: None,
             eval: None,
@@ -312,11 +316,14 @@ impl TrdrMarketMap {
     }
 
     fn fresh_books(&self, now_ms: i64) -> Vec<BookState> {
-        self.books
+        let mut books = self
+            .books
             .values()
             .filter(|b| now_ms - b.ts_ms <= self.cfg.book_fresh_ms)
             .cloned()
-            .collect()
+            .collect::<Vec<_>>();
+        books.sort_by_key(|state| state.book.exchange.as_str());
+        books
     }
 
     fn metric_for_books(&self, books: &[BookState], band: f64) -> BandMetric {
@@ -471,6 +478,7 @@ impl TrdrMarketMap {
             self.zone_tracker = None;
             self.latest_coverage.clear();
             self.latest_bands.clear();
+            self.latest_local_bins = json!({});
             return None;
         }
         let metrics = self
@@ -499,6 +507,12 @@ impl TrdrMarketMap {
         // 永远无法成立。局部镜像买卖比更接近热图对单个流动性墙的定义。
         let Some(selected_band) = metrics.iter().find(|m| m.complete).map(|m| m.band_pct) else {
             self.zone_tracker = None;
+            self.latest_local_bins = json!({
+                "ready":false,
+                "reason":"no_complete_band",
+                "required_sources":self.cfg.min_book_sources,
+                "source_count":books.len(),
+            });
             return None;
         };
         let covered = books
@@ -514,8 +528,38 @@ impl TrdrMarketMap {
             .collect::<Vec<_>>();
         let reference_mid = mids.iter().sum::<f64>() / mids.len() as f64;
         let n_bins = (selected_band / self.cfg.zone_bin_pct).ceil().max(1.0) as usize;
-        let candidate = (0..n_bins)
-            .filter_map(|distance_bin| {
+        let source_bins = covered
+            .iter()
+            .map(|state| {
+                let bins = (0..n_bins)
+                    .map(|distance_bin| {
+                        let (bid, ask) = Self::distance_bin_notional(
+                            &state.book,
+                            selected_band,
+                            distance_bin,
+                            self.cfg.zone_bin_pct,
+                        );
+                        let (side, ratio) = if bid > ask && ask > 0.0 {
+                            (Some("buy"), Some(bid / ask))
+                        } else if ask > bid && bid > 0.0 {
+                            (Some("sell"), Some(ask / bid))
+                        } else {
+                            (None, None)
+                        };
+                        json!({
+                            "distance_bin":distance_bin,
+                            "from_pct":distance_bin as f64 * self.cfg.zone_bin_pct,
+                            "to_pct":((distance_bin + 1) as f64 * self.cfg.zone_bin_pct).min(selected_band),
+                            "bid_usd":bid, "ask_usd":ask, "side":side, "ratio":ratio,
+                            "meets_source_wall":ratio.is_some_and(|value| value >= self.cfg.source_wall_ratio),
+                        })
+                    })
+                    .collect::<Vec<_>>();
+                json!({"exchange":state.book.exchange.as_str(), "bins":bins})
+            })
+            .collect::<Vec<_>>();
+        let aggregate_metrics = (0..n_bins)
+            .map(|distance_bin| {
                 let (bid, ask) = covered.iter().fold((0.0, 0.0), |(bid, ask), state| {
                     let (local_bid, local_ask) = Self::distance_bin_notional(
                         &state.book,
@@ -525,16 +569,16 @@ impl TrdrMarketMap {
                     );
                     (bid + local_bid, ask + local_ask)
                 });
-                if bid <= 0.0 || ask <= 0.0 {
-                    return None;
-                }
-                let (side, ratio, wall_usd) = if bid >= ask {
-                    (Side::Buy, bid / ask, bid)
+                let (side, ratio, wall_usd) = if bid >= ask && ask > 0.0 {
+                    (Some(Side::Buy), Some(bid / ask), bid)
+                } else if ask > bid && bid > 0.0 {
+                    (Some(Side::Sell), Some(ask / bid), ask)
                 } else {
-                    (Side::Sell, ask / bid, ask)
+                    (None, None, bid.max(ask))
                 };
-                let (grade, grade_rank) = self.grade(ratio);
-                (grade_rank > 0 && wall_usd >= self.cfg.min_zone_depth_usd).then_some((
+                let (grade, grade_rank) =
+                    ratio.map(|value| self.grade(value)).unwrap_or(("none", 0));
+                (
                     distance_bin,
                     side,
                     ratio,
@@ -543,8 +587,50 @@ impl TrdrMarketMap {
                     wall_usd,
                     grade,
                     grade_rank,
-                ))
+                )
             })
+            .collect::<Vec<_>>();
+        let aggregate_bins = aggregate_metrics
+            .iter()
+            .map(|(distance_bin, side, ratio, bid, ask, wall, grade, _)| json!({
+                "distance_bin":distance_bin,
+                "from_pct":*distance_bin as f64 * self.cfg.zone_bin_pct,
+                "to_pct":((*distance_bin + 1) as f64 * self.cfg.zone_bin_pct).min(selected_band),
+                "bid_usd":bid, "ask_usd":ask, "side":side.map(side_name),
+                "ratio":ratio, "wall_usd":wall, "grade":grade,
+                "meets_depth":*wall >= self.cfg.min_zone_depth_usd,
+            }))
+            .collect::<Vec<_>>();
+        self.latest_local_bins = json!({
+            "ready":true,
+            "selected_band_pct":selected_band,
+            "bin_pct":self.cfg.zone_bin_pct,
+            "reference_mid":reference_mid,
+            "required_sources":self.cfg.min_book_sources,
+            "source_wall_ratio":self.cfg.source_wall_ratio,
+            "min_zone_depth_usd":self.cfg.min_zone_depth_usd,
+            "aggregate":aggregate_bins,
+            "sources":source_bins,
+        });
+        let candidate = aggregate_metrics
+            .into_iter()
+            .filter_map(
+                |(distance_bin, side, ratio, bid, ask, wall_usd, grade, grade_rank)| {
+                    let (Some(side), Some(ratio)) = (side, ratio) else {
+                        return None;
+                    };
+                    (grade_rank > 0 && wall_usd >= self.cfg.min_zone_depth_usd).then_some((
+                        distance_bin,
+                        side,
+                        ratio,
+                        bid,
+                        ask,
+                        wall_usd,
+                        grade,
+                        grade_rank,
+                    ))
+                },
+            )
             .max_by(|a, b| {
                 a.7.cmp(&b.7)
                     .then_with(|| a.2.total_cmp(&b.2))
@@ -958,6 +1044,7 @@ impl TrdrMarketMap {
             zone["coverage"] = json!(self.latest_coverage);
             zone["bands"] = json!(self.latest_bands);
         }
+        zone["local_bins"] = self.latest_local_bins.clone();
         let mut flow = Self::flow_payload(self.latest_flow.as_ref());
         if let Some(obj) = flow.as_object_mut() {
             obj.insert("window_ms".into(), json!(self.cfg.delta_window_ms));
@@ -997,12 +1084,9 @@ impl TrdrMarketMap {
     }
 
     fn zone_signal(&self, ts: Timestamp) -> Signal {
-        Signal::new(
-            SignalKind::ObiZone,
-            ts,
-            "TrdrMarketMap",
-            Self::zone_payload(self.latest_zone.as_ref()),
-        )
+        let mut payload = Self::zone_payload(self.latest_zone.as_ref());
+        payload["local_bins"] = self.latest_local_bins.clone();
+        Signal::new(SignalKind::ObiZone, ts, "TrdrMarketMap", payload)
     }
 
     fn flow_signals(&self, ts: Timestamp) -> Vec<Signal> {
@@ -1283,6 +1367,31 @@ mod tests {
             &ctx,
         );
         assert!(out[0].payload["persistence_ms"].as_i64().unwrap() <= 1_000);
+    }
+
+    #[test]
+    fn logs_all_local_bins_even_without_an_active_zone() {
+        let mut cfg = Config::from_params(&json!({}));
+        cfg.book_bands = vec![0.002];
+        cfg.min_zone_depth_usd = 1_000_000_000.0; // 故意让候选无法成为有效色带
+        cfg.min_book_sources = 2;
+        let mut map = TrdrMarketMap::new(cfg);
+        let ctx = Ctx::default();
+        map.on_event(
+            &Event::Book(locally_balanced_book(Exchange::BinanceFutures, 1_000)),
+            &ctx,
+        );
+        let out = map.on_event(
+            &Event::Book(locally_balanced_book(Exchange::BinanceSpot, 2_000)),
+            &ctx,
+        );
+        let zone = &out[0].payload;
+        assert_eq!(zone["active"], false);
+        assert_eq!(zone["local_bins"]["ready"], true);
+        assert_eq!(zone["local_bins"]["sources"].as_array().unwrap().len(), 2);
+        assert_eq!(zone["local_bins"]["aggregate"].as_array().unwrap().len(), 2);
+        assert!(zone["local_bins"]["aggregate"][0]["bid_usd"].is_number());
+        assert!(zone["local_bins"]["sources"][0]["bins"][0]["ask_usd"].is_number());
     }
 
     #[test]
