@@ -129,6 +129,7 @@ pub struct EngineSnapshot {
     pub research_log_dir: String,
     pub active_shadow_signals: usize,
     pub confirmed_signals_run: usize,
+    pub observation_signals_run: usize,
     pub shadow_outcomes_run: usize,
     /// userTrades 最近一次轮询是否成功；false 时引擎禁止新开仓。
     pub execution_healthy: bool,
@@ -187,6 +188,8 @@ struct EngineState {
     #[serde(default)]
     confirmed_signals_run: usize,
     #[serde(default)]
+    observation_signals_run: usize,
+    #[serde(default)]
     shadow_outcomes_run: usize,
 }
 
@@ -215,6 +218,7 @@ pub struct LiveEngine {
     pos_track: Option<PosTrack>,
     shadow_signals: Vec<ShadowSignal>,
     confirmed_signals_run: usize,
+    observation_signals_run: usize,
     shadow_outcomes_run: usize,
     // ---- 入场挂起 ----
     pending_entry: Option<PendingEntry>,
@@ -264,6 +268,7 @@ impl LiveEngine {
             pos_track: None,
             shadow_signals: Vec::new(),
             confirmed_signals_run: 0,
+            observation_signals_run: 0,
             shadow_outcomes_run: 0,
             pending_entry: None,
             pending_exit: None,
@@ -415,6 +420,7 @@ impl LiveEngine {
         self.pos_track = state.pos_track;
         self.shadow_signals = state.shadow_signals;
         self.confirmed_signals_run = state.confirmed_signals_run;
+        self.observation_signals_run = state.observation_signals_run;
         self.shadow_outcomes_run = state.shadow_outcomes_run;
         self.needs_stop_rearm = needs_rearm;
         self.sync_position_flag();
@@ -578,6 +584,8 @@ impl LiveEngine {
             self.shadow_signals.push(shadow);
             if stage == "confirmed" {
                 self.confirmed_signals_run += 1;
+            } else {
+                self.observation_signals_run += 1;
             }
         }
     }
@@ -746,6 +754,7 @@ impl LiveEngine {
             research_log_dir: self.config.research_log_dir.display().to_string(),
             active_shadow_signals: self.shadow_signals.len(),
             confirmed_signals_run: self.confirmed_signals_run,
+            observation_signals_run: self.observation_signals_run,
             shadow_outcomes_run: self.shadow_outcomes_run,
             execution_healthy: self.broker.execution_healthy(),
         }
@@ -1635,6 +1644,7 @@ impl LiveEngine {
             pos_track: self.pos_track.clone(),
             shadow_signals: self.shadow_signals.clone(),
             confirmed_signals_run: self.confirmed_signals_run,
+            observation_signals_run: self.observation_signals_run,
             shadow_outcomes_run: self.shadow_outcomes_run,
         };
         let journal = Journal {
@@ -2123,6 +2133,7 @@ location_buckets = 10
         );
         eng.track_new_shadow_signals(&[signal]);
         assert_eq!(eng.confirmed_signals_run, 0);
+        assert_eq!(eng.observation_signals_run, 1);
         assert_eq!(eng.shadow_signals.len(), 1);
         eng.update_shadow_outcomes(
             Timestamp::from_millis(1_000 + 5 * 60_000),

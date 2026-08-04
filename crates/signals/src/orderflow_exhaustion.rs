@@ -508,6 +508,25 @@ impl OrderFlowExhaustion {
         ))
     }
 
+    fn emit_cumulative_if_due(
+        &mut self,
+        ts: Timestamp,
+        bucket_start_ms: i64,
+        cumulative: &mut Json,
+        out: &mut Vec<Signal>,
+    ) {
+        if cumulative.get("active").and_then(Json::as_bool) == Some(true)
+            && bucket_start_ms >= self.cumulative_cooldown_until
+        {
+            if let Some(observation) = self.cumulative_signal(ts, cumulative) {
+                out.push(observation);
+                cumulative["emitted"] = json!(true);
+                self.cumulative_cooldown_until = bucket_start_ms
+                    + self.cfg.cumulative_cooldown_buckets as i64 * self.cfg.bucket_ms;
+            }
+        }
+    }
+
     fn profile(&self, setup: &Setup) -> &'static str {
         if setup.strength == "strong"
             && setup.event_volume_ratio >= self.cfg.quality_volume_ratio
@@ -596,11 +615,13 @@ impl OrderFlowExhaustion {
     fn evaluate(&mut self, b: &Bucket, ctx: &Ctx) -> Vec<Signal> {
         let ts = Timestamp::from_millis(b.start_ms + self.cfg.bucket_ms);
         let observed = self.history.iter().filter(|x| x.volume > 0.0).count();
+        let mut cumulative = self.cumulative_absorption(b);
         if observed < self.cfg.min_baseline_buckets {
             self.eval = Some(json!({
                 "ts_ms":ts.as_millis(), "decision":"warmup", "reason":"真实 10 秒订单流基线积累中",
                 "buckets":observed, "required":self.cfg.min_baseline_buckets,
-                "bucket_ms":self.cfg.bucket_ms
+                "bucket_ms":self.cfg.bucket_ms,
+                "cumulative_absorption":cumulative
             }));
             return vec![];
         }
@@ -618,7 +639,6 @@ impl OrderFlowExhaustion {
         };
         let range = (b.high - b.low).max(b.close * 1e-7);
         let efficiency = (b.close - b.open).abs() / range;
-        let mut cumulative = self.cumulative_absorption(b);
         let prior: Vec<&Bucket> = self
             .history
             .iter()
@@ -704,15 +724,19 @@ impl OrderFlowExhaustion {
                 if trdr.trend_blocked {
                     decision = "trend_blocked";
                     reason = "TRDR 判定为同向单边，禁止逆势抄底/摸顶";
+                    self.emit_cumulative_if_due(ts, b.start_ms, &mut cumulative, &mut out);
                     self.eval = Some(json!({
                         "ts_ms":ts.as_millis(), "decision":decision, "reason":reason,
                         "price":b.close, "bucket_ms":self.cfg.bucket_ms,
                         "volume_ratio":volume_ratio, "delta_share":delta_share,
                         "trdr_regime":trdr.regime, "trdr_zone_grade":trdr.zone_grade,
                         "trdr_delta_tier":trdr.delta_tier,
-                        "trend_blocked":true
+                        "trend_blocked":true,
+                        "funnel":{"volume":true,"pressure":true,"stalled":no_result,
+                            "pending_confirmation":false,"confirmed":false},
+                        "cumulative_absorption":cumulative
                     }));
-                    return vec![];
+                    return out;
                 }
                 let local_location = match side {
                     Side::Buy => swept_low || vwap_dev <= -self.cfg.min_vwap_deviation_pct,
@@ -881,21 +905,13 @@ impl OrderFlowExhaustion {
                 "trdr_short_liquidation_usd":s.trdr_short_liquidation_usd
             })
         });
-        if cumulative.get("active").and_then(Json::as_bool) == Some(true)
-            && b.start_ms >= self.cumulative_cooldown_until
-        {
-            if let Some(observation) = self.cumulative_signal(ts, &cumulative) {
-                out.push(observation);
-                cumulative["emitted"] = json!(true);
-                self.cumulative_cooldown_until =
-                    b.start_ms + self.cfg.cumulative_cooldown_buckets as i64 * self.cfg.bucket_ms;
-            }
-        }
+        self.emit_cumulative_if_due(ts, b.start_ms, &mut cumulative, &mut out);
         let confirmed_profile = out
             .iter()
             .find(|signal| signal.payload.get("stage").and_then(Json::as_str) == Some("confirmed"))
             .and_then(|signal| signal.payload.get("profile"))
             .cloned();
+        let trade_confirmed = confirmed_profile.is_some();
         self.eval = Some(json!({
             "ts_ms":ts.as_millis(), "price":b.close, "decision":decision, "reason":reason,
             "bucket_ms":self.cfg.bucket_ms, "volume_usd":b.volume,
@@ -911,7 +927,7 @@ impl OrderFlowExhaustion {
                 "pressure":pressure_side.is_some(),
                 "stalled":no_result,
                 "pending_confirmation":self.setup.is_some(),
-                "confirmed":!out.is_empty()
+                "confirmed":trade_confirmed
             },
             "pending":pending, "profile":confirmed_profile,
             "cumulative_absorption":cumulative
@@ -1057,6 +1073,7 @@ mod tests {
         assert_eq!(out[0].payload["profile"], "cumulative_absorption");
         assert_eq!(out[0].payload["side"], "buy");
         assert_eq!(signal.eval.as_ref().unwrap()["decision"], "none");
+        assert_eq!(signal.eval.as_ref().unwrap()["funnel"]["confirmed"], false);
         assert_eq!(
             signal.eval.as_ref().unwrap()["cumulative_absorption"]["active"],
             true
