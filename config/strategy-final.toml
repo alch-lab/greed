@@ -2,7 +2,7 @@
 # 订单流力竭再在有效区域内确认入场。每个事件簇只允许产生一次入场。
 
 [strategy]
-name = "trdr-orderflow-v3-depth-compatible"
+name = "trdr-orderflow-v6-local-wall"
 signals = ["TrdrMarketMap", "OrderFlowExhaustion"]
 trigger = "OrderFlowEntry"
 filters = ["CircuitBreaker"]
@@ -21,7 +21,11 @@ green_ratio = 1.80
 yellow_ratio = 2.50
 red_ratio = 3.50
 blue_ratio = 5.00
+# 按距中间价 0.1% 的局部价格簇寻找墙体，而不是用整片盘口总买卖比做区域。
 zone_bin_pct = 0.001
+# 单个交易所只需在同一局部价格簇达到 1.2x，即计入跨市场方向共振；
+# 区域本身仍使用 green/yellow/red/blue 的更高聚合墙体强度。
+source_wall_ratio = 1.20
 min_book_sources = 4
 min_spot_sources = 2
 min_perp_sources = 2
@@ -40,7 +44,8 @@ min_baseline_buckets = 120
 classic_volume_ratio = 1.60
 strong_volume_ratio = 2.20
 quality_volume_ratio = 3.00
-balanced_max_volume_ratio = 2.50
+# 与 quality_volume_ratio 对齐，消除 2.5x–3.0x 永远只能观察的层级断档。
+balanced_max_volume_ratio = 3.00
 min_delta_share = 0.15
 strong_delta_share = 0.35
 confirm_delta_share = 0.08
@@ -55,7 +60,8 @@ balanced_context_score = 6
 quality_context_score = 7
 require_trdr_location = true
 block_countertrend = true
-min_trdr_grade_rank = 2
+# 局部绿色墙体已经经过 4 路覆盖、2 现货+2 永续共振和 30 秒持续性确认。
+min_trdr_grade_rank = 1
 min_trdr_delta_tier = 1
 max_zone_distance_pct = 0.004
 trdr_max_age_ms = 30000

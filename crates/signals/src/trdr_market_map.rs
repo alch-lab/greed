@@ -23,6 +23,8 @@ pub struct Config {
     pub red_ratio: f64,
     pub blue_ratio: f64,
     pub zone_bin_pct: f64,
+    /// 单一交易所在同一局部价格簇中支持主导方向的最低买卖比。
+    pub source_wall_ratio: f64,
     pub min_book_sources: usize,
     pub min_spot_sources: usize,
     pub min_perp_sources: usize,
@@ -82,6 +84,7 @@ impl Config {
             red_ratio: f("red_ratio", 3.5).max(1.01),
             blue_ratio: f("blue_ratio", 5.0).max(1.01),
             zone_bin_pct: f("zone_bin_pct", 0.001).clamp(0.0001, 0.01),
+            source_wall_ratio: f("source_wall_ratio", 1.20).clamp(1.01, 10.0),
             min_book_sources: u("min_book_sources", 4).clamp(1, 6),
             min_spot_sources: u("min_spot_sources", 2).clamp(1, 3),
             min_perp_sources: u("min_perp_sources", 2).clamp(1, 3),
@@ -183,7 +186,6 @@ struct BandMetric {
     ratio: f64,
     side: Option<Side>,
     grade: &'static str,
-    grade_rank: u8,
     complete: bool,
     source_count: usize,
 }
@@ -203,6 +205,8 @@ struct BookZone {
     zone_center: f64,
     distance_pct: f64,
     wall_usd: f64,
+    distance_bin: usize,
+    source_wall_ratio: f64,
     persistence_ms: i64,
     spot_ratio: Option<f64>,
     perp_ratio: Option<f64>,
@@ -341,10 +345,10 @@ impl TrdrMarketMap {
         let dominant = bid.max(ask);
         let source_count = covered.len();
         let complete = source_count >= self.cfg.min_book_sources;
-        let (grade, grade_rank) = if complete && dominant >= self.cfg.min_zone_depth_usd {
-            self.grade(ratio)
+        let grade = if complete && dominant >= self.cfg.min_zone_depth_usd {
+            self.grade(ratio).0
         } else {
-            ("none", 0)
+            "none"
         };
         BandMetric {
             band_pct: band,
@@ -353,18 +357,56 @@ impl TrdrMarketMap {
             ratio,
             side,
             grade,
-            grade_rank,
             complete,
             source_count,
         }
     }
 
-    fn one_exchange_ratio(
+    fn distance_bin_notional(
+        book: &BookSnapshot,
+        band: f64,
+        distance_bin: usize,
+        bin_pct: f64,
+    ) -> (f64, f64) {
+        let Some(mid) = book.mid_price().map(|p| p.to_f64()) else {
+            return (0.0, 0.0);
+        };
+        if mid <= 0.0 {
+            return (0.0, 0.0);
+        }
+        let lower = distance_bin as f64 * bin_pct;
+        let upper = ((distance_bin + 1) as f64 * bin_pct).min(band);
+        let in_bin = |distance: f64| {
+            distance >= lower && (distance < upper || (upper >= band && distance <= upper * 1.001))
+        };
+        let bid = book
+            .bids
+            .iter()
+            .filter_map(|(price, qty)| {
+                let px = price.to_f64();
+                let distance = 1.0 - px / mid;
+                (distance >= 0.0 && in_bin(distance)).then(|| px * qty.to_f64())
+            })
+            .sum();
+        let ask = book
+            .asks
+            .iter()
+            .filter_map(|(price, qty)| {
+                let px = price.to_f64();
+                let distance = px / mid - 1.0;
+                (distance >= 0.0 && in_bin(distance)).then(|| px * qty.to_f64())
+            })
+            .sum();
+        (bid, ask)
+    }
+
+    fn one_exchange_bin_ratio(
         &self,
         exchange: Exchange,
         band: f64,
+        distance_bin: usize,
         now_ms: i64,
-    ) -> Option<(Side, f64, u8)> {
+    ) -> Option<(Side, f64)> {
         let state = self.books.get(&exchange)?;
         if now_ms - state.ts_ms > self.cfg.book_fresh_ms {
             return None;
@@ -373,8 +415,8 @@ impl TrdrMarketMap {
         if down < band * 0.98 || up < band * 0.98 {
             return None;
         }
-        let bid = state.book.bid_qty_within(band);
-        let ask = state.book.ask_qty_within(band);
+        let (bid, ask) =
+            Self::distance_bin_notional(&state.book, band, distance_bin, self.cfg.zone_bin_pct);
         let (side, ratio) = if bid > ask && ask > 0.0 {
             (Side::Buy, bid / ask)
         } else if ask > bid && bid > 0.0 {
@@ -382,8 +424,7 @@ impl TrdrMarketMap {
         } else {
             return None;
         };
-        let (_, grade_rank) = self.grade(ratio);
-        Some((side, ratio, grade_rank))
+        (ratio >= self.cfg.source_wall_ratio).then_some((side, ratio))
     }
 
     fn coverage(&self, book: &BookSnapshot, now_ms: i64) -> Json {
@@ -453,54 +494,84 @@ impl TrdrMarketMap {
                 })
             })
             .collect();
-        let best = metrics
+        // 先选择覆盖完整的最窄价格带，再在带内按“距各自中间价的局部价格簇”寻找墙体。
+        // 旧实现先要求整片盘口达到 1.8x/2.5x，真实多市场深度会相互稀释，导致区域
+        // 永远无法成立。局部镜像买卖比更接近热图对单个流动性墙的定义。
+        let Some(selected_band) = metrics.iter().find(|m| m.complete).map(|m| m.band_pct) else {
+            self.zone_tracker = None;
+            return None;
+        };
+        let covered = books
             .iter()
-            .filter(|m| m.grade_rank > 0 && m.side.is_some())
-            .max_by(|a, b| {
-                a.grade_rank
-                    .cmp(&b.grade_rank)
-                    .then_with(|| b.band_pct.total_cmp(&a.band_pct))
-            })?
-            .clone();
-        let side = best.side?;
+            .filter(|state| {
+                let (down, up) = Self::coverage_values(&state.book);
+                down >= selected_band * 0.98 && up >= selected_band * 0.98
+            })
+            .collect::<Vec<_>>();
         let mids = books
             .iter()
             .filter_map(|b| b.book.mid_price().map(|p| p.to_f64()))
             .collect::<Vec<_>>();
         let reference_mid = mids.iter().sum::<f64>() / mids.len() as f64;
-        let bin_width = (reference_mid * self.cfg.zone_bin_pct).max(0.01);
-        let mut bins = BTreeMap::<i64, f64>::new();
-        for state in books.iter().filter(|state| {
-            let (down, up) = Self::coverage_values(&state.book);
-            down >= best.band_pct * 0.98 && up >= best.band_pct * 0.98
-        }) {
-            let levels = match side {
-                Side::Buy => &state.book.bids,
-                Side::Sell => &state.book.asks,
-            };
-            for (price, qty) in levels {
-                let px = price.to_f64();
-                let within = match side {
-                    Side::Buy => px <= reference_mid && px >= reference_mid * (1.0 - best.band_pct),
-                    Side::Sell => {
-                        px >= reference_mid && px <= reference_mid * (1.0 + best.band_pct)
-                    }
-                };
-                if within {
-                    let key = (px / bin_width).floor() as i64;
-                    *bins.entry(key).or_default() += px * qty.to_f64();
+        let n_bins = (selected_band / self.cfg.zone_bin_pct).ceil().max(1.0) as usize;
+        let candidate = (0..n_bins)
+            .filter_map(|distance_bin| {
+                let (bid, ask) = covered.iter().fold((0.0, 0.0), |(bid, ask), state| {
+                    let (local_bid, local_ask) = Self::distance_bin_notional(
+                        &state.book,
+                        selected_band,
+                        distance_bin,
+                        self.cfg.zone_bin_pct,
+                    );
+                    (bid + local_bid, ask + local_ask)
+                });
+                if bid <= 0.0 || ask <= 0.0 {
+                    return None;
                 }
-            }
-        }
-        let (best_bin, wall_usd) = bins
-            .into_iter()
-            .max_by(|a, b| a.1.total_cmp(&b.1))
-            .unwrap_or(((reference_mid / bin_width).floor() as i64, 0.0));
-        let zone_low = best_bin as f64 * bin_width;
-        let zone_high = zone_low + bin_width;
+                let (side, ratio, wall_usd) = if bid >= ask {
+                    (Side::Buy, bid / ask, bid)
+                } else {
+                    (Side::Sell, ask / bid, ask)
+                };
+                let (grade, grade_rank) = self.grade(ratio);
+                (grade_rank > 0 && wall_usd >= self.cfg.min_zone_depth_usd).then_some((
+                    distance_bin,
+                    side,
+                    ratio,
+                    bid,
+                    ask,
+                    wall_usd,
+                    grade,
+                    grade_rank,
+                ))
+            })
+            .max_by(|a, b| {
+                a.7.cmp(&b.7)
+                    .then_with(|| a.2.total_cmp(&b.2))
+                    .then_with(|| a.5.total_cmp(&b.5))
+            });
+        let Some(candidate) = candidate else {
+            // 区域中断必须清空持续性计时，不能让消失后重新出现的墙继承旧时长。
+            self.zone_tracker = None;
+            return None;
+        };
+        let (distance_bin, side, ratio, bid_usd, ask_usd, wall_usd, grade, grade_rank) = candidate;
+        let lower_distance = distance_bin as f64 * self.cfg.zone_bin_pct;
+        let upper_distance = ((distance_bin + 1) as f64 * self.cfg.zone_bin_pct).min(selected_band);
+        let (zone_low, zone_high) = match side {
+            Side::Buy => (
+                reference_mid * (1.0 - upper_distance),
+                reference_mid * (1.0 - lower_distance),
+            ),
+            Side::Sell => (
+                reference_mid * (1.0 + lower_distance),
+                reference_mid * (1.0 + upper_distance),
+            ),
+        };
         let center = (zone_low + zone_high) / 2.0;
         let same_zone = self.zone_tracker.as_ref().is_some_and(|z| {
-            z.side == side && z.center > 0.0 && (center / z.center - 1.0).abs() <= 0.005
+            let tolerance = (self.cfg.zone_bin_pct * 1.5).max(0.0005);
+            z.side == side && z.center > 0.0 && (center / z.center - 1.0).abs() <= tolerance
         });
         if !same_zone {
             self.zone_tracker = Some(ZoneTracker {
@@ -520,8 +591,8 @@ impl TrdrMarketMap {
             Exchange::OkxSpot,
         ]
         .into_iter()
-        .filter_map(|ex| self.one_exchange_ratio(ex, best.band_pct, now_ms))
-        .filter(|x| x.0 == side && x.2 > 0)
+        .filter_map(|ex| self.one_exchange_bin_ratio(ex, selected_band, distance_bin, now_ms))
+        .filter(|x| x.0 == side)
         .collect::<Vec<_>>();
         let perp_metrics = [
             Exchange::BinanceFutures,
@@ -529,30 +600,32 @@ impl TrdrMarketMap {
             Exchange::OkxFutures,
         ]
         .into_iter()
-        .filter_map(|ex| self.one_exchange_ratio(ex, best.band_pct, now_ms))
-        .filter(|x| x.0 == side && x.2 > 0)
+        .filter_map(|ex| self.one_exchange_bin_ratio(ex, selected_band, distance_bin, now_ms))
+        .filter(|x| x.0 == side)
         .collect::<Vec<_>>();
         let spot_source_count = spot_metrics.len();
         let perp_source_count = perp_metrics.len();
         let confluence = spot_source_count >= self.cfg.min_spot_sources
             && perp_source_count >= self.cfg.min_perp_sources;
-        let average_ratio = |xs: &[(Side, f64, u8)]| {
+        let average_ratio = |xs: &[(Side, f64)]| {
             (!xs.is_empty()).then(|| xs.iter().map(|x| x.1).sum::<f64>() / xs.len() as f64)
         };
         Some(BookZone {
             ts_ms: now_ms,
             side,
-            grade: best.grade,
-            grade_rank: best.grade_rank,
-            band_pct: best.band_pct,
-            ratio: best.ratio,
-            bid_usd: best.bid_usd,
-            ask_usd: best.ask_usd,
+            grade,
+            grade_rank,
+            band_pct: selected_band,
+            ratio,
+            bid_usd,
+            ask_usd,
             zone_low,
             zone_high,
             zone_center: center,
             distance_pct: center / reference_mid - 1.0,
             wall_usd,
+            distance_bin,
+            source_wall_ratio: self.cfg.source_wall_ratio,
             persistence_ms,
             spot_ratio: average_ratio(&spot_metrics),
             perp_ratio: average_ratio(&perp_metrics),
@@ -839,6 +912,8 @@ impl TrdrMarketMap {
                 "ratio":z.ratio, "bid_usd":z.bid_usd, "ask_usd":z.ask_usd,
                 "zone_low":z.zone_low, "zone_high":z.zone_high, "zone_center":z.zone_center,
                 "distance_pct":z.distance_pct, "wall_usd":z.wall_usd,
+                "distance_bin":z.distance_bin, "ratio_basis":"local_mirrored_bin",
+                "source_wall_ratio":z.source_wall_ratio,
                 "persistence_ms":z.persistence_ms, "spot_ratio":z.spot_ratio,
                 "perp_ratio":z.perp_ratio, "spot_perp_confluence":z.spot_perp_confluence,
                 "spot_source_count":z.spot_source_count,"perp_source_count":z.perp_source_count,
@@ -1088,6 +1163,39 @@ mod tests {
         }
     }
 
+    fn locally_imbalanced_book(exchange: Exchange, ts_ms: i64) -> BookSnapshot {
+        BookSnapshot {
+            ts: Timestamp::from_millis(ts_ms),
+            exchange,
+            symbol: Symbol::new("BTCUSDT"),
+            // 整片盘口接近平衡，但最靠近现价的 0.1% 价格簇存在明显买墙。
+            bids: vec![
+                (Price::from_f64(99.95), Qty::from_f64(7.0)),
+                (Price::from_f64(99.80), Qty::from_f64(1.0)),
+            ],
+            asks: vec![
+                (Price::from_f64(100.05), Qty::from_f64(1.0)),
+                (Price::from_f64(100.20), Qty::from_f64(6.0)),
+            ],
+        }
+    }
+
+    fn locally_balanced_book(exchange: Exchange, ts_ms: i64) -> BookSnapshot {
+        BookSnapshot {
+            ts: Timestamp::from_millis(ts_ms),
+            exchange,
+            symbol: Symbol::new("BTCUSDT"),
+            bids: vec![
+                (Price::from_f64(99.95), Qty::from_f64(1.0)),
+                (Price::from_f64(99.80), Qty::from_f64(1.0)),
+            ],
+            asks: vec![
+                (Price::from_f64(100.05), Qty::from_f64(1.0)),
+                (Price::from_f64(100.20), Qty::from_f64(1.0)),
+            ],
+        }
+    }
+
     #[test]
     fn aggregates_spot_and_perp_into_blue_support() {
         let mut cfg = Config::from_params(&json!({}));
@@ -1111,6 +1219,70 @@ mod tests {
         assert_eq!(out[0].payload["spot_perp_confluence"], true);
         assert!(out[0].payload["coverage"][0]["bands"].is_array());
         assert!(out[0].payload["coverage"][0]["age_ms"].is_number());
+    }
+
+    #[test]
+    fn local_wall_survives_whole_band_dilution() {
+        let mut cfg = Config::from_params(&json!({}));
+        cfg.book_bands = vec![0.002];
+        cfg.min_zone_depth_usd = 1.0;
+        cfg.min_book_sources = 2;
+        cfg.min_spot_sources = 1;
+        cfg.min_perp_sources = 1;
+        let mut map = TrdrMarketMap::new(cfg);
+        let ctx = Ctx::default();
+        let futures = locally_imbalanced_book(Exchange::BinanceFutures, 1_000);
+        let spot = locally_imbalanced_book(Exchange::BinanceSpot, 2_000);
+        let broad_bid = futures.bid_qty_within(0.002) + spot.bid_qty_within(0.002);
+        let broad_ask = futures.ask_qty_within(0.002) + spot.ask_qty_within(0.002);
+        assert!(broad_bid / broad_ask < 1.8);
+        map.on_event(&Event::Book(futures), &ctx);
+        let out = map.on_event(&Event::Book(spot), &ctx);
+        assert_eq!(out[0].payload["active"], true);
+        assert_eq!(out[0].payload["side"], "buy");
+        assert_eq!(out[0].payload["grade"], "blue");
+        assert_eq!(out[0].payload["ratio_basis"], "local_mirrored_bin");
+        assert_eq!(out[0].payload["spot_perp_confluence"], true);
+    }
+
+    #[test]
+    fn disappearing_wall_resets_persistence() {
+        let mut cfg = Config::from_params(&json!({}));
+        cfg.book_bands = vec![0.002];
+        cfg.min_zone_depth_usd = 1.0;
+        cfg.min_book_sources = 2;
+        cfg.min_spot_sources = 1;
+        cfg.min_perp_sources = 1;
+        let mut map = TrdrMarketMap::new(cfg);
+        let ctx = Ctx::default();
+        map.on_event(
+            &Event::Book(locally_imbalanced_book(Exchange::BinanceFutures, 1_000)),
+            &ctx,
+        );
+        map.on_event(
+            &Event::Book(locally_imbalanced_book(Exchange::BinanceSpot, 2_000)),
+            &ctx,
+        );
+        assert!(map.latest_zone.is_some());
+        map.on_event(
+            &Event::Book(locally_balanced_book(Exchange::BinanceFutures, 10_000)),
+            &ctx,
+        );
+        map.on_event(
+            &Event::Book(locally_balanced_book(Exchange::BinanceSpot, 11_000)),
+            &ctx,
+        );
+        assert!(map.latest_zone.is_none());
+        assert!(map.zone_tracker.is_none());
+        map.on_event(
+            &Event::Book(locally_imbalanced_book(Exchange::BinanceFutures, 20_000)),
+            &ctx,
+        );
+        let out = map.on_event(
+            &Event::Book(locally_imbalanced_book(Exchange::BinanceSpot, 21_000)),
+            &ctx,
+        );
+        assert!(out[0].payload["persistence_ms"].as_i64().unwrap() <= 1_000);
     }
 
     #[test]

@@ -60,7 +60,7 @@ impl Config {
             classic_volume_ratio: f("classic_volume_ratio", 1.60).max(1.0),
             strong_volume_ratio: f("strong_volume_ratio", 2.20).max(1.0),
             quality_volume_ratio: f("quality_volume_ratio", 3.00).max(1.0),
-            balanced_max_volume_ratio: f("balanced_max_volume_ratio", 2.50).max(1.0),
+            balanced_max_volume_ratio: f("balanced_max_volume_ratio", 3.00).max(1.0),
             min_delta_share: f("min_delta_share", 0.15).clamp(0.01, 0.95),
             strong_delta_share: f("strong_delta_share", 0.35).clamp(0.01, 0.95),
             confirm_delta_share: f("confirm_delta_share", 0.08).clamp(0.01, 0.95),
@@ -75,7 +75,7 @@ impl Config {
             quality_context_score: u("quality_context_score", 7).min(8) as u8,
             require_trdr_location: b("require_trdr_location", true),
             block_countertrend: b("block_countertrend", true),
-            min_trdr_grade_rank: u("min_trdr_grade_rank", 2).clamp(1, 4) as u8,
+            min_trdr_grade_rank: u("min_trdr_grade_rank", 1).clamp(1, 4) as u8,
             min_trdr_delta_tier: u("min_trdr_delta_tier", 1).min(4) as u8,
             max_zone_distance_pct: f("max_zone_distance_pct", 0.004).clamp(0.0005, 0.05),
             trdr_max_age_ms: p
@@ -145,6 +145,10 @@ struct Setup {
     context_reasons: Vec<String>,
     trdr_zone_grade: String,
     trdr_zone_band_pct: Option<f64>,
+    trdr_zone_ratio: Option<f64>,
+    trdr_zone_wall_usd: Option<f64>,
+    trdr_zone_distance_bin: Option<u64>,
+    trdr_source_wall_ratio: Option<f64>,
     trdr_zone_distance_pct: Option<f64>,
     trdr_zone_low: Option<f64>,
     trdr_zone_high: Option<f64>,
@@ -176,6 +180,10 @@ struct TrdrContext {
     zone_matches: bool,
     zone_grade: String,
     zone_band_pct: Option<f64>,
+    zone_ratio: Option<f64>,
+    zone_wall_usd: Option<f64>,
+    zone_distance_bin: Option<u64>,
+    source_wall_ratio: Option<f64>,
     zone_distance_pct: Option<f64>,
     zone_low: Option<f64>,
     zone_high: Option<f64>,
@@ -276,6 +284,10 @@ fn trdr_context(ctx: &Ctx, side: Side, cfg: &Config, now_ms: i64) -> TrdrContext
             .unwrap_or("none")
             .to_string(),
         zone_band_pct: zone.and_then(|z| z.get("band_pct").and_then(Json::as_f64)),
+        zone_ratio: zone.and_then(|z| z.get("ratio").and_then(Json::as_f64)),
+        zone_wall_usd: zone.and_then(|z| z.get("wall_usd").and_then(Json::as_f64)),
+        zone_distance_bin: zone.and_then(|z| z.get("distance_bin").and_then(Json::as_u64)),
+        source_wall_ratio: zone.and_then(|z| z.get("source_wall_ratio").and_then(Json::as_f64)),
         zone_distance_pct: zone_distance,
         zone_low: zone.and_then(|z| z.get("zone_low").and_then(Json::as_f64)),
         zone_high: zone.and_then(|z| z.get("zone_high").and_then(Json::as_f64)),
@@ -402,6 +414,11 @@ impl OrderFlowExhaustion {
         let trdr = json!({
             "zone_grade":setup.trdr_zone_grade,
             "zone_band_pct":setup.trdr_zone_band_pct,
+            "zone_ratio":setup.trdr_zone_ratio,
+            "zone_wall_usd":setup.trdr_zone_wall_usd,
+            "zone_distance_bin":setup.trdr_zone_distance_bin,
+            "source_wall_ratio":setup.trdr_source_wall_ratio,
+            "ratio_basis":"local_mirrored_bin",
             "zone_distance_pct":setup.trdr_zone_distance_pct,
             "zone_low":setup.trdr_zone_low,
             "zone_high":setup.trdr_zone_high,
@@ -431,7 +448,7 @@ impl OrderFlowExhaustion {
             ts,
             "OrderFlowExhaustion",
             json!({
-                "model":"orderflow_exhaustion_v3",
+                "model":"orderflow_exhaustion_v6",
                 "stage":"confirmed",
                 "profile":profile,
                 "event_id":setup.event_id,
@@ -663,6 +680,10 @@ impl OrderFlowExhaustion {
                     context_reasons,
                     trdr_zone_grade: trdr.zone_grade,
                     trdr_zone_band_pct: trdr.zone_band_pct,
+                    trdr_zone_ratio: trdr.zone_ratio,
+                    trdr_zone_wall_usd: trdr.zone_wall_usd,
+                    trdr_zone_distance_bin: trdr.zone_distance_bin,
+                    trdr_source_wall_ratio: trdr.source_wall_ratio,
                     trdr_zone_distance_pct: trdr.zone_distance_pct,
                     trdr_zone_low: trdr.zone_low,
                     trdr_zone_high: trdr.zone_high,
@@ -710,6 +731,10 @@ impl OrderFlowExhaustion {
                 "event_delta_share":s.event_delta_share,
                 "trdr_zone_grade":s.trdr_zone_grade,
                 "trdr_zone_band_pct":s.trdr_zone_band_pct,
+                "trdr_zone_ratio":s.trdr_zone_ratio,
+                "trdr_zone_wall_usd":s.trdr_zone_wall_usd,
+                "trdr_zone_distance_bin":s.trdr_zone_distance_bin,
+                "trdr_source_wall_ratio":s.trdr_source_wall_ratio,
                 "trdr_zone_distance_pct":s.trdr_zone_distance_pct,
                 "trdr_spot_perp_confluence":s.trdr_spot_perp_confluence,
                 "trdr_delta_tier":s.trdr_delta_tier,
@@ -867,6 +892,10 @@ mod tests {
             context_reasons: vec![],
             trdr_zone_grade: "yellow".into(),
             trdr_zone_band_pct: Some(0.025),
+            trdr_zone_ratio: Some(2.5),
+            trdr_zone_wall_usd: Some(2_000_000.0),
+            trdr_zone_distance_bin: Some(1),
+            trdr_source_wall_ratio: Some(1.2),
             trdr_zone_distance_pct: Some(0.001),
             trdr_zone_low: Some(99.5),
             trdr_zone_high: Some(100.5),
@@ -906,10 +935,10 @@ mod tests {
     }
 
     #[test]
-    fn profile_keeps_middle_volume_band_observational() {
+    fn profile_has_no_dead_band_before_quality() {
         let s = test_signal();
         assert_eq!(s.profile(&setup(2.2, true, 6)), "balanced");
-        assert_eq!(s.profile(&setup(2.7, true, 6)), "high_frequency");
+        assert_eq!(s.profile(&setup(2.7, true, 6)), "balanced");
         assert_eq!(s.profile(&setup(3.2, true, 7)), "quality");
         assert_eq!(s.profile(&setup(2.2, false, 6)), "high_frequency");
     }
