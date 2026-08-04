@@ -101,6 +101,9 @@ struct ShadowSignal {
     stop_anchor: Option<f64>,
     context_score: Option<u64>,
     location_confirmed: Option<bool>,
+    /// 观察信号触发时的完整特征，随各期限结果一起落盘供离线归因。
+    #[serde(default)]
+    features: serde_json::Value,
     mfe_pct: f64,
     mae_pct: f64,
     next_horizon: usize,
@@ -513,7 +516,8 @@ impl LiveEngine {
     fn track_new_shadow_signals(&mut self, signals: &[Signal]) {
         for signal in signals {
             let p = &signal.payload;
-            if p.get("stage").and_then(|v| v.as_str()) != Some("confirmed") {
+            let stage = p.get("stage").and_then(|v| v.as_str()).unwrap_or("");
+            if stage != "confirmed" && stage != "observation" {
                 continue;
             }
             let Some(event_id) = p.get("event_id").and_then(|v| v.as_i64()) else {
@@ -554,17 +558,27 @@ impl LiveEngine {
                 stop_anchor: p.get("stop_anchor").and_then(|v| v.as_f64()),
                 context_score: p.get("context_score").and_then(|v| v.as_u64()),
                 location_confirmed: p.get("location_confirmed").and_then(|v| v.as_bool()),
+                features: p
+                    .get("observation")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
                 mfe_pct: 0.0,
                 mae_pct: 0.0,
                 next_horizon: 0,
             };
             self.append_research(
-                "signal_confirmed",
+                if stage == "confirmed" {
+                    "signal_confirmed"
+                } else {
+                    "observation_detected"
+                },
                 signal.ts.as_millis(),
                 serde_json::json!({ "signal": p }),
             );
             self.shadow_signals.push(shadow);
-            self.confirmed_signals_run += 1;
+            if stage == "confirmed" {
+                self.confirmed_signals_run += 1;
+            }
         }
     }
 
@@ -598,6 +612,7 @@ impl LiveEngine {
                         "stop_anchor": shadow.stop_anchor,
                         "context_score": shadow.context_score,
                         "location_confirmed": shadow.location_confirmed,
+                        "features": shadow.features,
                         "gross_return_pct": gross,
                         "estimated_net_return_pct": gross - fee_pct,
                         "mfe_pct": shadow.mfe_pct,
@@ -2081,6 +2096,43 @@ location_buckets = 10
         assert_eq!(text.matches("\"event_type\":\"shadow_outcome\"").count(), 6);
         assert!(text.contains("\"estimated_net_return_pct\""));
         assert!(text.contains("\"profile\":\"observation\""));
+        let _ = std::fs::remove_dir_all(&cfg.research_log_dir);
+    }
+
+    #[test]
+    fn observation_signal_tracks_outcomes_without_counting_as_confirmed() {
+        let cfg = test_config("observation-shadow");
+        let _ = std::fs::remove_dir_all(&cfg.research_log_dir);
+        let mut eng = LiveEngine::new(
+            noop_strategy(),
+            AnyBroker::dry(FeeModel::default()),
+            cfg.clone(),
+            100_000.0,
+            "1970-01-01".into(),
+        );
+        let signal = Signal::new(
+            SignalKind::Other,
+            Timestamp::from_millis(1_000),
+            "OrderFlowExhaustion",
+            serde_json::json!({
+                "stage":"observation", "event_id":1, "side":"buy",
+                "profile":"cumulative_absorption", "strength":"watch",
+                "price":100.0, "zone":100.0,
+                "observation":{"delta_share":-0.25,"return_pct":-0.001,"efficiency":0.2}
+            }),
+        );
+        eng.track_new_shadow_signals(&[signal]);
+        assert_eq!(eng.confirmed_signals_run, 0);
+        assert_eq!(eng.shadow_signals.len(), 1);
+        eng.update_shadow_outcomes(
+            Timestamp::from_millis(1_000 + 5 * 60_000),
+            Price::from_f64(101.0),
+        );
+        let text = std::fs::read_to_string(cfg.research_log_dir.join("1970-01-01.jsonl"))
+            .expect("observation research log");
+        assert!(text.contains("\"event_type\":\"observation_detected\""));
+        assert!(text.contains("\"profile\":\"cumulative_absorption\""));
+        assert!(text.contains("\"features\":{\"delta_share\":-0.25"));
         let _ = std::fs::remove_dir_all(&cfg.research_log_dir);
     }
 }

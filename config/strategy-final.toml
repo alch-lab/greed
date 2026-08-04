@@ -2,7 +2,7 @@
 # 订单流力竭再在有效区域内确认入场。每个事件簇只允许产生一次入场。
 
 [strategy]
-name = "trdr-orderflow-v6-local-wall"
+name = "trdr-orderflow-v7-cumulative-observation"
 signals = ["TrdrMarketMap", "OrderFlowExhaustion"]
 trigger = "OrderFlowEntry"
 filters = ["CircuitBreaker"]
@@ -70,6 +70,13 @@ require_spot_perp_confluence = true
 require_source_coverage = true
 min_stacked_imbalance = 2
 min_liquidation_usd = 1000000
+# 纯观察层：30 分钟滚动 Delta 持续单边，但价格推进 ≤0.6%、路径效率 ≤45% 时，
+# 记录渐进吸收事件及后续 5m–4h 表现。该信号不会进入 OrderFlowEntry。
+cumulative_window_buckets = 180
+cumulative_min_delta_share = 0.15
+cumulative_max_return_pct = 0.006
+cumulative_max_efficiency = 0.45
+cumulative_cooldown_buckets = 180
 
 [strategy.plugins.OrderFlowEntry]
 trade_classic = false

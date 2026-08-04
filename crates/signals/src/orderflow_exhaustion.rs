@@ -36,6 +36,12 @@ pub struct Config {
     pub require_source_coverage: bool,
     pub min_stacked_imbalance: usize,
     pub min_liquidation_usd: f64,
+    /// 渐进吸收观察窗口；只产出 shadow observation，永不直接下单。
+    pub cumulative_window_buckets: usize,
+    pub cumulative_min_delta_share: f64,
+    pub cumulative_max_return_pct: f64,
+    pub cumulative_max_efficiency: f64,
+    pub cumulative_cooldown_buckets: usize,
 }
 
 impl Config {
@@ -92,6 +98,11 @@ impl Config {
             require_source_coverage: b("require_source_coverage", true),
             min_stacked_imbalance: u("min_stacked_imbalance", 2).clamp(1, 10),
             min_liquidation_usd: f("min_liquidation_usd", 1_000_000.0).max(0.0),
+            cumulative_window_buckets: u("cumulative_window_buckets", 180).max(6),
+            cumulative_min_delta_share: f("cumulative_min_delta_share", 0.15).clamp(0.01, 0.95),
+            cumulative_max_return_pct: f("cumulative_max_return_pct", 0.006).clamp(0.0001, 0.10),
+            cumulative_max_efficiency: f("cumulative_max_efficiency", 0.45).clamp(0.01, 1.0),
+            cumulative_cooldown_buckets: u("cumulative_cooldown_buckets", 180).max(1),
         }
     }
 }
@@ -339,6 +350,7 @@ pub struct OrderFlowExhaustion {
     history: VecDeque<Bucket>,
     setup: Option<Setup>,
     cooldown_until: i64,
+    cumulative_cooldown_until: i64,
     session_day: i64,
     session_notional: f64,
     session_pv: f64,
@@ -360,6 +372,7 @@ impl OrderFlowExhaustion {
             history: VecDeque::new(),
             setup: None,
             cooldown_until: 0,
+            cumulative_cooldown_until: 0,
             session_day: i64::MIN,
             session_notional: 0.0,
             session_pv: 0.0,
@@ -384,6 +397,115 @@ impl OrderFlowExhaustion {
         }
         xs.sort_by(f64::total_cmp);
         xs[xs.len() / 2]
+    }
+
+    /// 在较长窗口中识别“Delta 持续单边，但价格推进有限且路径反复”的渐进吸收。
+    /// 返回的特征每个 10 秒桶都会写入 eval；active 只代表值得跟踪，不参与交易。
+    fn cumulative_absorption(&self, current: &Bucket) -> Json {
+        let needed = self.cfg.cumulative_window_buckets;
+        let mut window = self
+            .history
+            .iter()
+            .rev()
+            .take(needed.saturating_sub(1))
+            .collect::<Vec<_>>();
+        window.reverse();
+        if window.len() + 1 < needed {
+            return json!({
+                "ready":false,
+                "active":false,
+                "observed_buckets":window.len() + 1,
+                "required_buckets":needed,
+                "window_ms":needed as i64 * self.cfg.bucket_ms,
+                "reason":"渐进吸收观察窗口预热中",
+            });
+        }
+
+        let open = window
+            .first()
+            .map(|bucket| bucket.open)
+            .unwrap_or(current.open);
+        let close = current.close;
+        let mut volume = current.volume;
+        let mut delta = current.delta;
+        let mut path = 0.0;
+        let mut previous_close = open;
+        for bucket in &window {
+            volume += bucket.volume;
+            delta += bucket.delta;
+            path += (bucket.close - previous_close).abs();
+            previous_close = bucket.close;
+        }
+        path += (current.close - previous_close).abs();
+        let delta_share = if volume > 0.0 { delta / volume } else { 0.0 };
+        let return_pct = if open > 0.0 { close / open - 1.0 } else { 0.0 };
+        let efficiency = if path > 0.0 {
+            (close - open).abs() / path
+        } else {
+            0.0
+        };
+        let pressure = if delta_share >= self.cfg.cumulative_min_delta_share {
+            Some(Side::Buy)
+        } else if delta_share <= -self.cfg.cumulative_min_delta_share {
+            Some(Side::Sell)
+        } else {
+            None
+        };
+        let fade_side = pressure.map(Side::opposite);
+        let limited_return = return_pct.abs() <= self.cfg.cumulative_max_return_pct;
+        let inefficient_path = efficiency <= self.cfg.cumulative_max_efficiency;
+        let active = pressure.is_some() && limited_return && inefficient_path;
+        let reason = if pressure.is_none() {
+            "滚动 Delta 尚未达到观察门槛"
+        } else if !limited_return {
+            "价格已随 Delta 明显推进，不属于吸收"
+        } else if !inefficient_path {
+            "价格路径仍偏单边，不属于反复承接"
+        } else {
+            "持续单边 Delta 未换来等比例价格推进，记录渐进吸收观察事件"
+        };
+        json!({
+            "ready":true,
+            "active":active,
+            "emitted":false,
+            "window_buckets":needed,
+            "window_ms":needed as i64 * self.cfg.bucket_ms,
+            "open":open,
+            "close":close,
+            "volume_usd":volume,
+            "delta_usd":delta,
+            "delta_share":delta_share,
+            "return_pct":return_pct,
+            "efficiency":efficiency,
+            "pressure_side":pressure.map(side_name),
+            "fade_side":fade_side.map(side_name),
+            "min_delta_share":self.cfg.cumulative_min_delta_share,
+            "max_return_pct":self.cfg.cumulative_max_return_pct,
+            "max_efficiency":self.cfg.cumulative_max_efficiency,
+            "reason":reason,
+        })
+    }
+
+    fn cumulative_signal(&self, ts: Timestamp, observation: &Json) -> Option<Signal> {
+        let side = observation.get("fade_side")?.as_str()?;
+        Some(Signal::new(
+            SignalKind::Other,
+            ts,
+            "OrderFlowExhaustion",
+            json!({
+                "model":"orderflow_exhaustion_v6",
+                "stage":"observation",
+                "profile":"cumulative_absorption",
+                "event_id":ts.as_millis(),
+                "strength":if observation.get("delta_share").and_then(Json::as_f64).unwrap_or(0.0).abs() >= self.cfg.strong_delta_share { "strong" } else { "watch" },
+                "side":side,
+                "price":observation.get("close").and_then(Json::as_f64),
+                "zone":observation.get("close").and_then(Json::as_f64),
+                "location_confirmed":false,
+                "context_score":0,
+                "observation":observation,
+            }),
+        ))
     }
 
     fn profile(&self, setup: &Setup) -> &'static str {
@@ -496,6 +618,7 @@ impl OrderFlowExhaustion {
         };
         let range = (b.high - b.low).max(b.close * 1e-7);
         let efficiency = (b.close - b.open).abs() / range;
+        let mut cumulative = self.cumulative_absorption(b);
         let prior: Vec<&Bucket> = self
             .history
             .iter()
@@ -758,7 +881,21 @@ impl OrderFlowExhaustion {
                 "trdr_short_liquidation_usd":s.trdr_short_liquidation_usd
             })
         });
-        let confirmed_profile = out.first().and_then(|s| s.payload.get("profile")).cloned();
+        if cumulative.get("active").and_then(Json::as_bool) == Some(true)
+            && b.start_ms >= self.cumulative_cooldown_until
+        {
+            if let Some(observation) = self.cumulative_signal(ts, &cumulative) {
+                out.push(observation);
+                cumulative["emitted"] = json!(true);
+                self.cumulative_cooldown_until =
+                    b.start_ms + self.cfg.cumulative_cooldown_buckets as i64 * self.cfg.bucket_ms;
+            }
+        }
+        let confirmed_profile = out
+            .iter()
+            .find(|signal| signal.payload.get("stage").and_then(Json::as_str) == Some("confirmed"))
+            .and_then(|signal| signal.payload.get("profile"))
+            .cloned();
         self.eval = Some(json!({
             "ts_ms":ts.as_millis(), "price":b.close, "decision":decision, "reason":reason,
             "bucket_ms":self.cfg.bucket_ms, "volume_usd":b.volume,
@@ -776,7 +913,8 @@ impl OrderFlowExhaustion {
                 "pending_confirmation":self.setup.is_some(),
                 "confirmed":!out.is_empty()
             },
-            "pending":pending, "profile":confirmed_profile
+            "pending":pending, "profile":confirmed_profile,
+            "cumulative_absorption":cumulative
         }));
         out
     }
@@ -826,7 +964,11 @@ impl SignalPlugin for OrderFlowExhaustion {
                     signals = self.evaluate(&completed, ctx);
                     self.history.push_back(completed);
                     while self.history.len()
-                        > self.cfg.location_buckets.max(self.cfg.baseline_buckets)
+                        > self
+                            .cfg
+                            .location_buckets
+                            .max(self.cfg.baseline_buckets)
+                            .max(self.cfg.cumulative_window_buckets)
                     {
                         self.history.pop_front();
                     }
@@ -874,6 +1016,55 @@ mod tests {
         cfg.weak_confirm_buckets = 5;
         cfg.cluster_cooldown_buckets = 10;
         OrderFlowExhaustion::new(cfg)
+    }
+
+    #[test]
+    fn cumulative_absorption_emits_observation_only_signal() {
+        let mut cfg = Config::from_params(&json!({}));
+        cfg.bucket_ms = 1_000;
+        cfg.min_baseline_buckets = 5;
+        cfg.baseline_buckets = 5;
+        cfg.location_buckets = 5;
+        cfg.cumulative_window_buckets = 3;
+        cfg.cumulative_min_delta_share = 0.20;
+        cfg.cumulative_max_return_pct = 0.01;
+        cfg.cumulative_max_efficiency = 0.60;
+        let mut signal = OrderFlowExhaustion::new(cfg);
+        for i in 0..5 {
+            let close = if i % 2 == 0 { 100.1 } else { 99.9 };
+            signal.history.push_back(Bucket {
+                start_ms: i * 1_000,
+                open: 100.0,
+                high: 100.2,
+                low: 99.8,
+                close,
+                volume: 100.0,
+                delta: -30.0,
+            });
+        }
+        let current = Bucket {
+            start_ms: 6_000,
+            open: 99.9,
+            high: 100.1,
+            low: 99.8,
+            close: 100.0,
+            volume: 100.0,
+            delta: -30.0,
+        };
+        let out = signal.evaluate(&current, &Ctx::default());
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].payload["stage"], "observation");
+        assert_eq!(out[0].payload["profile"], "cumulative_absorption");
+        assert_eq!(out[0].payload["side"], "buy");
+        assert_eq!(signal.eval.as_ref().unwrap()["decision"], "none");
+        assert_eq!(
+            signal.eval.as_ref().unwrap()["cumulative_absorption"]["active"],
+            true
+        );
+        assert_eq!(
+            signal.eval.as_ref().unwrap()["cumulative_absorption"]["emitted"],
+            true
+        );
     }
 
     fn setup(volume_ratio: f64, location_confirmed: bool, context_score: u8) -> Setup {
