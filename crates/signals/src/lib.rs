@@ -4,5 +4,6 @@
 //! 力竭（大量 effort、很少 result）→ Delta 反转确认。旧的 EMA/MR/Renko
 //! 近似模型已退出装配入口，避免同名概念对应不同实现。
 
+pub mod intraday_extension_reversion;
 pub mod orderflow_exhaustion;
 pub mod trdr_market_map;

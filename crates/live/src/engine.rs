@@ -122,6 +122,8 @@ pub struct EngineSnapshot {
     pub last_eval: Option<serde_json::Value>,
     /// TRDR 市场地图的独立实时快照，避免被高频入场评估覆盖。
     pub market_map: Option<serde_json::Value>,
+    /// 不依赖盘口墙的 30 分钟过度延伸 MR 腿。
+    pub intraday_reversion: Option<serde_json::Value>,
     pub run_id: String,
     pub strategy_name: String,
     pub strategy_hash: String,
@@ -131,7 +133,7 @@ pub struct EngineSnapshot {
     pub confirmed_signals_run: usize,
     pub observation_signals_run: usize,
     pub shadow_outcomes_run: usize,
-    /// userTrades 最近一次轮询是否成功；false 时引擎禁止新开仓。
+    /// userTrades 是否在 30 秒内成功轮询过；false 时引擎禁止新开仓。
     pub execution_healthy: bool,
 }
 
@@ -747,6 +749,7 @@ impl LiveEngine {
             n_fills: self.account.fills().len(),
             last_eval: plugin_note("OrderFlowExhaustion").or_else(|| self.latest_eval.clone()),
             market_map: plugin_note("TrdrMarketMap"),
+            intraday_reversion: plugin_note("IntradayExtensionReversion"),
             run_id: self.config.run_id.clone(),
             strategy_name: self.config.strategy_name.clone(),
             strategy_hash: self.config.strategy_hash.clone(),

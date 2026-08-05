@@ -9,7 +9,10 @@
 //! 两种实现产出同一 [`Execution`] 序列 → 同一个 [`Account`] 记账 →
 //! 同一份 Journal 契约，前端无感知。
 
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    time::{Duration, Instant},
+};
 
 use backtest::{Broker, Execution, FeeModel, Order, OrderKind};
 use tcore::types::{Price, Qty, Side, Timestamp};
@@ -78,6 +81,14 @@ pub struct TestnetBroker {
     last_submitted_order_id: Option<i64>,
     /// 最近一次 userTrades 轮询是否成功；失败期间禁止新增风险。
     execution_healthy: bool,
+    consecutive_poll_failures: u32,
+    last_poll_success: Instant,
+}
+
+const EXECUTION_STALE_AFTER: Duration = Duration::from_secs(30);
+
+fn execution_channel_healthy(since_success: Duration) -> bool {
+    since_success < EXECUTION_STALE_AFTER
 }
 
 /// 经纪层统一入口（枚举分发，避免 async trait 对象安全问题）。
@@ -102,6 +113,8 @@ impl AnyBroker {
             last_trade_id: 0,
             last_submitted_order_id: None,
             execution_healthy: true,
+            consecutive_poll_failures: 0,
+            last_poll_success: Instant::now(),
         })
     }
 
@@ -116,6 +129,9 @@ impl AnyBroker {
         };
         let trades = b.rest.user_trades(&b.symbol, 0).await?;
         b.last_trade_id = trades.iter().map(|trade| trade.trade_id).max().unwrap_or(0);
+        b.last_poll_success = Instant::now();
+        b.consecutive_poll_failures = 0;
+        b.execution_healthy = true;
         info!(
             last_trade_id = b.last_trade_id,
             ignored_history = trades.len(),
@@ -203,12 +219,35 @@ impl AnyBroker {
         };
         let trades = match b.rest.user_trades(&b.symbol, b.last_trade_id + 1).await {
             Ok(t) => {
+                if !b.execution_healthy {
+                    info!(
+                        failures = b.consecutive_poll_failures,
+                        "userTrades 成交回报通道已恢复"
+                    );
+                }
+                b.last_poll_success = Instant::now();
+                b.consecutive_poll_failures = 0;
                 b.execution_healthy = true;
                 t
             }
             Err(e) => {
-                b.execution_healthy = false;
-                warn!(error = %e, "userTrades 轮询失败（禁止新开仓，下周期重试）");
+                b.consecutive_poll_failures = b.consecutive_poll_failures.saturating_add(1);
+                let stale_for = b.last_poll_success.elapsed();
+                let was_healthy = b.execution_healthy;
+                b.execution_healthy = execution_channel_healthy(stale_for);
+                // 瞬时 502 不应封死策略，也不应每 2 秒刷屏；超过 30 秒才禁止新增风险。
+                if b.consecutive_poll_failures == 1
+                    || (was_healthy && !b.execution_healthy)
+                    || b.consecutive_poll_failures % 30 == 0
+                {
+                    warn!(
+                        error = %e,
+                        failures = b.consecutive_poll_failures,
+                        stale_seconds = stale_for.as_secs(),
+                        execution_healthy = b.execution_healthy,
+                        "userTrades 轮询失败（短暂故障容忍 30 秒，持续故障禁止新开仓）"
+                    );
+                }
                 return Vec::new();
             }
         };
@@ -326,6 +365,12 @@ impl AnyBroker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn transient_poll_failure_does_not_immediately_disable_entries() {
+        assert!(execution_channel_healthy(Duration::from_secs(5)));
+        assert!(!execution_channel_healthy(Duration::from_secs(30)));
+    }
 
     #[test]
     fn external_fill_is_not_registered_or_accounted() {

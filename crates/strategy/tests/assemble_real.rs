@@ -9,7 +9,8 @@ fn assemble_real_strategy_toml() {
     let s = strategy::assemble_from_toml(&toml_str, &reg).expect("装配失败");
     println!("装配成功: {}", s.describe());
     assert_eq!(s.trigger.name(), "OrderFlowEntry");
-    assert_eq!(s.signals.len(), 2);
+    assert_eq!(s.signals.len(), 3);
     assert_eq!(s.signals[0].name(), "TrdrMarketMap");
     assert_eq!(s.signals[1].name(), "OrderFlowExhaustion");
+    assert_eq!(s.signals[2].name(), "IntradayExtensionReversion");
 }
