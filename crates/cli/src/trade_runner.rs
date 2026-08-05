@@ -364,31 +364,32 @@ pub async fn run_trade(
                 engine.on_timer(now_ms).await;
                 if let Some(tx) = &status_tx {
                     let snap = engine.snapshot();
-                    let _ = tx.send(serde_json::json!({
+                    let account_net_qty = snap
+                        .position
+                        .as_ref()
+                        .map(|p| if p.side == "Buy" { p.qty } else { -p.qty });
+                    // EngineSnapshot 已是控制面的正式契约；先整体序列化，再补运行器元数据，
+                    // 避免新增引擎字段时忘记在此手工透传，导致后端有值而前端永远看不到。
+                    let mut status = serde_json::to_value(&snap)
+                        .expect("EngineSnapshot serialization cannot fail");
+                    let runtime = serde_json::json!({
                         "state": "running",
                         "mode": mode.as_str(),
                         "started_at_ms": started_ms,
                         "uptime_s": (now_ms - started_ms) / 1000,
                         "journal": journal_path,
-                        "last_price": snap.last_price,
-                        "equity": snap.equity,
-                        "cash": snap.cash,
-                        "position": snap.position,
-                        "account_net_qty": snap.position.as_ref().map(|p| if p.side == "Buy" { p.qty } else { -p.qty }),
-                        "n_intents": snap.n_intents,
-                        "n_fills": snap.n_fills,
-                        "last_eval": snap.last_eval,
-                        "market_map": snap.market_map,
-                        "run_id": snap.run_id,
-                        "strategy_name": snap.strategy_name,
-                        "strategy_hash": snap.strategy_hash,
-                        "git_commit": snap.git_commit,
-                        "research_log_dir": snap.research_log_dir,
-                        "active_shadow_signals": snap.active_shadow_signals,
-                        "confirmed_signals_run": snap.confirmed_signals_run,
-                        "shadow_outcomes_run": snap.shadow_outcomes_run,
-                        "execution_healthy": snap.execution_healthy,
-                    }));
+                        "account_net_qty": account_net_qty,
+                    });
+                    status
+                        .as_object_mut()
+                        .expect("EngineSnapshot serializes to an object")
+                        .extend(
+                            runtime
+                                .as_object()
+                                .expect("runtime metadata is an object")
+                                .clone(),
+                        );
+                    let _ = tx.send(status);
                 }
             }
             _ = shutdown.changed() => {
