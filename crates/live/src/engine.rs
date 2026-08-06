@@ -68,6 +68,8 @@ struct PendingEntry {
     event_id: Option<i64>,
     order_id: Option<i64>,
     submitted_ts_ms: i64,
+    reference_price: f64,
+    planned_price: f64,
     qty: f64,
     reason: String,
 }
@@ -84,6 +86,8 @@ struct PendingExit {
     requested_qty: f64,
     filled_qty: f64,
     submitted_ts_ms: i64,
+    reference_price: f64,
+    planned_price: f64,
     rearm_stop: Option<Price>,
     timeout_noted: bool,
 }
@@ -106,6 +110,10 @@ struct ShadowSignal {
     features: serde_json::Value,
     mfe_pct: f64,
     mae_pct: f64,
+    #[serde(default)]
+    mfe_ts_ms: Option<i64>,
+    #[serde(default)]
+    mae_ts_ms: Option<i64>,
     next_horizon: usize,
 }
 
@@ -154,6 +162,11 @@ struct PosTrack {
     mfe_pct: f64,
     /// 最大不利偏移 %（MAE：浮亏峰值，负值）
     mae_pct: f64,
+    /// MFE/MAE 首次刷新到当前极值的时间，用于优化止盈与时间退出。
+    #[serde(default)]
+    mfe_ts_ms: Option<i64>,
+    #[serde(default)]
+    mae_ts_ms: Option<i64>,
     /// 开仓时的 fill 下标（平仓时汇总本 trip 的已实现盈亏）
     start_fill_idx: usize,
     /// 上次观察到的持仓数量（识别加仓）
@@ -575,6 +588,8 @@ impl LiveEngine {
                 },
                 mfe_pct: 0.0,
                 mae_pct: 0.0,
+                mfe_ts_ms: None,
+                mae_ts_ms: None,
                 next_horizon: 0,
             };
             self.append_research(
@@ -604,8 +619,14 @@ impl LiveEngine {
         for shadow in &mut self.shadow_signals {
             let sign = if shadow.side == "buy" { 1.0 } else { -1.0 };
             let gross = sign * (px / shadow.confirm_price - 1.0) * 100.0;
-            shadow.mfe_pct = shadow.mfe_pct.max(gross);
-            shadow.mae_pct = shadow.mae_pct.min(gross);
+            if gross > shadow.mfe_pct {
+                shadow.mfe_pct = gross;
+                shadow.mfe_ts_ms = Some(now_ms);
+            }
+            if gross < shadow.mae_pct {
+                shadow.mae_pct = gross;
+                shadow.mae_ts_ms = Some(now_ms);
+            }
             while shadow.next_horizon < SHADOW_HORIZONS_MIN.len()
                 && now_ms - shadow.signal_ts_ms >= SHADOW_HORIZONS_MIN[shadow.next_horizon] * 60_000
             {
@@ -630,6 +651,10 @@ impl LiveEngine {
                         "estimated_net_return_pct": gross - fee_pct,
                         "mfe_pct": shadow.mfe_pct,
                         "mae_pct": shadow.mae_pct,
+                        "mfe_ts_ms": shadow.mfe_ts_ms,
+                        "mae_ts_ms": shadow.mae_ts_ms,
+                        "time_to_mfe_ms": shadow.mfe_ts_ms.map(|value| value - shadow.signal_ts_ms),
+                        "time_to_mae_ms": shadow.mae_ts_ms.map(|value| value - shadow.signal_ts_ms),
                     }),
                 ));
                 shadow.next_horizon += 1;
@@ -666,6 +691,8 @@ impl LiveEngine {
                     entry_ts_ms: ts.as_millis(),
                     mfe_pct: dev.max(0.0),
                     mae_pct: dev.min(0.0),
+                    mfe_ts_ms: (dev > 0.0).then_some(ts.as_millis()),
+                    mae_ts_ms: (dev < 0.0).then_some(ts.as_millis()),
                     start_fill_idx: self.account.fills().len(),
                     last_qty: p.qty.to_f64(),
                     adds: 0,
@@ -675,8 +702,14 @@ impl LiveEngine {
                 let px = price.to_f64();
                 let sign = if t.side == "Buy" { 1.0 } else { -1.0 };
                 let dev = (px - t.entry_price) / t.entry_price * 100.0 * sign;
-                t.mfe_pct = t.mfe_pct.max(dev);
-                t.mae_pct = t.mae_pct.min(dev);
+                if dev > t.mfe_pct {
+                    t.mfe_pct = dev;
+                    t.mfe_ts_ms = Some(ts.as_millis());
+                }
+                if dev < t.mae_pct {
+                    t.mae_pct = dev;
+                    t.mae_ts_ms = Some(ts.as_millis());
+                }
                 let q = p.qty.to_f64();
                 if q > t.last_qty + 1e-9 {
                     t.adds += 1;
@@ -689,8 +722,14 @@ impl LiveEngine {
                 let px = price.to_f64();
                 let sign = if t.side == "Buy" { 1.0 } else { -1.0 };
                 let dev = (px - t.entry_price) / t.entry_price * 100.0 * sign;
-                t.mfe_pct = t.mfe_pct.max(dev);
-                t.mae_pct = t.mae_pct.min(dev);
+                if dev > t.mfe_pct {
+                    t.mfe_pct = dev;
+                    t.mfe_ts_ms = Some(ts.as_millis());
+                }
+                if dev < t.mae_pct {
+                    t.mae_pct = dev;
+                    t.mae_ts_ms = Some(ts.as_millis());
+                }
                 // 汇总本 trip 的 fills，写 trip 记录（MFE/MAE 是优化 TP/SL 的核心数据）
                 let fills = self.account.fills();
                 let trip_fills = &fills[t.start_fill_idx.min(fills.len())..];
@@ -699,6 +738,8 @@ impl LiveEngine {
                 let exit_reason = exit.map(|f| f.reason.clone()).unwrap_or_default();
                 let realized: f64 = trip_fills.iter().map(|f| f.realized_pnl - f.fee).sum();
                 let holding_min = (ts.as_millis() - t.entry_ts_ms) as f64 / 60_000.0;
+                let time_to_mfe_ms = t.mfe_ts_ms.map(|value| value - t.entry_ts_ms);
+                let time_to_mae_ms = t.mae_ts_ms.map(|value| value - t.entry_ts_ms);
                 let side_cn = if t.side == "Buy" { "多单" } else { "空单" };
                 let reason = format!(
                     "{}出场（{}）：持仓 {:.0}min，净盈亏 {:+.2} USD（MFE {:+.2}% / MAE {:+.2}%，加仓 {} 次）",
@@ -717,11 +758,36 @@ impl LiveEngine {
                         "pnl_usd": realized,
                         "mfe_pct": t.mfe_pct,
                         "mae_pct": t.mae_pct,
+                        "mfe_ts_ms": t.mfe_ts_ms,
+                        "mae_ts_ms": t.mae_ts_ms,
+                        "time_to_mfe_ms": time_to_mfe_ms,
+                        "time_to_mae_ms": time_to_mae_ms,
                         "holding_min": holding_min,
                         "adds": t.adds,
                         "reason": reason,
                     }),
                 });
+                self.append_research(
+                    "trip_closed",
+                    ts.as_millis(),
+                    serde_json::json!({
+                        "side": t.side,
+                        "entry_price": t.entry_price,
+                        "entry_ts_ms": t.entry_ts_ms,
+                        "exit_price": exit_price,
+                        "exit_ts_ms": ts.as_millis(),
+                        "exit_reason": exit_reason,
+                        "pnl_usd": realized,
+                        "mfe_pct": t.mfe_pct,
+                        "mae_pct": t.mae_pct,
+                        "mfe_ts_ms": t.mfe_ts_ms,
+                        "mae_ts_ms": t.mae_ts_ms,
+                        "time_to_mfe_ms": time_to_mfe_ms,
+                        "time_to_mae_ms": time_to_mae_ms,
+                        "holding_ms": ts.as_millis() - t.entry_ts_ms,
+                        "adds": t.adds,
+                    }),
+                );
             }
             (None, None) => {}
         }
@@ -780,7 +846,14 @@ impl LiveEngine {
         // 1) 撮合/成交回报（dry：本地模拟撮合；testnet：本地挂单不消费价格）
         let execs = self.broker.on_trade_price(trade.ts, trade.price).await;
         for ex in execs {
-            self.log_execution(&ex, None, None);
+            let benchmark = self.pending_entry.as_ref().map(|pending| {
+                (
+                    pending.submitted_ts_ms,
+                    pending.reference_price,
+                    pending.planned_price,
+                )
+            });
+            self.log_execution(&ex, None, None, benchmark);
             self.account.apply_fill(FillRequest {
                 ts: ex.ts,
                 side: ex.side,
@@ -857,10 +930,28 @@ impl LiveEngine {
                 });
                 let exit_fill_qty = ex.qty.to_f64();
                 let pending = self.pending_entry.as_ref();
+                let benchmark = if exit_match {
+                    self.pending_exit.as_ref().map(|exit| {
+                        (
+                            exit.submitted_ts_ms,
+                            exit.reference_price,
+                            exit.planned_price,
+                        )
+                    })
+                } else {
+                    pending.map(|entry| {
+                        (
+                            entry.submitted_ts_ms,
+                            entry.reference_price,
+                            entry.planned_price,
+                        )
+                    })
+                };
                 self.log_execution(
                     &ex,
                     pending.map(|p| p.intent_id.as_str()),
                     pending.and_then(|p| p.event_id),
+                    benchmark,
                 );
                 self.account.apply_fill(FillRequest {
                     ts: ex.ts,
@@ -1290,7 +1381,16 @@ impl LiveEngine {
         match self.broker.submit(trade.ts, trade.price, order).await {
             Ok(Some(ex)) => {
                 // dry 市价单立即成交
-                self.log_execution(&ex, Some(&intent_id), event_id);
+                self.log_execution(
+                    &ex,
+                    Some(&intent_id),
+                    event_id,
+                    Some((
+                        trade.ts.as_millis(),
+                        trade.price.to_f64(),
+                        intent.limit_price.unwrap_or(trade.price).to_f64(),
+                    )),
+                );
                 self.account.apply_fill(FillRequest {
                     ts: ex.ts,
                     side: ex.side,
@@ -1322,6 +1422,8 @@ impl LiveEngine {
                     event_id,
                     order_id,
                     submitted_ts_ms: trade.ts.as_millis(),
+                    reference_price: trade.price.to_f64(),
+                    planned_price: intent.limit_price.unwrap_or(trade.price).to_f64(),
                     qty: qty.to_f64(),
                     reason: intent.reason.clone(),
                 });
@@ -1439,7 +1541,16 @@ impl LiveEngine {
         };
         match self.broker.submit(trade.ts, trade.price, order).await {
             Ok(Some(ex)) => {
-                self.log_execution(&ex, None, None);
+                self.log_execution(
+                    &ex,
+                    None,
+                    None,
+                    Some((
+                        trade.ts.as_millis(),
+                        trade.price.to_f64(),
+                        trade.price.to_f64(),
+                    )),
+                );
                 self.account.apply_fill(FillRequest {
                     ts: ex.ts,
                     side: ex.side,
@@ -1476,6 +1587,8 @@ impl LiveEngine {
                     requested_qty: qty.to_f64(),
                     filled_qty: 0.0,
                     submitted_ts_ms: trade.ts.as_millis(),
+                    reference_price: trade.price.to_f64(),
+                    planned_price: trade.price.to_f64(),
                     rearm_stop,
                     timeout_noted: false,
                 });
@@ -1546,7 +1659,24 @@ impl LiveEngine {
         ex: &backtest::Execution,
         intent_id: Option<&str>,
         event_id: Option<i64>,
+        benchmark: Option<(i64, f64, f64)>,
     ) {
+        let fill_price = ex.price.to_f64();
+        let adverse_slippage_bps = |reference: f64| {
+            if reference <= 0.0 {
+                return None;
+            }
+            let raw = (fill_price / reference - 1.0) * 10_000.0;
+            Some(match ex.side {
+                tcore::Side::Buy => raw,
+                tcore::Side::Sell => -raw,
+            })
+        };
+        let (submitted_ts_ms, reference_price, planned_price) = benchmark
+            .map(|(submitted, reference, planned)| {
+                (Some(submitted), Some(reference), Some(planned))
+            })
+            .unwrap_or((None, None, None));
         self.append_research(
             "order_filled",
             ex.ts.as_millis(),
@@ -1556,11 +1686,19 @@ impl LiveEngine {
                 "order_id": ex.order_id,
                 "trade_id": ex.trade_id,
                 "side": format!("{:?}", ex.side),
-                "price": ex.price.to_f64(),
+                "price": fill_price,
                 "qty": ex.qty.to_f64(),
+                "notional_usd": fill_price * ex.qty.to_f64(),
                 "fee": ex.fee,
                 "is_maker": ex.is_maker,
                 "reason": ex.reason,
+                "submitted_ts_ms": submitted_ts_ms,
+                "fill_ts_ms": ex.ts.as_millis(),
+                "latency_ms": submitted_ts_ms.map(|value| ex.ts.as_millis() - value),
+                "reference_price": reference_price,
+                "planned_price": planned_price,
+                "slippage_vs_reference_bps": reference_price.and_then(adverse_slippage_bps),
+                "slippage_vs_planned_bps": planned_price.and_then(adverse_slippage_bps),
             }),
         );
     }
@@ -1841,6 +1979,8 @@ trigger = "OrderFlowEntry"
             requested_qty: 0.5,
             filled_qty: 0.5,
             submitted_ts_ms: 1_500,
+            reference_price: 101.0,
+            planned_price: 101.0,
             rearm_stop: Some(Price::from_f64(100.0)),
             timeout_noted: false,
         });
@@ -1894,6 +2034,7 @@ trigger = "OrderFlowEntry"
         let cfg = test_config("trip");
         let _ = std::fs::remove_file(&cfg.journal_path);
         let _ = std::fs::remove_file(&cfg.eval_log_path);
+        let _ = std::fs::remove_dir_all(&cfg.research_log_dir);
         let mut eng = LiveEngine::new(
             noop_strategy(),
             AnyBroker::dry(FeeModel::default()),
@@ -1937,6 +2078,10 @@ trigger = "OrderFlowEntry"
             note["mfe_pct"]
         );
         assert!(note["mae_pct"].as_f64().unwrap() < 0.0, "MAE 应为负");
+        assert!(note["time_to_mfe_ms"]
+            .as_i64()
+            .is_some_and(|value| value <= 1_000));
+        assert_eq!(note["time_to_mae_ms"], 2_000);
         assert_eq!(note["exit_reason"], "stop");
         assert_eq!(note["side"], "Buy");
         assert!(note["pnl_usd"].as_f64().unwrap() < 0.0, "止损单净盈亏为负");
@@ -1945,8 +2090,14 @@ trigger = "OrderFlowEntry"
         // JSONL 全量落盘含同一条记录
         let jsonl = std::fs::read_to_string(&cfg.eval_log_path).unwrap();
         assert!(jsonl.contains("trip_closed"));
+        let research = std::fs::read_to_string(cfg.research_log_dir.join("1970-01-01.jsonl"))
+            .expect("trip research log");
+        assert!(research.contains("\"time_to_mfe_ms\":"));
+        assert!(research.contains("\"slippage_vs_reference_bps\""));
+        assert!(research.contains("\"latency_ms\""));
         let _ = std::fs::remove_file(&cfg.journal_path);
         let _ = std::fs::remove_file(&cfg.eval_log_path);
+        let _ = std::fs::remove_dir_all(&cfg.research_log_dir);
     }
 
     /// 评估流水：订单流模型积累真实成交桶后，journal 与快照均可解释。
@@ -2111,6 +2262,8 @@ location_buckets = 10
         assert_eq!(text.matches("\"event_type\":\"shadow_outcome\"").count(), 6);
         assert!(text.contains("\"estimated_net_return_pct\""));
         assert!(text.contains("\"profile\":\"observation\""));
+        assert!(text.contains("\"time_to_mfe_ms\""));
+        assert!(text.contains("\"mfe_ts_ms\""));
         let _ = std::fs::remove_dir_all(&cfg.research_log_dir);
     }
 
