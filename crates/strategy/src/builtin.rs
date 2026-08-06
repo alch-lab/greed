@@ -28,11 +28,6 @@ pub fn register_builtin(r: &mut PluginRegistry) {
                 as Box<dyn tcore::SignalPlugin>,
         )
     });
-    r.register_signal("IntradayExtensionReversion", |p| {
-        Ok(Box::new(
-            signals::intraday_extension_reversion::IntradayExtensionReversion::from_params(p),
-        ) as Box<dyn tcore::SignalPlugin>)
-    });
 }
 
 #[cfg(test)]
@@ -45,7 +40,6 @@ mod tests {
         assert!(r.filter_names().contains(&"CircuitBreaker"));
         assert!(r.signal_names().contains(&"TrdrMarketMap"));
         assert!(r.signal_names().contains(&"OrderFlowExhaustion"));
-        assert!(r.signal_names().contains(&"IntradayExtensionReversion"));
         assert_eq!(r.trigger_names(), vec!["OrderFlowEntry"]);
     }
 }

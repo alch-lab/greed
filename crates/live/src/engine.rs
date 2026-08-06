@@ -122,8 +122,6 @@ pub struct EngineSnapshot {
     pub last_eval: Option<serde_json::Value>,
     /// TRDR 市场地图的独立实时快照，避免被高频入场评估覆盖。
     pub market_map: Option<serde_json::Value>,
-    /// 不依赖盘口墙的 30 分钟过度延伸 MR 腿。
-    pub intraday_reversion: Option<serde_json::Value>,
     pub run_id: String,
     pub strategy_name: String,
     pub strategy_hash: String,
@@ -566,10 +564,15 @@ impl LiveEngine {
                 stop_anchor: p.get("stop_anchor").and_then(|v| v.as_f64()),
                 context_score: p.get("context_score").and_then(|v| v.as_u64()),
                 location_confirmed: p.get("location_confirmed").and_then(|v| v.as_bool()),
-                features: p
-                    .get("observation")
-                    .cloned()
-                    .unwrap_or(serde_json::Value::Null),
+                features: if stage == "observation" {
+                    p.get("observation")
+                        .cloned()
+                        .unwrap_or(serde_json::Value::Null)
+                } else {
+                    // 确认信号把当时的完整 TRDR/context/trade_gate 一起带到每个
+                    // 影子结果，离线分析无需再跨日按 event_id 拼接特征。
+                    p.clone()
+                },
                 mfe_pct: 0.0,
                 mae_pct: 0.0,
                 next_horizon: 0,
@@ -749,7 +752,6 @@ impl LiveEngine {
             n_fills: self.account.fills().len(),
             last_eval: plugin_note("OrderFlowExhaustion").or_else(|| self.latest_eval.clone()),
             market_map: plugin_note("TrdrMarketMap"),
-            intraday_reversion: plugin_note("IntradayExtensionReversion"),
             run_id: self.config.run_id.clone(),
             strategy_name: self.config.strategy_name.clone(),
             strategy_hash: self.config.strategy_hash.clone(),

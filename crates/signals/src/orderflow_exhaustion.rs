@@ -11,8 +11,6 @@ pub struct Config {
     pub min_baseline_buckets: usize,
     pub classic_volume_ratio: f64,
     pub strong_volume_ratio: f64,
-    pub quality_volume_ratio: f64,
-    pub balanced_max_volume_ratio: f64,
     pub min_delta_share: f64,
     pub strong_delta_share: f64,
     pub confirm_delta_share: f64,
@@ -23,8 +21,9 @@ pub struct Config {
     pub weak_confirm_buckets: usize,
     pub cluster_cooldown_buckets: usize,
     pub stop_buffer_pct: f64,
-    pub balanced_context_score: u8,
-    pub quality_context_score: u8,
+    pub execution_min_context_score: u8,
+    pub execution_require_source_coverage: bool,
+    pub execution_require_footprint: bool,
     pub require_trdr_location: bool,
     pub block_countertrend: bool,
     pub min_trdr_grade_rank: u8,
@@ -65,8 +64,6 @@ impl Config {
             min_baseline_buckets: u("min_baseline_buckets", 120).max(20),
             classic_volume_ratio: f("classic_volume_ratio", 1.60).max(1.0),
             strong_volume_ratio: f("strong_volume_ratio", 2.20).max(1.0),
-            quality_volume_ratio: f("quality_volume_ratio", 3.00).max(1.0),
-            balanced_max_volume_ratio: f("balanced_max_volume_ratio", 3.00).max(1.0),
             min_delta_share: f("min_delta_share", 0.15).clamp(0.01, 0.95),
             strong_delta_share: f("strong_delta_share", 0.35).clamp(0.01, 0.95),
             confirm_delta_share: f("confirm_delta_share", 0.08).clamp(0.01, 0.95),
@@ -77,8 +74,9 @@ impl Config {
             weak_confirm_buckets: u("weak_confirm_buckets", 30).max(1),
             cluster_cooldown_buckets: u("cluster_cooldown_buckets", 60).max(1),
             stop_buffer_pct: f("stop_buffer_pct", 0.00035).max(0.0),
-            balanced_context_score: u("balanced_context_score", 6).min(8) as u8,
-            quality_context_score: u("quality_context_score", 7).min(8) as u8,
+            execution_min_context_score: u("execution_min_context_score", 5).min(8) as u8,
+            execution_require_source_coverage: b("execution_require_source_coverage", true),
+            execution_require_footprint: b("execution_require_footprint", true),
             require_trdr_location: b("require_trdr_location", true),
             block_countertrend: b("block_countertrend", true),
             min_trdr_grade_rank: u("min_trdr_grade_rank", 1).clamp(1, 4) as u8,
@@ -527,31 +525,31 @@ impl OrderFlowExhaustion {
         }
     }
 
+    fn trade_gate(&self, setup: &Setup) -> (bool, Vec<&'static str>) {
+        let mut blockers = Vec::new();
+        if setup.context_score < self.cfg.execution_min_context_score {
+            blockers.push("context_score");
+        }
+        if self.cfg.execution_require_source_coverage && !setup.trdr_source_coverage_complete {
+            blockers.push("source_coverage");
+        }
+        if self.cfg.execution_require_footprint && !setup.trdr_footprint_matches {
+            blockers.push("footprint");
+        }
+        (blockers.is_empty(), blockers)
+    }
+
     fn profile(&self, setup: &Setup) -> &'static str {
-        if setup.strength == "strong"
-            && setup.event_volume_ratio >= self.cfg.quality_volume_ratio
-            && setup.location_confirmed
-            && setup.production_ready
-            && setup.context_score >= self.cfg.quality_context_score
-        {
-            "quality"
-        } else if setup.context_score >= self.cfg.balanced_context_score
-            && setup.location_confirmed
-            && setup.production_ready
-            && setup.event_volume_ratio < self.cfg.balanced_max_volume_ratio
-        {
-            "balanced"
-        } else if setup.context_score > 0 {
-            "high_frequency"
-        } else if setup.strength == "strong" {
-            "strength"
+        if self.trade_gate(setup).0 {
+            "verified_context"
         } else {
-            "classic"
+            "research_context"
         }
     }
 
     fn signal(&self, ts: Timestamp, setup: &Setup, price: f64, delta_share: f64) -> Signal {
         let profile = self.profile(setup);
+        let (trade_eligible, gate_blockers) = self.trade_gate(setup);
         let trdr = json!({
             "zone_grade":setup.trdr_zone_grade,
             "zone_band_pct":setup.trdr_zone_band_pct,
@@ -606,6 +604,13 @@ impl OrderFlowExhaustion {
                 "location_confirmed":setup.location_confirmed,
                 "context_score":setup.context_score,
                 "context_reasons":setup.context_reasons,
+                "trade_eligible":trade_eligible,
+                "trade_gate":{
+                    "min_context_score":self.cfg.execution_min_context_score,
+                    "source_coverage_required":self.cfg.execution_require_source_coverage,
+                    "footprint_required":self.cfg.execution_require_footprint,
+                    "blockers":gate_blockers
+                },
                 "book_imbalance":self.book_imbalance,
                 "trdr":trdr
             }),
@@ -685,12 +690,10 @@ impl OrderFlowExhaustion {
                 if reverse_delta && reverse_price {
                     let profile = self.profile(&setup);
                     decision = "confirmed";
-                    reason = match profile {
-                        "quality" => "Delta 反转确认，强放量与多因子 context 同时成立",
-                        "balanced" => "Delta 反转确认，context 达到均衡执行标准",
-                        "high_frequency" => "Delta 反转确认，仅通过宽松 context",
-                        "strength" => "强放量已确认，但 context 不足",
-                        _ => "经典放量力竭得到 Delta 反转确认",
+                    reason = if profile == "verified_context" {
+                        "反转与全市场执行门槛全部通过"
+                    } else {
+                        "反转已确认，但只记录研究样本，不允许下单"
                     };
                     out.push(self.signal(ts, &setup, b.close, delta_share));
                     self.setup = None;
@@ -906,12 +909,19 @@ impl OrderFlowExhaustion {
             })
         });
         self.emit_cumulative_if_due(ts, b.start_ms, &mut cumulative, &mut out);
-        let confirmed_profile = out
+        let confirmed_signal = out
             .iter()
             .find(|signal| signal.payload.get("stage").and_then(Json::as_str) == Some("confirmed"))
-            .and_then(|signal| signal.payload.get("profile"))
+            .map(|signal| signal.payload.clone());
+        let confirmed_profile = confirmed_signal
+            .as_ref()
+            .and_then(|payload| payload.get("profile"))
             .cloned();
-        let trade_confirmed = confirmed_profile.is_some();
+        let trade_confirmed = confirmed_signal
+            .as_ref()
+            .and_then(|payload| payload.get("trade_eligible"))
+            .and_then(Json::as_bool)
+            == Some(true);
         self.eval = Some(json!({
             "ts_ms":ts.as_millis(), "price":b.close, "decision":decision, "reason":reason,
             "bucket_ms":self.cfg.bucket_ms, "volume_usd":b.volume,
@@ -930,6 +940,7 @@ impl OrderFlowExhaustion {
                 "confirmed":trade_confirmed
             },
             "pending":pending, "profile":confirmed_profile,
+            "confirmation":confirmed_signal,
             "cumulative_absorption":cumulative
         }));
         out
@@ -1143,12 +1154,10 @@ mod tests {
     }
 
     #[test]
-    fn profile_has_no_dead_band_before_quality() {
+    fn profile_is_a_single_verified_or_research_gate() {
         let s = test_signal();
-        assert_eq!(s.profile(&setup(2.2, true, 6)), "balanced");
-        assert_eq!(s.profile(&setup(2.7, true, 6)), "balanced");
-        assert_eq!(s.profile(&setup(3.2, true, 7)), "quality");
-        assert_eq!(s.profile(&setup(2.2, false, 6)), "high_frequency");
+        assert_eq!(s.profile(&setup(2.2, true, 5)), "verified_context");
+        assert_eq!(s.profile(&setup(2.2, true, 4)), "research_context");
     }
 
     #[test]

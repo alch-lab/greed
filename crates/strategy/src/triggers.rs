@@ -1,61 +1,29 @@
-//! 分层订单流确认入场。
+//! 唯一生产入场扳机：全市场数据完整的订单流力竭确认。
 
 use crate::registry::PluginBuildError;
 use serde_json::Value as Json;
 use tcore::{Ctx, OrderIntent, Price, Qty, Side, Signal, Symbol, TriggerPlugin};
 
 pub struct OrderFlowEntry {
-    trade_classic: bool,
-    trade_strength: bool,
-    trade_high_frequency: bool,
-    trade_balanced: bool,
-    trade_quality: bool,
-    trade_intraday_reversion: bool,
-    classic_risk_scale: f64,
-    strength_risk_scale: f64,
-    high_frequency_risk_scale: f64,
-    balanced_risk_scale: f64,
-    quality_risk_scale: f64,
-    intraday_reversion_risk_scale: f64,
+    risk_scale: f64,
     tp1_r: f64,
-    intraday_reversion_tp1_r: f64,
     min_stop_pct: f64,
     max_stop_pct: f64,
-    intraday_reversion_min_stop_pct: f64,
-    intraday_reversion_max_stop_pct: f64,
-    passive_entry: bool,
+    market_entry: bool,
 }
 
 impl OrderFlowEntry {
-    fn profile_config(&self, profile: &str) -> Option<(bool, f64)> {
-        Some(match profile {
-            "classic" => (self.trade_classic, self.classic_risk_scale),
-            "strength" => (self.trade_strength, self.strength_risk_scale),
-            "high_frequency" => (self.trade_high_frequency, self.high_frequency_risk_scale),
-            "balanced" => (self.trade_balanced, self.balanced_risk_scale),
-            "quality" => (self.trade_quality, self.quality_risk_scale),
-            "intraday_reversion" => (
-                self.trade_intraday_reversion,
-                self.intraday_reversion_risk_scale,
-            ),
-            _ => return None,
-        })
-    }
-
     fn intent(&self, signal: &Signal, symbol: &Symbol) -> Option<OrderIntent> {
-        if !matches!(
-            signal.source,
-            "OrderFlowExhaustion" | "IntradayExtensionReversion"
-        ) || signal.payload.get("stage")?.as_str()? != "confirmed"
+        if signal.source != "OrderFlowExhaustion"
+            || signal.payload.get("stage")?.as_str()? != "confirmed"
         {
             return None;
         }
         let p = &signal.payload;
-        let profile = p.get("profile")?.as_str()?;
-        let (enabled, risk_scale) = self.profile_config(profile)?;
-        if !enabled || risk_scale <= 0.0 {
+        if p.get("trade_eligible").and_then(Json::as_bool) != Some(true) {
             return None;
         }
+
         let side = match p.get("side")?.as_str()? {
             "buy" => Side::Buy,
             "sell" => Side::Sell,
@@ -63,48 +31,34 @@ impl OrderFlowEntry {
         };
         let signal_price = p.get("price")?.as_f64()?;
         let zone = p.get("zone").and_then(Json::as_f64).unwrap_or(signal_price);
-        let force_market = p
-            .get("force_market")
-            .and_then(Json::as_bool)
-            .unwrap_or(false);
-        let use_limit = self.passive_entry && !force_market;
-        let entry = if use_limit { zone } else { signal_price };
+        let entry = if self.market_entry {
+            signal_price
+        } else {
+            zone
+        };
         let structural_stop = p.get("stop_anchor")?.as_f64()?;
         let structural_risk_pct = (entry - structural_stop).abs() / entry;
-        let (min_stop_pct, max_stop_pct, tp1_r) = if profile == "intraday_reversion" {
-            (
-                self.intraday_reversion_min_stop_pct,
-                self.intraday_reversion_max_stop_pct,
-                self.intraday_reversion_tp1_r,
-            )
-        } else {
-            (self.min_stop_pct, self.max_stop_pct, self.tp1_r)
-        };
-        if structural_risk_pct > max_stop_pct {
+        if structural_risk_pct > self.max_stop_pct {
             return None;
         }
         let stop = match side {
-            Side::Buy => structural_stop.min(entry * (1.0 - min_stop_pct)),
-            Side::Sell => structural_stop.max(entry * (1.0 + min_stop_pct)),
+            Side::Buy => structural_stop.min(entry * (1.0 - self.min_stop_pct)),
+            Side::Sell => structural_stop.max(entry * (1.0 + self.min_stop_pct)),
         };
         let risk = (entry - stop).abs();
         let tp1 = match side {
-            Side::Buy => entry + risk * tp1_r,
-            Side::Sell => entry - risk * tp1_r,
+            Side::Buy => entry + risk * self.tp1_r,
+            Side::Sell => entry - risk * self.tp1_r,
         };
         Some(OrderIntent {
             symbol: symbol.clone(),
             side,
             qty: Qty::ZERO,
-            risk_scale,
-            limit_price: use_limit.then_some(Price::from_f64(zone)),
+            risk_scale: self.risk_scale,
+            limit_price: (!self.market_entry).then_some(Price::from_f64(zone)),
             stop_price: Price::from_f64(stop),
             tp1_price: Some(Price::from_f64(tp1)),
-            reason: if profile == "intraday_reversion" {
-                "intraday_extension_reversion".to_string()
-            } else {
-                format!("orderflow_{profile}")
-            },
+            reason: "orderflow_verified_context".to_string(),
             ts: signal.ts,
         })
     }
@@ -125,36 +79,21 @@ impl TriggerPlugin for OrderFlowEntry {
         _ctx: &Ctx,
         symbol: &Symbol,
     ) -> Option<OrderIntent> {
-        // 信号层已经按 event_id 去重；此处只消费一次确认后的最高通过层级。
-        signals.iter().find_map(|s| self.intent(s, symbol))
+        signals
+            .iter()
+            .find_map(|signal| self.intent(signal, symbol))
     }
 }
 
 pub fn build_orderflow(p: &Json) -> Result<Box<dyn TriggerPlugin>, PluginBuildError> {
-    let f = |k: &str, d: f64| p.get(k).and_then(Json::as_f64).unwrap_or(d);
-    let b = |k: &str, d: bool| p.get(k).and_then(Json::as_bool).unwrap_or(d);
+    let f = |key: &str, default: f64| p.get(key).and_then(Json::as_f64).unwrap_or(default);
+    let b = |key: &str, default: bool| p.get(key).and_then(Json::as_bool).unwrap_or(default);
     Ok(Box::new(OrderFlowEntry {
-        trade_classic: b("trade_classic", true),
-        trade_strength: b("trade_strength", true),
-        trade_high_frequency: b("trade_high_frequency", true),
-        trade_balanced: b("trade_balanced", true),
-        trade_quality: b("trade_quality", true),
-        trade_intraday_reversion: b("trade_intraday_reversion", false),
-        classic_risk_scale: f("classic_risk_scale", 0.20).clamp(0.0, 1.0),
-        strength_risk_scale: f("strength_risk_scale", 0.35).clamp(0.0, 1.0),
-        high_frequency_risk_scale: f("high_frequency_risk_scale", 0.15).clamp(0.0, 1.0),
-        balanced_risk_scale: f("balanced_risk_scale", 0.60).clamp(0.0, 1.0),
-        quality_risk_scale: f("quality_risk_scale", 1.00).clamp(0.0, 1.0),
-        intraday_reversion_risk_scale: f("intraday_reversion_risk_scale", 0.25).clamp(0.0, 1.0),
-        tp1_r: f("tp1_r", 2.0).max(0.1),
-        intraday_reversion_tp1_r: f("intraday_reversion_tp1_r", 1.0).max(0.1),
-        min_stop_pct: f("min_stop_pct", 0.003).clamp(0.0005, 0.02),
-        max_stop_pct: f("max_stop_pct", 0.008).clamp(0.001, 0.05),
-        intraday_reversion_min_stop_pct: f("intraday_reversion_min_stop_pct", 0.005)
-            .clamp(0.0005, 0.02),
-        intraday_reversion_max_stop_pct: f("intraday_reversion_max_stop_pct", 0.010)
-            .clamp(0.001, 0.05),
-        passive_entry: b("passive_entry", false),
+        risk_scale: f("risk_scale", 0.15).clamp(0.0, 1.0),
+        tp1_r: f("tp1_r", 1.5).max(0.1),
+        min_stop_pct: f("min_stop_pct", 0.005).clamp(0.0005, 0.02),
+        max_stop_pct: f("max_stop_pct", 0.010).clamp(0.001, 0.05),
+        market_entry: b("market_entry", true),
     }))
 }
 
@@ -164,69 +103,31 @@ mod tests {
     use serde_json::json;
     use tcore::{SignalKind, Timestamp};
 
-    fn signal(profile: &str) -> Signal {
+    fn signal(eligible: bool) -> Signal {
         Signal::new(
             SignalKind::Other,
             Timestamp::from_millis(1),
             "OrderFlowExhaustion",
             json!({
-                "stage":"confirmed", "profile":profile, "side":"sell",
-                "price":100.0, "zone":100.0, "stop_anchor":100.5
+                "stage":"confirmed", "side":"sell", "price":100.0,
+                "zone":99.9, "stop_anchor":100.5, "trade_eligible":eligible
             }),
         )
     }
 
     #[test]
-    fn profile_controls_risk_scale() {
-        let mut t = build_orderflow(&json!({"max_stop_pct":0.02})).unwrap();
-        let i = t
-            .on_signals(
-                &[signal("balanced")],
-                &Ctx::default(),
-                &Symbol::new("BTCUSDT"),
-            )
-            .unwrap();
-        assert_eq!(i.side, Side::Sell);
-        assert!((i.risk_scale - 0.60).abs() < 1e-9);
-        assert_eq!(i.reason, "orderflow_balanced");
-    }
-
-    #[test]
-    fn disabled_profile_does_not_trade() {
-        let mut t = build_orderflow(&json!({"trade_high_frequency":false})).unwrap();
-        assert!(t
-            .on_signals(
-                &[signal("high_frequency")],
-                &Ctx::default(),
-                &Symbol::new("BTCUSDT")
-            )
+    fn requires_all_verified_context_gates() {
+        let mut trigger = build_orderflow(&json!({"max_stop_pct":0.02})).unwrap();
+        let symbol = Symbol::new("BTCUSDT");
+        assert!(trigger
+            .on_signals(&[signal(false)], &Ctx::default(), &symbol)
             .is_none());
-    }
-
-    #[test]
-    fn intraday_reversion_forces_market_and_uses_own_risk_profile() {
-        let mut t = build_orderflow(&json!({
-            "trade_intraday_reversion":true,
-            "intraday_reversion_risk_scale":0.25,
-            "intraday_reversion_max_stop_pct":0.02,
-            "passive_entry":true
-        }))
-        .unwrap();
-        let s = Signal::new(
-            SignalKind::Other,
-            Timestamp::from_millis(2),
-            "IntradayExtensionReversion",
-            json!({
-                "stage":"confirmed", "profile":"intraday_reversion", "side":"buy",
-                "price":100.0, "stop_anchor":99.5, "force_market":true
-            }),
-        );
-        let i = t
-            .on_signals(&[s], &Ctx::default(), &Symbol::new("BTCUSDT"))
+        let intent = trigger
+            .on_signals(&[signal(true)], &Ctx::default(), &symbol)
             .unwrap();
-        assert_eq!(i.side, Side::Buy);
-        assert!(i.limit_price.is_none());
-        assert!((i.risk_scale - 0.25).abs() < 1e-9);
-        assert_eq!(i.reason, "intraday_extension_reversion");
+        assert_eq!(intent.side, Side::Sell);
+        assert!(intent.limit_price.is_none());
+        assert!((intent.risk_scale - 0.15).abs() < 1e-9);
+        assert_eq!(intent.reason, "orderflow_verified_context");
     }
 }
