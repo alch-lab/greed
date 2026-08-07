@@ -570,6 +570,25 @@ impl BacktestEngine {
     /// 把账户持仓同步到 ctx.position（供出场/扳机插件读取）。
     fn sync_position_flag(&mut self) {
         self.ctx.position = self.account.position_view(&self.symbol);
+        match self
+            .account
+            .position()
+            .map(|position| position.strategy_tag)
+        {
+            Some(2) => self
+                .ctx
+                .flags
+                .insert("position_strategy".into(), "trend".into()),
+            Some(1) => self
+                .ctx
+                .flags
+                .insert("position_strategy".into(), "mr".into()),
+            Some(_) => self
+                .ctx
+                .flags
+                .insert("position_strategy".into(), "unknown".into()),
+            None => self.ctx.flags.remove("position_strategy"),
+        };
     }
 
     /// 维护时段等环境标志（UTC）。

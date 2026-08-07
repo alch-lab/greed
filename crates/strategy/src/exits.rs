@@ -10,6 +10,9 @@ pub struct OrderFlowTradeManagement {
     tp2_r: f64,
     runner_trail_pct: f64,
     max_hold_ms: i64,
+    trend_trail_pct: f64,
+    trend_trail_activation_pct: f64,
+    trend_max_hold_ms: i64,
 }
 
 impl ExitPlugin for OrderFlowTradeManagement {
@@ -19,7 +22,13 @@ impl ExitPlugin for OrderFlowTradeManagement {
 
     fn manage(&self, pos: &Position, ctx: &Ctx) -> Vec<ExitAction> {
         let Some(now) = ctx.now else { return vec![] };
-        if now.as_millis() - pos.entry_ts.as_millis() >= self.max_hold_ms {
+        let is_trend = ctx.flag("position_strategy") == Some("trend");
+        let max_hold_ms = if is_trend {
+            self.trend_max_hold_ms
+        } else {
+            self.max_hold_ms
+        };
+        if now.as_millis() - pos.entry_ts.as_millis() >= max_hold_ms {
             return vec![ExitAction::CloseAll];
         }
         let Some(last) = ctx.flag("last_price").and_then(|v| v.parse::<f64>().ok()) else {
@@ -29,6 +38,28 @@ impl ExitPlugin for OrderFlowTradeManagement {
             Side::Buy => last >= target,
             Side::Sell => last <= target,
         };
+        if is_trend {
+            let favorable_pct = match pos.side {
+                Side::Buy => last / pos.entry_price.to_f64() - 1.0,
+                Side::Sell => 1.0 - last / pos.entry_price.to_f64(),
+            };
+            if favorable_pct < self.trend_trail_activation_pct {
+                return vec![];
+            }
+            let candidate = match pos.side {
+                Side::Buy => last * (1.0 - self.trend_trail_pct),
+                Side::Sell => last * (1.0 + self.trend_trail_pct),
+            };
+            let improves = match pos.side {
+                Side::Buy => candidate > pos.stop_price.to_f64(),
+                Side::Sell => candidate < pos.stop_price.to_f64(),
+            };
+            return if improves {
+                vec![ExitAction::MoveStop(Price::from_f64(candidate))]
+            } else {
+                vec![]
+            };
+        }
         let entry = pos.entry_price.to_f64();
         let initial_stop = pos.initial_stop_price.to_f64();
         let risk = (entry - initial_stop).abs();
@@ -83,5 +114,57 @@ pub fn build_orderflow_management(p: &Json) -> Result<Box<dyn ExitPlugin>, Plugi
         tp2_r: f("tp2_r", 4.0).max(0.2),
         runner_trail_pct: f("runner_trail_pct", 0.006).clamp(0.001, 0.05),
         max_hold_ms: (f("max_hold_hours", 4.0).max(0.1) * 3_600_000.0) as i64,
+        trend_trail_pct: f("trend_trail_pct", 0.0025).clamp(0.001, 0.05),
+        trend_trail_activation_pct: f("trend_trail_activation_pct", 0.0025).clamp(0.001, 0.05),
+        trend_max_hold_ms: (f("trend_max_hold_hours", 2.0).max(0.1) * 3_600_000.0) as i64,
     }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tcore::{Qty, Symbol, Timestamp};
+
+    fn position() -> Position {
+        Position {
+            symbol: Symbol::new("BTCUSDT"),
+            side: Side::Buy,
+            entry_price: Price::from_f64(100.0),
+            qty: Qty::from_f64(1.0),
+            entry_ts: Timestamp::from_millis(0),
+            stop_price: Price::from_f64(99.75),
+            initial_stop_price: Price::from_f64(99.75),
+            tp1_price: Some(Price::from_f64(100.20)),
+            breakeven_moved: false,
+            closed_frac: 0.0,
+        }
+    }
+
+    #[test]
+    fn trend_trail_waits_for_activation_profit() {
+        let exit = build_orderflow_management(&json!({})).unwrap();
+        let mut ctx = Ctx::default();
+        ctx.now = Some(Timestamp::from_millis(60_000));
+        ctx.flags.insert("position_strategy".into(), "trend".into());
+        ctx.flags.insert("last_price".into(), "100.10".into());
+        assert!(exit.manage(&position(), &ctx).is_empty());
+        ctx.flags.insert("last_price".into(), "100.30".into());
+        assert!(matches!(
+            exit.manage(&position(), &ctx)[0],
+            ExitAction::MoveStop(_)
+        ));
+    }
+
+    #[test]
+    fn mr_uses_partial_tp_and_breakeven() {
+        let exit = build_orderflow_management(&json!({"max_hold_hours":0.5})).unwrap();
+        let mut ctx = Ctx::default();
+        ctx.now = Some(Timestamp::from_millis(60_000));
+        ctx.flags.insert("position_strategy".into(), "mr".into());
+        ctx.flags.insert("last_price".into(), "100.20".into());
+        let actions = exit.manage(&position(), &ctx);
+        assert!(matches!(actions[0], ExitAction::ClosePartial(_)));
+        assert!(matches!(actions[1], ExitAction::MoveStop(_)));
+    }
 }

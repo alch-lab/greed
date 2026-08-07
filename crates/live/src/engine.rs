@@ -34,6 +34,10 @@ pub struct LiveConfig {
     pub risk_pct: f64,
     pub max_risk_pct: f64,
     pub max_leverage: f64,
+    /// 策略触发器对账户基础风险的倍率；用于控制面解释实际风险预算。
+    pub strategy_risk_scale: f64,
+    /// 当前组合用于展示典型名义仓位的 MR 初始保护距离。
+    pub strategy_stop_pct: f64,
     pub entry_ttl_ms: i64,
     pub cb_max_daily_losses: u32,
     pub cb_daily_dd_pct: f64,
@@ -108,6 +112,8 @@ struct ShadowSignal {
     /// 观察信号触发时的完整特征，随各期限结果一起落盘供离线归因。
     #[serde(default)]
     features: serde_json::Value,
+    #[serde(default)]
+    estimated_roundtrip_fee_bps: Option<f64>,
     mfe_pct: f64,
     mae_pct: f64,
     #[serde(default)]
@@ -123,6 +129,13 @@ pub struct EngineSnapshot {
     pub last_price: Option<f64>,
     pub equity: f64,
     pub cash: f64,
+    pub risk_pct: f64,
+    pub max_risk_pct: f64,
+    pub max_leverage: f64,
+    pub strategy_risk_scale: f64,
+    pub effective_risk_pct: f64,
+    pub estimated_risk_usd: f64,
+    pub estimated_notional_usd: f64,
     pub position: Option<PositionSnap>,
     pub n_intents: usize,
     pub n_fills: usize,
@@ -130,6 +143,8 @@ pub struct EngineSnapshot {
     pub last_eval: Option<serde_json::Value>,
     /// TRDR 市场地图的独立实时快照，避免被高频入场评估覆盖。
     pub market_map: Option<serde_json::Value>,
+    /// 强趋势覆盖层的独立漏斗状态。
+    pub trend_continuation: Option<serde_json::Value>,
     pub run_id: String,
     pub strategy_name: String,
     pub strategy_hash: String,
@@ -146,6 +161,7 @@ pub struct EngineSnapshot {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PositionSnap {
     pub side: String,
+    pub strategy: String,
     pub qty: f64,
     pub entry_price: f64,
     pub stop_price: Option<f64>,
@@ -304,6 +320,10 @@ impl LiveEngine {
                 "risk_pct": engine.config.risk_pct,
                 "max_risk_pct": engine.config.max_risk_pct,
                 "max_leverage": engine.config.max_leverage,
+                "strategy_risk_scale": engine.config.strategy_risk_scale,
+                "strategy_stop_pct": engine.config.strategy_stop_pct,
+                "estimated_risk_usd": initial_cash * engine.config.risk_pct.min(engine.config.max_risk_pct) * engine.config.strategy_risk_scale,
+                "estimated_notional_usd": initial_cash * engine.config.risk_pct.min(engine.config.max_risk_pct) * engine.config.strategy_risk_scale / engine.config.strategy_stop_pct,
                 "entry_ttl_ms": engine.config.entry_ttl_ms,
                 "estimated_roundtrip_fee_bps": engine.config.estimated_roundtrip_fee_bps,
                 "initial_cash": initial_cash,
@@ -586,6 +606,9 @@ impl LiveEngine {
                     // 影子结果，离线分析无需再跨日按 event_id 拼接特征。
                     p.clone()
                 },
+                estimated_roundtrip_fee_bps: p
+                    .get("estimated_roundtrip_fee_bps")
+                    .and_then(|value| value.as_f64()),
                 mfe_pct: 0.0,
                 mae_pct: 0.0,
                 mfe_ts_ms: None,
@@ -613,12 +636,15 @@ impl LiveEngine {
     fn update_shadow_outcomes(&mut self, ts: Timestamp, price: Price) {
         let now_ms = ts.as_millis();
         let px = price.to_f64();
-        let fee_pct = self.config.estimated_roundtrip_fee_bps / 100.0;
         let mut completed = Vec::new();
         let mut events = Vec::new();
         for shadow in &mut self.shadow_signals {
             let sign = if shadow.side == "buy" { 1.0 } else { -1.0 };
             let gross = sign * (px / shadow.confirm_price - 1.0) * 100.0;
+            let fee_pct = shadow
+                .estimated_roundtrip_fee_bps
+                .unwrap_or(self.config.estimated_roundtrip_fee_bps)
+                / 100.0;
             if gross > shadow.mfe_pct {
                 shadow.mfe_pct = gross;
                 shadow.mfe_ts_ms = Some(now_ms);
@@ -796,6 +822,9 @@ impl LiveEngine {
     /// 状态快照（控制面轮询用）。
     pub fn snapshot(&self) -> EngineSnapshot {
         let px = self.latest_price;
+        let equity = self.account.equity(px.unwrap_or(Price::ZERO));
+        let effective_risk_pct = self.config.risk_pct.min(self.config.max_risk_pct)
+            * self.config.strategy_risk_scale.clamp(0.0, 1.0);
         let plugin_note = |name: &str| {
             self.strategy
                 .signals
@@ -805,10 +834,27 @@ impl LiveEngine {
         };
         EngineSnapshot {
             last_price: px.map(|p| p.to_f64()),
-            equity: self.account.equity(px.unwrap_or(Price::ZERO)),
+            equity,
             cash: self.account.cash(),
+            risk_pct: self.config.risk_pct,
+            max_risk_pct: self.config.max_risk_pct,
+            max_leverage: self.config.max_leverage,
+            strategy_risk_scale: self.config.strategy_risk_scale,
+            effective_risk_pct,
+            estimated_risk_usd: equity * effective_risk_pct,
+            estimated_notional_usd: if self.config.strategy_stop_pct > 0.0 {
+                equity * effective_risk_pct / self.config.strategy_stop_pct
+            } else {
+                0.0
+            },
             position: self.account.position().map(|p| PositionSnap {
                 side: format!("{:?}", p.side),
+                strategy: match p.strategy_tag {
+                    2 => "trend",
+                    1 => "mr",
+                    _ => "unknown",
+                }
+                .into(),
                 qty: p.qty.to_f64(),
                 entry_price: p.entry_price.to_f64(),
                 stop_price: p.stop_price.map(|s| s.to_f64()),
@@ -818,6 +864,7 @@ impl LiveEngine {
             n_fills: self.account.fills().len(),
             last_eval: plugin_note("OrderFlowExhaustion").or_else(|| self.latest_eval.clone()),
             market_map: plugin_note("TrdrMarketMap"),
+            trend_continuation: plugin_note("TrendContinuation"),
             run_id: self.config.run_id.clone(),
             strategy_name: self.config.strategy_name.clone(),
             strategy_hash: self.config.strategy_hash.clone(),
@@ -1705,6 +1752,25 @@ impl LiveEngine {
 
     fn sync_position_flag(&mut self) {
         self.ctx.position = self.account.position_view(&self.symbol);
+        match self
+            .account
+            .position()
+            .map(|position| position.strategy_tag)
+        {
+            Some(2) => self
+                .ctx
+                .flags
+                .insert("position_strategy".into(), "trend".into()),
+            Some(1) => self
+                .ctx
+                .flags
+                .insert("position_strategy".into(), "mr".into()),
+            Some(_) => self
+                .ctx
+                .flags
+                .insert("position_strategy".into(), "unknown".into()),
+            None => self.ctx.flags.remove("position_strategy"),
+        };
     }
 
     fn update_env_flags(&mut self, ts: Timestamp, price: Price) {
@@ -1855,6 +1921,8 @@ trigger = "OrderFlowEntry"
             risk_pct: 0.0075,
             max_risk_pct: 0.015,
             max_leverage: 3.0,
+            strategy_risk_scale: 1.0,
+            strategy_stop_pct: 0.0025,
             entry_ttl_ms: 4 * 3_600_000,
             cb_max_daily_losses: 0,
             cb_daily_dd_pct: 0.0,

@@ -24,7 +24,10 @@ pub struct Config {
     pub execution_min_context_score: u8,
     pub execution_require_source_coverage: bool,
     pub execution_require_footprint: bool,
-    pub require_trdr_location: bool,
+    pub allow_local_location: bool,
+    pub execution_require_absorption: bool,
+    pub execution_require_location_in_range: bool,
+    pub trend_aligned_context_discount: u8,
     pub block_countertrend: bool,
     pub min_trdr_grade_rank: u8,
     pub min_trdr_delta_tier: u8,
@@ -77,7 +80,10 @@ impl Config {
             execution_min_context_score: u("execution_min_context_score", 5).min(8) as u8,
             execution_require_source_coverage: b("execution_require_source_coverage", true),
             execution_require_footprint: b("execution_require_footprint", true),
-            require_trdr_location: b("require_trdr_location", true),
+            allow_local_location: b("allow_local_location", true),
+            execution_require_absorption: b("execution_require_absorption", true),
+            execution_require_location_in_range: b("execution_require_location_in_range", true),
+            trend_aligned_context_discount: u("trend_aligned_context_discount", 1).min(4) as u8,
             block_countertrend: b("block_countertrend", true),
             min_trdr_grade_rank: u("min_trdr_grade_rank", 1).clamp(1, 4) as u8,
             min_trdr_delta_tier: u("min_trdr_delta_tier", 1).min(4) as u8,
@@ -150,6 +156,8 @@ struct Setup {
     event_delta_share: f64,
     event_efficiency: f64,
     location_confirmed: bool,
+    absorption_confirmed: bool,
+    trend_aligned: bool,
     context_score: u8,
     context_reasons: Vec<String>,
     trdr_zone_grade: String,
@@ -527,8 +535,24 @@ impl OrderFlowExhaustion {
 
     fn trade_gate(&self, setup: &Setup) -> (bool, Vec<&'static str>) {
         let mut blockers = Vec::new();
-        if setup.context_score < self.cfg.execution_min_context_score {
+        let min_context_score = if setup.trend_aligned {
+            self.cfg
+                .execution_min_context_score
+                .saturating_sub(self.cfg.trend_aligned_context_discount)
+        } else {
+            self.cfg.execution_min_context_score
+        };
+        if setup.context_score < min_context_score {
             blockers.push("context_score");
+        }
+        if self.cfg.execution_require_absorption && !setup.absorption_confirmed {
+            blockers.push("absorption");
+        }
+        if self.cfg.execution_require_location_in_range
+            && setup.trdr_regime == "range"
+            && !setup.location_confirmed
+        {
+            blockers.push("range_location");
         }
         if self.cfg.execution_require_source_coverage && !setup.trdr_source_coverage_complete {
             blockers.push("source_coverage");
@@ -550,6 +574,13 @@ impl OrderFlowExhaustion {
     fn signal(&self, ts: Timestamp, setup: &Setup, price: f64, delta_share: f64) -> Signal {
         let profile = self.profile(setup);
         let (trade_eligible, gate_blockers) = self.trade_gate(setup);
+        let effective_min_context_score = if setup.trend_aligned {
+            self.cfg
+                .execution_min_context_score
+                .saturating_sub(self.cfg.trend_aligned_context_discount)
+        } else {
+            self.cfg.execution_min_context_score
+        };
         let trdr = json!({
             "zone_grade":setup.trdr_zone_grade,
             "zone_band_pct":setup.trdr_zone_band_pct,
@@ -587,7 +618,7 @@ impl OrderFlowExhaustion {
             ts,
             "OrderFlowExhaustion",
             json!({
-                "model":"orderflow_exhaustion_v6",
+                "model":"orderflow_exhaustion_v11",
                 "stage":"confirmed",
                 "profile":profile,
                 "event_id":setup.event_id,
@@ -602,13 +633,20 @@ impl OrderFlowExhaustion {
                 "confirm_delta_share":delta_share,
                 "efficiency":setup.event_efficiency,
                 "location_confirmed":setup.location_confirmed,
+                "absorption_confirmed":setup.absorption_confirmed,
+                "trend_aligned":setup.trend_aligned,
                 "context_score":setup.context_score,
                 "context_reasons":setup.context_reasons,
                 "trade_eligible":trade_eligible,
+                "estimated_roundtrip_fee_bps":6.0,
                 "trade_gate":{
-                    "min_context_score":self.cfg.execution_min_context_score,
+                    "min_context_score":effective_min_context_score,
+                    "base_min_context_score":self.cfg.execution_min_context_score,
+                    "trend_aligned_discount":self.cfg.trend_aligned_context_discount,
                     "source_coverage_required":self.cfg.execution_require_source_coverage,
                     "footprint_required":self.cfg.execution_require_footprint,
+                    "absorption_required":self.cfg.execution_require_absorption,
+                    "range_location_required":self.cfg.execution_require_location_in_range,
                     "blockers":gate_blockers
                 },
                 "book_imbalance":self.book_imbalance,
@@ -746,7 +784,7 @@ impl OrderFlowExhaustion {
                     Side::Sell => swept_high || vwap_dev >= self.cfg.min_vwap_deviation_pct,
                 };
                 let location =
-                    trdr.zone_matches || (!self.cfg.require_trdr_location && local_location);
+                    trdr.zone_matches || (self.cfg.allow_local_location && local_location);
                 let oi_support =
                     trdr.oi_quadrant != "neutral" || oi_change.is_some_and(|v| v.abs() >= 0.0005);
                 let stalled = efficiency <= self.cfg.max_efficiency * 0.65;
@@ -780,10 +818,7 @@ impl OrderFlowExhaustion {
                     context_score += 1;
                     context_reasons.push("spot_perp_confluence".to_string());
                 }
-                if local_location {
-                    context_score += 1;
-                    context_reasons.push("sweep_or_vwap".to_string());
-                }
+                // local_location 已在 location 中计过一次，不能把同一证据重复加分。
                 let liquidation_support = match side {
                     Side::Buy => trdr.long_liquidation_usd >= self.cfg.min_liquidation_usd,
                     Side::Sell => trdr.short_liquidation_usd >= self.cfg.min_liquidation_usd,
@@ -826,6 +861,11 @@ impl OrderFlowExhaustion {
                     event_delta_share: delta_share,
                     event_efficiency: efficiency,
                     location_confirmed: location,
+                    absorption_confirmed: stalled,
+                    trend_aligned: matches!(
+                        (side, trdr.regime.as_str()),
+                        (Side::Buy, "trend_up") | (Side::Sell, "trend_down")
+                    ),
                     context_score,
                     context_reasons,
                     trdr_zone_grade: trdr.zone_grade,
@@ -876,6 +916,8 @@ impl OrderFlowExhaustion {
                 "expires_at_ms":s.expires_at,
             "context_score":s.context_score,
             "location_confirmed":s.location_confirmed,
+                "absorption_confirmed":s.absorption_confirmed,
+                "trend_aligned":s.trend_aligned,
                 "context_reasons":s.context_reasons,
                 "volume_ratio":s.event_volume_ratio,
                 "event_delta_share":s.event_delta_share,
@@ -1107,6 +1149,8 @@ mod tests {
             event_delta_share: 0.5,
             event_efficiency: 0.1,
             location_confirmed,
+            absorption_confirmed: true,
+            trend_aligned: false,
             context_score,
             context_reasons: vec![],
             trdr_zone_grade: "yellow".into(),
@@ -1158,6 +1202,27 @@ mod tests {
         let s = test_signal();
         assert_eq!(s.profile(&setup(2.2, true, 5)), "verified_context");
         assert_eq!(s.profile(&setup(2.2, true, 4)), "research_context");
+    }
+
+    #[test]
+    fn execution_requires_absorption_and_range_location() {
+        let s = test_signal();
+        let mut no_absorption = setup(2.2, true, 5);
+        no_absorption.absorption_confirmed = false;
+        assert!(s.trade_gate(&no_absorption).1.contains(&"absorption"));
+
+        let no_location = setup(2.2, false, 5);
+        assert!(s.trade_gate(&no_location).1.contains(&"range_location"));
+    }
+
+    #[test]
+    fn trend_aligned_setup_gets_one_point_discount() {
+        let s = test_signal();
+        let mut aligned = setup(2.2, false, 4);
+        aligned.side = Side::Buy;
+        aligned.trdr_regime = "trend_up".into();
+        aligned.trend_aligned = true;
+        assert_eq!(s.profile(&aligned), "verified_context");
     }
 
     #[test]

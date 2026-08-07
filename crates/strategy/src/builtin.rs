@@ -16,6 +16,7 @@ pub fn register_builtin(r: &mut PluginRegistry) {
         exits::build_orderflow_management,
     );
     r.register_trigger("OrderFlowEntry", triggers::build_orderflow);
+    r.register_trigger("HybridEntry", triggers::build_hybrid);
     r.register_signal("TrdrMarketMap", |p| {
         Ok(
             Box::new(signals::trdr_market_map::TrdrMarketMap::from_params(p))
@@ -26,6 +27,13 @@ pub fn register_builtin(r: &mut PluginRegistry) {
         Ok(
             Box::new(signals::orderflow_exhaustion::OrderFlowExhaustion::from_params(p))
                 as Box<dyn tcore::SignalPlugin>,
+        )
+    });
+    r.register_signal("TrendContinuation", |p| {
+        Ok(
+            Box::new(signals::trend_continuation::TrendContinuation::from_params(
+                p,
+            )) as Box<dyn tcore::SignalPlugin>,
         )
     });
 }
@@ -40,6 +48,7 @@ mod tests {
         assert!(r.filter_names().contains(&"CircuitBreaker"));
         assert!(r.signal_names().contains(&"TrdrMarketMap"));
         assert!(r.signal_names().contains(&"OrderFlowExhaustion"));
-        assert_eq!(r.trigger_names(), vec!["OrderFlowEntry"]);
+        assert!(r.trigger_names().contains(&"OrderFlowEntry"));
+        assert!(r.trigger_names().contains(&"HybridEntry"));
     }
 }

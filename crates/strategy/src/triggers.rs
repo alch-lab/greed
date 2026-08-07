@@ -97,6 +97,93 @@ pub fn build_orderflow(p: &Json) -> Result<Box<dyn TriggerPlugin>, PluginBuildEr
     }))
 }
 
+/// 单账户统一仲裁：强趋势覆盖层优先，MR 只在没有趋势信号时接管。
+/// 同一事件若出现反向信号则不下单；引擎的 pending/position 锁继续保证后续信号
+/// 不会在已有订单或持仓时建立第二个方向。
+pub struct HybridEntry {
+    mr: OrderFlowEntry,
+    trend_risk_scale: f64,
+    trend_stop_pct: f64,
+}
+
+impl HybridEntry {
+    fn trend_intent(&self, signal: &Signal, symbol: &Symbol) -> Option<OrderIntent> {
+        if signal.source != "TrendContinuation"
+            || signal.payload.get("stage")?.as_str()? != "confirmed"
+            || signal.payload.get("trade_eligible").and_then(Json::as_bool) != Some(true)
+        {
+            return None;
+        }
+        let side = match signal.payload.get("side")?.as_str()? {
+            "buy" => Side::Buy,
+            "sell" => Side::Sell,
+            _ => return None,
+        };
+        let entry = signal.payload.get("price")?.as_f64()?;
+        let stop = match side {
+            Side::Buy => entry * (1.0 - self.trend_stop_pct),
+            Side::Sell => entry * (1.0 + self.trend_stop_pct),
+        };
+        Some(OrderIntent {
+            symbol: symbol.clone(),
+            side,
+            qty: Qty::ZERO,
+            risk_scale: self.trend_risk_scale,
+            limit_price: None,
+            stop_price: Price::from_f64(stop),
+            tp1_price: None,
+            reason: "trend_continuation_strong".into(),
+            ts: signal.ts,
+        })
+    }
+}
+
+impl TriggerPlugin for HybridEntry {
+    fn name(&self) -> &'static str {
+        "HybridEntry"
+    }
+
+    fn should_fire(&self, _signals: &[Signal], _ctx: &Ctx) -> Option<OrderIntent> {
+        None
+    }
+
+    fn on_signals(
+        &mut self,
+        signals: &[Signal],
+        _ctx: &Ctx,
+        symbol: &Symbol,
+    ) -> Option<OrderIntent> {
+        let trend = signals
+            .iter()
+            .find_map(|signal| self.trend_intent(signal, symbol));
+        let mr = signals
+            .iter()
+            .find_map(|signal| self.mr.intent(signal, symbol));
+        match (trend, mr) {
+            (Some(trend), Some(mr)) if trend.side != mr.side => None,
+            (Some(trend), _) => Some(trend),
+            (None, Some(mr)) => Some(mr),
+            (None, None) => None,
+        }
+    }
+}
+
+pub fn build_hybrid(p: &Json) -> Result<Box<dyn TriggerPlugin>, PluginBuildError> {
+    let f = |key: &str, default: f64| p.get(key).and_then(Json::as_f64).unwrap_or(default);
+    let b = |key: &str, default: bool| p.get(key).and_then(Json::as_bool).unwrap_or(default);
+    Ok(Box::new(HybridEntry {
+        mr: OrderFlowEntry {
+            risk_scale: f("mr_risk_scale", 1.0).clamp(0.0, 1.0),
+            tp1_r: f("mr_tp1_r", 0.8).max(0.1),
+            min_stop_pct: f("mr_stop_pct", 0.0025).clamp(0.0005, 0.02),
+            max_stop_pct: f("mr_max_structural_stop_pct", 0.0025).clamp(0.001, 0.05),
+            market_entry: b("mr_market_entry", false),
+        },
+        trend_risk_scale: f("trend_risk_scale", 1.0).clamp(0.0, 1.0),
+        trend_stop_pct: f("trend_stop_pct", 0.0025).clamp(0.001, 0.02),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,5 +216,27 @@ mod tests {
         assert!(intent.limit_price.is_none());
         assert!((intent.risk_scale - 0.15).abs() < 1e-9);
         assert_eq!(intent.reason, "orderflow_verified_context");
+    }
+
+    #[test]
+    fn hybrid_prioritizes_trend_and_rejects_opposite_simultaneous_signal() {
+        let mut trigger = build_hybrid(&json!({"mr_max_structural_stop_pct":0.02})).unwrap();
+        let symbol = Symbol::new("BTCUSDT");
+        let trend = Signal::new(
+            SignalKind::Other,
+            Timestamp::from_millis(2),
+            "TrendContinuation",
+            json!({"stage":"confirmed","trade_eligible":true,"side":"buy","price":100.0}),
+        );
+        let mut mr = signal(true);
+        mr.payload["side"] = json!("sell");
+        assert!(trigger
+            .on_signals(&[trend.clone(), mr], &Ctx::default(), &symbol)
+            .is_none());
+        let intent = trigger
+            .on_signals(&[trend], &Ctx::default(), &symbol)
+            .unwrap();
+        assert_eq!(intent.side, Side::Buy);
+        assert!(intent.reason.starts_with("trend_continuation"));
     }
 }

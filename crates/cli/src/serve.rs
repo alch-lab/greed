@@ -317,7 +317,7 @@ async fn trade_start(
         journal: None, // data/journal/{mode}.json
         mode: Some(req.mode),
         cash: req.cash.unwrap_or(100_000.0),
-        risk_pct: req.risk_pct.unwrap_or(0.002),
+        risk_pct: req.risk_pct.unwrap_or(0.0025),
         max_risk_pct: req.max_risk_pct.unwrap_or(0.005),
         entry_ttl_ms: 10 * 60_000,
         cb_max_daily_losses: 0,

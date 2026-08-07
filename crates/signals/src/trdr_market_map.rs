@@ -15,6 +15,7 @@ pub struct Config {
     pub bucket_ms: i64,
     pub delta_window_ms: i64,
     pub trend_window_ms: i64,
+    pub trend_slow_window_ms: i64,
     pub book_fresh_ms: i64,
     pub book_bands: Vec<f64>,
     pub min_zone_depth_usd: f64,
@@ -33,6 +34,8 @@ pub struct Config {
     pub footprint_imbalance_share: f64,
     pub trend_return_pct: f64,
     pub trend_efficiency: f64,
+    pub trend_slow_return_pct: f64,
+    pub trend_slow_efficiency: f64,
     pub oi_change_threshold: f64,
 }
 
@@ -76,6 +79,7 @@ impl Config {
             bucket_ms: i("bucket_ms", 10_000).max(1_000),
             delta_window_ms: i("delta_window_ms", 30 * 60_000).max(60_000),
             trend_window_ms: i("trend_window_ms", 30 * 60_000).max(60_000),
+            trend_slow_window_ms: i("trend_slow_window_ms", 2 * 60 * 60_000).max(5 * 60_000),
             book_fresh_ms: i("book_fresh_ms", 20_000).max(1_000),
             book_bands: bands,
             min_zone_depth_usd: f("min_zone_depth_usd", 1_000_000.0).max(0.0),
@@ -93,6 +97,8 @@ impl Config {
             footprint_imbalance_share: f("footprint_imbalance_share", 0.20).clamp(0.05, 0.95),
             trend_return_pct: f("trend_return_pct", 0.012).clamp(0.001, 0.10),
             trend_efficiency: f("trend_efficiency", 0.45).clamp(0.05, 1.0),
+            trend_slow_return_pct: f("trend_slow_return_pct", 0.005).clamp(0.001, 0.10),
+            trend_slow_efficiency: f("trend_slow_efficiency", 0.10).clamp(0.01, 1.0),
             oi_change_threshold: f("oi_change_threshold", 0.001).clamp(0.00001, 0.10),
         }
     }
@@ -258,6 +264,9 @@ struct FlowState {
     regime: &'static str,
     trend_return_pct: f64,
     trend_efficiency: f64,
+    trend_slow_return_pct: f64,
+    trend_slow_efficiency: f64,
+    trend_slow_window_ms: i64,
 }
 
 pub struct TrdrMarketMap {
@@ -724,8 +733,41 @@ impl TrdrMarketMap {
     }
 
     fn prune_flows(&mut self, now_ms: i64) {
-        let keep_ms = self.cfg.delta_window_ms.max(self.cfg.trend_window_ms) + self.cfg.bucket_ms;
+        let keep_ms = self
+            .cfg
+            .delta_window_ms
+            .max(self.cfg.trend_window_ms)
+            .max(self.cfg.trend_slow_window_ms)
+            + self.cfg.bucket_ms;
         self.flows.retain(|start, _| now_ms - *start <= keep_ms);
+    }
+
+    fn trend_stats<'a>(buckets: impl Iterator<Item = &'a FlowBucket>) -> (f64, f64) {
+        let mut first = None;
+        let mut last = None;
+        let mut previous = None;
+        let mut path = 0.0;
+        for bucket in buckets.filter(|bucket| bucket.open > 0.0) {
+            if first.is_none() {
+                first = Some(bucket.open);
+                previous = Some(bucket.open);
+            }
+            if let Some(prev) = previous {
+                path += (bucket.close - prev).abs();
+            }
+            previous = Some(bucket.close);
+            last = Some(bucket.close);
+        }
+        let (Some(first), Some(last)) = (first, last) else {
+            return (0.0, 0.0);
+        };
+        let trend_return = if first > 0.0 { last / first - 1.0 } else { 0.0 };
+        let efficiency = if path > 0.0 {
+            (last - first).abs() / path
+        } else {
+            0.0
+        };
+        (trend_return, efficiency)
     }
 
     fn delta_tier(&self, delta: f64, volume: f64) -> (u8, &'static str) {
@@ -764,6 +806,7 @@ impl TrdrMarketMap {
     fn build_flow_state(&self, now_ms: i64) -> FlowState {
         let delta_from = now_ms - self.cfg.delta_window_ms;
         let trend_from = now_ms - self.cfg.trend_window_ms;
+        let trend_slow_from = now_ms - self.cfg.trend_slow_window_ms;
         let mut volume = 0.0;
         let mut delta = 0.0;
         let mut spot_volume = 0.0;
@@ -779,7 +822,6 @@ impl TrdrMarketMap {
         let mut liquidation_sources = HashSet::new();
         let mut long_liquidation_by_source = HashMap::<Exchange, f64>::new();
         let mut short_liquidation_by_source = HashMap::<Exchange, f64>::new();
-        let mut trend = Vec::new();
         for (start, b) in &self.flows {
             if *start >= delta_from {
                 volume += b.volume;
@@ -815,9 +857,6 @@ impl TrdrMarketMap {
                 for (exchange, value) in &b.short_liquidation_by_source {
                     *short_liquidation_by_source.entry(*exchange).or_default() += value;
                 }
-            }
-            if *start >= trend_from && b.open > 0.0 {
-                trend.push(b);
             }
         }
         let delta_share = if volume > 0.0 { delta / volume } else { 0.0 };
@@ -903,30 +942,33 @@ impl TrdrMarketMap {
                 })
             })
             .collect::<Vec<_>>();
-        let first = trend.first().map(|b| b.open).unwrap_or(0.0);
-        let last = trend.last().map(|b| b.close).unwrap_or(first);
-        let trend_return = if first > 0.0 { last / first - 1.0 } else { 0.0 };
-        let mut path = 0.0;
-        let mut prev = first;
-        for b in &trend {
-            path += (b.close - prev).abs();
-            prev = b.close;
-        }
-        let efficiency = if path > 0.0 {
-            (last - first).abs() / path
-        } else {
-            0.0
-        };
+        let (trend_return, efficiency) =
+            Self::trend_stats(self.flows.range(trend_from..).map(|(_, bucket)| bucket));
+        let (slow_return, slow_efficiency) = Self::trend_stats(
+            self.flows
+                .range(trend_slow_from..)
+                .map(|(_, bucket)| bucket),
+        );
         let aligned = trend_return.signum() == delta.signum();
-        let regime = if aligned
+        let fast_up = aligned
             && trend_return >= self.cfg.trend_return_pct
-            && efficiency >= self.cfg.trend_efficiency
-        {
-            "trend_up"
-        } else if aligned
+            && efficiency >= self.cfg.trend_efficiency;
+        let fast_down = aligned
             && trend_return <= -self.cfg.trend_return_pct
-            && efficiency >= self.cfg.trend_efficiency
-        {
+            && efficiency >= self.cfg.trend_efficiency;
+        // 慢趋势只看价格本身。上涨中的卖方 Delta 往往代表回调或吸收，不能因此把
+        // 两小时上涨误标成 range，再允许均值回归模型逆势摸顶。
+        let slow_up = slow_return >= self.cfg.trend_slow_return_pct
+            && slow_efficiency >= self.cfg.trend_slow_efficiency;
+        let slow_down = slow_return <= -self.cfg.trend_slow_return_pct
+            && slow_efficiency >= self.cfg.trend_slow_efficiency;
+        let regime = if slow_up {
+            "trend_up"
+        } else if slow_down {
+            "trend_down"
+        } else if fast_up {
+            "trend_up"
+        } else if fast_down {
             "trend_down"
         } else {
             "range"
@@ -987,6 +1029,9 @@ impl TrdrMarketMap {
             regime,
             trend_return_pct: trend_return,
             trend_efficiency: efficiency,
+            trend_slow_return_pct: slow_return,
+            trend_slow_efficiency: slow_efficiency,
+            trend_slow_window_ms: self.cfg.trend_slow_window_ms,
         }
     }
 
@@ -1032,7 +1077,10 @@ impl TrdrMarketMap {
                 "liquidation_stats":f.liquidation_stats,
                 "oi_change_pct":f.oi_change_pct, "oi_quadrant":f.oi_quadrant,
                 "regime":f.regime, "trend_return_pct":f.trend_return_pct,
-                "trend_efficiency":f.trend_efficiency
+                "trend_efficiency":f.trend_efficiency,
+                "trend_slow_return_pct":f.trend_slow_return_pct,
+                "trend_slow_efficiency":f.trend_slow_efficiency,
+                "trend_slow_window_ms":f.trend_slow_window_ms
             }),
             None => json!({"tier":0,"tier_name":"none","direction":"neutral","regime":"warming"}),
         }
@@ -1048,6 +1096,10 @@ impl TrdrMarketMap {
         let mut flow = Self::flow_payload(self.latest_flow.as_ref());
         if let Some(obj) = flow.as_object_mut() {
             obj.insert("window_ms".into(), json!(self.cfg.delta_window_ms));
+            obj.insert(
+                "trend_slow_window_ms".into(),
+                json!(self.cfg.trend_slow_window_ms),
+            );
         }
         let regime = self
             .latest_flow
@@ -1113,7 +1165,10 @@ impl TrdrMarketMap {
                 json!({
                     "ts_ms":f.ts_ms,"regime":f.regime,
                     "blocked_side":match f.regime { "trend_up"=>"sell", "trend_down"=>"buy", _=>"none" },
-                    "return_pct":f.trend_return_pct,"efficiency":f.trend_efficiency
+                    "return_pct":f.trend_return_pct,"efficiency":f.trend_efficiency,
+                    "slow_return_pct":f.trend_slow_return_pct,
+                    "slow_efficiency":f.trend_slow_efficiency,
+                    "slow_window_ms":self.cfg.trend_slow_window_ms
                 }),
             ),
         ]
@@ -1429,6 +1484,31 @@ mod tests {
                 .unwrap()
                 > 0.0
         );
+    }
+
+    #[test]
+    fn slow_price_trend_is_not_erased_by_opposite_delta() {
+        let mut cfg = Config::from_params(&json!({}));
+        cfg.trend_return_pct = 0.10; // disable the fast detector in this fixture
+        cfg.trend_slow_return_pct = 0.005;
+        cfg.trend_slow_efficiency = 0.10;
+        let mut map = TrdrMarketMap::new(cfg);
+        let ctx = Ctx::default();
+        for (ts, px) in [(1_000, 100.0), (11_000, 100.4), (21_000, 100.8)] {
+            let trade = Trade {
+                ts: Timestamp::from_millis(ts),
+                exchange: Exchange::BinanceFutures,
+                symbol: Symbol::new("BTCUSDT"),
+                price: Price::from_f64(px),
+                qty: Qty::from_f64(100.0),
+                is_buyer_maker: true, // aggressive sells: Delta points down while price rises
+            };
+            map.on_event(&Event::Trade(trade), &ctx);
+        }
+        let flow = map.latest_flow.as_ref().unwrap();
+        assert!(flow.delta_usd < 0.0);
+        assert_eq!(flow.regime, "trend_up");
+        assert!(flow.trend_slow_return_pct >= 0.005);
     }
 
     #[test]

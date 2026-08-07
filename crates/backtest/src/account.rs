@@ -56,6 +56,9 @@ pub struct OpenPosition {
     pub tp1_price: Option<Price>,
     pub breakeven_moved: bool,
     pub closed_frac: f64,
+    /// 0=旧版本/未知，1=均值回归，2=趋势延续。保持整数以兼容旧 journal 恢复。
+    #[serde(default)]
+    pub strategy_tag: u8,
 }
 
 impl OpenPosition {
@@ -214,6 +217,13 @@ impl Account {
                         tp1_price: None,
                         breakeven_moved: false,
                         closed_frac: 0.0,
+                        strategy_tag: if reason.starts_with("trend_continuation") {
+                            2
+                        } else if reason.starts_with("orderflow_verified_context") {
+                            1
+                        } else {
+                            0
+                        },
                     });
                 }
             }

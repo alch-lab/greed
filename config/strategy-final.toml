@@ -2,9 +2,9 @@
 # 订单流力竭再在有效区域内确认入场。每个事件簇只允许产生一次入场。
 
 [strategy]
-name = "trdr-mr-v10-verified-funnel"
-signals = ["TrdrMarketMap", "OrderFlowExhaustion"]
-trigger = "OrderFlowEntry"
+name = "trdr-hybrid-v12-mr-strong-trend"
+signals = ["TrdrMarketMap", "OrderFlowExhaustion", "TrendContinuation"]
+trigger = "HybridEntry"
 filters = ["CircuitBreaker"]
 exits = ["OrderFlowTradeManagement"]
 
@@ -35,6 +35,11 @@ footprint_imbalance_share = 0.20
 # BTC 日内常见的有效方向腿约为 0.5%–0.9%；旧 1.2% 门槛会把整天都显示成 range。
 trend_return_pct = 0.006
 trend_efficiency = 0.40
+# 30m Delta 可能在上涨回调中转负，不能用它抹掉更大级别的价格方向。
+# 额外用 2h 价格路径识别日内趋势，达到 0.5% 且路径效率 >= 10% 即禁止逆势入场。
+trend_slow_window_ms = 7200000
+trend_slow_return_pct = 0.005
+trend_slow_efficiency = 0.10
 oi_change_threshold = 0.001
 
 [strategy.plugins.OrderFlowExhaustion]
@@ -57,7 +62,13 @@ stop_buffer_pct = 0.00035
 execution_min_context_score = 5
 execution_require_source_coverage = true
 execution_require_footprint = true
-require_trdr_location = true
+# TRDR 墙体覆盖不足时，允许“扫过 90m 极值 / 偏离日内 VWAP”充当位置证据。
+# 同一位置证据只计 1 分；区间交易必须有位置，所有交易必须有真实价格吸收。
+allow_local_location = true
+execution_require_absorption = true
+execution_require_location_in_range = true
+# 顺 2h 趋势的回调反转允许 context 4/7；区间仍需 5/7。
+trend_aligned_context_discount = 1
 block_countertrend = true
 # 局部绿色墙体已经经过 4 路覆盖、2 现货+2 永续共振和 30 秒持续性确认。
 min_trdr_grade_rank = 1
@@ -70,26 +81,48 @@ require_source_coverage = true
 min_stacked_imbalance = 2
 min_liquidation_usd = 1000000
 # 纯观察层：30 分钟滚动 Delta 持续单边，但价格推进 ≤0.6%、路径效率 ≤45% 时，
-# 记录渐进吸收事件及后续 5m–4h 表现。该信号不会进入 OrderFlowEntry。
+# 记录渐进吸收事件及后续 5m–4h 表现。该信号不会进入 HybridEntry。
 cumulative_window_buckets = 180
 cumulative_min_delta_share = 0.15
 cumulative_max_return_pct = 0.006
 cumulative_max_efficiency = 0.45
 cumulative_cooldown_buckets = 180
 
-[strategy.plugins.OrderFlowEntry]
-# 只交易实时全市场口径：完整来源 + footprint 成交簇 + context >= 5。
+[strategy.plugins.TrendContinuation]
+bucket_ms = 10000
+warmup_ms = 7200000
+# 只覆盖真正的强趋势；普通 0.5% 慢趋势仍只用于 MR 方向过滤。
+min_return_pct = 0.008
+min_efficiency = 0.15
+min_delta_tier = 1
+reset_neutral_ms = 900000
+require_source_coverage = true
+require_spot_perp_delta = true
+require_oi_support = true
+
+[strategy.plugins.HybridEntry]
+# 只交易实时全市场口径：完整来源 + footprint 成交簇 + 吸收；
+# 区间要求 context >= 5 且必须在有效位置，顺势回调要求 context >= 4。
 # Binance-only 历史数据无法重建该门槛，因此不会被误当作同一信号下单。
-risk_scale = 0.15
-tp1_r = 1.50
-min_stop_pct = 0.0050
-max_stop_pct = 0.0100
-market_entry = true
+mr_risk_scale = 1.0
+# MR 固定 0.25% 保护距离，TP1=0.8R=0.20%；结构止损超过 0.25% 的信号放弃。
+mr_tp1_r = 0.80
+mr_stop_pct = 0.0025
+mr_max_structural_stop_pct = 0.0025
+# 在事件区域挂被动限价单，10 分钟未成交自动撤单；与 6bps 往返费用假设一致。
+mr_market_entry = false
+# 强趋势市价确认入场，0.25% 初始保护；统一仲裁器优先趋势且拒绝反向同时信号。
+trend_risk_scale = 1.0
+trend_stop_pct = 0.0025
 
 [strategy.plugins.OrderFlowTradeManagement]
 tp1_close = 0.50
-tp2_original_close = 0.25
-tp2_r = 3.00
-runner_trail_pct = 0.006
-# 该子集的优势集中在确认后 30 分钟，超时退出释放验证频率。
+tp2_original_close = 0.30
+# MR: TP1 0.20% 平 50%并推保本；TP2 0.35% 再平原仓 30%；余下 20% 跟踪。
+tp2_r = 1.40
+runner_trail_pct = 0.0015
 max_hold_hours = 0.5
+# 趋势覆盖层不套用 MR 目标，使用 0.25% 单向跟踪止损，最多持有 2 小时。
+trend_trail_pct = 0.0025
+trend_trail_activation_pct = 0.0025
+trend_max_hold_hours = 2.0

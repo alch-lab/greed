@@ -82,7 +82,7 @@ enum Command {
         #[arg(long, default_value_t = 100_000.0)]
         cash: f64,
         /// 风险分数
-        #[arg(long, default_value_t = 0.002)]
+        #[arg(long, default_value_t = 0.0025)]
         risk_pct: f64,
         /// 随机方向胜率基线
         #[arg(long, default_value_t = 0.5)]

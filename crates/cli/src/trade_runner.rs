@@ -178,6 +178,30 @@ pub async fn run_trade(
     let started_ms = chrono::Utc::now().timestamp_millis();
     let run_id = format!("{}-{}-{}", mode.as_str(), started_ms, std::process::id());
     let strategy_hash = format!("{:x}", Sha256::digest(toml_str.as_bytes()));
+    let strategy_doc = toml::from_str::<toml::Value>(&toml_str).ok();
+    let plugins = strategy_doc
+        .as_ref()
+        .and_then(|v| v.get("strategy"))
+        .and_then(|v| v.get("plugins"));
+    let hybrid_params = plugins.and_then(|v| v.get("HybridEntry"));
+    let orderflow_params = plugins.and_then(|v| v.get("OrderFlowEntry"));
+    let strategy_risk_scale = hybrid_params
+        .and_then(|v| v.get("mr_risk_scale"))
+        .or_else(|| orderflow_params.and_then(|v| v.get("risk_scale")))
+        .and_then(toml::Value::as_float)
+        .unwrap_or(0.15)
+        .clamp(0.0, 1.0);
+    let market_entry = hybrid_params
+        .and_then(|v| v.get("mr_market_entry"))
+        .or_else(|| orderflow_params.and_then(|v| v.get("market_entry")))
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(true);
+    let strategy_stop_pct = hybrid_params
+        .and_then(|v| v.get("mr_stop_pct"))
+        .or_else(|| orderflow_params.and_then(|v| v.get("min_stop_pct")))
+        .and_then(toml::Value::as_float)
+        .unwrap_or(0.005)
+        .max(1e-6);
     let git_commit = std::env::var("GREED_GIT_COMMIT").unwrap_or_else(|_| {
         std::process::Command::new("git")
             .args(["rev-parse", "HEAD"])
@@ -195,6 +219,8 @@ pub async fn run_trade(
         risk_pct: args.risk_pct,
         max_risk_pct: args.max_risk_pct,
         max_leverage: args.leverage as f64,
+        strategy_risk_scale,
+        strategy_stop_pct,
         entry_ttl_ms: args.entry_ttl_ms,
         cb_max_daily_losses: args.cb_max_daily_losses,
         cb_daily_dd_pct: args.cb_daily_dd_pct,
@@ -209,7 +235,7 @@ pub async fn run_trade(
         git_commit,
         run_id,
         mode: mode.as_str().into(),
-        estimated_roundtrip_fee_bps: 6.0,
+        estimated_roundtrip_fee_bps: if market_entry { 8.0 } else { 6.0 },
     };
     if let Some(parent) = std::path::Path::new(&journal_path).parent() {
         std::fs::create_dir_all(parent)?;

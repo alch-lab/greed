@@ -6,3 +6,4 @@
 
 pub mod orderflow_exhaustion;
 pub mod trdr_market_map;
+pub mod trend_continuation;
