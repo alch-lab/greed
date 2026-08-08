@@ -145,6 +145,8 @@ pub struct EngineSnapshot {
     pub market_map: Option<serde_json::Value>,
     /// 强趋势覆盖层的独立漏斗状态。
     pub trend_continuation: Option<serde_json::Value>,
+    /// 日内趋势回踩层的独立漏斗状态。
+    pub tactical_pullback: Option<serde_json::Value>,
     pub run_id: String,
     pub strategy_name: String,
     pub strategy_hash: String,
@@ -865,6 +867,7 @@ impl LiveEngine {
             last_eval: plugin_note("OrderFlowExhaustion").or_else(|| self.latest_eval.clone()),
             market_map: plugin_note("TrdrMarketMap"),
             trend_continuation: plugin_note("TrendContinuation"),
+            tactical_pullback: plugin_note("TacticalPullback"),
             run_id: self.config.run_id.clone(),
             strategy_name: self.config.strategy_name.clone(),
             strategy_hash: self.config.strategy_hash.clone(),

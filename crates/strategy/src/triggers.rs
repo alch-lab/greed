@@ -104,6 +104,8 @@ pub struct HybridEntry {
     mr: OrderFlowEntry,
     trend_risk_scale: f64,
     trend_stop_pct: f64,
+    tactical_risk_scale: f64,
+    tactical_stop_pct: f64,
 }
 
 impl HybridEntry {
@@ -136,6 +138,36 @@ impl HybridEntry {
             ts: signal.ts,
         })
     }
+
+    fn tactical_intent(&self, signal: &Signal, symbol: &Symbol) -> Option<OrderIntent> {
+        if signal.source != "TacticalPullback"
+            || signal.payload.get("stage")?.as_str()? != "confirmed"
+            || signal.payload.get("trade_eligible").and_then(Json::as_bool) != Some(true)
+        {
+            return None;
+        }
+        let side = match signal.payload.get("side")?.as_str()? {
+            "buy" => Side::Buy,
+            "sell" => Side::Sell,
+            _ => return None,
+        };
+        let entry = signal.payload.get("price")?.as_f64()?;
+        let stop = match side {
+            Side::Buy => entry * (1.0 - self.tactical_stop_pct),
+            Side::Sell => entry * (1.0 + self.tactical_stop_pct),
+        };
+        Some(OrderIntent {
+            symbol: symbol.clone(),
+            side,
+            qty: Qty::ZERO,
+            risk_scale: self.tactical_risk_scale,
+            limit_price: None,
+            stop_price: Price::from_f64(stop),
+            tp1_price: None,
+            reason: "trend_pullback_tactical".into(),
+            ts: signal.ts,
+        })
+    }
 }
 
 impl TriggerPlugin for HybridEntry {
@@ -159,10 +191,23 @@ impl TriggerPlugin for HybridEntry {
         let mr = signals
             .iter()
             .find_map(|signal| self.mr.intent(signal, symbol));
-        match (trend, mr) {
-            (Some(trend), Some(mr)) if trend.side != mr.side => None,
-            (Some(trend), _) => Some(trend),
-            (None, Some(mr)) => Some(mr),
+        let tactical = signals
+            .iter()
+            .find_map(|signal| self.tactical_intent(signal, symbol));
+        if let Some(trend) = trend {
+            if mr.as_ref().is_some_and(|other| other.side != trend.side)
+                || tactical
+                    .as_ref()
+                    .is_some_and(|other| other.side != trend.side)
+            {
+                return None;
+            }
+            return Some(trend);
+        }
+        match (mr, tactical) {
+            (Some(mr), Some(tactical)) if mr.side != tactical.side => None,
+            (Some(mr), _) => Some(mr),
+            (None, Some(tactical)) => Some(tactical),
             (None, None) => None,
         }
     }
@@ -181,6 +226,8 @@ pub fn build_hybrid(p: &Json) -> Result<Box<dyn TriggerPlugin>, PluginBuildError
         },
         trend_risk_scale: f("trend_risk_scale", 1.0).clamp(0.0, 1.0),
         trend_stop_pct: f("trend_stop_pct", 0.0025).clamp(0.001, 0.02),
+        tactical_risk_scale: f("tactical_risk_scale", 1.0).clamp(0.0, 1.0),
+        tactical_stop_pct: f("tactical_stop_pct", 0.0025).clamp(0.001, 0.02),
     }))
 }
 
@@ -238,5 +285,22 @@ mod tests {
             .unwrap();
         assert_eq!(intent.side, Side::Buy);
         assert!(intent.reason.starts_with("trend_continuation"));
+    }
+
+    #[test]
+    fn hybrid_uses_tactical_pullback_when_other_sleeves_are_idle() {
+        let mut trigger = build_hybrid(&json!({})).unwrap();
+        let symbol = Symbol::new("BTCUSDT");
+        let tactical = Signal::new(
+            SignalKind::Other,
+            Timestamp::from_millis(3),
+            "TacticalPullback",
+            json!({"stage":"confirmed","trade_eligible":true,"side":"buy","price":100.0}),
+        );
+        let intent = trigger
+            .on_signals(&[tactical], &Ctx::default(), &symbol)
+            .unwrap();
+        assert_eq!(intent.side, Side::Buy);
+        assert_eq!(intent.reason, "trend_pullback_tactical");
     }
 }

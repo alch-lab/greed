@@ -217,7 +217,9 @@ impl Account {
                         tp1_price: None,
                         breakeven_moved: false,
                         closed_frac: 0.0,
-                        strategy_tag: if reason.starts_with("trend_continuation") {
+                        strategy_tag: if reason.starts_with("trend_continuation")
+                            || reason.starts_with("trend_pullback")
+                        {
                             2
                         } else if reason.starts_with("orderflow_verified_context") {
                             1

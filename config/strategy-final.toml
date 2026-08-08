@@ -2,8 +2,8 @@
 # 订单流力竭再在有效区域内确认入场。每个事件簇只允许产生一次入场。
 
 [strategy]
-name = "trdr-hybrid-v12-mr-strong-trend"
-signals = ["TrdrMarketMap", "OrderFlowExhaustion", "TrendContinuation"]
+name = "trdr-hybrid-v14-tactical-pullback"
+signals = ["TrdrMarketMap", "OrderFlowExhaustion", "TrendContinuation", "TacticalPullback"]
 trigger = "HybridEntry"
 filters = ["CircuitBreaker"]
 exits = ["OrderFlowTradeManagement"]
@@ -58,6 +58,10 @@ min_vwap_deviation_pct = 0.0030
 strong_confirm_buckets = 18
 weak_confirm_buckets = 30
 cluster_cooldown_buckets = 60
+# 冷却按方向隔离；只有 50x 异常放量，或与上次同向事件相距 0.5% 的新价区，
+# 才能提前重新武装。避免普通噪声反复开仓，同时不再漏掉真正的新事件。
+cooldown_rearm_volume_ratio = 50.0
+cooldown_rearm_price_pct = 0.005
 stop_buffer_pct = 0.00035
 execution_min_context_score = 5
 execution_require_source_coverage = true
@@ -100,6 +104,22 @@ require_source_coverage = true
 require_spot_perp_delta = true
 require_oi_support = true
 
+[strategy.plugins.TacticalPullback]
+bucket_ms = 10000
+warmup_ms = 7200000
+price_window_ms = 1800000
+range_window_ms = 3600000
+# 2h 方向先成立，30m 内至少回踩 0.20%，随后回收 0.06%，最后要求六路
+# 现货/永续主动成交重新与趋势同向。普通区间边界只记录，不进入真实下单。
+min_return_pct = 0.005
+min_efficiency = 0.10
+min_pullback_pct = 0.002
+reclaim_pct = 0.0006
+min_delta_tier = 1
+cooldown_ms = 1800000
+require_source_coverage = true
+require_spot_perp_delta = true
+
 [strategy.plugins.HybridEntry]
 # 只交易实时全市场口径：完整来源 + footprint 成交簇 + 吸收；
 # 区间要求 context >= 5 且必须在有效位置，顺势回调要求 context >= 4。
@@ -114,6 +134,9 @@ mr_market_entry = false
 # 强趋势市价确认入场，0.25% 初始保护；统一仲裁器优先趋势且拒绝反向同时信号。
 trend_risk_scale = 1.0
 trend_stop_pct = 0.0025
+# 趋势回踩与强趋势共用趋势退出模型和单账户锁，但拥有独立信号漏斗。
+tactical_risk_scale = 1.0
+tactical_stop_pct = 0.0025
 
 [strategy.plugins.OrderFlowTradeManagement]
 tp1_close = 0.50

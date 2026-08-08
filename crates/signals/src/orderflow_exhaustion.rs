@@ -20,6 +20,8 @@ pub struct Config {
     pub strong_confirm_buckets: usize,
     pub weak_confirm_buckets: usize,
     pub cluster_cooldown_buckets: usize,
+    pub cooldown_rearm_volume_ratio: f64,
+    pub cooldown_rearm_price_pct: f64,
     pub stop_buffer_pct: f64,
     pub execution_min_context_score: u8,
     pub execution_require_source_coverage: bool,
@@ -76,6 +78,8 @@ impl Config {
             strong_confirm_buckets: u("strong_confirm_buckets", 18).max(1),
             weak_confirm_buckets: u("weak_confirm_buckets", 30).max(1),
             cluster_cooldown_buckets: u("cluster_cooldown_buckets", 60).max(1),
+            cooldown_rearm_volume_ratio: f("cooldown_rearm_volume_ratio", 50.0).max(2.0),
+            cooldown_rearm_price_pct: f("cooldown_rearm_price_pct", 0.005).clamp(0.001, 0.05),
             stop_buffer_pct: f("stop_buffer_pct", 0.00035).max(0.0),
             execution_min_context_score: u("execution_min_context_score", 5).min(8) as u8,
             execution_require_source_coverage: b("execution_require_source_coverage", true),
@@ -150,6 +154,7 @@ struct Setup {
     side: Side,
     strength: &'static str,
     event_price: f64,
+    entry_price: f64,
     stop_anchor: f64,
     event_volume: f64,
     event_volume_ratio: f64,
@@ -160,6 +165,7 @@ struct Setup {
     trend_aligned: bool,
     context_score: u8,
     context_reasons: Vec<String>,
+    context_fused: bool,
     trdr_zone_grade: String,
     trdr_zone_band_pct: Option<f64>,
     trdr_zone_ratio: Option<f64>,
@@ -232,6 +238,128 @@ fn side_name(side: Side) -> &'static str {
         Side::Buy => "buy",
         Side::Sell => "sell",
     }
+}
+
+fn side_slot(side: Side) -> usize {
+    match side {
+        Side::Buy => 0,
+        Side::Sell => 1,
+    }
+}
+
+fn add_reason(reasons: &mut Vec<String>, reason: &str) -> bool {
+    if reasons.iter().any(|value| value == reason) {
+        false
+    } else {
+        reasons.push(reason.to_string());
+        true
+    }
+}
+
+fn evidence_score(reasons: &[String]) -> u8 {
+    let has = |reason: &str| reasons.iter().any(|value| value == reason);
+    let location = has("trdr_zone") || has("local_location");
+    [
+        location,
+        has("absorption"),
+        has("trdr_delta"),
+        has("footprint_cluster"),
+        has("oi"),
+        has("spot_perp_confluence"),
+        has("liquidation"),
+    ]
+    .into_iter()
+    .filter(|value| *value)
+    .count() as u8
+}
+
+fn fuse_setup_context(
+    setup: &mut Setup,
+    trdr: &TrdrContext,
+    oi_support: bool,
+    cfg: &Config,
+    now_ms: i64,
+) {
+    let mut added = false;
+    if trdr.zone_matches {
+        setup.location_confirmed = true;
+        added |= add_reason(&mut setup.context_reasons, "trdr_zone");
+        if let (Some(low), Some(high)) = (trdr.zone_low, trdr.zone_high) {
+            setup.entry_price = (low + high) / 2.0;
+            setup.stop_anchor = match setup.side {
+                Side::Buy => setup.stop_anchor.min(low * (1.0 - cfg.stop_buffer_pct)),
+                Side::Sell => setup.stop_anchor.max(high * (1.0 + cfg.stop_buffer_pct)),
+            };
+        }
+        setup.trdr_zone_grade = trdr.zone_grade.clone();
+        setup.trdr_zone_band_pct = trdr.zone_band_pct;
+        setup.trdr_zone_ratio = trdr.zone_ratio;
+        setup.trdr_zone_wall_usd = trdr.zone_wall_usd;
+        setup.trdr_zone_distance_bin = trdr.zone_distance_bin;
+        setup.trdr_source_wall_ratio = trdr.source_wall_ratio;
+        setup.trdr_zone_distance_pct = trdr.zone_distance_pct;
+        setup.trdr_zone_low = trdr.zone_low;
+        setup.trdr_zone_high = trdr.zone_high;
+        setup.trdr_zone_persistence_ms = trdr.zone_persistence_ms;
+    }
+    if trdr.delta_matches {
+        added |= add_reason(&mut setup.context_reasons, "trdr_delta");
+    }
+    if trdr.footprint_matches {
+        added |= add_reason(&mut setup.context_reasons, "footprint_cluster");
+    }
+    if oi_support {
+        added |= add_reason(&mut setup.context_reasons, "oi");
+    }
+    if trdr.spot_perp_confluence {
+        added |= add_reason(&mut setup.context_reasons, "spot_perp_confluence");
+    }
+    let liquidation_support = match setup.side {
+        Side::Buy => trdr.long_liquidation_usd >= cfg.min_liquidation_usd,
+        Side::Sell => trdr.short_liquidation_usd >= cfg.min_liquidation_usd,
+    };
+    if liquidation_support {
+        added |= add_reason(&mut setup.context_reasons, "liquidation");
+    }
+    setup.context_fused |= added && now_ms > setup.event_id;
+    setup.context_score = evidence_score(&setup.context_reasons);
+    setup.trdr_spot_perp_confluence |= trdr.spot_perp_confluence;
+    setup.trdr_delta_tier = setup.trdr_delta_tier.max(trdr.delta_tier);
+    if trdr.delta_matches {
+        setup.trdr_delta_usd = trdr.delta_usd;
+        setup.trdr_delta_share = trdr.delta_share;
+    }
+    setup.trdr_spot_volume_usd = trdr.spot_volume_usd.or(setup.trdr_spot_volume_usd);
+    setup.trdr_perp_volume_usd = trdr.perp_volume_usd.or(setup.trdr_perp_volume_usd);
+    if !trdr.source_stats.is_empty() {
+        setup.trdr_source_stats = trdr.source_stats.clone();
+    }
+    if !trdr.liquidation_stats.is_empty() {
+        setup.trdr_liquidation_stats = trdr.liquidation_stats.clone();
+    }
+    if trdr.oi_quadrant != "neutral" {
+        setup.trdr_oi_quadrant = trdr.oi_quadrant.clone();
+    }
+    setup.trdr_source_coverage_complete |= trdr.source_coverage_complete;
+    setup.trdr_footprint_matches |= trdr.footprint_matches;
+    if trdr.footprint_matches {
+        setup.trdr_footprint_price = trdr.footprint_price;
+        setup.trdr_footprint_delta_usd = trdr.footprint_delta_usd;
+        setup.trdr_stacked_imbalance = setup.trdr_stacked_imbalance.max(trdr.stacked_imbalance);
+    }
+    setup.trdr_long_liquidation_usd = setup
+        .trdr_long_liquidation_usd
+        .max(trdr.long_liquidation_usd);
+    setup.trdr_short_liquidation_usd = setup
+        .trdr_short_liquidation_usd
+        .max(trdr.short_liquidation_usd);
+    setup.production_ready = setup.location_confirmed
+        && setup
+            .context_reasons
+            .iter()
+            .any(|value| value == "trdr_delta")
+        && setup.trdr_footprint_matches
+        && (!cfg.require_source_coverage || setup.trdr_source_coverage_complete);
 }
 
 fn trdr_context(ctx: &Ctx, side: Side, cfg: &Config, now_ms: i64) -> TrdrContext {
@@ -355,7 +483,8 @@ pub struct OrderFlowExhaustion {
     current: Option<Bucket>,
     history: VecDeque<Bucket>,
     setup: Option<Setup>,
-    cooldown_until: i64,
+    cooldown_until: [i64; 2],
+    cooldown_price: [Option<f64>; 2],
     cumulative_cooldown_until: i64,
     session_day: i64,
     session_notional: f64,
@@ -377,7 +506,8 @@ impl OrderFlowExhaustion {
             current: None,
             history: VecDeque::new(),
             setup: None,
-            cooldown_until: 0,
+            cooldown_until: [0; 2],
+            cooldown_price: [None; 2],
             cumulative_cooldown_until: 0,
             session_day: i64::MIN,
             session_notional: 0.0,
@@ -387,6 +517,19 @@ impl OrderFlowExhaustion {
             book_imbalance: None,
             eval: None,
         }
+    }
+
+    fn rearm_triggered(&self, side: Side, price: f64, volume_ratio: f64) -> bool {
+        let slot = side_slot(side);
+        let new_price_region = self.cooldown_price[slot].is_some_and(|anchor| {
+            anchor > 0.0 && (price / anchor - 1.0).abs() >= self.cfg.cooldown_rearm_price_pct
+        });
+        volume_ratio >= self.cfg.cooldown_rearm_volume_ratio || new_price_region
+    }
+
+    fn cooldown_blocks(&self, side: Side, now_ms: i64, price: f64, volume_ratio: f64) -> bool {
+        let slot = side_slot(side);
+        now_ms < self.cooldown_until[slot] && !self.rearm_triggered(side, price, volume_ratio)
     }
 
     fn median_volume(&self) -> f64 {
@@ -618,14 +761,14 @@ impl OrderFlowExhaustion {
             ts,
             "OrderFlowExhaustion",
             json!({
-                "model":"orderflow_exhaustion_v11",
+                "model":"orderflow_exhaustion_v13",
                 "stage":"confirmed",
                 "profile":profile,
                 "event_id":setup.event_id,
                 "strength":setup.strength,
                 "side":match setup.side { Side::Buy => "buy", Side::Sell => "sell" },
                 "price":price,
-                "zone":setup.event_price,
+                "zone":setup.entry_price,
                 "stop_anchor":setup.stop_anchor,
                 "volume_usd":setup.event_volume,
                 "volume_ratio":setup.event_volume_ratio,
@@ -637,6 +780,7 @@ impl OrderFlowExhaustion {
                 "trend_aligned":setup.trend_aligned,
                 "context_score":setup.context_score,
                 "context_reasons":setup.context_reasons,
+                "context_fused":setup.context_fused,
                 "trade_eligible":trade_eligible,
                 "estimated_roundtrip_fee_bps":6.0,
                 "trade_gate":{
@@ -711,12 +855,15 @@ impl OrderFlowExhaustion {
         let mut reason = "等待自适应放量事件";
         let mut out = Vec::new();
 
-        if let Some(setup) = self.setup.clone() {
+        if let Some(mut setup) = self.setup.take() {
             if b.start_ms > setup.expires_at {
                 decision = "expired";
                 reason = "放量事件在确认窗口内未出现 Delta 反转";
-                self.setup = None;
             } else {
+                let trdr = trdr_context(ctx, setup.side, &self.cfg, ts.as_millis());
+                let oi_support = trdr.oi_quadrant != "neutral"
+                    || oi_change.is_some_and(|value| value.abs() >= 0.0005);
+                fuse_setup_context(&mut setup, &trdr, oi_support, &self.cfg, ts.as_millis());
                 let reverse_delta = match setup.side {
                     Side::Buy => delta_share >= self.cfg.confirm_delta_share,
                     Side::Sell => delta_share <= -self.cfg.confirm_delta_share,
@@ -734,9 +881,12 @@ impl OrderFlowExhaustion {
                         "反转已确认，但只记录研究样本，不允许下单"
                     };
                     out.push(self.signal(ts, &setup, b.close, delta_share));
-                    self.setup = None;
-                    self.cooldown_until =
+                    let slot = side_slot(setup.side);
+                    self.cooldown_until[slot] =
                         b.start_ms + self.cfg.cluster_cooldown_buckets as i64 * self.cfg.bucket_ms;
+                    self.cooldown_price[slot] = Some(setup.event_price);
+                } else {
+                    self.setup = Some(setup);
                 }
             }
         }
@@ -755,12 +905,24 @@ impl OrderFlowExhaustion {
         let volume_event =
             volume_ratio >= self.cfg.classic_volume_ratio && pressure_side.is_some() && no_result;
 
-        if self.setup.is_none() && volume_event && decision == "none" {
-            if b.start_ms < self.cooldown_until {
+        if volume_event && decision == "none" {
+            let side = exhausted_side.expect("volume event has pressure side");
+            let slot = side_slot(side);
+            let cooldown_blocks = self.cooldown_blocks(side, b.start_ms, b.close, volume_ratio);
+            let exceptional = self.rearm_triggered(side, b.close, volume_ratio);
+            let replace_pending = self.setup.as_ref().is_some_and(|pending| {
+                exceptional
+                    && (pending.side != side
+                        || volume_ratio >= self.cfg.cooldown_rearm_volume_ratio)
+            });
+            let can_arm = self.setup.is_none() || replace_pending;
+            if !can_arm {
+                // Existing confirmation window remains authoritative unless a genuinely
+                // exceptional/opposite event starts a new market episode.
+            } else if cooldown_blocks {
                 decision = "deduplicated";
-                reason = "同一放量事件簇仍在冷却，已去重";
+                reason = "同方向同价区事件仍在冷却，已去重";
             } else {
-                let side = exhausted_side.expect("volume event has pressure side");
                 let trdr = trdr_context(ctx, side, &self.cfg, ts.as_millis());
                 if trdr.trend_blocked {
                     decision = "trend_blocked";
@@ -855,6 +1017,14 @@ impl OrderFlowExhaustion {
                     } else {
                         b.close
                     },
+                    entry_price: if trdr.zone_matches {
+                        match (trdr.zone_low, trdr.zone_high) {
+                            (Some(lo), Some(hi)) => (lo + hi) / 2.0,
+                            _ => b.close,
+                        }
+                    } else {
+                        b.close
+                    },
                     stop_anchor,
                     event_volume: b.volume,
                     event_volume_ratio: volume_ratio,
@@ -868,6 +1038,7 @@ impl OrderFlowExhaustion {
                     ),
                     context_score,
                     context_reasons,
+                    context_fused: false,
                     trdr_zone_grade: trdr.zone_grade,
                     trdr_zone_band_pct: trdr.zone_band_pct,
                     trdr_zone_ratio: trdr.zone_ratio,
@@ -900,7 +1071,9 @@ impl OrderFlowExhaustion {
                     expires_at: b.start_ms + confirm_buckets as i64 * self.cfg.bucket_ms,
                 });
                 decision = "volume_event";
-                reason = if strong {
+                reason = if exceptional && b.start_ms < self.cooldown_until[slot] {
+                    "异常放量或新价区事件，已突破同方向冷却并等待反转"
+                } else if strong {
                     "强放量事件，等待 3 分钟内 Delta 反转"
                 } else {
                     "弱放量事件，等待 5 分钟内 Delta 反转"
@@ -913,9 +1086,12 @@ impl OrderFlowExhaustion {
                 "event_id":s.event_id,
                 "side":match s.side { Side::Buy => "buy", Side::Sell => "sell" },
                 "strength":s.strength,
+                "event_price":s.event_price,
+                "entry_price":s.entry_price,
                 "expires_at_ms":s.expires_at,
-            "context_score":s.context_score,
-            "location_confirmed":s.location_confirmed,
+                "context_score":s.context_score,
+                "context_fused":s.context_fused,
+                "location_confirmed":s.location_confirmed,
                 "absorption_confirmed":s.absorption_confirmed,
                 "trend_aligned":s.trend_aligned,
                 "context_reasons":s.context_reasons,
@@ -1143,6 +1319,7 @@ mod tests {
             side: Side::Sell,
             strength: "strong",
             event_price: 100.0,
+            entry_price: 100.0,
             stop_anchor: 101.0,
             event_volume: 1_000.0,
             event_volume_ratio: volume_ratio,
@@ -1153,6 +1330,7 @@ mod tests {
             trend_aligned: false,
             context_score,
             context_reasons: vec![],
+            context_fused: false,
             trdr_zone_grade: "yellow".into(),
             trdr_zone_band_pct: Some(0.025),
             trdr_zone_ratio: Some(2.5),
@@ -1223,6 +1401,72 @@ mod tests {
         aligned.trdr_regime = "trend_up".into();
         aligned.trend_aligned = true;
         assert_eq!(s.profile(&aligned), "verified_context");
+    }
+
+    #[test]
+    fn cooldown_is_directional_and_exceptional_events_rearm_it() {
+        let mut signal = test_signal();
+        signal.cfg.cooldown_rearm_volume_ratio = 50.0;
+        signal.cfg.cooldown_rearm_price_pct = 0.005;
+        signal.cooldown_until[side_slot(Side::Sell)] = 20_000;
+        signal.cooldown_price[side_slot(Side::Sell)] = Some(100.0);
+
+        assert!(signal.cooldown_blocks(Side::Sell, 10_000, 100.1, 10.0));
+        assert!(!signal.cooldown_blocks(Side::Buy, 10_000, 100.1, 10.0));
+        assert!(!signal.cooldown_blocks(Side::Sell, 10_000, 100.1, 50.0));
+        assert!(!signal.cooldown_blocks(Side::Sell, 10_000, 100.51, 10.0));
+    }
+
+    #[test]
+    fn pending_event_can_fuse_later_trdr_context() {
+        let signal = test_signal();
+        let mut ctx = Ctx::default();
+        ctx.set_latest(Signal::new(
+            SignalKind::ObiZone,
+            Timestamp::from_millis(40_000),
+            "test",
+            json!({
+                "active":true,"ts_ms":40_000,"side":"sell","grade":"red",
+                "grade_rank":3,"distance_pct":0.001,"persistence_ms":40_000,
+                "spot_perp_confluence":true,"zone_low":99.8,"zone_high":100.2,
+                "ratio":4.0,"wall_usd":40_000_000.0
+            }),
+        ));
+        ctx.set_latest(Signal::new(
+            SignalKind::DeltaTier,
+            Timestamp::from_millis(40_000),
+            "test",
+            json!({
+                "ts_ms":40_000,"tier":3,"direction":"buy",
+                "source_coverage_complete":true,"footprint_direction":"buy",
+                "stacked_imbalance":4,"spot_delta_usd":1.0,"perp_delta_usd":2.0
+            }),
+        ));
+        ctx.set_latest(Signal::new(
+            SignalKind::OiQuadrant,
+            Timestamp::from_millis(40_000),
+            "test",
+            json!({"quadrant":"new_longs"}),
+        ));
+        ctx.set_latest(Signal::new(
+            SignalKind::TrendRegime,
+            Timestamp::from_millis(40_000),
+            "test",
+            json!({"regime":"range","blocked_side":"none"}),
+        ));
+
+        let mut pending = setup(60.0, false, 2);
+        pending.event_id = 10_000;
+        pending.context_reasons = vec!["absorption".into(), "oi".into()];
+        let trdr = trdr_context(&ctx, Side::Sell, &signal.cfg, 40_000);
+        fuse_setup_context(&mut pending, &trdr, true, &signal.cfg, 40_000);
+
+        assert!(pending.context_fused);
+        assert!(pending.location_confirmed);
+        assert!(pending.trdr_footprint_matches);
+        assert!(pending.trdr_source_coverage_complete);
+        assert_eq!(pending.trdr_zone_grade, "red");
+        assert!(pending.context_score >= 6);
     }
 
     #[test]

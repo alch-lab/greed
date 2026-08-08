@@ -36,6 +36,12 @@ pub fn register_builtin(r: &mut PluginRegistry) {
             )) as Box<dyn tcore::SignalPlugin>,
         )
     });
+    r.register_signal("TacticalPullback", |p| {
+        Ok(
+            Box::new(signals::tactical_pullback::TacticalPullback::from_params(p))
+                as Box<dyn tcore::SignalPlugin>,
+        )
+    });
 }
 
 #[cfg(test)]
@@ -48,6 +54,7 @@ mod tests {
         assert!(r.filter_names().contains(&"CircuitBreaker"));
         assert!(r.signal_names().contains(&"TrdrMarketMap"));
         assert!(r.signal_names().contains(&"OrderFlowExhaustion"));
+        assert!(r.signal_names().contains(&"TacticalPullback"));
         assert!(r.trigger_names().contains(&"OrderFlowEntry"));
         assert!(r.trigger_names().contains(&"HybridEntry"));
     }

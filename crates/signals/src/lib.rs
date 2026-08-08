@@ -5,5 +5,6 @@
 //! 近似模型已退出装配入口，避免同名概念对应不同实现。
 
 pub mod orderflow_exhaustion;
+pub mod tactical_pullback;
 pub mod trdr_market_map;
 pub mod trend_continuation;
