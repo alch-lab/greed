@@ -33,6 +33,12 @@ pub struct SymbolFilters {
     pub tick_size: f64,
     /// 数量最小步长（LOT_SIZE stepSize）
     pub step_size: f64,
+    /// 市价类订单数量步长（MARKET_LOT_SIZE）。
+    pub market_step_size: f64,
+    /// 价格允许的最大小数位（exchangeInfo.pricePrecision）。
+    pub price_precision: usize,
+    /// 数量允许的最大小数位（exchangeInfo.quantityPrecision）。
+    pub quantity_precision: usize,
     /// 最小名义价值（MIN_NOTIONAL/NOTIONAL）
     pub min_notional: f64,
 }
@@ -42,7 +48,7 @@ pub fn floor_to_step(x: f64, step: f64) -> f64 {
     if step <= 0.0 {
         return x;
     }
-    (x / step).floor() * step
+    ((x / step) + 1e-10).floor() * step
 }
 
 /// 向上取整到步长的整数倍。保护性止损按方向选择更保守的 tick。
@@ -50,22 +56,106 @@ pub fn ceil_to_step(x: f64, step: f64) -> f64 {
     if step <= 0.0 {
         return x;
     }
-    (x / step).ceil() * step
+    ((x / step) - 1e-10).ceil() * step
 }
 
 /// 把 f64 格式化成币安接受的十进制字符串（按步长推小数位，去尾零）。
 pub fn fmt_step(x: f64, step: f64) -> String {
-    let decimals = if step >= 1.0 {
-        0
-    } else {
-        (-step.log10()).ceil().max(0.0) as usize
-    };
+    let decimals = step_decimal_places(step);
     let s = format!("{:.*}", decimals, x);
     if s.contains('.') {
         s.trim_end_matches('0').trim_end_matches('.').to_string()
     } else {
         s
     }
+}
+
+fn step_decimal_places(step: f64) -> usize {
+    (0..=15)
+        .find(|decimals| {
+            let scaled = step * 10f64.powi(*decimals as i32);
+            (scaled - scaled.round()).abs() < 1e-9
+        })
+        .unwrap_or(15)
+}
+
+/// 同时遵守步长与交易对最大小数位。部分山寨币的 MARKET_LOT_SIZE 与
+/// LOT_SIZE 不同，单靠 stepSize 推导小数位会触发 Binance -1111。
+pub fn fmt_step_with_precision(x: f64, step: f64, precision: usize) -> String {
+    let precision_step = 10f64.powi(-(precision.min(15) as i32));
+    let effective_step = step.max(precision_step);
+    let aligned = floor_to_step(x, effective_step);
+    let step_decimals = step_decimal_places(effective_step);
+    let decimals = step_decimals.min(precision);
+    let s = format!("{:.*}", decimals, aligned + effective_step * 1e-9);
+    if s.contains('.') {
+        s.trim_end_matches('0').trim_end_matches('.').to_string()
+    } else {
+        s
+    }
+}
+
+fn quantity_string(kind: &str, qty: f64, filters: &SymbolFilters) -> String {
+    let step = if kind == "MARKET" || kind == "STOP_MARKET" {
+        filters.market_step_size
+    } else {
+        filters.step_size
+    };
+    fmt_step_with_precision(qty, step, filters.quantity_precision)
+}
+
+fn parse_symbol_filters(
+    value: &serde_json::Value,
+    symbol: &str,
+) -> Result<SymbolFilters, RestError> {
+    let sym = value["symbols"]
+        .as_array()
+        .and_then(|symbols| symbols.first())
+        .ok_or_else(|| RestError::Data(format!("exchangeInfo 无 {symbol}")))?;
+    let mut filters = SymbolFilters {
+        tick_size: 0.1,
+        step_size: 0.001,
+        market_step_size: 0.001,
+        price_precision: sym["pricePrecision"].as_u64().unwrap_or(8) as usize,
+        quantity_precision: sym["quantityPrecision"].as_u64().unwrap_or(8) as usize,
+        min_notional: 100.0,
+    };
+    let mut market_step_seen = false;
+    for filter in sym["filters"].as_array().cloned().unwrap_or_default() {
+        match filter["filterType"].as_str().unwrap_or("") {
+            "PRICE_FILTER" => {
+                filters.tick_size = filter["tickSize"]
+                    .as_str()
+                    .and_then(|text| text.parse().ok())
+                    .unwrap_or(filters.tick_size)
+            }
+            "LOT_SIZE" => {
+                filters.step_size = filter["stepSize"]
+                    .as_str()
+                    .and_then(|text| text.parse().ok())
+                    .unwrap_or(filters.step_size)
+            }
+            "MARKET_LOT_SIZE" => {
+                market_step_seen = true;
+                filters.market_step_size = filter["stepSize"]
+                    .as_str()
+                    .and_then(|text| text.parse().ok())
+                    .unwrap_or(filters.step_size)
+            }
+            "MIN_NOTIONAL" | "NOTIONAL" => {
+                filters.min_notional = filter["notional"]
+                    .as_str()
+                    .or_else(|| filter["minNotional"].as_str())
+                    .and_then(|text| text.parse().ok())
+                    .unwrap_or(filters.min_notional)
+            }
+            _ => {}
+        }
+    }
+    if !market_step_seen || filters.market_step_size <= 0.0 {
+        filters.market_step_size = filters.step_size;
+    }
+    Ok(filters)
 }
 
 /// 一笔账户成交（GET /fapi/v1/userTrades）。
@@ -193,40 +283,7 @@ impl RestClient {
                 self.base, symbol
             ))
             .await?;
-        let sym = v["symbols"]
-            .as_array()
-            .and_then(|a| a.first())
-            .ok_or_else(|| RestError::Data(format!("exchangeInfo 无 {}", symbol)))?;
-        let mut f = SymbolFilters {
-            tick_size: 0.1,
-            step_size: 0.001,
-            min_notional: 100.0,
-        };
-        for flt in sym["filters"].as_array().cloned().unwrap_or_default() {
-            match flt["filterType"].as_str().unwrap_or("") {
-                "PRICE_FILTER" => {
-                    f.tick_size = flt["tickSize"]
-                        .as_str()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(f.tick_size)
-                }
-                "LOT_SIZE" => {
-                    f.step_size = flt["stepSize"]
-                        .as_str()
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(f.step_size)
-                }
-                "MIN_NOTIONAL" | "NOTIONAL" => {
-                    f.min_notional = flt["notional"]
-                        .as_str()
-                        .or_else(|| flt["minNotional"].as_str())
-                        .and_then(|s| s.parse().ok())
-                        .unwrap_or(f.min_notional)
-                }
-                _ => {}
-            }
-        }
-        Ok(f)
+        parse_symbol_filters(&v, symbol)
     }
 
     /// 设置杠杆（启动时调用一次）。
@@ -361,7 +418,7 @@ impl RestClient {
         reduce_only: bool,
         filters: &SymbolFilters,
     ) -> Result<i64, RestError> {
-        let qty_s = fmt_step(floor_to_step(qty, filters.step_size), filters.step_size);
+        let qty_s = quantity_string(kind, qty, filters);
         let mut params: Vec<(&str, String)> = vec![
             ("symbol", symbol.to_string()),
             ("side", side.to_string()),
@@ -373,18 +430,24 @@ impl RestClient {
             params.push(("timeInForce", "GTC".into()));
             params.push((
                 "price",
-                fmt_step(floor_to_step(p, filters.tick_size), filters.tick_size),
+                fmt_step_with_precision(p, filters.tick_size, filters.price_precision),
             ));
         }
         if kind == "STOP_MARKET" {
             let sp =
                 stop_price.ok_or_else(|| RestError::Data("STOP_MARKET 缺 triggerPrice".into()))?;
+            let precision_tick = filters
+                .tick_size
+                .max(10f64.powi(-(filters.price_precision.min(15) as i32)));
             let aligned = if side == "SELL" {
-                ceil_to_step(sp, filters.tick_size)
+                ceil_to_step(sp, precision_tick)
             } else {
-                floor_to_step(sp, filters.tick_size)
+                floor_to_step(sp, precision_tick)
             };
-            params.push(("triggerPrice", fmt_step(aligned, filters.tick_size)));
+            params.push((
+                "triggerPrice",
+                fmt_step_with_precision(aligned, precision_tick, filters.price_precision),
+            ));
             params.push(("algoType", "CONDITIONAL".into()));
             params.push(("workingType", "CONTRACT_PRICE".into()));
         }
@@ -490,6 +553,46 @@ mod tests {
         assert_eq!(fmt_step(67000.0, 0.1), "67000");
         assert_eq!(fmt_step(67000.1, 0.1), "67000.1");
         assert!((ceil_to_step(100.01, 0.1) - 100.1).abs() < 1e-9);
+        assert!((floor_to_step(0.15, 0.05) - 0.15).abs() < 1e-12);
+        assert_eq!(fmt_step(2.5, 2.5), "2.5");
+        assert_eq!(fmt_step_with_precision(123.456, 0.001, 0), "123");
+        assert_eq!(fmt_step_with_precision(0.159, 0.05, 2), "0.15");
+
+        let filters = SymbolFilters {
+            tick_size: 0.0001,
+            step_size: 0.001,
+            market_step_size: 1.0,
+            price_precision: 4,
+            quantity_precision: 3,
+            min_notional: 5.0,
+        };
+        assert_eq!(quantity_string("MARKET", 123.456, &filters), "123");
+        assert_eq!(quantity_string("STOP_MARKET", 123.456, &filters), "123");
+        assert_eq!(quantity_string("LIMIT", 123.456, &filters), "123.456");
+    }
+
+    #[test]
+    fn parses_market_lot_size_and_precision_independently() {
+        let value = serde_json::json!({
+            "symbols": [{
+                "symbol": "CATIUSDT",
+                "pricePrecision": 5,
+                "quantityPrecision": 0,
+                "filters": [
+                    {"filterType":"PRICE_FILTER", "tickSize":"0.00001000"},
+                    {"filterType":"LOT_SIZE", "stepSize":"0.10000000"},
+                    {"filterType":"MARKET_LOT_SIZE", "stepSize":"1.00000000"},
+                    {"filterType":"MIN_NOTIONAL", "notional":"5"}
+                ]
+            }]
+        });
+        let filters = parse_symbol_filters(&value, "CATIUSDT").unwrap();
+        assert_eq!(filters.tick_size, 0.00001);
+        assert_eq!(filters.step_size, 0.1);
+        assert_eq!(filters.market_step_size, 1.0);
+        assert_eq!(filters.price_precision, 5);
+        assert_eq!(filters.quantity_precision, 0);
+        assert_eq!(quantity_string("MARKET", 7_695.267, &filters), "7695");
     }
 
     #[test]

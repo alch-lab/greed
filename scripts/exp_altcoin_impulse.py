@@ -444,6 +444,26 @@ def main() -> None:
             except Exception as error:
                 print(f"warning: {symbol}: {error}", flush=True)
     models = [
+        Model(
+            "fast-impulse-R2",
+            0.04,
+            0.06,
+            3.0,
+            stop_fraction=0.05,
+            trail_fraction=0.03,
+            trail_activation=0.05,
+            risk_per_trade=0.10,
+            max_symbol_weight=2.0,
+            max_positions=2,
+            max_gross=4.0,
+            cooldown_bars=32,
+            max_holding_bars=24,
+            maximum_return_1h=0.45,
+            maximum_return_4h=1.20,
+            minimum_efficiency=0.35,
+            minimum_close_location=0.60,
+            maximum_daily_entries=6,
+        ),
         Model("balanced-R1.5", 0.04, 0.08, 4.0, risk_per_trade=0.015, max_positions=2, max_gross=1.0, cooldown_bars=96),
         Model("balanced-R2", 0.04, 0.08, 4.0, risk_per_trade=0.02, max_positions=2, max_gross=1.25, cooldown_bars=96),
         Model("strict-R2", 0.06, 0.10, 5.0, risk_per_trade=0.02, max_positions=2, max_gross=1.25, cooldown_bars=96),

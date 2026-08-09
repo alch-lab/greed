@@ -107,6 +107,14 @@ struct Position {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct ExecutionIssue {
+    ts_ms: i64,
+    symbol: String,
+    stage: String,
+    reason: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedState {
     cash: f64,
     realized_pnl: f64,
@@ -120,6 +128,10 @@ struct PersistedState {
     total_entries: u64,
     total_exits: u64,
     wins: u64,
+    #[serde(default)]
+    rejected_entries: u64,
+    #[serde(default)]
+    last_execution_issue: Option<ExecutionIssue>,
 }
 
 impl PersistedState {
@@ -137,7 +149,19 @@ impl PersistedState {
             total_entries: 0,
             total_exits: 0,
             wins: 0,
+            rejected_entries: 0,
+            last_execution_issue: None,
         }
+    }
+
+    fn note_execution_issue(&mut self, ts_ms: i64, symbol: &str, stage: &str, reason: String) {
+        self.rejected_entries += 1;
+        self.last_execution_issue = Some(ExecutionIssue {
+            ts_ms,
+            symbol: symbol.to_owned(),
+            stage: stage.to_owned(),
+            reason,
+        });
     }
 }
 
@@ -469,6 +493,31 @@ async fn closing_fill(
         .filter_map(|fill| fill.commission.parse::<f64>().ok())
         .sum();
     Ok(Some((quote / qty, qty, fee)))
+}
+
+async fn emergency_flatten(
+    rest: &live::RestClient,
+    symbol: &str,
+    filters: &live::SymbolFilters,
+) -> Result<Option<(f64, f64, f64)>> {
+    let amount = rest.position_amt(symbol).await?;
+    if amount.abs() <= 1e-12 {
+        return Ok(None);
+    }
+    let side = if amount > 0.0 { "SELL" } else { "BUY" };
+    let order = rest
+        .place_order(
+            symbol,
+            side,
+            "MARKET",
+            amount.abs(),
+            None,
+            None,
+            true,
+            filters,
+        )
+        .await?;
+    Ok(Some(wait_fill(rest, symbol, order).await?))
 }
 
 /// 是否为山寨币专用配置。读取失败留给正式运行器报告。
@@ -868,25 +917,87 @@ pub async fn run_altcoin_impulse(
             let mut qty = notional / entry;
             let mut fee = notional * 0.0005;
             if let Some(client) = rest.as_ref() {
-                client
+                if let Err(error) = client
                     .set_leverage(&candidate.symbol, cfg.exchange_leverage)
-                    .await?;
-                client.set_margin_isolated(&candidate.symbol).await?;
+                    .await
+                {
+                    state.note_execution_issue(
+                        scan_ms,
+                        &candidate.symbol,
+                        "set_leverage",
+                        error.to_string(),
+                    );
+                    append_event(
+                        &event_path,
+                        json!({"ts_ms":scan_ms,"event":"entry_rejected","stage":"set_leverage","symbol":candidate.symbol,"reason":error.to_string()}),
+                    )?;
+                    continue;
+                }
+                if let Err(error) = client.set_margin_isolated(&candidate.symbol).await {
+                    state.note_execution_issue(
+                        scan_ms,
+                        &candidate.symbol,
+                        "set_margin",
+                        error.to_string(),
+                    );
+                    append_event(
+                        &event_path,
+                        json!({"ts_ms":scan_ms,"event":"entry_rejected","stage":"set_margin","symbol":candidate.symbol,"reason":error.to_string()}),
+                    )?;
+                    continue;
+                }
                 let filters = match client.symbol_filters(&candidate.symbol).await {
                     Ok(filters) => filters,
                     Err(e) => {
+                        state.note_execution_issue(
+                            scan_ms,
+                            &candidate.symbol,
+                            "exchange_info",
+                            e.to_string(),
+                        );
                         append_event(
                             &event_path,
-                            json!({"ts_ms":scan_ms,"event":"entry_rejected","symbol":candidate.symbol,"reason":format!("demo 不支持或精度失败: {e}")}),
+                            json!({"ts_ms":scan_ms,"event":"entry_rejected","stage":"exchange_info","symbol":candidate.symbol,"reason":format!("demo 不支持或精度失败: {e}")}),
                         )?;
                         continue;
                     }
                 };
                 if notional < filters.min_notional {
+                    let reason = format!(
+                        "名义仓位 {:.2} USDT 低于交易所最小值 {:.2} USDT",
+                        notional, filters.min_notional
+                    );
+                    state.note_execution_issue(
+                        scan_ms,
+                        &candidate.symbol,
+                        "minimum_notional",
+                        reason.clone(),
+                    );
+                    append_event(
+                        &event_path,
+                        json!({"ts_ms":scan_ms,"event":"entry_rejected","stage":"minimum_notional","symbol":candidate.symbol,"reason":reason}),
+                    )?;
                     continue;
                 }
                 let side = if candidate.side > 0 { "BUY" } else { "SELL" };
-                let order = client
+                let formatted_qty = live::rest::fmt_step_with_precision(
+                    qty,
+                    filters.market_step_size,
+                    filters.quantity_precision,
+                );
+                append_event(
+                    &event_path,
+                    json!({
+                        "ts_ms":scan_ms,"event":"entry_attempt","symbol":candidate.symbol,
+                        "side":side,"raw_qty":qty,"formatted_qty":formatted_qty,
+                        "notional":notional,"price":candidate.price,
+                        "filters":{"lot_step":filters.step_size,"market_step":filters.market_step_size,
+                            "quantity_precision":filters.quantity_precision,"tick_size":filters.tick_size,
+                            "price_precision":filters.price_precision,"min_notional":filters.min_notional},
+                        "signal":candidate
+                    }),
+                )?;
+                let order = match client
                     .place_order(
                         &candidate.symbol,
                         side,
@@ -897,11 +1008,47 @@ pub async fn run_altcoin_impulse(
                         false,
                         &filters,
                     )
-                    .await?;
-                (entry, qty, fee) = wait_fill(client, &candidate.symbol, order).await?;
+                    .await
+                {
+                    Ok(order) => order,
+                    Err(error) => {
+                        state.note_execution_issue(
+                            scan_ms,
+                            &candidate.symbol,
+                            "market_order",
+                            error.to_string(),
+                        );
+                        append_event(
+                            &event_path,
+                            json!({"ts_ms":scan_ms,"event":"entry_rejected","stage":"market_order","symbol":candidate.symbol,"reason":error.to_string(),"formatted_qty":formatted_qty}),
+                        )?;
+                        continue;
+                    }
+                };
+                match wait_fill(client, &candidate.symbol, order).await {
+                    Ok(fill) => (entry, qty, fee) = fill,
+                    Err(error) => {
+                        state.note_execution_issue(
+                            scan_ms,
+                            &candidate.symbol,
+                            "fill_reconciliation",
+                            error.to_string(),
+                        );
+                        let emergency =
+                            emergency_flatten(client, &candidate.symbol, &filters).await;
+                        append_event(
+                            &event_path,
+                            json!({"ts_ms":scan_ms,"event":"entry_reconciliation_failed","symbol":candidate.symbol,"order_id":order,"reason":error.to_string(),"emergency_flatten":format!("{emergency:?}")}),
+                        )?;
+                        emergency.with_context(|| {
+                            format!("{} 成交回报不明且应急平仓失败", candidate.symbol)
+                        })?;
+                        continue;
+                    }
+                }
                 let stop = entry * (1.0 - candidate.side as f64 * cfg.stop_pct);
                 let close_side = if candidate.side > 0 { "SELL" } else { "BUY" };
-                client
+                if let Err(error) = client
                     .place_order(
                         &candidate.symbol,
                         close_side,
@@ -912,9 +1059,27 @@ pub async fn run_altcoin_impulse(
                         true,
                         &filters,
                     )
-                    .await?;
+                    .await
+                {
+                    state.note_execution_issue(
+                        scan_ms,
+                        &candidate.symbol,
+                        "protective_stop",
+                        error.to_string(),
+                    );
+                    let emergency = emergency_flatten(client, &candidate.symbol, &filters).await;
+                    append_event(
+                        &event_path,
+                        json!({"ts_ms":scan_ms,"event":"protection_failed","symbol":candidate.symbol,"entry_price":entry,"qty":qty,"stop_price":stop,"reason":error.to_string(),"emergency_flatten":format!("{emergency:?}")}),
+                    )?;
+                    emergency.with_context(|| {
+                        format!("{} 止损挂单失败且应急平仓失败", candidate.symbol)
+                    })?;
+                    continue;
+                }
             }
             let stop = entry * (1.0 - candidate.side as f64 * cfg.stop_pct);
+            state.last_execution_issue = None;
             state.cash -= fee;
             state.fees += fee;
             state.daily_entries += 1;
@@ -969,6 +1134,7 @@ pub async fn run_altcoin_impulse(
                     "daily_entries":state.daily_entries, "max_daily_entries":cfg.max_daily_entries,
                     "daily_loss_blocked":daily_loss_blocked, "positions":state.positions.values().collect::<Vec<_>>(),
                     "total_entries":state.total_entries, "total_exits":state.total_exits, "wins":state.wins,
+                    "rejected_entries":state.rejected_entries, "last_execution_issue":state.last_execution_issue,
                     "realized_pnl":state.realized_pnl, "fees":state.fees,
                     "candidates":candidates.into_iter().take(10).collect::<Vec<_>>(),
                     "journal":event_path,
@@ -993,12 +1159,12 @@ mod tests {
     #[test]
     fn exchange_leverage_does_not_change_stop_risk() {
         let equity = 1_000.0;
-        let risk = 0.02;
-        let stop = 0.08;
+        let risk = 0.10;
+        let stop = 0.05;
         let leverage = 10.0;
         let notional = equity * risk / stop;
-        assert_eq!(notional, 250.0);
-        assert_eq!(notional / leverage, 25.0);
-        assert_eq!(notional * stop, 20.0);
+        assert_eq!(notional, 2_000.0);
+        assert_eq!(notional / leverage, 200.0);
+        assert_eq!(notional * stop, 100.0);
     }
 }
