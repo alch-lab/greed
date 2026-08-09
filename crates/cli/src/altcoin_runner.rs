@@ -132,6 +132,8 @@ struct PersistedState {
     rejected_entries: u64,
     #[serde(default)]
     last_execution_issue: Option<ExecutionIssue>,
+    #[serde(default)]
+    recent_trades: Vec<Value>,
 }
 
 impl PersistedState {
@@ -151,6 +153,7 @@ impl PersistedState {
             wins: 0,
             rejected_entries: 0,
             last_execution_issue: None,
+            recent_trades: Vec::new(),
         }
     }
 
@@ -162,6 +165,13 @@ impl PersistedState {
             stage: stage.to_owned(),
             reason,
         });
+    }
+
+    fn record_trade(&mut self, event: Value) {
+        self.recent_trades.push(event);
+        if self.recent_trades.len() > 100 {
+            self.recent_trades.drain(..self.recent_trades.len() - 100);
+        }
     }
 }
 
@@ -412,6 +422,26 @@ fn append_event(path: &str, event: Value) -> Result<()> {
     Ok(())
 }
 
+fn load_recent_trades(path: &str) -> Vec<Value> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut events: Vec<Value> = text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+        .filter(|event| {
+            matches!(
+                event["event"].as_str(),
+                Some("entry" | "exit" | "exit_detected")
+            )
+        })
+        .collect();
+    if events.len() > 100 {
+        events.drain(..events.len() - 100);
+    }
+    events
+}
+
 fn save_state(path: &str, state: &PersistedState) -> Result<()> {
     if let Some(parent) = std::path::Path::new(path).parent() {
         std::fs::create_dir_all(parent)?;
@@ -602,6 +632,9 @@ pub async fn run_altcoin_impulse(
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_else(|| PersistedState::new(initial_cash, now_ms));
+    if state.recent_trades.is_empty() {
+        state.recent_trades = load_recent_trades(&event_path);
+    }
     if let Some(client) = rest.as_ref() {
         let external: Vec<_> = client
             .open_position_amounts()
@@ -746,10 +779,9 @@ pub async fn run_altcoin_impulse(
                         symbol.clone(),
                         scan_ms + cfg.cooldown_hours as i64 * 3_600_000,
                     );
-                    append_event(
-                        &event_path,
-                        json!({"ts_ms":scan_ms,"event":"exit_detected","symbol":symbol,"price":exit,"qty":exit_qty,"pnl":pnl,"fee":exit_fee,"trade_reconciled":reconciled}),
-                    )?;
+                    let event = json!({"ts_ms":scan_ms,"event":"exit_detected","symbol":symbol,"side":position.side,"price":exit,"qty":exit_qty,"pnl":pnl,"fee":exit_fee,"trade_reconciled":reconciled});
+                    append_event(&event_path, event.clone())?;
+                    state.record_trade(event);
                     continue;
                 }
             }
@@ -800,10 +832,9 @@ pub async fn run_altcoin_impulse(
                     symbol.clone(),
                     scan_ms + cfg.cooldown_hours as i64 * 3_600_000,
                 );
-                append_event(
-                    &event_path,
-                    json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"reason":if stopped{"stop"}else{"time"},"price":exit,"pnl":pnl}),
-                )?;
+                let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"reason":if stopped{"stop"}else{"time"},"price":exit,"qty":position.qty,"pnl":pnl,"fee":fee});
+                append_event(&event_path, event.clone())?;
+                state.record_trade(event);
             } else if let Some(client) = rest.as_ref() {
                 if timed {
                     client.cancel_all_open_orders(&symbol).await?;
@@ -838,10 +869,9 @@ pub async fn run_altcoin_impulse(
                         symbol.clone(),
                         scan_ms + cfg.cooldown_hours as i64 * 3_600_000,
                     );
-                    append_event(
-                        &event_path,
-                        json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"reason":"time","price":exit,"pnl":pnl,"fee":fee}),
-                    )?;
+                    let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"reason":"time","price":exit,"qty":position.qty,"pnl":pnl,"fee":fee});
+                    append_event(&event_path, event.clone())?;
+                    state.record_trade(event);
                 } else {
                     // 每根闭合 K 线重挂一次保护单，使交易所始终持有真实止损。
                     client.cancel_all_open_orders(&symbol).await?;
@@ -1103,13 +1133,33 @@ pub async fn run_altcoin_impulse(
                     last_bar_ms: candidate.signal_ms,
                 },
             );
-            append_event(
-                &event_path,
-                json!({"ts_ms":scan_ms,"event":"entry","symbol":candidate.symbol,"side":candidate.side,"signal":candidate,"entry_price":entry,"qty":qty,"notional":qty*entry,"margin_estimate":qty*entry/cfg.exchange_leverage as f64,"risk_usd":qty*entry*cfg.stop_pct,"fee":fee}),
-            )?;
+            let event = json!({"ts_ms":scan_ms,"event":"entry","symbol":candidate.symbol,"side":candidate.side,"signal":candidate,"entry_price":entry,"qty":qty,"notional":qty*entry,"margin_estimate":qty*entry/cfg.exchange_leverage as f64,"risk_usd":qty*entry*cfg.stop_pct,"fee":fee});
+            append_event(&event_path, event.clone())?;
+            state.record_trade(event);
         }
         save_state(&state_path, &state)?;
         let current_equity = equity(&state, &prices);
+        let mut open_positions: Vec<_> = state.positions.values().collect();
+        open_positions.sort_by_key(|position| position.entry_ms);
+        let position_status: Vec<Value> = open_positions
+            .into_iter()
+            .map(|position| {
+                let mark_price = prices
+                    .get(&position.symbol)
+                    .copied()
+                    .unwrap_or(position.entry_price);
+                let unrealized_pnl =
+                    position.side as f64 * position.qty * (mark_price - position.entry_price);
+                json!({
+                    "symbol":position.symbol, "side":position.side, "qty":position.qty,
+                    "entry_ms":position.entry_ms, "entry_price":position.entry_price,
+                    "initial_notional":position.initial_notional, "stop_price":position.stop_price,
+                    "extreme":position.extreme, "mark_price":mark_price,
+                    "unrealized_pnl":unrealized_pnl,
+                    "return_pct":position.side as f64 * (mark_price / position.entry_price - 1.0)
+                })
+            })
+            .collect();
         append_event(
             &event_path,
             json!({
@@ -1136,9 +1186,10 @@ pub async fn run_altcoin_impulse(
                     "margin_per_trade_estimate":current_equity*cfg.risk_per_trade/cfg.stop_pct/cfg.exchange_leverage as f64,
                     "worst_loss_per_trade_estimate":current_equity*cfg.risk_per_trade,
                     "daily_entries":state.daily_entries, "max_daily_entries":cfg.max_daily_entries,
-                    "daily_loss_blocked":daily_loss_blocked, "positions":state.positions.values().collect::<Vec<_>>(),
+                    "daily_loss_blocked":daily_loss_blocked, "positions":position_status,
                     "total_entries":state.total_entries, "total_exits":state.total_exits, "wins":state.wins,
                     "rejected_entries":state.rejected_entries, "last_execution_issue":state.last_execution_issue,
+                    "recent_trades":state.recent_trades,
                     "realized_pnl":state.realized_pnl, "fees":state.fees,
                     "candidates":candidates.into_iter().take(10).collect::<Vec<_>>(),
                     "journal":event_path,
