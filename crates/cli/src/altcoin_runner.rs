@@ -554,8 +554,8 @@ pub async fn run_altcoin_impulse(
         "exchange_leverage 必须在 1..=20"
     );
     anyhow::ensure!(
-        cfg.risk_per_trade > 0.0 && cfg.risk_per_trade <= 0.03,
-        "单笔风险硬上限为 3%"
+        cfg.risk_per_trade > 0.0 && cfg.risk_per_trade <= 0.10,
+        "山寨币策略单笔风险必须在 0%..=10%"
     );
     anyhow::ensure!(
         cfg.stop_pct >= 0.03 && cfg.stop_pct <= 0.12,
