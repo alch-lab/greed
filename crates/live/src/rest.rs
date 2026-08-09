@@ -110,7 +110,11 @@ fn parse_symbol_filters(
 ) -> Result<SymbolFilters, RestError> {
     let sym = value["symbols"]
         .as_array()
-        .and_then(|symbols| symbols.first())
+        .and_then(|symbols| {
+            symbols
+                .iter()
+                .find(|item| item["symbol"].as_str() == Some(symbol))
+        })
         .ok_or_else(|| RestError::Data(format!("exchangeInfo 无 {symbol}")))?;
     let mut filters = SymbolFilters {
         tick_size: 0.1,
@@ -278,10 +282,7 @@ impl RestClient {
     /// 交易对精度约束。
     pub async fn symbol_filters(&self, symbol: &str) -> Result<SymbolFilters, RestError> {
         let v = self
-            .get_json(&format!(
-                "{}/fapi/v1/exchangeInfo?symbol={}",
-                self.base, symbol
-            ))
+            .get_json(&format!("{}/fapi/v1/exchangeInfo", self.base))
             .await?;
         parse_symbol_filters(&v, symbol)
     }
@@ -574,19 +575,31 @@ mod tests {
     #[test]
     fn parses_market_lot_size_and_precision_independently() {
         let value = serde_json::json!({
-            "symbols": [{
-                "symbol": "CATIUSDT",
-                "pricePrecision": 5,
-                "quantityPrecision": 0,
-                "filters": [
-                    {"filterType":"PRICE_FILTER", "tickSize":"0.00001000"},
-                    {"filterType":"LOT_SIZE", "stepSize":"0.10000000"},
-                    {"filterType":"MARKET_LOT_SIZE", "stepSize":"1.00000000"},
-                    {"filterType":"MIN_NOTIONAL", "notional":"5"}
-                ]
-            }]
+            "symbols": [
+                {
+                    "symbol": "BTCUSDT",
+                    "pricePrecision": 2,
+                    "quantityPrecision": 3,
+                    "filters": [
+                        {"filterType":"PRICE_FILTER", "tickSize":"0.01000000"},
+                        {"filterType":"LOT_SIZE", "stepSize":"0.00100000"},
+                        {"filterType":"MARKET_LOT_SIZE", "stepSize":"0.00100000"}
+                    ]
+                },
+                {
+                    "symbol": "SHELLUSDT",
+                    "pricePrecision": 5,
+                    "quantityPrecision": 0,
+                    "filters": [
+                        {"filterType":"PRICE_FILTER", "tickSize":"0.00001000"},
+                        {"filterType":"LOT_SIZE", "stepSize":"0.10000000"},
+                        {"filterType":"MARKET_LOT_SIZE", "stepSize":"1.00000000"},
+                        {"filterType":"MIN_NOTIONAL", "notional":"5"}
+                    ]
+                }
+            ]
         });
-        let filters = parse_symbol_filters(&value, "CATIUSDT").unwrap();
+        let filters = parse_symbol_filters(&value, "SHELLUSDT").unwrap();
         assert_eq!(filters.tick_size, 0.00001);
         assert_eq!(filters.step_size, 0.1);
         assert_eq!(filters.market_step_size, 1.0);

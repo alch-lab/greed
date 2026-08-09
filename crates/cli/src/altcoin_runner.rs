@@ -1012,15 +1012,19 @@ pub async fn run_altcoin_impulse(
                 {
                     Ok(order) => order,
                     Err(error) => {
+                        let reason = format!(
+                            "{error}; formatted_qty={formatted_qty}; market_step={}; quantity_precision={}",
+                            filters.market_step_size, filters.quantity_precision
+                        );
                         state.note_execution_issue(
                             scan_ms,
                             &candidate.symbol,
                             "market_order",
-                            error.to_string(),
+                            reason.clone(),
                         );
                         append_event(
                             &event_path,
-                            json!({"ts_ms":scan_ms,"event":"entry_rejected","stage":"market_order","symbol":candidate.symbol,"reason":error.to_string(),"formatted_qty":formatted_qty}),
+                            json!({"ts_ms":scan_ms,"event":"entry_rejected","stage":"market_order","symbol":candidate.symbol,"reason":reason,"formatted_qty":formatted_qty}),
                         )?;
                         continue;
                     }
