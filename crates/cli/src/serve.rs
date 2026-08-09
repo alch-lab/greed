@@ -25,6 +25,7 @@ use tokio::sync::{watch, Mutex};
 use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
 
+use crate::altcoin_runner::{is_altcoin_strategy, run_altcoin_impulse};
 use crate::trade_runner::{run_trade, TradeArgs, TradeMode};
 
 // ============================================================================
@@ -350,7 +351,12 @@ async fn trade_start(
                 break;
             }
             *error.lock().await = None;
-            match run_trade(args.clone(), sd_rx.clone(), Some(st_tx.clone())).await {
+            let result = if is_altcoin_strategy(&args.strategy) {
+                run_altcoin_impulse(args.clone(), sd_rx.clone(), Some(st_tx.clone())).await
+            } else {
+                run_trade(args.clone(), sd_rx.clone(), Some(st_tx.clone())).await
+            };
+            match result {
                 Ok(()) => {
                     info!("交易任务已停止");
                     break;

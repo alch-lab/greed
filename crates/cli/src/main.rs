@@ -6,6 +6,7 @@
 //! - `trade`    → 模拟盘/实盘执行
 //! - `serve`    → HTTP 控制面（前端监控/启停/回测任务）
 
+mod altcoin_runner;
 mod serve;
 mod trade_runner;
 
@@ -541,29 +542,29 @@ async fn main() -> Result<()> {
             ws_base,
         } => {
             let (_tx, rx) = tokio::sync::watch::channel(false);
-            trade_runner::run_trade(
-                trade_runner::TradeArgs {
-                    config,
-                    strategy,
-                    journal,
-                    mode: if dry_run {
-                        Some(trade_runner::TradeMode::Dry)
-                    } else {
-                        None // 由 [account].testnet 推导
-                    },
-                    cash,
-                    risk_pct,
-                    max_risk_pct,
-                    entry_ttl_ms,
-                    cb_max_daily_losses,
-                    cb_daily_dd_pct,
-                    leverage,
-                    ws_base,
+            let args = trade_runner::TradeArgs {
+                config,
+                strategy: strategy.clone(),
+                journal,
+                mode: if dry_run {
+                    Some(trade_runner::TradeMode::Dry)
+                } else {
+                    None // 由 [account].testnet 推导
                 },
-                rx,
-                None,
-            )
-            .await
+                cash,
+                risk_pct,
+                max_risk_pct,
+                entry_ttl_ms,
+                cb_max_daily_losses,
+                cb_daily_dd_pct,
+                leverage,
+                ws_base,
+            };
+            if altcoin_runner::is_altcoin_strategy(&strategy) {
+                altcoin_runner::run_altcoin_impulse(args, rx, None).await
+            } else {
+                trade_runner::run_trade(args, rx, None).await
+            }
         }
         Command::Serve {
             host,

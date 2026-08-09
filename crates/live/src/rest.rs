@@ -310,6 +310,24 @@ impl RestClient {
             .ok_or_else(|| RestError::Data("positionRisk 响应异常".into()))
     }
 
+    /// 账户全部非零 USDⓈ-M 持仓。多币种执行器启动时用它阻止接管外部/BTC 仓位。
+    pub async fn open_position_amounts(&self) -> Result<Vec<(String, f64)>, RestError> {
+        let v = self
+            .signed(reqwest::Method::GET, "/fapi/v2/positionRisk", &[])
+            .await?;
+        let rows = v
+            .as_array()
+            .ok_or_else(|| RestError::Data("positionRisk 响应不是数组".into()))?;
+        Ok(rows
+            .iter()
+            .filter_map(|position| {
+                let symbol = position["symbol"].as_str()?.to_owned();
+                let amount = position["positionAmt"].as_str()?.parse::<f64>().ok()?;
+                (amount.abs() > 1e-12).then_some((symbol, amount))
+            })
+            .collect())
+    }
+
     /// 撤销本交易对全部挂单。
     pub async fn cancel_all_open_orders(&self, symbol: &str) -> Result<(), RestError> {
         self.signed(

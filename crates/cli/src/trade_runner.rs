@@ -134,6 +134,18 @@ pub async fn run_trade(
         let mut rest = live::RestClient::new(http.clone(), account.rest_base(), key, secret);
         rest.sync_time().await?;
 
+        let external: Vec<_> = rest
+            .open_position_amounts()
+            .await?
+            .into_iter()
+            .filter(|(symbol, _)| symbol != &collector.symbol)
+            .collect();
+        anyhow::ensure!(
+            external.is_empty(),
+            "账户存在其他策略/手工持仓 {:?}；单账户模式拒绝同时启动 BTC 执行器",
+            external
+        );
+
         let amt = rest.position_amt(&collector.symbol).await?;
         // 空仓才可在恢复检查前清遗留单。有仓时先保留交易所保护性止损；若后续确认
         // journal 与仓位一致，首个行情节拍会安全撤旧并重挂。若不一致则原止损不受影响。
