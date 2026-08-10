@@ -561,7 +561,7 @@ async fn main() -> Result<()> {
                 ws_base,
             };
             if altcoin_runner::is_altcoin_strategy(&strategy) {
-                altcoin_runner::run_altcoin_impulse(args, rx, None).await
+                altcoin_runner::run_altcoin_impulse(args, rx, None, None, None).await
             } else {
                 trade_runner::run_trade(args, rx, None).await
             }

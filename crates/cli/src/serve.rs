@@ -35,6 +35,8 @@ use crate::trade_runner::{run_trade, TradeArgs, TradeMode};
 struct TradeHandle {
     mode: TradeMode,
     shutdown: watch::Sender<bool>,
+    daily_risk_reset: Option<watch::Sender<u64>>,
+    daily_entry_bonus: Option<watch::Sender<u64>>,
     status_rx: watch::Receiver<serde_json::Value>,
     running: Arc<AtomicBool>,
     error: Arc<Mutex<Option<String>>>,
@@ -327,6 +329,9 @@ async fn trade_start(
         ws_base: None,
     };
     let (sd_tx, sd_rx) = watch::channel(false);
+    let altcoin_strategy = is_altcoin_strategy(&args.strategy);
+    let (risk_reset_tx, risk_reset_rx) = watch::channel(0u64);
+    let (entry_bonus_tx, entry_bonus_rx) = watch::channel(0u64);
     let (st_tx, st_rx) = watch::channel(serde_json::json!({
         "state": "starting",
         "mode": req.mode.as_str(),
@@ -336,6 +341,8 @@ async fn trade_start(
     *guard = Some(TradeHandle {
         mode: req.mode,
         shutdown: sd_tx,
+        daily_risk_reset: altcoin_strategy.then_some(risk_reset_tx),
+        daily_entry_bonus: altcoin_strategy.then_some(entry_bonus_tx),
         status_rx: st_rx,
         running: running.clone(),
         error: error.clone(),
@@ -351,8 +358,15 @@ async fn trade_start(
                 break;
             }
             *error.lock().await = None;
-            let result = if is_altcoin_strategy(&args.strategy) {
-                run_altcoin_impulse(args.clone(), sd_rx.clone(), Some(st_tx.clone())).await
+            let result = if altcoin_strategy {
+                run_altcoin_impulse(
+                    args.clone(),
+                    sd_rx.clone(),
+                    Some(st_tx.clone()),
+                    Some(risk_reset_rx.clone()),
+                    Some(entry_bonus_rx.clone()),
+                )
+                .await
             } else {
                 run_trade(args.clone(), sd_rx.clone(), Some(st_tx.clone())).await
             };
@@ -401,6 +415,104 @@ async fn trade_start(
     Ok(Json(
         serde_json::json!({ "ok": true, "mode": req.mode.as_str() }),
     ))
+}
+
+async fn trade_reset_daily_risk(
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let (mode, running, task_state, reset) = {
+        let guard = st.trade.lock().await;
+        let handle = guard
+            .as_ref()
+            .ok_or((StatusCode::CONFLICT, "当前没有运行中的交易".into()))?;
+        let task_state = {
+            let status = handle.status_rx.borrow();
+            status["state"].as_str().unwrap_or("unknown").to_owned()
+        };
+        (
+            handle.mode,
+            handle.running.load(Ordering::SeqCst),
+            task_state,
+            handle.daily_risk_reset.clone(),
+        )
+    };
+    if !running {
+        return Err((StatusCode::CONFLICT, "交易任务未运行".into()));
+    }
+    if task_state != "running" {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("交易任务当前状态为 {task_state}，请恢复运行后再重置"),
+        ));
+    }
+    if mode == TradeMode::Live {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "实盘禁止从前端人工重置当日风控".into(),
+        ));
+    }
+    let reset = reset.ok_or((StatusCode::BAD_REQUEST, "当前策略不支持重置当日风控".into()))?;
+    let sequence = reset.borrow().saturating_add(1);
+    reset
+        .send(sequence)
+        .map_err(|_| (StatusCode::CONFLICT, "交易任务已停止".into()))?;
+    info!(mode = mode.as_str(), sequence, "收到人工重置当日风控请求");
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "sequence": sequence,
+        "message": "将在下一个持仓管理节拍以当前权益重建 4% 风控基准"
+    })))
+}
+
+async fn trade_add_daily_entries(
+    State(st): State<Arc<AppState>>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    let (mode, running, task_state, bonus) = {
+        let guard = st.trade.lock().await;
+        let handle = guard
+            .as_ref()
+            .ok_or((StatusCode::CONFLICT, "当前没有运行中的交易".into()))?;
+        let task_state = {
+            let status = handle.status_rx.borrow();
+            status["state"].as_str().unwrap_or("unknown").to_owned()
+        };
+        (
+            handle.mode,
+            handle.running.load(Ordering::SeqCst),
+            task_state,
+            handle.daily_entry_bonus.clone(),
+        )
+    };
+    if !running || task_state != "running" {
+        return Err((
+            StatusCode::CONFLICT,
+            format!("交易任务当前状态为 {task_state}，请恢复运行后再增加额度"),
+        ));
+    }
+    if mode == TradeMode::Live {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "实盘禁止从前端增加单日开仓额度".into(),
+        ));
+    }
+    let bonus = bonus.ok_or((
+        StatusCode::BAD_REQUEST,
+        "当前策略不支持增加单日开仓额度".into(),
+    ))?;
+    let sequence = (*bonus.borrow()).saturating_add(1);
+    bonus
+        .send(sequence)
+        .map_err(|_| (StatusCode::CONFLICT, "交易任务已停止".into()))?;
+    info!(
+        mode = mode.as_str(),
+        sequence, "收到今日临时增加开仓额度请求"
+    );
+    Ok(Json(serde_json::json!({
+        "ok": true,
+        "sequence": sequence,
+        "increment": 2,
+        "message": "将在下一个持仓管理节拍为今日临时增加 2 笔额度"
+    })))
 }
 
 async fn trade_stop(
@@ -751,6 +863,11 @@ pub async fn run_serve(
         .route("/api/trade/status", get(trade_status))
         .route("/api/trade/start", post(trade_start))
         .route("/api/trade/stop", post(trade_stop))
+        .route("/api/trade/reset-daily-risk", post(trade_reset_daily_risk))
+        .route(
+            "/api/trade/add-daily-entries",
+            post(trade_add_daily_entries),
+        )
         .route("/api/journal/{mode}", get(trade_journal))
         .route("/api/backtest/run", post(backtest_run))
         .route("/api/backtest/jobs", get(backtest_jobs))

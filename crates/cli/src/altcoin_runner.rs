@@ -155,6 +155,12 @@ struct PersistedState {
     day: i64,
     day_start_equity: f64,
     daily_entries: u32,
+    #[serde(default)]
+    daily_entry_bonus: u32,
+    #[serde(default)]
+    daily_risk_resets: u32,
+    #[serde(default)]
+    last_daily_risk_reset_ms: Option<i64>,
     total_entries: u64,
     total_exits: u64,
     wins: u64,
@@ -178,6 +184,9 @@ impl PersistedState {
             day: now_ms / DAY_MS,
             day_start_equity: cash,
             daily_entries: 0,
+            daily_entry_bonus: 0,
+            daily_risk_resets: 0,
+            last_daily_risk_reset_ms: None,
             total_entries: 0,
             total_exits: 0,
             wins: 0,
@@ -563,6 +572,22 @@ fn positions_unrealized(positions: &[Value]) -> f64 {
         .sum()
 }
 
+fn take_control_commands(
+    receiver: &mut Option<tokio::sync::watch::Receiver<u64>>,
+    handled: &mut u64,
+) -> u64 {
+    let Some(receiver) = receiver.as_mut() else {
+        return 0;
+    };
+    let sequence = *receiver.borrow_and_update();
+    if sequence <= *handled {
+        return 0;
+    }
+    let count = sequence - *handled;
+    *handled = sequence;
+    count
+}
+
 fn realtime_trailing_stop(
     side: i32,
     entry_price: f64,
@@ -679,6 +704,60 @@ fn record_exit(
         now_ms + cooldown_hours as i64 * 3_600_000,
     );
     pnl
+}
+
+fn apply_daily_risk_reset(
+    state: &mut PersistedState,
+    current_equity: f64,
+    now_ms: i64,
+    event_path: &str,
+) -> Result<()> {
+    let previous_baseline = state.day_start_equity;
+    state.day = now_ms / DAY_MS;
+    state.day_start_equity = current_equity;
+    state.daily_risk_resets += 1;
+    state.last_daily_risk_reset_ms = Some(now_ms);
+    append_event(
+        event_path,
+        json!({
+            "ts_ms":now_ms,
+            "event":"daily_risk_reset",
+            "source":"manual_frontend",
+            "previous_baseline_equity":previous_baseline,
+            "new_baseline_equity":current_equity,
+            "daily_entries_preserved":state.daily_entries,
+            "reset_count":state.daily_risk_resets
+        }),
+    )?;
+    Ok(())
+}
+
+fn apply_daily_entry_bonus(
+    state: &mut PersistedState,
+    base_limit: u32,
+    now_ms: i64,
+    event_path: &str,
+) -> Result<bool> {
+    let maximum_bonus = base_limit;
+    let previous_bonus = state.daily_entry_bonus;
+    state.daily_entry_bonus = state.daily_entry_bonus.saturating_add(2).min(maximum_bonus);
+    if state.daily_entry_bonus == previous_bonus {
+        return Ok(false);
+    }
+    append_event(
+        event_path,
+        json!({
+            "ts_ms":now_ms,
+            "event":"daily_entry_limit_increased",
+            "source":"manual_frontend",
+            "base_limit":base_limit,
+            "previous_effective_limit":base_limit+previous_bonus,
+            "new_effective_limit":base_limit+state.daily_entry_bonus,
+            "daily_entries":state.daily_entries,
+            "resets_at":"00:00 UTC"
+        }),
+    )?;
+    Ok(true)
 }
 
 /// 模拟盘/实盘的独立持仓管理循环。信号扫描可以维持低频，但交易所仓位必须高频：
@@ -849,6 +928,8 @@ pub async fn run_altcoin_impulse(
     args: TradeArgs,
     mut shutdown: tokio::sync::watch::Receiver<bool>,
     status_tx: Option<tokio::sync::watch::Sender<Value>>,
+    mut daily_risk_reset: Option<tokio::sync::watch::Receiver<u64>>,
+    mut daily_entry_bonus: Option<tokio::sync::watch::Receiver<u64>>,
 ) -> Result<()> {
     let strategy_text = std::fs::read_to_string(&args.strategy)
         .with_context(|| format!("读取策略失败: {}", args.strategy))?;
@@ -939,6 +1020,14 @@ pub async fn run_altcoin_impulse(
         );
     }
     let started_ms = now_ms;
+    let mut handled_risk_reset = daily_risk_reset
+        .as_ref()
+        .map(|receiver| *receiver.borrow())
+        .unwrap_or(0);
+    let mut handled_entry_bonus = daily_entry_bonus
+        .as_ref()
+        .map(|receiver| *receiver.borrow())
+        .unwrap_or(0);
     info!(
         mode = mode.as_str(),
         leverage = cfg.exchange_leverage,
@@ -1049,6 +1138,20 @@ pub async fn run_altcoin_impulse(
             state.day = current_day;
             state.day_start_equity = current_equity;
             state.daily_entries = 0;
+            state.daily_entry_bonus = 0;
+            state.daily_risk_resets = 0;
+        }
+        if take_control_commands(&mut daily_risk_reset, &mut handled_risk_reset) > 0 {
+            apply_daily_risk_reset(&mut state, current_equity, scan_ms, &event_path)?;
+            save_state(&state_path, &state)?;
+        }
+        let bonus_commands =
+            take_control_commands(&mut daily_entry_bonus, &mut handled_entry_bonus);
+        for _ in 0..bonus_commands {
+            apply_daily_entry_bonus(&mut state, cfg.max_daily_entries, scan_ms, &event_path)?;
+        }
+        if bonus_commands > 0 {
+            save_state(&state_path, &state)?;
         }
 
         // 先管理已有仓位。模拟盘/实盘走独立实时循环；dry 才使用闭合 K 线撮合。
@@ -1153,10 +1256,13 @@ pub async fn run_altcoin_impulse(
         let daily_loss_blocked =
             managed_equity < state.day_start_equity * (1.0 - cfg.daily_loss_limit);
         let mut eligible_count = 0usize;
+        let effective_daily_limit = cfg
+            .max_daily_entries
+            .saturating_add(state.daily_entry_bonus);
         for candidate in candidates.iter().filter(|c| c.eligible()) {
             eligible_count += 1;
             if state.positions.len() >= cfg.max_positions
-                || state.daily_entries >= cfg.max_daily_entries
+                || state.daily_entries >= effective_daily_limit
                 || daily_loss_blocked
             {
                 break;
@@ -1424,6 +1530,9 @@ pub async fn run_altcoin_impulse(
                 "ts_ms":scan_ms, "event":"scan", "universe_count":spot_symbols.intersection(&active).count(),
                 "shortlist_count":shortlist_count, "eligible_count":eligible_count,
                 "equity":current_equity, "daily_entries":state.daily_entries,
+                "base_max_daily_entries":cfg.max_daily_entries,
+                "daily_entry_bonus":state.daily_entry_bonus,
+                "max_daily_entries":effective_daily_limit,
                 "daily_loss_blocked":daily_loss_blocked,
                 "positions":position_status,
                 "candidates":candidates.iter().take(10).collect::<Vec<_>>()
@@ -1443,7 +1552,7 @@ pub async fn run_altcoin_impulse(
                 "stop_pct":cfg.stop_pct, "notional_per_trade_estimate":current_equity*cfg.risk_per_trade/cfg.stop_pct,
                 "margin_per_trade_estimate":current_equity*cfg.risk_per_trade/cfg.stop_pct/cfg.exchange_leverage as f64,
                 "worst_loss_per_trade_estimate":current_equity*cfg.risk_per_trade,
-                "daily_entries":state.daily_entries, "max_daily_entries":cfg.max_daily_entries,
+                "daily_entries":state.daily_entries, "max_daily_entries":effective_daily_limit,
                 "daily_loss_blocked":daily_loss_blocked, "positions":position_status,
                 "last_valuation_ms":valuation_ms,
                 "valuation_source": if rest.is_some() {"binance_position_risk"} else {"closed_15m_fallback"},
@@ -1455,6 +1564,13 @@ pub async fn run_altcoin_impulse(
                 "journal":event_path,
             }
         });
+        status_payload["altcoin_impulse"]["daily_risk_baseline_equity"] =
+            json!(state.day_start_equity);
+        status_payload["altcoin_impulse"]["base_max_daily_entries"] = json!(cfg.max_daily_entries);
+        status_payload["altcoin_impulse"]["daily_entry_bonus"] = json!(state.daily_entry_bonus);
+        status_payload["altcoin_impulse"]["daily_risk_resets"] = json!(state.daily_risk_resets);
+        status_payload["altcoin_impulse"]["last_daily_risk_reset_ms"] =
+            json!(state.last_daily_risk_reset_ms);
         if let Some(tx) = &status_tx {
             let _ = tx.send(status_payload.clone());
         }
@@ -1494,6 +1610,42 @@ pub async fn run_altcoin_impulse(
                 let refreshed =
                     build_position_status(&state, &prices, Some(client), refresh_ms).await;
                 let refreshed_equity = state.cash + positions_unrealized(&refreshed);
+                if take_control_commands(&mut daily_risk_reset, &mut handled_risk_reset) > 0 {
+                    apply_daily_risk_reset(&mut state, refreshed_equity, refresh_ms, &event_path)?;
+                    save_state(&state_path, &state)?;
+                    status_payload["altcoin_impulse"]["daily_loss_blocked"] = json!(false);
+                    status_payload["altcoin_impulse"]["daily_risk_baseline_equity"] =
+                        json!(state.day_start_equity);
+                    status_payload["altcoin_impulse"]["daily_risk_resets"] =
+                        json!(state.daily_risk_resets);
+                    status_payload["altcoin_impulse"]["last_daily_risk_reset_ms"] =
+                        json!(state.last_daily_risk_reset_ms);
+                    status_payload["altcoin_impulse"]["stage"] = json!(if eligible_count > 0 {
+                        "execution"
+                    } else if shortlist_count > 0 {
+                        "confirmation"
+                    } else {
+                        "scan"
+                    });
+                }
+                let bonus_commands =
+                    take_control_commands(&mut daily_entry_bonus, &mut handled_entry_bonus);
+                for _ in 0..bonus_commands {
+                    apply_daily_entry_bonus(
+                        &mut state,
+                        cfg.max_daily_entries,
+                        refresh_ms,
+                        &event_path,
+                    )?;
+                }
+                if bonus_commands > 0 {
+                    save_state(&state_path, &state)?;
+                    status_payload["altcoin_impulse"]["max_daily_entries"] = json!(cfg
+                        .max_daily_entries
+                        .saturating_add(state.daily_entry_bonus));
+                    status_payload["altcoin_impulse"]["daily_entry_bonus"] =
+                        json!(state.daily_entry_bonus);
+                }
                 status_payload["uptime_s"] = json!((refresh_ms - started_ms) / 1000);
                 status_payload["equity"] = json!(refreshed_equity);
                 status_payload["altcoin_impulse"]["positions"] = json!(refreshed);
@@ -1517,7 +1669,10 @@ pub async fn run_altcoin_impulse(
 
 #[cfg(test)]
 mod tests {
-    use super::{detected_exit_reason, realtime_trailing_stop, Position};
+    use super::{
+        apply_daily_entry_bonus, apply_daily_risk_reset, detected_exit_reason,
+        realtime_trailing_stop, PersistedState, Position,
+    };
 
     #[test]
     fn exchange_leverage_does_not_change_stop_risk() {
@@ -1580,5 +1735,44 @@ mod tests {
         let (extreme, stop) = realtime_trailing_stop(-1, 100.0, 100.0, 105.0, 95.0, 0.05, 0.03);
         assert_eq!(extreme, 95.0);
         assert!((stop.unwrap() - 97.85).abs() < 1e-10);
+    }
+
+    #[test]
+    fn manual_daily_reset_preserves_entries_and_rebases_equity() {
+        let now_ms = 1_800_000_000_000i64;
+        let mut state = PersistedState::new(1_000.0, now_ms);
+        state.day_start_equity = 1_200.0;
+        state.daily_entries = 4;
+        let path = std::env::temp_dir().join(format!(
+            "greed-daily-risk-reset-{}-{}.jsonl",
+            std::process::id(),
+            now_ms
+        ));
+        apply_daily_risk_reset(&mut state, 950.0, now_ms, path.to_str().unwrap()).unwrap();
+        assert_eq!(state.day_start_equity, 950.0);
+        assert_eq!(state.daily_entries, 4);
+        assert_eq!(state.daily_risk_resets, 1);
+        let log = std::fs::read_to_string(&path).unwrap();
+        assert!(log.contains("daily_risk_reset"));
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn temporary_daily_entry_bonus_increases_by_two_and_caps_at_double() {
+        let now_ms = 1_800_000_000_000i64;
+        let mut state = PersistedState::new(1_000.0, now_ms);
+        let path = std::env::temp_dir().join(format!(
+            "greed-daily-entry-bonus-{}-{}.jsonl",
+            std::process::id(),
+            now_ms
+        ));
+        for _ in 0..4 {
+            apply_daily_entry_bonus(&mut state, 6, now_ms, path.to_str().unwrap()).unwrap();
+        }
+        assert_eq!(state.daily_entry_bonus, 6);
+        assert_eq!(6 + state.daily_entry_bonus, 12);
+        let log = std::fs::read_to_string(&path).unwrap();
+        assert!(log.contains("daily_entry_limit_increased"));
+        let _ = std::fs::remove_file(path);
     }
 }
