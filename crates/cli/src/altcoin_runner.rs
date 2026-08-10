@@ -563,6 +563,39 @@ fn positions_unrealized(positions: &[Value]) -> f64 {
         .sum()
 }
 
+fn realtime_trailing_stop(
+    side: i32,
+    entry_price: f64,
+    previous_extreme: f64,
+    current_stop: f64,
+    mark_price: f64,
+    activation_pct: f64,
+    trail_pct: f64,
+) -> (f64, Option<f64>) {
+    let extreme = if side > 0 {
+        previous_extreme.max(mark_price)
+    } else {
+        previous_extreme.min(mark_price)
+    };
+    let excursion = side as f64 * (extreme / entry_price - 1.0);
+    if excursion < activation_pct {
+        return (extreme, None);
+    }
+    let proposed = extreme * (1.0 - side as f64 * trail_pct);
+    let improved = if side > 0 {
+        current_stop.max(proposed)
+    } else {
+        current_stop.min(proposed)
+    };
+    // 至少改善 0.10% 才换单，防止单边行情中每个微小 tick 都触发撤挂。
+    let material = if side > 0 {
+        improved >= current_stop * 1.001
+    } else {
+        improved <= current_stop * 0.999
+    };
+    (extreme, material.then_some(improved))
+}
+
 async fn wait_fill(
     rest: &live::RestClient,
     symbol: &str,
@@ -621,6 +654,161 @@ async fn closing_fill(
         .filter_map(|fill| fill.commission.parse::<f64>().ok())
         .sum();
     Ok(Some((quote / qty, qty, fee)))
+}
+
+fn record_exit(
+    state: &mut PersistedState,
+    position: &Position,
+    now_ms: i64,
+    cooldown_hours: u32,
+    exit: f64,
+    qty: f64,
+    fee: f64,
+) -> f64 {
+    let pnl = position.side as f64 * qty * (exit - position.entry_price) - position.entry_fee - fee;
+    state.cash += position.side as f64 * qty * (exit - position.entry_price) - fee;
+    state.realized_pnl += pnl;
+    state.fees += fee;
+    state.total_exits += 1;
+    if pnl > 0.0 {
+        state.wins += 1;
+    }
+    state.positions.remove(&position.symbol);
+    state.cooldown_until.insert(
+        position.symbol.clone(),
+        now_ms + cooldown_hours as i64 * 3_600_000,
+    );
+    pnl
+}
+
+/// 模拟盘/实盘的独立持仓管理循环。信号扫描可以维持低频，但交易所仓位必须高频：
+/// - 识别交易所止损成交；
+/// - 用实时 markPrice 推进极值与跟踪止盈；
+/// - 按墙钟执行时间退出。
+async fn manage_live_positions(
+    state: &mut PersistedState,
+    client: &live::RestClient,
+    cfg: &AltcoinImpulseConfig,
+    now_ms: i64,
+    event_path: &str,
+) -> Result<bool> {
+    let mut changed = false;
+    let symbols: Vec<String> = state.positions.keys().cloned().collect();
+    for symbol in symbols {
+        let Some(mut position) = state.positions.get(&symbol).cloned() else {
+            continue;
+        };
+        let snapshot = client.position_risk(&symbol).await?;
+        if snapshot.position_amt.abs() <= 1e-12 {
+            if let Err(error) = client.cancel_all_open_orders(&symbol).await {
+                warn!(symbol=%symbol, error=%error, "仓位已平，但清理残留保护单失败");
+            }
+            let Some((exit, exit_qty, exit_fee)) = closing_fill(client, &position).await? else {
+                append_event(
+                    event_path,
+                    json!({"ts_ms":now_ms,"event":"exit_reconciliation_pending","symbol":symbol,"protection_order_id":position.protection_order_id,"stop_price":position.stop_price}),
+                )?;
+                continue;
+            };
+            let exit_qty = exit_qty.min(position.qty);
+            let reason = detected_exit_reason(&position, exit, true);
+            let pnl = record_exit(
+                state,
+                &position,
+                now_ms,
+                cfg.cooldown_hours,
+                exit,
+                exit_qty,
+                exit_fee,
+            );
+            let event = json!({"ts_ms":now_ms,"event":"exit_detected","symbol":symbol,"side":position.side,"price":exit,"qty":exit_qty,"pnl":pnl,"fee":exit_fee,"reason":reason,"protection_order_id":position.protection_order_id,"stop_price":position.stop_price,"trade_reconciled":true});
+            append_event(event_path, event.clone())?;
+            state.record_trade(event);
+            changed = true;
+            continue;
+        }
+
+        let timed = now_ms - position.entry_ms >= cfg.max_hold_hours as i64 * 3_600_000;
+        if timed {
+            client.cancel_all_open_orders(&symbol).await?;
+            let filters = client.symbol_filters(&symbol).await?;
+            let side = if position.side > 0 { "SELL" } else { "BUY" };
+            let qty = snapshot.position_amt.abs();
+            let order = client
+                .place_order(&symbol, side, "MARKET", qty, None, None, true, &filters)
+                .await?;
+            let (exit, exit_qty, fee) = wait_fill(client, &symbol, order).await?;
+            let exit_qty = exit_qty.min(position.qty);
+            let pnl = record_exit(
+                state,
+                &position,
+                now_ms,
+                cfg.cooldown_hours,
+                exit,
+                exit_qty,
+                fee,
+            );
+            let event = json!({"ts_ms":now_ms,"event":"exit","symbol":symbol,"side":position.side,"reason":"time","price":exit,"qty":exit_qty,"pnl":pnl,"fee":fee,"hold_ms":now_ms-position.entry_ms});
+            append_event(event_path, event.clone())?;
+            state.record_trade(event);
+            changed = true;
+            continue;
+        }
+
+        let previous_extreme = position.extreme;
+        let (new_extreme, improved_stop) = realtime_trailing_stop(
+            position.side,
+            position.entry_price,
+            position.extreme,
+            position.stop_price,
+            snapshot.mark_price,
+            cfg.trail_activation_pct,
+            cfg.trail_pct,
+        );
+        position.extreme = new_extreme;
+        let excursion = position.side as f64 * (position.extreme / position.entry_price - 1.0);
+        if let Some(improved_stop) = improved_stop {
+            let filters = client.symbol_filters(&symbol).await?;
+            let side = if position.side > 0 { "SELL" } else { "BUY" };
+            // 先挂新保护，确认成功后才撤旧保护；任何下单失败都保留原止损。
+            let new_order_id = client
+                .place_order(
+                    &symbol,
+                    side,
+                    "STOP_MARKET",
+                    snapshot.position_amt.abs(),
+                    None,
+                    Some(improved_stop),
+                    true,
+                    &filters,
+                )
+                .await?;
+            let old_order_id = position.protection_order_id;
+            if let Some(old_order_id) = old_order_id {
+                if let Err(error) = client.cancel_algo_order(&symbol, old_order_id).await {
+                    warn!(symbol=%symbol, old_order_id, error=%error, "新保护已生效，但旧保护撤销失败");
+                    append_event(
+                        event_path,
+                        json!({"ts_ms":now_ms,"event":"old_protection_cancel_failed","symbol":symbol,"old_order_id":old_order_id,"new_order_id":new_order_id,"reason":error.to_string()}),
+                    )?;
+                }
+            }
+            let old_stop = position.stop_price;
+            position.stop_price = improved_stop;
+            position.protection_order_id = Some(new_order_id);
+            position.protection_reason = "trailing_take_profit".to_owned();
+            append_event(
+                event_path,
+                json!({"ts_ms":now_ms,"event":"protection_updated","symbol":symbol,"side":position.side,"mark_price":snapshot.mark_price,"extreme":position.extreme,"excursion":excursion,"old_stop":old_stop,"new_stop":improved_stop,"old_order_id":old_order_id,"new_order_id":new_order_id,"reason":"trailing_take_profit"}),
+            )?;
+            changed = true;
+        }
+        if position.extreme != previous_extreme {
+            changed = true;
+        }
+        state.positions.insert(symbol, position);
+    }
+    Ok(changed)
 }
 
 async fn emergency_flatten(
@@ -863,163 +1051,83 @@ pub async fn run_altcoin_impulse(
             state.daily_entries = 0;
         }
 
-        // 先管理已有仓位。实盘/模拟盘以交易所仓位为准，dry 用闭合 K 线模拟止损。
-        let position_symbols: Vec<String> = state.positions.keys().cloned().collect();
-        for symbol in position_symbols {
-            let Some(mut position) = state.positions.get(&symbol).cloned() else {
-                continue;
-            };
-            let Some(bars) = bars_by_symbol.get(&symbol) else {
-                continue;
-            };
-            let Some(bar) = bars.last() else { continue };
-            if let Some(client) = rest.as_ref() {
-                if client.position_amt(&symbol).await?.abs() <= 1e-12 {
-                    let (exit, exit_qty, exit_fee, reconciled) =
-                        match closing_fill(client, &position).await? {
-                            Some((price, qty, fee)) => (price, qty.min(position.qty), fee, true),
-                            None => (bar.close, position.qty, 0.0, false),
-                        };
-                    let pnl = position.side as f64 * exit_qty * (exit - position.entry_price)
-                        - position.entry_fee
-                        - exit_fee;
-                    state.cash +=
-                        position.side as f64 * exit_qty * (exit - position.entry_price) - exit_fee;
-                    state.realized_pnl += pnl;
-                    state.fees += exit_fee;
-                    state.total_exits += 1;
-                    if pnl > 0.0 {
-                        state.wins += 1;
-                    }
-                    state.positions.remove(&symbol);
-                    state.cooldown_until.insert(
-                        symbol.clone(),
-                        scan_ms + cfg.cooldown_hours as i64 * 3_600_000,
-                    );
-                    let reason = detected_exit_reason(&position, exit, reconciled);
-                    let event = json!({"ts_ms":scan_ms,"event":"exit_detected","symbol":symbol,"side":position.side,"price":exit,"qty":exit_qty,"pnl":pnl,"fee":exit_fee,"reason":reason,"protection_order_id":position.protection_order_id,"stop_price":position.stop_price,"trade_reconciled":reconciled});
-                    append_event(&event_path, event.clone())?;
-                    state.record_trade(event);
+        // 先管理已有仓位。模拟盘/实盘走独立实时循环；dry 才使用闭合 K 线撮合。
+        if let Some(client) = rest.as_ref() {
+            match manage_live_positions(&mut state, client, &cfg, scan_ms, &event_path).await {
+                Ok(true) => save_state(&state_path, &state)?,
+                Ok(false) => {}
+                Err(error) => {
+                    warn!(error=%error, "实时持仓管理短暂失败；交易所原保护单保持有效");
+                    append_event(
+                        &event_path,
+                        json!({"ts_ms":scan_ms,"event":"position_management_error","reason":error.to_string(),"original_protection_retained":true}),
+                    )?;
+                }
+            }
+        } else {
+            let position_symbols: Vec<String> = state.positions.keys().cloned().collect();
+            for symbol in position_symbols {
+                let Some(mut position) = state.positions.get(&symbol).cloned() else {
+                    continue;
+                };
+                let Some(bar) = bars_by_symbol.get(&symbol).and_then(|bars| bars.last()) else {
+                    continue;
+                };
+                if bar.open_ms <= position.last_bar_ms {
                     continue;
                 }
-            }
-            if bar.open_ms <= position.last_bar_ms {
-                continue;
-            }
-            position.last_bar_ms = bar.open_ms;
-            if position.side > 0 {
-                position.extreme = position.extreme.max(bar.high);
-            } else {
-                position.extreme = position.extreme.min(bar.low);
-            }
-            let excursion = position.side as f64 * (position.extreme / position.entry_price - 1.0);
-            if excursion >= cfg.trail_activation_pct {
-                let trail = position.extreme * (1.0 - position.side as f64 * cfg.trail_pct);
-                position.stop_price = if position.side > 0 {
-                    position.stop_price.max(trail)
+                position.last_bar_ms = bar.open_ms;
+                position.extreme = if position.side > 0 {
+                    position.extreme.max(bar.high)
                 } else {
-                    position.stop_price.min(trail)
+                    position.extreme.min(bar.low)
                 };
-                position.protection_reason = "trailing_take_profit".to_owned();
-            }
-            let stopped = if position.side > 0 {
-                bar.low <= position.stop_price
-            } else {
-                bar.high >= position.stop_price
-            };
-            let timed = scan_ms - position.entry_ms >= cfg.max_hold_hours as i64 * 3_600_000;
-            if mode == TradeMode::Dry && (stopped || timed) {
-                let exit = if stopped {
-                    position.stop_price
-                } else {
-                    bar.close
-                };
-                let fee = position.qty * exit * 0.0005;
-                let pnl = position.side as f64 * position.qty * (exit - position.entry_price)
-                    - position.entry_fee
-                    - fee;
-                state.cash +=
-                    position.side as f64 * position.qty * (exit - position.entry_price) - fee;
-                state.realized_pnl += pnl;
-                state.fees += fee;
-                state.total_exits += 1;
-                if pnl > 0.0 {
-                    state.wins += 1;
+                let excursion =
+                    position.side as f64 * (position.extreme / position.entry_price - 1.0);
+                if excursion >= cfg.trail_activation_pct {
+                    let trail = position.extreme * (1.0 - position.side as f64 * cfg.trail_pct);
+                    position.stop_price = if position.side > 0 {
+                        position.stop_price.max(trail)
+                    } else {
+                        position.stop_price.min(trail)
+                    };
+                    position.protection_reason = "trailing_take_profit".to_owned();
                 }
-                state.positions.remove(&symbol);
-                state.cooldown_until.insert(
-                    symbol.clone(),
-                    scan_ms + cfg.cooldown_hours as i64 * 3_600_000,
-                );
-                let reason = if timed {
-                    "time"
-                } else if position.protection_reason == "trailing_take_profit" {
-                    "trailing_take_profit"
+                let stopped = if position.side > 0 {
+                    bar.low <= position.stop_price
                 } else {
-                    "initial_stop"
+                    bar.high >= position.stop_price
                 };
-                let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"reason":reason,"price":exit,"qty":position.qty,"pnl":pnl,"fee":fee});
-                append_event(&event_path, event.clone())?;
-                state.record_trade(event);
-            } else if let Some(client) = rest.as_ref() {
-                if timed {
-                    client.cancel_all_open_orders(&symbol).await?;
-                    let filters = client.symbol_filters(&symbol).await?;
-                    let side = if position.side > 0 { "SELL" } else { "BUY" };
-                    let order = client
-                        .place_order(
-                            &symbol,
-                            side,
-                            "MARKET",
-                            position.qty,
-                            None,
-                            None,
-                            true,
-                            &filters,
-                        )
-                        .await?;
-                    let (exit, _, fee) = wait_fill(client, &symbol, order).await?;
-                    let pnl = position.side as f64 * position.qty * (exit - position.entry_price)
-                        - position.entry_fee
-                        - fee;
-                    state.cash +=
-                        position.side as f64 * position.qty * (exit - position.entry_price) - fee;
-                    state.realized_pnl += pnl;
-                    state.fees += fee;
-                    state.total_exits += 1;
-                    if pnl > 0.0 {
-                        state.wins += 1;
-                    }
-                    state.positions.remove(&symbol);
-                    state.cooldown_until.insert(
-                        symbol.clone(),
-                        scan_ms + cfg.cooldown_hours as i64 * 3_600_000,
+                let timed = scan_ms - position.entry_ms >= cfg.max_hold_hours as i64 * 3_600_000;
+                if stopped || timed {
+                    let exit = if stopped {
+                        position.stop_price
+                    } else {
+                        bar.close
+                    };
+                    let fee = position.qty * exit * 0.0005;
+                    let pnl = record_exit(
+                        &mut state,
+                        &position,
+                        scan_ms,
+                        cfg.cooldown_hours,
+                        exit,
+                        position.qty,
+                        fee,
                     );
-                    let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"reason":"time","price":exit,"qty":position.qty,"pnl":pnl,"fee":fee});
+                    let reason = if timed {
+                        "time"
+                    } else if position.protection_reason == "trailing_take_profit" {
+                        "trailing_take_profit"
+                    } else {
+                        "initial_stop"
+                    };
+                    let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"reason":reason,"price":exit,"qty":position.qty,"pnl":pnl,"fee":fee});
                     append_event(&event_path, event.clone())?;
                     state.record_trade(event);
                 } else {
-                    // 每根闭合 K 线重挂一次保护单，使交易所始终持有真实止损。
-                    client.cancel_all_open_orders(&symbol).await?;
-                    let filters = client.symbol_filters(&symbol).await?;
-                    let side = if position.side > 0 { "SELL" } else { "BUY" };
-                    let protection_order_id = client
-                        .place_order(
-                            &symbol,
-                            side,
-                            "STOP_MARKET",
-                            position.qty,
-                            None,
-                            Some(position.stop_price),
-                            true,
-                            &filters,
-                        )
-                        .await?;
-                    position.protection_order_id = Some(protection_order_id);
                     state.positions.insert(symbol, position);
                 }
-            } else {
-                state.positions.insert(symbol, position);
             }
         }
 
@@ -1369,8 +1477,20 @@ pub async fn run_altcoin_impulse(
             if *shutdown.borrow() {
                 break;
             }
-            if let (Some(tx), Some(client)) = (&status_tx, rest.as_ref()) {
+            if let Some(client) = rest.as_ref() {
                 let refresh_ms = chrono::Utc::now().timestamp_millis();
+                match manage_live_positions(&mut state, client, &cfg, refresh_ms, &event_path).await
+                {
+                    Ok(true) => save_state(&state_path, &state)?,
+                    Ok(false) => {}
+                    Err(error) => {
+                        warn!(error=%error, "5 秒持仓管理短暂失败；交易所原保护单保持有效");
+                        append_event(
+                            &event_path,
+                            json!({"ts_ms":refresh_ms,"event":"position_management_error","reason":error.to_string(),"original_protection_retained":true}),
+                        )?;
+                    }
+                }
                 let refreshed =
                     build_position_status(&state, &prices, Some(client), refresh_ms).await;
                 let refreshed_equity = state.cash + positions_unrealized(&refreshed);
@@ -1378,7 +1498,9 @@ pub async fn run_altcoin_impulse(
                 status_payload["equity"] = json!(refreshed_equity);
                 status_payload["altcoin_impulse"]["positions"] = json!(refreshed);
                 status_payload["altcoin_impulse"]["last_valuation_ms"] = json!(refresh_ms);
-                let _ = tx.send(status_payload.clone());
+                if let Some(tx) = &status_tx {
+                    let _ = tx.send(status_payload.clone());
+                }
             }
         }
         if *shutdown.borrow() {
@@ -1395,7 +1517,7 @@ pub async fn run_altcoin_impulse(
 
 #[cfg(test)]
 mod tests {
-    use super::{detected_exit_reason, Position};
+    use super::{detected_exit_reason, realtime_trailing_stop, Position};
 
     #[test]
     fn exchange_leverage_does_not_change_stop_risk() {
@@ -1437,5 +1559,26 @@ mod tests {
             "manual_or_external"
         );
         assert_eq!(detected_exit_reason(&position, 1.10, false), "unknown");
+    }
+
+    #[test]
+    fn realtime_trailing_activates_and_only_tightens() {
+        let (extreme, stop) = realtime_trailing_stop(1, 100.0, 100.0, 95.0, 104.9, 0.05, 0.03);
+        assert_eq!(extreme, 104.9);
+        assert_eq!(stop, None);
+
+        let (extreme, stop) = realtime_trailing_stop(1, 100.0, 104.9, 95.0, 105.0, 0.05, 0.03);
+        assert_eq!(extreme, 105.0);
+        assert!((stop.unwrap() - 101.85).abs() < 1e-10);
+
+        let (_, stop) = realtime_trailing_stop(1, 100.0, 105.0, 101.85, 104.0, 0.05, 0.03);
+        assert_eq!(stop, None, "回落时不得放宽已经上移的保护价");
+    }
+
+    #[test]
+    fn realtime_trailing_is_symmetric_for_shorts() {
+        let (extreme, stop) = realtime_trailing_stop(-1, 100.0, 100.0, 105.0, 95.0, 0.05, 0.03);
+        assert_eq!(extreme, 95.0);
+        assert!((stop.unwrap() - 97.85).abs() < 1e-10);
     }
 }

@@ -450,6 +450,21 @@ impl RestClient {
         Ok(())
     }
 
+    /// 撤销单个条件 Algo 订单。跟踪止损换挡时先挂新保护，再按 ID 撤旧保护，
+    /// 避免 `cancel all -> place` 窗口内仓位没有交易所保护。
+    pub async fn cancel_algo_order(&self, symbol: &str, algo_id: i64) -> Result<(), RestError> {
+        self.signed(
+            reqwest::Method::DELETE,
+            "/fapi/v1/algoOrder",
+            &[
+                ("symbol", symbol.to_string()),
+                ("algoId", algo_id.to_string()),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
     /// 下单。返回交易所订单标识（普通单为 orderId，条件单为 algoId）。
     ///
     /// - `kind`："MARKET" / "LIMIT" / "STOP_MARKET"
