@@ -19,6 +19,8 @@ trail_activation_pct = 0.05
 trail_pct = 0.03
 max_hold_hours = 6
 cooldown_hours = 8
+# 信号价到实际可成交价最多允许 1.5% 不利偏移；超出则 IOC 限价单不追。
+max_entry_slippage_pct = 0.015
 
 min_24h_volume_usd = 5000000.0
 min_return_1h = 0.04

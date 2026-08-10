@@ -39,6 +39,10 @@ pub struct SymbolFilters {
     pub price_precision: usize,
     /// 数量允许的最大小数位（exchangeInfo.quantityPrecision）。
     pub quantity_precision: usize,
+    /// 普通订单最大数量（LOT_SIZE maxQty）。
+    pub max_qty: f64,
+    /// 市价类订单最大数量（MARKET_LOT_SIZE maxQty）。
+    pub market_max_qty: f64,
     /// 最小名义价值（MIN_NOTIONAL/NOTIONAL）
     pub min_notional: f64,
 }
@@ -122,6 +126,8 @@ fn parse_symbol_filters(
         market_step_size: 0.001,
         price_precision: sym["pricePrecision"].as_u64().unwrap_or(8) as usize,
         quantity_precision: sym["quantityPrecision"].as_u64().unwrap_or(8) as usize,
+        max_qty: f64::INFINITY,
+        market_max_qty: f64::INFINITY,
         min_notional: 100.0,
     };
     let mut market_step_seen = false;
@@ -137,14 +143,22 @@ fn parse_symbol_filters(
                 filters.step_size = filter["stepSize"]
                     .as_str()
                     .and_then(|text| text.parse().ok())
-                    .unwrap_or(filters.step_size)
+                    .unwrap_or(filters.step_size);
+                filters.max_qty = filter["maxQty"]
+                    .as_str()
+                    .and_then(|text| text.parse().ok())
+                    .unwrap_or(filters.max_qty)
             }
             "MARKET_LOT_SIZE" => {
                 market_step_seen = true;
                 filters.market_step_size = filter["stepSize"]
                     .as_str()
                     .and_then(|text| text.parse().ok())
-                    .unwrap_or(filters.step_size)
+                    .unwrap_or(filters.step_size);
+                filters.market_max_qty = filter["maxQty"]
+                    .as_str()
+                    .and_then(|text| text.parse().ok())
+                    .unwrap_or(filters.market_max_qty)
             }
             "MIN_NOTIONAL" | "NOTIONAL" => {
                 filters.min_notional = filter["notional"]
@@ -158,6 +172,10 @@ fn parse_symbol_filters(
     }
     if !market_step_seen || filters.market_step_size <= 0.0 {
         filters.market_step_size = filters.step_size;
+        filters.market_max_qty = filters.max_qty;
+    }
+    if filters.market_max_qty <= 0.0 {
+        filters.market_max_qty = filters.max_qty;
     }
     Ok(filters)
 }
@@ -419,19 +437,28 @@ impl RestClient {
         reduce_only: bool,
         filters: &SymbolFilters,
     ) -> Result<i64, RestError> {
-        let qty_s = quantity_string(kind, qty, filters);
+        let order_type = if kind == "LIMIT_IOC" { "LIMIT" } else { kind };
+        let qty_s = quantity_string(order_type, qty, filters);
         let mut params: Vec<(&str, String)> = vec![
             ("symbol", symbol.to_string()),
             ("side", side.to_string()),
-            ("type", kind.to_string()),
+            ("type", order_type.to_string()),
             ("quantity", qty_s),
         ];
-        if kind == "LIMIT" {
+        if kind == "LIMIT" || kind == "LIMIT_IOC" {
             let p = price.ok_or_else(|| RestError::Data("LIMIT 缺 price".into()))?;
-            params.push(("timeInForce", "GTC".into()));
+            params.push((
+                "timeInForce",
+                if kind == "LIMIT_IOC" { "IOC" } else { "GTC" }.into(),
+            ));
+            let aligned = if side == "SELL" {
+                ceil_to_step(p, filters.tick_size)
+            } else {
+                floor_to_step(p, filters.tick_size)
+            };
             params.push((
                 "price",
-                fmt_step_with_precision(p, filters.tick_size, filters.price_precision),
+                fmt_step_with_precision(aligned, filters.tick_size, filters.price_precision),
             ));
         }
         if kind == "STOP_MARKET" {
@@ -565,6 +592,8 @@ mod tests {
             market_step_size: 1.0,
             price_precision: 4,
             quantity_precision: 3,
+            max_qty: 1_000_000.0,
+            market_max_qty: 100_000.0,
             min_notional: 5.0,
         };
         assert_eq!(quantity_string("MARKET", 123.456, &filters), "123");
@@ -582,8 +611,8 @@ mod tests {
                     "quantityPrecision": 3,
                     "filters": [
                         {"filterType":"PRICE_FILTER", "tickSize":"0.01000000"},
-                        {"filterType":"LOT_SIZE", "stepSize":"0.00100000"},
-                        {"filterType":"MARKET_LOT_SIZE", "stepSize":"0.00100000"}
+                        {"filterType":"LOT_SIZE", "stepSize":"0.00100000", "maxQty":"1000"},
+                        {"filterType":"MARKET_LOT_SIZE", "stepSize":"0.00100000", "maxQty":"100"}
                     ]
                 },
                 {
@@ -592,8 +621,8 @@ mod tests {
                     "quantityPrecision": 0,
                     "filters": [
                         {"filterType":"PRICE_FILTER", "tickSize":"0.00001000"},
-                        {"filterType":"LOT_SIZE", "stepSize":"0.10000000"},
-                        {"filterType":"MARKET_LOT_SIZE", "stepSize":"1.00000000"},
+                        {"filterType":"LOT_SIZE", "stepSize":"0.10000000", "maxQty":"500000"},
+                        {"filterType":"MARKET_LOT_SIZE", "stepSize":"1.00000000", "maxQty":"100000"},
                         {"filterType":"MIN_NOTIONAL", "notional":"5"}
                     ]
                 }
@@ -605,6 +634,8 @@ mod tests {
         assert_eq!(filters.market_step_size, 1.0);
         assert_eq!(filters.price_precision, 5);
         assert_eq!(filters.quantity_precision, 0);
+        assert_eq!(filters.max_qty, 500_000.0);
+        assert_eq!(filters.market_max_qty, 100_000.0);
         assert_eq!(quantity_string("MARKET", 7_695.267, &filters), "7695");
     }
 

@@ -37,6 +37,8 @@ pub struct AltcoinImpulseConfig {
     pub trail_pct: f64,
     pub max_hold_hours: u32,
     pub cooldown_hours: u32,
+    #[serde(default = "default_max_entry_slippage_pct")]
+    pub max_entry_slippage_pct: f64,
     pub min_24h_volume_usd: f64,
     pub min_return_1h: f64,
     pub max_return_1h: f64,
@@ -104,6 +106,34 @@ struct Position {
     extreme: f64,
     stop_price: f64,
     last_bar_ms: i64,
+    #[serde(default)]
+    protection_order_id: Option<i64>,
+    #[serde(default = "default_protection_reason")]
+    protection_reason: String,
+}
+
+fn default_max_entry_slippage_pct() -> f64 {
+    0.015
+}
+
+fn default_protection_reason() -> String {
+    "initial_stop".to_owned()
+}
+
+fn detected_exit_reason(position: &Position, exit_price: f64, reconciled: bool) -> &'static str {
+    if !reconciled || position.stop_price <= 0.0 {
+        return "unknown";
+    }
+    let distance = (exit_price / position.stop_price - 1.0).abs();
+    if distance <= 0.02 {
+        if position.protection_reason == "trailing_take_profit" {
+            "trailing_take_profit"
+        } else {
+            "initial_stop"
+        }
+    } else {
+        "manual_or_external"
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -493,7 +523,7 @@ async fn wait_fill(
         }
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
-    anyhow::bail!("{symbol} 市价单 {order_id} 在 5 秒内没有成交回报")
+    anyhow::bail!("{symbol} 订单 {order_id} 在 5 秒内没有成交回报")
 }
 
 async fn closing_fill(
@@ -590,6 +620,10 @@ pub async fn run_altcoin_impulse(
     anyhow::ensure!(
         cfg.stop_pct >= 0.03 && cfg.stop_pct <= 0.12,
         "止损必须在 3%..=12%"
+    );
+    anyhow::ensure!(
+        cfg.max_entry_slippage_pct > 0.0 && cfg.max_entry_slippage_pct <= 0.03,
+        "最大入场滑点必须在 0%..=3%"
     );
     let base_text = std::fs::read_to_string(&args.config)?;
     let collector = CollectorConfig::from_toml_str(&base_text)?;
@@ -779,7 +813,8 @@ pub async fn run_altcoin_impulse(
                         symbol.clone(),
                         scan_ms + cfg.cooldown_hours as i64 * 3_600_000,
                     );
-                    let event = json!({"ts_ms":scan_ms,"event":"exit_detected","symbol":symbol,"side":position.side,"price":exit,"qty":exit_qty,"pnl":pnl,"fee":exit_fee,"trade_reconciled":reconciled});
+                    let reason = detected_exit_reason(&position, exit, reconciled);
+                    let event = json!({"ts_ms":scan_ms,"event":"exit_detected","symbol":symbol,"side":position.side,"price":exit,"qty":exit_qty,"pnl":pnl,"fee":exit_fee,"reason":reason,"protection_order_id":position.protection_order_id,"stop_price":position.stop_price,"trade_reconciled":reconciled});
                     append_event(&event_path, event.clone())?;
                     state.record_trade(event);
                     continue;
@@ -802,6 +837,7 @@ pub async fn run_altcoin_impulse(
                 } else {
                     position.stop_price.min(trail)
                 };
+                position.protection_reason = "trailing_take_profit".to_owned();
             }
             let stopped = if position.side > 0 {
                 bar.low <= position.stop_price
@@ -832,7 +868,14 @@ pub async fn run_altcoin_impulse(
                     symbol.clone(),
                     scan_ms + cfg.cooldown_hours as i64 * 3_600_000,
                 );
-                let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"reason":if stopped{"stop"}else{"time"},"price":exit,"qty":position.qty,"pnl":pnl,"fee":fee});
+                let reason = if timed {
+                    "time"
+                } else if position.protection_reason == "trailing_take_profit" {
+                    "trailing_take_profit"
+                } else {
+                    "initial_stop"
+                };
+                let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"reason":reason,"price":exit,"qty":position.qty,"pnl":pnl,"fee":fee});
                 append_event(&event_path, event.clone())?;
                 state.record_trade(event);
             } else if let Some(client) = rest.as_ref() {
@@ -877,7 +920,7 @@ pub async fn run_altcoin_impulse(
                     client.cancel_all_open_orders(&symbol).await?;
                     let filters = client.symbol_filters(&symbol).await?;
                     let side = if position.side > 0 { "SELL" } else { "BUY" };
-                    client
+                    let protection_order_id = client
                         .place_order(
                             &symbol,
                             side,
@@ -889,6 +932,7 @@ pub async fn run_altcoin_impulse(
                             &filters,
                         )
                         .await?;
+                    position.protection_order_id = Some(protection_order_id);
                     state.positions.insert(symbol, position);
                 }
             } else {
@@ -912,8 +956,11 @@ pub async fn run_altcoin_impulse(
         while let Some(Ok((index, candidate))) = enrich.join_next().await {
             candidates[index] = candidate;
         }
+        // 仓位管理可能刚刚产生止损/时间退出，必须用更新后的现金重新计算，
+        // 避免同一扫描周期在触发日损门槛后又开出新仓。
+        let managed_equity = equity(&state, &prices);
         let daily_loss_blocked =
-            current_equity < state.day_start_equity * (1.0 - cfg.daily_loss_limit);
+            managed_equity < state.day_start_equity * (1.0 - cfg.daily_loss_limit);
         let mut eligible_count = 0usize;
         for candidate in candidates.iter().filter(|c| c.eligible()) {
             eligible_count += 1;
@@ -938,14 +985,15 @@ pub async fn run_altcoin_impulse(
                 .seen_signal
                 .insert(candidate.symbol.clone(), candidate.signal_ms);
             let gross: f64 = state.positions.values().map(|p| p.initial_notional).sum();
-            let notional = (current_equity * cfg.risk_per_trade / cfg.stop_pct)
-                .min((current_equity * cfg.max_gross_multiple - gross).max(0.0));
+            let notional = (managed_equity * cfg.risk_per_trade / cfg.stop_pct)
+                .min((managed_equity * cfg.max_gross_multiple - gross).max(0.0));
             if notional < 20.0 {
                 continue;
             }
             let mut entry = candidate.price;
             let mut qty = notional / entry;
             let mut fee = notional * 0.0005;
+            let mut protection_order_id = None;
             if let Some(client) = rest.as_ref() {
                 if let Err(error) = client
                     .set_leverage(&candidate.symbol, cfg.exchange_leverage)
@@ -992,10 +1040,22 @@ pub async fn run_altcoin_impulse(
                         continue;
                     }
                 };
-                if notional < filters.min_notional {
+                let requested_qty = qty;
+                // 入场使用 LIMIT IOC，但随后必须用一张 STOP_MARKET 覆盖全部仓位，
+                // 因此同时遵守 LOT_SIZE 与 MARKET_LOT_SIZE 的较小 maxQty。
+                let entry_max_qty = filters.max_qty.min(filters.market_max_qty);
+                if entry_max_qty.is_finite() && qty > entry_max_qty {
+                    qty = entry_max_qty;
+                    append_event(
+                        &event_path,
+                        json!({"ts_ms":scan_ms,"event":"entry_quantity_capped","symbol":candidate.symbol,"requested_qty":requested_qty,"capped_qty":qty,"max_entry_qty":entry_max_qty,"lot_max_qty":filters.max_qty,"market_max_qty":filters.market_max_qty,"requested_notional":notional,"capped_notional":qty*candidate.price}),
+                    )?;
+                }
+                let capped_notional = qty * candidate.price;
+                if capped_notional < filters.min_notional {
                     let reason = format!(
                         "名义仓位 {:.2} USDT 低于交易所最小值 {:.2} USDT",
-                        notional, filters.min_notional
+                        capped_notional, filters.min_notional
                     );
                     state.note_execution_issue(
                         scan_ms,
@@ -1012,7 +1072,7 @@ pub async fn run_altcoin_impulse(
                 let side = if candidate.side > 0 { "BUY" } else { "SELL" };
                 let formatted_qty = live::rest::fmt_step_with_precision(
                     qty,
-                    filters.market_step_size,
+                    filters.step_size,
                     filters.quantity_precision,
                 );
                 append_event(
@@ -1020,20 +1080,24 @@ pub async fn run_altcoin_impulse(
                     json!({
                         "ts_ms":scan_ms,"event":"entry_attempt","symbol":candidate.symbol,
                         "side":side,"raw_qty":qty,"formatted_qty":formatted_qty,
-                        "notional":notional,"price":candidate.price,
+                        "notional":capped_notional,"price":candidate.price,
+                        "order_kind":"LIMIT_IOC","max_entry_slippage_pct":cfg.max_entry_slippage_pct,
                         "filters":{"lot_step":filters.step_size,"market_step":filters.market_step_size,
                             "quantity_precision":filters.quantity_precision,"tick_size":filters.tick_size,
-                            "price_precision":filters.price_precision,"min_notional":filters.min_notional},
+                            "price_precision":filters.price_precision,"min_notional":filters.min_notional,
+                            "lot_max_qty":filters.max_qty,"market_max_qty":filters.market_max_qty},
                         "signal":candidate
                     }),
                 )?;
+                let guard_price =
+                    candidate.price * (1.0 + candidate.side as f64 * cfg.max_entry_slippage_pct);
                 let order = match client
                     .place_order(
                         &candidate.symbol,
                         side,
-                        "MARKET",
+                        "LIMIT_IOC",
                         qty,
-                        None,
+                        Some(guard_price),
                         None,
                         false,
                         &filters,
@@ -1043,18 +1107,18 @@ pub async fn run_altcoin_impulse(
                     Ok(order) => order,
                     Err(error) => {
                         let reason = format!(
-                            "{error}; formatted_qty={formatted_qty}; market_step={}; quantity_precision={}",
-                            filters.market_step_size, filters.quantity_precision
+                            "{error}; formatted_qty={formatted_qty}; market_step={}; quantity_precision={}; market_max_qty={}",
+                            filters.market_step_size, filters.quantity_precision, filters.market_max_qty
                         );
                         state.note_execution_issue(
                             scan_ms,
                             &candidate.symbol,
-                            "market_order",
+                            "entry_order",
                             reason.clone(),
                         );
                         append_event(
                             &event_path,
-                            json!({"ts_ms":scan_ms,"event":"entry_rejected","stage":"market_order","symbol":candidate.symbol,"reason":reason,"formatted_qty":formatted_qty}),
+                            json!({"ts_ms":scan_ms,"event":"entry_rejected","stage":"entry_order","symbol":candidate.symbol,"reason":reason,"formatted_qty":formatted_qty}),
                         )?;
                         continue;
                     }
@@ -1062,27 +1126,42 @@ pub async fn run_altcoin_impulse(
                 match wait_fill(client, &candidate.symbol, order).await {
                     Ok(fill) => (entry, qty, fee) = fill,
                     Err(error) => {
-                        state.note_execution_issue(
-                            scan_ms,
-                            &candidate.symbol,
-                            "fill_reconciliation",
-                            error.to_string(),
-                        );
-                        let emergency =
-                            emergency_flatten(client, &candidate.symbol, &filters).await;
-                        append_event(
-                            &event_path,
-                            json!({"ts_ms":scan_ms,"event":"entry_reconciliation_failed","symbol":candidate.symbol,"order_id":order,"reason":error.to_string(),"emergency_flatten":format!("{emergency:?}")}),
-                        )?;
-                        emergency.with_context(|| {
-                            format!("{} 成交回报不明且应急平仓失败", candidate.symbol)
-                        })?;
-                        continue;
+                        match emergency_flatten(client, &candidate.symbol, &filters).await {
+                            Ok(None) => {
+                                append_event(
+                                    &event_path,
+                                    json!({"ts_ms":scan_ms,"event":"entry_rejected","stage":"price_guard_unfilled","symbol":candidate.symbol,"order_id":order,"reason":"1.5% 追价保护 IOC 未成交","detail":error.to_string()}),
+                                )?;
+                                continue;
+                            }
+                            Ok(Some(flatten)) => {
+                                state.note_execution_issue(
+                                    scan_ms,
+                                    &candidate.symbol,
+                                    "fill_reconciliation",
+                                    error.to_string(),
+                                );
+                                append_event(
+                                    &event_path,
+                                    json!({"ts_ms":scan_ms,"event":"entry_reconciliation_failed","symbol":candidate.symbol,"order_id":order,"reason":error.to_string(),"emergency_flatten":format!("{flatten:?}")}),
+                                )?;
+                                anyhow::bail!(
+                                    "{} IOC 成交回报超时，已应急平仓；需核对成交日志",
+                                    candidate.symbol
+                                );
+                            }
+                            Err(flatten_error) => {
+                                anyhow::bail!(
+                                    "{} IOC 成交回报不明且应急平仓失败: {flatten_error}",
+                                    candidate.symbol
+                                );
+                            }
+                        }
                     }
                 }
                 let stop = entry * (1.0 - candidate.side as f64 * cfg.stop_pct);
                 let close_side = if candidate.side > 0 { "SELL" } else { "BUY" };
-                if let Err(error) = client
+                match client
                     .place_order(
                         &candidate.symbol,
                         close_side,
@@ -1095,21 +1174,25 @@ pub async fn run_altcoin_impulse(
                     )
                     .await
                 {
-                    state.note_execution_issue(
-                        scan_ms,
-                        &candidate.symbol,
-                        "protective_stop",
-                        error.to_string(),
-                    );
-                    let emergency = emergency_flatten(client, &candidate.symbol, &filters).await;
-                    append_event(
-                        &event_path,
-                        json!({"ts_ms":scan_ms,"event":"protection_failed","symbol":candidate.symbol,"entry_price":entry,"qty":qty,"stop_price":stop,"reason":error.to_string(),"emergency_flatten":format!("{emergency:?}")}),
-                    )?;
-                    emergency.with_context(|| {
-                        format!("{} 止损挂单失败且应急平仓失败", candidate.symbol)
-                    })?;
-                    continue;
+                    Ok(order_id) => protection_order_id = Some(order_id),
+                    Err(error) => {
+                        state.note_execution_issue(
+                            scan_ms,
+                            &candidate.symbol,
+                            "protective_stop",
+                            error.to_string(),
+                        );
+                        let emergency =
+                            emergency_flatten(client, &candidate.symbol, &filters).await;
+                        append_event(
+                            &event_path,
+                            json!({"ts_ms":scan_ms,"event":"protection_failed","symbol":candidate.symbol,"entry_price":entry,"qty":qty,"stop_price":stop,"reason":error.to_string(),"emergency_flatten":format!("{emergency:?}")}),
+                        )?;
+                        emergency.with_context(|| {
+                            format!("{} 止损挂单失败且应急平仓失败", candidate.symbol)
+                        })?;
+                        continue;
+                    }
                 }
             }
             let stop = entry * (1.0 - candidate.side as f64 * cfg.stop_pct);
@@ -1131,6 +1214,8 @@ pub async fn run_altcoin_impulse(
                     extreme: entry,
                     stop_price: stop,
                     last_bar_ms: candidate.signal_ms,
+                    protection_order_id,
+                    protection_reason: default_protection_reason(),
                 },
             );
             let event = json!({"ts_ms":scan_ms,"event":"entry","symbol":candidate.symbol,"side":candidate.side,"signal":candidate,"entry_price":entry,"qty":qty,"notional":qty*entry,"margin_estimate":qty*entry/cfg.exchange_leverage as f64,"risk_usd":qty*entry*cfg.stop_pct,"fee":fee});
@@ -1155,6 +1240,8 @@ pub async fn run_altcoin_impulse(
                     "entry_ms":position.entry_ms, "entry_price":position.entry_price,
                     "initial_notional":position.initial_notional, "stop_price":position.stop_price,
                     "extreme":position.extreme, "mark_price":mark_price,
+                    "protection_order_id":position.protection_order_id,
+                    "protection_reason":position.protection_reason,
                     "unrealized_pnl":unrealized_pnl,
                     "return_pct":position.side as f64 * (mark_price / position.entry_price - 1.0)
                 })
@@ -1211,6 +1298,8 @@ pub async fn run_altcoin_impulse(
 
 #[cfg(test)]
 mod tests {
+    use super::{detected_exit_reason, Position};
+
     #[test]
     fn exchange_leverage_does_not_change_stop_risk() {
         let equity = 1_000.0;
@@ -1221,5 +1310,35 @@ mod tests {
         assert_eq!(notional, 2_000.0);
         assert_eq!(notional / leverage, 200.0);
         assert_eq!(notional * stop, 100.0);
+    }
+
+    #[test]
+    fn detected_exit_uses_persisted_protection_stage() {
+        let mut position = Position {
+            symbol: "TESTUSDT".into(),
+            side: 1,
+            qty: 100.0,
+            entry_ms: 1,
+            entry_price: 1.0,
+            entry_fee: 0.1,
+            initial_notional: 100.0,
+            extreme: 1.0,
+            stop_price: 0.95,
+            last_bar_ms: 1,
+            protection_order_id: Some(42),
+            protection_reason: "initial_stop".into(),
+        };
+        assert_eq!(detected_exit_reason(&position, 0.949, true), "initial_stop");
+        position.stop_price = 1.10;
+        position.protection_reason = "trailing_take_profit".into();
+        assert_eq!(
+            detected_exit_reason(&position, 1.095, true),
+            "trailing_take_profit"
+        );
+        assert_eq!(
+            detected_exit_reason(&position, 1.25, true),
+            "manual_or_external"
+        );
+        assert_eq!(detected_exit_reason(&position, 1.10, false), "unknown");
     }
 }
