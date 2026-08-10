@@ -27,6 +27,8 @@ pub struct AltcoinImpulseConfig {
     pub enabled: bool,
     pub capital_usdt: f64,
     pub exchange_leverage: u32,
+    #[serde(default = "default_min_exchange_leverage")]
+    pub min_exchange_leverage: u32,
     pub risk_per_trade: f64,
     pub max_positions: usize,
     pub max_daily_entries: u32,
@@ -110,10 +112,16 @@ struct Position {
     protection_order_id: Option<i64>,
     #[serde(default = "default_protection_reason")]
     protection_reason: String,
+    #[serde(default)]
+    exchange_leverage: Option<u32>,
 }
 
 fn default_max_entry_slippage_pct() -> f64 {
     0.015
+}
+
+fn default_min_exchange_leverage() -> u32 {
+    5
 }
 
 fn default_protection_reason() -> String {
@@ -556,6 +564,7 @@ async fn build_position_status(
             "extreme":position.extreme, "mark_price":mark_price,
             "protection_order_id":position.protection_order_id,
             "protection_reason":position.protection_reason,
+            "exchange_leverage":position.exchange_leverage,
             "unrealized_pnl":unrealized_pnl,
             "return_pct": if entry_notional > 0.0 { unrealized_pnl / entry_notional } else { 0.0 },
             "valuation_source":valuation_source,
@@ -619,6 +628,25 @@ fn realtime_trailing_stop(
         improved <= current_stop * 0.999
     };
     (extreme, material.then_some(improved))
+}
+
+fn clamp_entry_guard_price(
+    side: i32,
+    signal_price: f64,
+    max_slippage_pct: f64,
+    execution_mark: f64,
+    multiplier_up: f64,
+    multiplier_down: f64,
+    tick_size: f64,
+) -> (f64, f64) {
+    let raw = signal_price * (1.0 + side as f64 * max_slippage_pct);
+    let clamped = if side > 0 {
+        raw.min(execution_mark * multiplier_up - tick_size)
+            .max(tick_size)
+    } else {
+        raw.max(execution_mark * multiplier_down + tick_size)
+    };
+    (raw, clamped)
 }
 
 async fn wait_fill(
@@ -951,12 +979,23 @@ pub async fn run_altcoin_impulse(
         "exchange_leverage 必须在 1..=20"
     );
     anyhow::ensure!(
+        (1..=cfg.exchange_leverage).contains(&cfg.min_exchange_leverage),
+        "min_exchange_leverage 必须在 1..=exchange_leverage"
+    );
+    anyhow::ensure!(
         cfg.risk_per_trade > 0.0 && cfg.risk_per_trade <= 0.10,
         "山寨币策略单笔风险必须在 0%..=10%"
     );
     anyhow::ensure!(
         cfg.stop_pct >= 0.03 && cfg.stop_pct <= 0.12,
         "止损必须在 3%..=12%"
+    );
+    anyhow::ensure!(
+        cfg.trail_activation_pct >= 0.01
+            && cfg.trail_activation_pct <= 0.10
+            && cfg.trail_pct >= 0.005
+            && cfg.trail_pct < cfg.trail_activation_pct,
+        "跟踪止盈要求激活点 1%..=10%，跟踪距离 >=0.5% 且小于激活点"
     );
     anyhow::ensure!(
         cfg.max_entry_slippage_pct > 0.0 && cfg.max_entry_slippage_pct <= 0.03,
@@ -1291,22 +1330,36 @@ pub async fn run_altcoin_impulse(
             let mut qty = notional / entry;
             let mut fee = notional * 0.0005;
             let mut protection_order_id = None;
+            let mut actual_leverage = cfg.exchange_leverage;
             if let Some(client) = rest.as_ref() {
-                if let Err(error) = client
-                    .set_leverage(&candidate.symbol, cfg.exchange_leverage)
+                actual_leverage = match client
+                    .set_leverage_up_to(
+                        &candidate.symbol,
+                        cfg.exchange_leverage,
+                        cfg.min_exchange_leverage,
+                    )
                     .await
                 {
-                    state.note_execution_issue(
-                        scan_ms,
-                        &candidate.symbol,
-                        "set_leverage",
-                        error.to_string(),
-                    );
+                    Ok(leverage) => leverage,
+                    Err(error) => {
+                        state.note_execution_issue(
+                            scan_ms,
+                            &candidate.symbol,
+                            "set_leverage",
+                            error.to_string(),
+                        );
+                        append_event(
+                            &event_path,
+                            json!({"ts_ms":scan_ms,"event":"entry_rejected","stage":"set_leverage","symbol":candidate.symbol,"reason":error.to_string()}),
+                        )?;
+                        continue;
+                    }
+                };
+                if actual_leverage != cfg.exchange_leverage {
                     append_event(
                         &event_path,
-                        json!({"ts_ms":scan_ms,"event":"entry_rejected","stage":"set_leverage","symbol":candidate.symbol,"reason":error.to_string()}),
+                        json!({"ts_ms":scan_ms,"event":"leverage_adjusted","symbol":candidate.symbol,"requested_leverage":cfg.exchange_leverage,"actual_leverage":actual_leverage}),
                     )?;
-                    continue;
                 }
                 if let Err(error) = client.set_margin_isolated(&candidate.symbol).await {
                     state.note_execution_issue(
@@ -1382,12 +1435,43 @@ pub async fn run_altcoin_impulse(
                         "filters":{"lot_step":filters.step_size,"market_step":filters.market_step_size,
                             "quantity_precision":filters.quantity_precision,"tick_size":filters.tick_size,
                             "price_precision":filters.price_precision,"min_notional":filters.min_notional,
-                            "lot_max_qty":filters.max_qty,"market_max_qty":filters.market_max_qty},
+                            "lot_max_qty":filters.max_qty,"market_max_qty":filters.market_max_qty,
+                            "multiplier_up":filters.multiplier_up,"multiplier_down":filters.multiplier_down},
+                        "requested_leverage":cfg.exchange_leverage,"actual_leverage":actual_leverage,
                         "signal":candidate
                     }),
                 )?;
-                let guard_price =
-                    candidate.price * (1.0 + candidate.side as f64 * cfg.max_entry_slippage_pct);
+                let execution_mark = match client.mark_price(&candidate.symbol).await {
+                    Ok(price) => price,
+                    Err(error) => {
+                        state.note_execution_issue(
+                            scan_ms,
+                            &candidate.symbol,
+                            "execution_mark_price",
+                            error.to_string(),
+                        );
+                        append_event(
+                            &event_path,
+                            json!({"ts_ms":scan_ms,"event":"entry_rejected","stage":"execution_mark_price","symbol":candidate.symbol,"reason":error.to_string()}),
+                        )?;
+                        continue;
+                    }
+                };
+                let (raw_guard_price, guard_price) = clamp_entry_guard_price(
+                    candidate.side,
+                    candidate.price,
+                    cfg.max_entry_slippage_pct,
+                    execution_mark,
+                    filters.multiplier_up,
+                    filters.multiplier_down,
+                    filters.tick_size,
+                );
+                if (guard_price - raw_guard_price).abs() > filters.tick_size * 0.5 {
+                    append_event(
+                        &event_path,
+                        json!({"ts_ms":scan_ms,"event":"entry_price_guard_clamped","symbol":candidate.symbol,"side":side,"signal_price":candidate.price,"execution_mark_price":execution_mark,"raw_guard_price":raw_guard_price,"clamped_guard_price":guard_price,"multiplier_up":filters.multiplier_up,"multiplier_down":filters.multiplier_down}),
+                    )?;
+                }
                 let order = match client
                     .place_order(
                         &candidate.symbol,
@@ -1513,9 +1597,10 @@ pub async fn run_altcoin_impulse(
                     last_bar_ms: candidate.signal_ms,
                     protection_order_id,
                     protection_reason: default_protection_reason(),
+                    exchange_leverage: Some(actual_leverage),
                 },
             );
-            let event = json!({"ts_ms":scan_ms,"event":"entry","symbol":candidate.symbol,"side":candidate.side,"signal":candidate,"entry_price":entry,"qty":qty,"notional":qty*entry,"margin_estimate":qty*entry/cfg.exchange_leverage as f64,"risk_usd":qty*entry*cfg.stop_pct,"fee":fee});
+            let event = json!({"ts_ms":scan_ms,"event":"entry","symbol":candidate.symbol,"side":candidate.side,"signal":candidate,"entry_price":entry,"qty":qty,"notional":qty*entry,"requested_leverage":cfg.exchange_leverage,"actual_leverage":actual_leverage,"margin_estimate":qty*entry/actual_leverage as f64,"risk_usd":qty*entry*cfg.stop_pct,"fee":fee});
             append_event(&event_path, event.clone())?;
             state.record_trade(event);
         }
@@ -1670,8 +1755,8 @@ pub async fn run_altcoin_impulse(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_daily_entry_bonus, apply_daily_risk_reset, detected_exit_reason,
-        realtime_trailing_stop, PersistedState, Position,
+        apply_daily_entry_bonus, apply_daily_risk_reset, clamp_entry_guard_price,
+        detected_exit_reason, realtime_trailing_stop, PersistedState, Position,
     };
 
     #[test]
@@ -1701,6 +1786,7 @@ mod tests {
             last_bar_ms: 1,
             protection_order_id: Some(42),
             protection_reason: "initial_stop".into(),
+            exchange_leverage: Some(10),
         };
         assert_eq!(detected_exit_reason(&position, 0.949, true), "initial_stop");
         position.stop_price = 1.10;
@@ -1774,5 +1860,16 @@ mod tests {
         let log = std::fs::read_to_string(&path).unwrap();
         assert!(log.contains("daily_entry_limit_increased"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn entry_guard_respects_demo_percent_price_band() {
+        let (raw, clamped) =
+            clamp_entry_guard_price(1, 0.02405, 0.015, 0.0226241, 1.05, 0.95, 0.00001);
+        assert!(raw > 0.0244);
+        assert!(clamped < 0.0237553, "必须低于交易所报告的最高限价");
+
+        let (_, short_guard) = clamp_entry_guard_price(-1, 100.0, 0.015, 100.0, 1.05, 0.95, 0.1);
+        assert!(short_guard > 95.0, "卖出限价必须高于交易所最低边界");
     }
 }

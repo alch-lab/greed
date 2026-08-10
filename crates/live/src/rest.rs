@@ -45,6 +45,9 @@ pub struct SymbolFilters {
     pub market_max_qty: f64,
     /// 最小名义价值（MIN_NOTIONAL/NOTIONAL）
     pub min_notional: f64,
+    /// 相对参考价允许的最高/最低限价倍数（PERCENT_PRICE）。
+    pub multiplier_up: f64,
+    pub multiplier_down: f64,
 }
 
 /// Binance `positionRisk` 返回的交易所侧实时仓位估值。
@@ -141,6 +144,8 @@ fn parse_symbol_filters(
         max_qty: f64::INFINITY,
         market_max_qty: f64::INFINITY,
         min_notional: 100.0,
+        multiplier_up: f64::INFINITY,
+        multiplier_down: 0.0,
     };
     let mut market_step_seen = false;
     for filter in sym["filters"].as_array().cloned().unwrap_or_default() {
@@ -178,6 +183,16 @@ fn parse_symbol_filters(
                     .or_else(|| filter["minNotional"].as_str())
                     .and_then(|text| text.parse().ok())
                     .unwrap_or(filters.min_notional)
+            }
+            "PERCENT_PRICE" => {
+                filters.multiplier_up = filter["multiplierUp"]
+                    .as_str()
+                    .and_then(|text| text.parse().ok())
+                    .unwrap_or(filters.multiplier_up);
+                filters.multiplier_down = filter["multiplierDown"]
+                    .as_str()
+                    .and_then(|text| text.parse().ok())
+                    .unwrap_or(filters.multiplier_down);
             }
             _ => {}
         }
@@ -329,6 +344,42 @@ impl RestClient {
         )
         .await?;
         Ok(())
+    }
+
+    /// 尝试请求目标杠杆；若交易所返回 -4028（该标的不支持），逐级回退到可用值。
+    pub async fn set_leverage_up_to(
+        &self,
+        symbol: &str,
+        requested: u32,
+        minimum: u32,
+    ) -> Result<u32, RestError> {
+        let requested = requested.max(1);
+        let minimum = minimum.clamp(1, requested);
+        for leverage in (minimum..=requested).rev() {
+            match self.set_leverage(symbol, leverage).await {
+                Ok(()) => return Ok(leverage),
+                Err(RestError::Binance { code: -4028, .. }) if leverage > minimum => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Err(RestError::Data(format!(
+            "{symbol} 在 {minimum}..={requested} 范围内没有可用杠杆"
+        )))
+    }
+
+    /// 当前执行端点的标记价。Paper 模式下这是 Demo Futures 的价格，可能与用于
+    /// 生成信号的主网价格有偏差，限价单必须按这个市场的 PERCENT_PRICE 约束。
+    pub async fn mark_price(&self, symbol: &str) -> Result<f64, RestError> {
+        let value = self
+            .get_json(&format!(
+                "{}/fapi/v1/premiumIndex?symbol={symbol}",
+                self.base
+            ))
+            .await?;
+        value["markPrice"]
+            .as_str()
+            .and_then(|text| text.parse().ok())
+            .ok_or_else(|| RestError::Data(format!("premiumIndex 无 {symbol} markPrice")))
     }
 
     /// 设逐仓（已是逐仓时币安返回 -4046 / -4059，视为成功）。
@@ -638,6 +689,8 @@ mod tests {
             max_qty: 1_000_000.0,
             market_max_qty: 100_000.0,
             min_notional: 5.0,
+            multiplier_up: 1.05,
+            multiplier_down: 0.95,
         };
         assert_eq!(quantity_string("MARKET", 123.456, &filters), "123");
         assert_eq!(quantity_string("STOP_MARKET", 123.456, &filters), "123");
@@ -666,7 +719,8 @@ mod tests {
                         {"filterType":"PRICE_FILTER", "tickSize":"0.00001000"},
                         {"filterType":"LOT_SIZE", "stepSize":"0.10000000", "maxQty":"500000"},
                         {"filterType":"MARKET_LOT_SIZE", "stepSize":"1.00000000", "maxQty":"100000"},
-                        {"filterType":"MIN_NOTIONAL", "notional":"5"}
+                        {"filterType":"MIN_NOTIONAL", "notional":"5"},
+                        {"filterType":"PERCENT_PRICE", "multiplierUp":"1.0500", "multiplierDown":"0.9500"}
                     ]
                 }
             ]
@@ -679,6 +733,8 @@ mod tests {
         assert_eq!(filters.quantity_precision, 0);
         assert_eq!(filters.max_qty, 500_000.0);
         assert_eq!(filters.market_max_qty, 100_000.0);
+        assert_eq!(filters.multiplier_up, 1.05);
+        assert_eq!(filters.multiplier_down, 0.95);
         assert_eq!(quantity_string("MARKET", 7_695.267, &filters), "7695");
     }
 
