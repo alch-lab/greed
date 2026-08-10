@@ -495,6 +495,74 @@ fn equity(state: &PersistedState, prices: &HashMap<String, f64>) -> f64 {
             .sum::<f64>()
 }
 
+async fn build_position_status(
+    state: &PersistedState,
+    prices: &HashMap<String, f64>,
+    rest: Option<&live::RestClient>,
+    valuation_ms: i64,
+) -> Vec<Value> {
+    let mut open_positions: Vec<_> = state.positions.values().collect();
+    open_positions.sort_by_key(|position| position.entry_ms);
+    let mut result = Vec::with_capacity(open_positions.len());
+    for position in open_positions {
+        let fallback_mark = prices
+            .get(&position.symbol)
+            .copied()
+            .unwrap_or(position.entry_price);
+        let fallback_pnl =
+            position.side as f64 * position.qty * (fallback_mark - position.entry_price);
+        let exchange = if let Some(client) = rest {
+            match client.position_risk(&position.symbol).await {
+                Ok(snapshot) if snapshot.position_amt.abs() > 1e-12 => Some(snapshot),
+                Ok(_) => None,
+                Err(error) => {
+                    warn!(symbol=%position.symbol, error=%error, "实时仓位估值失败，暂用已收盘 K 线");
+                    None
+                }
+            }
+        } else {
+            None
+        };
+        let (qty, entry_price, mark_price, unrealized_pnl, valuation_source) = match exchange {
+            Some(snapshot) => (
+                snapshot.position_amt.abs(),
+                snapshot.entry_price,
+                snapshot.mark_price,
+                snapshot.unrealized_profit,
+                "binance_position_risk",
+            ),
+            None => (
+                position.qty,
+                position.entry_price,
+                fallback_mark,
+                fallback_pnl,
+                "closed_15m_fallback",
+            ),
+        };
+        let entry_notional = qty * entry_price;
+        result.push(json!({
+            "symbol":position.symbol, "side":position.side, "qty":qty,
+            "entry_ms":position.entry_ms, "entry_price":entry_price,
+            "initial_notional":position.initial_notional, "stop_price":position.stop_price,
+            "extreme":position.extreme, "mark_price":mark_price,
+            "protection_order_id":position.protection_order_id,
+            "protection_reason":position.protection_reason,
+            "unrealized_pnl":unrealized_pnl,
+            "return_pct": if entry_notional > 0.0 { unrealized_pnl / entry_notional } else { 0.0 },
+            "valuation_source":valuation_source,
+            "valuation_ms":valuation_ms
+        }));
+    }
+    result
+}
+
+fn positions_unrealized(positions: &[Value]) -> f64 {
+    positions
+        .iter()
+        .filter_map(|position| position["unrealized_pnl"].as_f64())
+        .sum()
+}
+
 async fn wait_fill(
     rest: &live::RestClient,
     symbol: &str,
@@ -768,10 +836,25 @@ pub async fn run_altcoin_impulse(
                 Err(e) => warn!(error=%e, "候选任务失败"),
             }
         }
-        let prices: HashMap<String, f64> = bars_by_symbol
+        let mut prices: HashMap<String, f64> = bars_by_symbol
             .iter()
             .filter_map(|(s, b)| b.last().map(|x| (s.clone(), x.close)))
             .collect();
+        // 已持仓标的用交易所实时 markPrice 覆盖 15m 已收盘价。这个价格不仅用于
+        // 页面，也用于日损门槛和动态仓位，避免策略风险判断滞后最多 15 分钟。
+        if let Some(client) = rest.as_ref() {
+            for symbol in state.positions.keys() {
+                match client.position_risk(symbol).await {
+                    Ok(snapshot) if snapshot.position_amt.abs() > 1e-12 => {
+                        prices.insert(symbol.clone(), snapshot.mark_price);
+                    }
+                    Ok(_) => {}
+                    Err(error) => {
+                        warn!(symbol=%symbol, error=%error, "实时标记价失败，风险计算暂用已收盘 K 线")
+                    }
+                }
+            }
+        }
         let current_equity = equity(&state, &prices);
         let current_day = scan_ms / DAY_MS;
         if current_day != state.day {
@@ -1223,30 +1306,10 @@ pub async fn run_altcoin_impulse(
             state.record_trade(event);
         }
         save_state(&state_path, &state)?;
-        let current_equity = equity(&state, &prices);
-        let mut open_positions: Vec<_> = state.positions.values().collect();
-        open_positions.sort_by_key(|position| position.entry_ms);
-        let position_status: Vec<Value> = open_positions
-            .into_iter()
-            .map(|position| {
-                let mark_price = prices
-                    .get(&position.symbol)
-                    .copied()
-                    .unwrap_or(position.entry_price);
-                let unrealized_pnl =
-                    position.side as f64 * position.qty * (mark_price - position.entry_price);
-                json!({
-                    "symbol":position.symbol, "side":position.side, "qty":position.qty,
-                    "entry_ms":position.entry_ms, "entry_price":position.entry_price,
-                    "initial_notional":position.initial_notional, "stop_price":position.stop_price,
-                    "extreme":position.extreme, "mark_price":mark_price,
-                    "protection_order_id":position.protection_order_id,
-                    "protection_reason":position.protection_reason,
-                    "unrealized_pnl":unrealized_pnl,
-                    "return_pct":position.side as f64 * (mark_price / position.entry_price - 1.0)
-                })
-            })
-            .collect();
+        let valuation_ms = chrono::Utc::now().timestamp_millis();
+        let position_status =
+            build_position_status(&state, &prices, rest.as_ref(), valuation_ms).await;
+        let current_equity = state.cash + positions_unrealized(&position_status);
         append_event(
             &event_path,
             json!({
@@ -1254,38 +1317,72 @@ pub async fn run_altcoin_impulse(
                 "shortlist_count":shortlist_count, "eligible_count":eligible_count,
                 "equity":current_equity, "daily_entries":state.daily_entries,
                 "daily_loss_blocked":daily_loss_blocked,
+                "positions":position_status,
                 "candidates":candidates.iter().take(10).collect::<Vec<_>>()
             }),
         )?;
+        let mut status_payload = json!({
+            "state":"running", "mode":mode.as_str(), "started_at_ms":started_ms,
+            "uptime_s":(scan_ms-started_ms)/1000, "strategy_name":args.strategy,
+            "strategy_hash":strategy_hash, "git_commit":git_commit,
+            "equity":current_equity, "cash":state.cash, "position":Value::Null,
+            "n_intents":state.total_entries, "n_fills":state.total_entries + state.total_exits,
+            "altcoin_impulse": {
+                "stage": if daily_loss_blocked {"risk_blocked"} else if eligible_count>0 {"execution"} else if shortlist_count>0 {"confirmation"} else {"scan"},
+                "universe_count":spot_symbols.intersection(&active).count(), "shortlist_count":shortlist_count,
+                "eligible_count":eligible_count, "last_scan_ms":scan_ms,
+                "exchange_leverage":cfg.exchange_leverage, "risk_per_trade":cfg.risk_per_trade,
+                "stop_pct":cfg.stop_pct, "notional_per_trade_estimate":current_equity*cfg.risk_per_trade/cfg.stop_pct,
+                "margin_per_trade_estimate":current_equity*cfg.risk_per_trade/cfg.stop_pct/cfg.exchange_leverage as f64,
+                "worst_loss_per_trade_estimate":current_equity*cfg.risk_per_trade,
+                "daily_entries":state.daily_entries, "max_daily_entries":cfg.max_daily_entries,
+                "daily_loss_blocked":daily_loss_blocked, "positions":position_status,
+                "last_valuation_ms":valuation_ms,
+                "valuation_source": if rest.is_some() {"binance_position_risk"} else {"closed_15m_fallback"},
+                "total_entries":state.total_entries, "total_exits":state.total_exits, "wins":state.wins,
+                "rejected_entries":state.rejected_entries, "last_execution_issue":state.last_execution_issue,
+                "recent_trades":state.recent_trades,
+                "realized_pnl":state.realized_pnl, "fees":state.fees,
+                "candidates":candidates.into_iter().take(10).collect::<Vec<_>>(),
+                "journal":event_path,
+            }
+        });
         if let Some(tx) = &status_tx {
-            let _ = tx.send(json!({
-                "state":"running", "mode":mode.as_str(), "started_at_ms":started_ms,
-                "uptime_s":(scan_ms-started_ms)/1000, "strategy_name":args.strategy,
-                "strategy_hash":strategy_hash, "git_commit":git_commit,
-                "equity":current_equity, "cash":state.cash, "position":Value::Null,
-                "n_intents":state.total_entries, "n_fills":state.total_entries + state.total_exits,
-                "altcoin_impulse": {
-                    "stage": if daily_loss_blocked {"risk_blocked"} else if eligible_count>0 {"execution"} else if shortlist_count>0 {"confirmation"} else {"scan"},
-                    "universe_count":spot_symbols.intersection(&active).count(), "shortlist_count":shortlist_count,
-                    "eligible_count":eligible_count, "last_scan_ms":scan_ms,
-                    "exchange_leverage":cfg.exchange_leverage, "risk_per_trade":cfg.risk_per_trade,
-                    "stop_pct":cfg.stop_pct, "notional_per_trade_estimate":current_equity*cfg.risk_per_trade/cfg.stop_pct,
-                    "margin_per_trade_estimate":current_equity*cfg.risk_per_trade/cfg.stop_pct/cfg.exchange_leverage as f64,
-                    "worst_loss_per_trade_estimate":current_equity*cfg.risk_per_trade,
-                    "daily_entries":state.daily_entries, "max_daily_entries":cfg.max_daily_entries,
-                    "daily_loss_blocked":daily_loss_blocked, "positions":position_status,
-                    "total_entries":state.total_entries, "total_exits":state.total_exits, "wins":state.wins,
-                    "rejected_entries":state.rejected_entries, "last_execution_issue":state.last_execution_issue,
-                    "recent_trades":state.recent_trades,
-                    "realized_pnl":state.realized_pnl, "fees":state.fees,
-                    "candidates":candidates.into_iter().take(10).collect::<Vec<_>>(),
-                    "journal":event_path,
-                }
-            }));
+            let _ = tx.send(status_payload.clone());
         }
-        tokio::select! {
-            _ = tokio::time::sleep(Duration::from_secs(cfg.poll_seconds.max(15))) => {},
-            changed = shutdown.changed() => { if changed.is_err() || *shutdown.borrow() { break; } }
+
+        // 全市场信号仍按 poll_seconds 扫描；持仓估值单独每 5 秒刷新，避免为了更新
+        // 浮盈亏而高频重拉数百个交易对的 K 线。
+        let next_scan = tokio::time::Instant::now() + Duration::from_secs(cfg.poll_seconds.max(15));
+        loop {
+            let now = tokio::time::Instant::now();
+            if now >= next_scan {
+                break;
+            }
+            let wait = (next_scan - now).min(Duration::from_secs(5));
+            tokio::select! {
+                _ = tokio::time::sleep(wait) => {},
+                changed = shutdown.changed() => {
+                    if changed.is_err() || *shutdown.borrow() { break; }
+                }
+            }
+            if *shutdown.borrow() {
+                break;
+            }
+            if let (Some(tx), Some(client)) = (&status_tx, rest.as_ref()) {
+                let refresh_ms = chrono::Utc::now().timestamp_millis();
+                let refreshed =
+                    build_position_status(&state, &prices, Some(client), refresh_ms).await;
+                let refreshed_equity = state.cash + positions_unrealized(&refreshed);
+                status_payload["uptime_s"] = json!((refresh_ms - started_ms) / 1000);
+                status_payload["equity"] = json!(refreshed_equity);
+                status_payload["altcoin_impulse"]["positions"] = json!(refreshed);
+                status_payload["altcoin_impulse"]["last_valuation_ms"] = json!(refresh_ms);
+                let _ = tx.send(status_payload.clone());
+            }
+        }
+        if *shutdown.borrow() {
+            break;
         }
     }
     save_state(&state_path, &state)?;

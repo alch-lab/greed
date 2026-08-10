@@ -47,6 +47,18 @@ pub struct SymbolFilters {
     pub min_notional: f64,
 }
 
+/// Binance `positionRisk` 返回的交易所侧实时仓位估值。
+///
+/// 前端与风险判断应优先使用这里的 markPrice/unRealizedProfit，不能用最近一根
+/// 已收盘 K 线代替，否则在高波动山寨币上会产生显著滞后。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct PositionRisk {
+    pub position_amt: f64,
+    pub entry_price: f64,
+    pub mark_price: f64,
+    pub unrealized_profit: f64,
+}
+
 /// 向下取整到步长的整数倍（币安要求 price/qty 对齐 tick/step）。
 pub fn floor_to_step(x: f64, step: f64) -> f64 {
     if step <= 0.0 {
@@ -372,6 +384,11 @@ impl RestClient {
 
     /// 当前持仓数量（带符号：多正空负；0 = 空仓）。GET /fapi/v2/positionRisk。
     pub async fn position_amt(&self, symbol: &str) -> Result<f64, RestError> {
+        Ok(self.position_risk(symbol).await?.position_amt)
+    }
+
+    /// 当前单一交易对的实时仓位、标记价和币安计算的未实现盈亏。
+    pub async fn position_risk(&self, symbol: &str) -> Result<PositionRisk, RestError> {
         let v = self
             .signed(
                 reqwest::Method::GET,
@@ -379,11 +396,22 @@ impl RestClient {
                 &[("symbol", symbol.to_string())],
             )
             .await?;
-        v.as_array()
+        let row = v
+            .as_array()
             .and_then(|a| a.first())
-            .and_then(|p| p["positionAmt"].as_str())
-            .and_then(|s| s.parse().ok())
-            .ok_or_else(|| RestError::Data("positionRisk 响应异常".into()))
+            .ok_or_else(|| RestError::Data("positionRisk 响应异常".into()))?;
+        let number = |field: &str| {
+            row[field]
+                .as_str()
+                .and_then(|value| value.parse::<f64>().ok())
+                .ok_or_else(|| RestError::Data(format!("positionRisk 缺少 {field}")))
+        };
+        Ok(PositionRisk {
+            position_amt: number("positionAmt")?,
+            entry_price: number("entryPrice")?,
+            mark_price: number("markPrice")?,
+            unrealized_profit: number("unRealizedProfit")?,
+        })
     }
 
     /// 账户全部非零 USDⓈ-M 持仓。多币种执行器启动时用它阻止接管外部/BTC 仓位。
