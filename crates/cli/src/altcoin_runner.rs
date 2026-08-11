@@ -16,6 +16,10 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use tracing::{info, warn};
 
+use crate::altcoin_reversal_observer::{
+    observer_status, tracked_symbols, update_reversal_observer, AltcoinReversalObserverConfig,
+    ReversalObserverState,
+};
 use crate::trade_runner::{TradeArgs, TradeMode};
 
 const FUTURES_BASE: &str = "https://fapi.binance.com";
@@ -58,16 +62,19 @@ pub struct AltcoinImpulseConfig {
 #[derive(Debug, Deserialize)]
 struct StrategyFile {
     altcoin_impulse: AltcoinImpulseConfig,
+    #[serde(default)]
+    altcoin_reversal_observer: AltcoinReversalObserverConfig,
 }
 
 #[derive(Debug, Clone)]
-struct Bar {
-    open_ms: i64,
-    close_ms: i64,
-    high: f64,
-    low: f64,
-    close: f64,
-    quote_volume: f64,
+pub(crate) struct Bar {
+    pub(crate) open_ms: i64,
+    pub(crate) close_ms: i64,
+    pub(crate) open: f64,
+    pub(crate) high: f64,
+    pub(crate) low: f64,
+    pub(crate) close: f64,
+    pub(crate) quote_volume: f64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -178,6 +185,8 @@ struct PersistedState {
     last_execution_issue: Option<ExecutionIssue>,
     #[serde(default)]
     recent_trades: Vec<Value>,
+    #[serde(default)]
+    reversal_observer: ReversalObserverState,
 }
 
 impl PersistedState {
@@ -201,6 +210,7 @@ impl PersistedState {
             rejected_entries: 0,
             last_execution_issue: None,
             recent_trades: Vec::new(),
+            reversal_observer: ReversalObserverState::default(),
         }
     }
 
@@ -230,7 +240,7 @@ fn parse_num(v: &Value, index: usize) -> Result<f64> {
         .context("K 线数字格式错误")
 }
 
-fn parse_bars(value: Value, now_ms: i64) -> Result<Vec<Bar>> {
+pub(crate) fn parse_bars(value: Value, now_ms: i64) -> Result<Vec<Bar>> {
     let rows = value.as_array().context("K 线响应不是数组")?;
     rows.iter()
         .filter(|row| row.get(6).and_then(Value::as_i64).unwrap_or(i64::MAX) < now_ms)
@@ -244,6 +254,7 @@ fn parse_bars(value: Value, now_ms: i64) -> Result<Vec<Bar>> {
                     .get(6)
                     .and_then(Value::as_i64)
                     .context("K 线缺 closeTime")?,
+                open: parse_num(row, 1)?,
                 high: parse_num(row, 2)?,
                 low: parse_num(row, 3)?,
                 close: parse_num(row, 4)?,
@@ -259,7 +270,7 @@ fn median(mut values: Vec<f64>) -> f64 {
     }
     values.sort_by(f64::total_cmp);
     let mid = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         (values[mid - 1] + values[mid]) / 2.0
     } else {
         values[mid]
@@ -433,7 +444,7 @@ async fn enrich_candidate(http: reqwest::Client, mut candidate: Candidate) -> Ca
     candidate
 }
 
-async fn get_json(http: &reqwest::Client, url: &str) -> Result<Value> {
+pub(crate) async fn get_json(http: &reqwest::Client, url: &str) -> Result<Value> {
     let mut last_error = None;
     for attempt in 0..3 {
         let request = async {
@@ -459,7 +470,7 @@ async fn fetch_bars(http: reqwest::Client, symbol: String) -> Result<(String, Ve
     Ok((symbol, bars))
 }
 
-fn append_event(path: &str, event: Value) -> Result<()> {
+pub(crate) fn append_event(path: &str, event: Value) -> Result<()> {
     if let Some(parent) = std::path::Path::new(path).parent() {
         std::fs::create_dir_all(parent)?;
     }
@@ -961,7 +972,9 @@ pub async fn run_altcoin_impulse(
 ) -> Result<()> {
     let strategy_text = std::fs::read_to_string(&args.strategy)
         .with_context(|| format!("读取策略失败: {}", args.strategy))?;
-    let cfg = toml::from_str::<StrategyFile>(&strategy_text)?.altcoin_impulse;
+    let strategy_file = toml::from_str::<StrategyFile>(&strategy_text)?;
+    let cfg = strategy_file.altcoin_impulse;
+    let observer_cfg = strategy_file.altcoin_reversal_observer;
     let strategy_hash = format!("{:x}", Sha256::digest(strategy_text.as_bytes()));
     let git_commit = std::env::var("GREED_GIT_COMMIT").unwrap_or_else(|_| {
         std::process::Command::new("git")
@@ -1001,6 +1014,7 @@ pub async fn run_altcoin_impulse(
         cfg.max_entry_slippage_pct > 0.0 && cfg.max_entry_slippage_pct <= 0.03,
         "最大入场滑点必须在 0%..=3%"
     );
+    observer_cfg.validate()?;
     let base_text = std::fs::read_to_string(&args.config)?;
     let collector = CollectorConfig::from_toml_str(&base_text)?;
     let mut account = AccountConfig::from_toml_str(&base_text)?;
@@ -1071,11 +1085,12 @@ pub async fn run_altcoin_impulse(
         mode = mode.as_str(),
         leverage = cfg.exchange_leverage,
         capital = initial_cash,
+        reversal_observer = observer_cfg.enabled,
         "启动独立山寨币放量突破策略"
     );
     append_event(
         &event_path,
-        json!({"ts_ms": now_ms, "event":"runner_start", "mode":mode.as_str(), "config":cfg}),
+        json!({"ts_ms": now_ms, "event":"runner_start", "mode":mode.as_str(), "config":cfg, "reversal_observer_config":observer_cfg}),
     )?;
 
     let spot_info = get_json(&http, &format!("{SPOT_BASE}/api/v3/exchangeInfo")).await?;
@@ -1137,6 +1152,12 @@ pub async fn run_altcoin_impulse(
             }
         }
         let shortlist_count = shortlist.len();
+        // 观察器虚拟持仓只复用公共 K 线，不计入生产策略动量池和持仓上限。
+        for symbol in tracked_symbols(&state.reversal_observer) {
+            if !shortlist.iter().any(|(item, _)| item == &symbol) {
+                shortlist.push((symbol, f64::INFINITY));
+            }
+        }
 
         let mut set = tokio::task::JoinSet::new();
         for (symbol, _) in shortlist {
@@ -1271,6 +1292,24 @@ pub async fn run_altcoin_impulse(
                     state.positions.insert(symbol, position);
                 }
             }
+        }
+
+        // 影子观察器在生产策略之外独立推进。该模块没有 RestClient，无法触发订单；
+        // 即使滚动门控通过，也只会在日志中标记 would-trade 状态。
+        if update_reversal_observer(
+            &mut state.reversal_observer,
+            &observer_cfg,
+            &http,
+            &active,
+            &spot_symbols,
+            &tickers,
+            &bars_by_symbol,
+            scan_ms,
+            &event_path,
+        )
+        .await?
+        {
+            save_state(&state_path, &state)?;
         }
 
         let mut candidates: Vec<Candidate> = bars_by_symbol
@@ -1609,6 +1648,7 @@ pub async fn run_altcoin_impulse(
         let position_status =
             build_position_status(&state, &prices, rest.as_ref(), valuation_ms).await;
         let current_equity = state.cash + positions_unrealized(&position_status);
+        let reversal_observer = observer_status(&state.reversal_observer, &observer_cfg, scan_ms);
         append_event(
             &event_path,
             json!({
@@ -1620,7 +1660,8 @@ pub async fn run_altcoin_impulse(
                 "max_daily_entries":effective_daily_limit,
                 "daily_loss_blocked":daily_loss_blocked,
                 "positions":position_status,
-                "candidates":candidates.iter().take(10).collect::<Vec<_>>()
+                "candidates":candidates.iter().take(10).collect::<Vec<_>>(),
+                "reversal_observer":reversal_observer
             }),
         )?;
         let mut status_payload = json!({
@@ -1646,6 +1687,7 @@ pub async fn run_altcoin_impulse(
                 "recent_trades":state.recent_trades,
                 "realized_pnl":state.realized_pnl, "fees":state.fees,
                 "candidates":candidates.into_iter().take(10).collect::<Vec<_>>(),
+                "reversal_observer":reversal_observer,
                 "journal":event_path,
             }
         });
@@ -1871,5 +1913,18 @@ mod tests {
 
         let (_, short_guard) = clamp_entry_guard_price(-1, 100.0, 0.015, 100.0, 1.05, 0.95, 0.1);
         assert!(short_guard > 95.0, "卖出限价必须高于交易所最低边界");
+    }
+
+    #[test]
+    fn deployed_altcoin_config_enables_observer_without_changing_live_strategy() {
+        let strategy: super::StrategyFile = toml::from_str(include_str!(
+            "../../../config/strategy-altcoin-impulse.toml"
+        ))
+        .unwrap();
+        assert!(strategy.altcoin_impulse.enabled);
+        assert!(strategy.altcoin_reversal_observer.enabled);
+        assert_eq!(strategy.altcoin_impulse.max_daily_entries, 6);
+        assert_eq!(strategy.altcoin_reversal_observer.gross_multiple, 1.0);
+        strategy.altcoin_reversal_observer.validate().unwrap();
     }
 }

@@ -40,3 +40,25 @@ poll_seconds = 60
 
 # 高风险模块默认禁止主网实盘；paper/dry 不受影响。
 allow_live = false
+
+# 7 日强势币横截面反转：仅做前向影子观测，绝不向交易所下单。
+# 每天 UTC 00:15（北京时间 08:15）对“同名现货 + USDT 永续”中等流动性币种
+# 排名，虚拟做空前 5 名并记录 24h 路径。滚动门控只标记是否具备历史优势，
+# 不会改变上面的放量突破策略，也不占用它的持仓或每日开仓额度。
+[altcoin_reversal_observer]
+enabled = true
+shadow_capital_usdt = 1000.0
+gross_multiple = 1.0
+lookback_days = 7
+top_n = 5
+min_24h_volume_usd = 10000000.0
+max_24h_volume_usd = 150000000.0
+stop_pct = 0.08
+hold_hours = 24
+fee_bps_per_side = 5.0
+slippage_bps_per_side = 5.0
+gate_window = 20
+gate_min_mean_return = 0.0
+gate_min_profit_factor = 1.20
+# 超过 00:15 后 5 分钟不再补做当日影子入场，防止使用事后价格。
+entry_window_minutes = 5
