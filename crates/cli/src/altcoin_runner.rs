@@ -145,7 +145,7 @@ fn default_max_entry_slippage_pct() -> f64 {
 }
 
 fn default_max_daily_entry_bonus() -> u32 {
-    2
+    4
 }
 
 fn default_max_signal_age_seconds() -> u64 {
@@ -2089,6 +2089,7 @@ pub async fn run_altcoin_impulse(
             json!(cfg.max_daily_entry_bonus);
         status_payload["altcoin_impulse"]["max_signal_age_seconds"] =
             json!(cfg.max_signal_age_seconds);
+        status_payload["altcoin_impulse"]["cooldown_hours"] = json!(cfg.cooldown_hours);
         status_payload["altcoin_impulse"]["recovery_lock_adverse_pct"] =
             json!(cfg.recovery_lock_adverse_pct);
         status_payload["altcoin_impulse"]["recovery_lock_activation_pct"] =
@@ -2388,10 +2389,10 @@ mod tests {
             now_ms
         ));
         for _ in 0..4 {
-            apply_daily_entry_bonus(&mut state, 6, 2, now_ms, path.to_str().unwrap()).unwrap();
+            apply_daily_entry_bonus(&mut state, 6, 4, now_ms, path.to_str().unwrap()).unwrap();
         }
-        assert_eq!(state.daily_entry_bonus, 2);
-        assert_eq!(6 + state.daily_entry_bonus, 8);
+        assert_eq!(state.daily_entry_bonus, 4);
+        assert_eq!(6 + state.daily_entry_bonus, 10);
         let log = std::fs::read_to_string(&path).unwrap();
         assert!(log.contains("daily_entry_limit_increased"));
         let _ = std::fs::remove_file(path);
@@ -2424,7 +2425,8 @@ mod tests {
         assert!(strategy.altcoin_impulse.enabled);
         assert!(strategy.altcoin_reversal_observer.enabled);
         assert_eq!(strategy.altcoin_impulse.max_daily_entries, 6);
-        assert_eq!(strategy.altcoin_impulse.max_daily_entry_bonus, 2);
+        assert_eq!(strategy.altcoin_impulse.max_daily_entry_bonus, 4);
+        assert_eq!(strategy.altcoin_impulse.cooldown_hours, 4);
         assert_eq!(strategy.altcoin_impulse.max_signal_age_seconds, 120);
         assert_eq!(strategy.altcoin_impulse.recovery_lock_adverse_pct, 0.03);
         assert_eq!(strategy.altcoin_impulse.recovery_lock_activation_pct, 0.01);

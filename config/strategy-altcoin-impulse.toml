@@ -13,9 +13,9 @@ min_exchange_leverage = 5
 risk_per_trade = 0.10
 max_positions = 2
 max_daily_entries = 6
-# 手动按钮最多只允许当日额外 2 笔。日志复盘显示第二次扩容后的第 9/10 笔
-# 承担了主要回撤，不能再把基础上限直接翻倍。
-max_daily_entry_bonus = 2
+# 手动按钮每次增加 2 笔，最多当日额外 4 笔：默认 6 笔可扩到 8/10 笔。
+# 额外额度只扩大机会数，不绕过 4% 当日权益回撤和同币 4 小时冷却。
+max_daily_entry_bonus = 4
 daily_loss_limit = 0.04
 max_gross_multiple = 4.0
 
@@ -29,7 +29,7 @@ recovery_lock_adverse_pct = 0.03
 recovery_lock_activation_pct = 0.01
 recovery_lock_pct = 0.0025
 max_hold_hours = 6
-cooldown_hours = 8
+cooldown_hours = 4
 # 信号价到实际可成交价最多允许 1.5% 不利偏移；超出则 IOC 限价单不追。
 max_entry_slippage_pct = 0.015
 # 只成交刚闭合的突破信号；仓位释放后不追逐已运行数分钟的旧 K 线。
