@@ -13,6 +13,9 @@ min_exchange_leverage = 5
 risk_per_trade = 0.10
 max_positions = 2
 max_daily_entries = 6
+# 手动按钮最多只允许当日额外 2 笔。日志复盘显示第二次扩容后的第 9/10 笔
+# 承担了主要回撤，不能再把基础上限直接翻倍。
+max_daily_entry_bonus = 2
 daily_loss_limit = 0.04
 max_gross_multiple = 4.0
 
@@ -20,14 +23,24 @@ stop_pct = 0.05
 # 日志显示短促行情常在 +2%～+4% 后反转；达到 +2% 即开始按峰值回撤 1% 保护。
 trail_activation_pct = 0.02
 trail_pct = 0.01
+# 纯价格路径保护：若持仓曾逆向达到 3%，随后修复到盈利 1%，
+# 将保护抬到入场价顺向 0.25%；不依赖持仓时间。
+recovery_lock_adverse_pct = 0.03
+recovery_lock_activation_pct = 0.01
+recovery_lock_pct = 0.0025
 max_hold_hours = 6
 cooldown_hours = 8
 # 信号价到实际可成交价最多允许 1.5% 不利偏移；超出则 IOC 限价单不追。
 max_entry_slippage_pct = 0.015
+# 只成交刚闭合的突破信号；仓位释放后不追逐已运行数分钟的旧 K 线。
+max_signal_age_seconds = 120
 
 min_24h_volume_usd = 5000000.0
 min_return_1h = 0.04
 max_return_1h = 0.45
+# 1h 顺向涨幅达到 12% 视为“过度延伸追多票”。历史上这类交易并非
+# 永久负期望，因此保留第一枪；但同类票一旦当日亏损，熔断后续追多。
+overextension_long_return_1h = 0.12
 min_return_4h = 0.06
 max_return_4h = 1.20
 min_volume_ratio = 3.0

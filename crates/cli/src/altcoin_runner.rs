@@ -36,18 +36,30 @@ pub struct AltcoinImpulseConfig {
     pub risk_per_trade: f64,
     pub max_positions: usize,
     pub max_daily_entries: u32,
+    #[serde(default = "default_max_daily_entry_bonus")]
+    pub max_daily_entry_bonus: u32,
     pub daily_loss_limit: f64,
     pub max_gross_multiple: f64,
     pub stop_pct: f64,
     pub trail_activation_pct: f64,
     pub trail_pct: f64,
+    #[serde(default = "default_recovery_lock_adverse_pct")]
+    pub recovery_lock_adverse_pct: f64,
+    #[serde(default = "default_recovery_lock_activation_pct")]
+    pub recovery_lock_activation_pct: f64,
+    #[serde(default = "default_recovery_lock_pct")]
+    pub recovery_lock_pct: f64,
     pub max_hold_hours: u32,
     pub cooldown_hours: u32,
     #[serde(default = "default_max_entry_slippage_pct")]
     pub max_entry_slippage_pct: f64,
+    #[serde(default = "default_max_signal_age_seconds")]
+    pub max_signal_age_seconds: u64,
     pub min_24h_volume_usd: f64,
     pub min_return_1h: f64,
     pub max_return_1h: f64,
+    #[serde(default = "default_overextension_long_return_1h")]
+    pub overextension_long_return_1h: f64,
     pub min_return_4h: f64,
     pub max_return_4h: f64,
     pub min_volume_ratio: f64,
@@ -90,6 +102,7 @@ struct Candidate {
     close_location: f64,
     volume_24h: f64,
     score: f64,
+    entry_phase: String,
     blockers: Vec<String>,
     spot_return_1h: Option<f64>,
     oi_change_1h: Option<f64>,
@@ -113,6 +126,8 @@ struct Position {
     entry_fee: f64,
     initial_notional: f64,
     extreme: f64,
+    #[serde(default)]
+    adverse_extreme: Option<f64>,
     stop_price: f64,
     last_bar_ms: i64,
     #[serde(default)]
@@ -121,10 +136,40 @@ struct Position {
     protection_reason: String,
     #[serde(default)]
     exchange_leverage: Option<u32>,
+    #[serde(default = "default_entry_phase")]
+    entry_phase: String,
 }
 
 fn default_max_entry_slippage_pct() -> f64 {
     0.015
+}
+
+fn default_max_daily_entry_bonus() -> u32 {
+    2
+}
+
+fn default_max_signal_age_seconds() -> u64 {
+    120
+}
+
+fn default_recovery_lock_adverse_pct() -> f64 {
+    0.03
+}
+
+fn default_recovery_lock_activation_pct() -> f64 {
+    0.01
+}
+
+fn default_recovery_lock_pct() -> f64 {
+    0.0025
+}
+
+fn default_overextension_long_return_1h() -> f64 {
+    0.12
+}
+
+fn default_entry_phase() -> String {
+    "standard_impulse".to_owned()
 }
 
 fn default_min_exchange_leverage() -> u32 {
@@ -135,16 +180,20 @@ fn default_protection_reason() -> String {
     "initial_stop".to_owned()
 }
 
+fn signal_age_ms(now_ms: i64, signal_ms: i64) -> i64 {
+    now_ms.saturating_sub(signal_ms).max(0)
+}
+
 fn detected_exit_reason(position: &Position, exit_price: f64, reconciled: bool) -> &'static str {
     if !reconciled || position.stop_price <= 0.0 {
         return "unknown";
     }
     let distance = (exit_price / position.stop_price - 1.0).abs();
     if distance <= 0.02 {
-        if position.protection_reason == "trailing_take_profit" {
-            "trailing_take_profit"
-        } else {
-            "initial_stop"
+        match position.protection_reason.as_str() {
+            "trailing_take_profit" => "trailing_take_profit",
+            "recovery_profit_lock" => "recovery_profit_lock",
+            _ => "initial_stop",
         }
     } else {
         "manual_or_external"
@@ -159,11 +208,21 @@ struct ExecutionIssue {
     reason: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+struct EquityPoint {
+    ts_ms: i64,
+    equity: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedState {
     cash: f64,
     realized_pnl: f64,
     fees: f64,
+    #[serde(default)]
+    initial_equity: f64,
+    #[serde(default)]
+    equity_curve: Vec<EquityPoint>,
     positions: HashMap<String, Position>,
     cooldown_until: HashMap<String, i64>,
     seen_signal: HashMap<String, i64>,
@@ -176,6 +235,12 @@ struct PersistedState {
     daily_risk_resets: u32,
     #[serde(default)]
     last_daily_risk_reset_ms: Option<i64>,
+    #[serde(default)]
+    overextension_long_blocked: bool,
+    #[serde(default)]
+    overextension_long_losses: u32,
+    #[serde(default)]
+    last_overextension_loss_ms: Option<i64>,
     total_entries: u64,
     total_exits: u64,
     wins: u64,
@@ -195,6 +260,8 @@ impl PersistedState {
             cash,
             realized_pnl: 0.0,
             fees: 0.0,
+            initial_equity: cash,
+            equity_curve: Vec::new(),
             positions: HashMap::new(),
             cooldown_until: HashMap::new(),
             seen_signal: HashMap::new(),
@@ -204,6 +271,9 @@ impl PersistedState {
             daily_entry_bonus: 0,
             daily_risk_resets: 0,
             last_daily_risk_reset_ms: None,
+            overextension_long_blocked: false,
+            overextension_long_losses: 0,
+            last_overextension_loss_ms: None,
             total_entries: 0,
             total_exits: 0,
             wins: 0,
@@ -274,6 +344,14 @@ fn median(mut values: Vec<f64>) -> f64 {
         (values[mid - 1] + values[mid]) / 2.0
     } else {
         values[mid]
+    }
+}
+
+fn entry_phase(side: i32, return_1h: f64, threshold: f64) -> &'static str {
+    if side > 0 && return_1h >= threshold {
+        "overextended_long"
+    } else {
+        "standard_impulse"
     }
 }
 
@@ -368,6 +446,7 @@ fn evaluate(symbol: String, bars: &[Bar], cfg: &AltcoinImpulseConfig) -> Option<
         close_location,
         volume_24h,
         score: return_1h.abs() * volume_ratio.ln_1p() * (volume_24h / 1e6).ln_1p(),
+        entry_phase: entry_phase(side, return_1h, cfg.overextension_long_return_1h).to_owned(),
         blockers,
         spot_return_1h: None,
         oi_change_1h: None,
@@ -500,6 +579,46 @@ fn load_recent_trades(path: &str) -> Vec<Value> {
     events
 }
 
+fn record_daily_equity(curve: &mut Vec<EquityPoint>, ts_ms: i64, equity: f64) {
+    if !equity.is_finite() || equity <= 0.0 {
+        return;
+    }
+    let day = ts_ms.div_euclid(DAY_MS);
+    if let Some(last) = curve.last_mut() {
+        let last_day = last.ts_ms.div_euclid(DAY_MS);
+        if last_day == day {
+            *last = EquityPoint { ts_ms, equity };
+            return;
+        }
+    }
+    curve.push(EquityPoint { ts_ms, equity });
+    // 状态接口只需要支持长期周/月统计；保留两年日线足够，同时避免轮询载荷无限增长。
+    if curve.len() > 730 {
+        curve.drain(..curve.len() - 730);
+    }
+}
+
+fn load_daily_equity(path: &str) -> Vec<EquityPoint> {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return Vec::new();
+    };
+    let mut curve = Vec::new();
+    for event in text
+        .lines()
+        .filter_map(|line| serde_json::from_str::<Value>(line).ok())
+    {
+        if event["event"] != "scan" {
+            continue;
+        }
+        let (Some(ts_ms), Some(equity)) = (event["ts_ms"].as_i64(), event["equity"].as_f64())
+        else {
+            continue;
+        };
+        record_daily_equity(&mut curve, ts_ms, equity);
+    }
+    curve
+}
+
 fn save_state(path: &str, state: &PersistedState) -> Result<()> {
     if let Some(parent) = std::path::Path::new(path).parent() {
         std::fs::create_dir_all(parent)?;
@@ -568,6 +687,7 @@ async fn build_position_status(
             ),
         };
         let entry_notional = qty * entry_price;
+        let adverse = position.adverse_extreme.unwrap_or(position.entry_price);
         result.push(json!({
             "symbol":position.symbol, "side":position.side, "qty":qty,
             "entry_ms":position.entry_ms, "entry_price":entry_price,
@@ -575,6 +695,9 @@ async fn build_position_status(
             "extreme":position.extreme, "mark_price":mark_price,
             "protection_order_id":position.protection_order_id,
             "protection_reason":position.protection_reason,
+            "entry_phase":position.entry_phase,
+            "max_favorable_excursion_pct": position.side as f64 * (position.extreme / position.entry_price - 1.0),
+            "max_adverse_excursion_pct": adverse_excursion(position.side, position.entry_price, adverse),
             "exchange_leverage":position.exchange_leverage,
             "unrealized_pnl":unrealized_pnl,
             "return_pct": if entry_notional > 0.0 { unrealized_pnl / entry_notional } else { 0.0 },
@@ -639,6 +762,48 @@ fn realtime_trailing_stop(
         improved <= current_stop * 0.999
     };
     (extreme, material.then_some(improved))
+}
+
+fn update_adverse_extreme(side: i32, previous: Option<f64>, entry: f64, price: f64) -> f64 {
+    let previous = previous.unwrap_or(entry);
+    if side > 0 {
+        previous.min(price)
+    } else {
+        previous.max(price)
+    }
+}
+
+fn adverse_excursion(side: i32, entry: f64, adverse_extreme: f64) -> f64 {
+    (-side as f64 * (adverse_extreme / entry - 1.0)).max(0.0)
+}
+
+fn recovery_profit_lock_stop(
+    side: i32,
+    entry_price: f64,
+    current_stop: f64,
+    mark_price: f64,
+    adverse_excursion: f64,
+    adverse_threshold: f64,
+    recovery_activation: f64,
+    lock_pct: f64,
+) -> Option<f64> {
+    let current_return = side as f64 * (mark_price / entry_price - 1.0);
+    if adverse_excursion + 1e-12 < adverse_threshold || current_return + 1e-12 < recovery_activation
+    {
+        return None;
+    }
+    let proposed = entry_price * (1.0 + side as f64 * lock_pct);
+    let improved = if side > 0 {
+        current_stop.max(proposed)
+    } else {
+        current_stop.min(proposed)
+    };
+    let material = if side > 0 {
+        improved >= current_stop * 1.001
+    } else {
+        improved <= current_stop * 0.999
+    };
+    material.then_some(improved)
 }
 
 fn clamp_entry_guard_price(
@@ -737,6 +902,11 @@ fn record_exit(
     if pnl > 0.0 {
         state.wins += 1;
     }
+    if position.entry_phase == "overextended_long" && pnl < 0.0 {
+        state.overextension_long_blocked = true;
+        state.overextension_long_losses = state.overextension_long_losses.saturating_add(1);
+        state.last_overextension_loss_ms = Some(now_ms);
+    }
     state.positions.remove(&position.symbol);
     state.cooldown_until.insert(
         position.symbol.clone(),
@@ -774,10 +944,10 @@ fn apply_daily_risk_reset(
 fn apply_daily_entry_bonus(
     state: &mut PersistedState,
     base_limit: u32,
+    maximum_bonus: u32,
     now_ms: i64,
     event_path: &str,
 ) -> Result<bool> {
-    let maximum_bonus = base_limit;
     let previous_bonus = state.daily_entry_bonus;
     state.daily_entry_bonus = state.daily_entry_bonus.saturating_add(2).min(maximum_bonus);
     if state.daily_entry_bonus == previous_bonus {
@@ -790,6 +960,7 @@ fn apply_daily_entry_bonus(
             "event":"daily_entry_limit_increased",
             "source":"manual_frontend",
             "base_limit":base_limit,
+            "maximum_bonus":maximum_bonus,
             "previous_effective_limit":base_limit+previous_bonus,
             "new_effective_limit":base_limit+state.daily_entry_bonus,
             "daily_entries":state.daily_entries,
@@ -839,7 +1010,7 @@ async fn manage_live_positions(
                 exit_qty,
                 exit_fee,
             );
-            let event = json!({"ts_ms":now_ms,"event":"exit_detected","symbol":symbol,"side":position.side,"price":exit,"qty":exit_qty,"pnl":pnl,"fee":exit_fee,"reason":reason,"protection_order_id":position.protection_order_id,"stop_price":position.stop_price,"trade_reconciled":true});
+            let event = json!({"ts_ms":now_ms,"event":"exit_detected","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"price":exit,"qty":exit_qty,"pnl":pnl,"fee":exit_fee,"reason":reason,"protection_order_id":position.protection_order_id,"stop_price":position.stop_price,"trade_reconciled":true,"overextension_long_blocked":state.overextension_long_blocked});
             append_event(event_path, event.clone())?;
             state.record_trade(event);
             changed = true;
@@ -866,7 +1037,7 @@ async fn manage_live_positions(
                 exit_qty,
                 fee,
             );
-            let event = json!({"ts_ms":now_ms,"event":"exit","symbol":symbol,"side":position.side,"reason":"time","price":exit,"qty":exit_qty,"pnl":pnl,"fee":fee,"hold_ms":now_ms-position.entry_ms});
+            let event = json!({"ts_ms":now_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"time","price":exit,"qty":exit_qty,"pnl":pnl,"fee":fee,"hold_ms":now_ms-position.entry_ms,"overextension_long_blocked":state.overextension_long_blocked});
             append_event(event_path, event.clone())?;
             state.record_trade(event);
             changed = true;
@@ -874,6 +1045,15 @@ async fn manage_live_positions(
         }
 
         let previous_extreme = position.extreme;
+        let previous_adverse = position.adverse_extreme;
+        let adverse = update_adverse_extreme(
+            position.side,
+            position.adverse_extreme,
+            position.entry_price,
+            snapshot.mark_price,
+        );
+        position.adverse_extreme = Some(adverse);
+        let max_adverse = adverse_excursion(position.side, position.entry_price, adverse);
         let (new_extreme, improved_stop) = realtime_trailing_stop(
             position.side,
             position.entry_price,
@@ -885,6 +1065,33 @@ async fn manage_live_positions(
         );
         position.extreme = new_extreme;
         let excursion = position.side as f64 * (position.extreme / position.entry_price - 1.0);
+        let recovery_stop = recovery_profit_lock_stop(
+            position.side,
+            position.entry_price,
+            position.stop_price,
+            snapshot.mark_price,
+            max_adverse,
+            cfg.recovery_lock_adverse_pct,
+            cfg.recovery_lock_activation_pct,
+            cfg.recovery_lock_pct,
+        );
+        let (improved_stop, protection_reason) = match (improved_stop, recovery_stop) {
+            (Some(trailing), Some(recovery)) => {
+                let trailing_is_tighter = if position.side > 0 {
+                    trailing >= recovery
+                } else {
+                    trailing <= recovery
+                };
+                if trailing_is_tighter {
+                    (Some(trailing), "trailing_take_profit")
+                } else {
+                    (Some(recovery), "recovery_profit_lock")
+                }
+            }
+            (Some(trailing), None) => (Some(trailing), "trailing_take_profit"),
+            (None, Some(recovery)) => (Some(recovery), "recovery_profit_lock"),
+            (None, None) => (None, "initial_stop"),
+        };
         if let Some(improved_stop) = improved_stop {
             let filters = client.symbol_filters(&symbol).await?;
             let side = if position.side > 0 { "SELL" } else { "BUY" };
@@ -914,14 +1121,14 @@ async fn manage_live_positions(
             let old_stop = position.stop_price;
             position.stop_price = improved_stop;
             position.protection_order_id = Some(new_order_id);
-            position.protection_reason = "trailing_take_profit".to_owned();
+            position.protection_reason = protection_reason.to_owned();
             append_event(
                 event_path,
-                json!({"ts_ms":now_ms,"event":"protection_updated","symbol":symbol,"side":position.side,"mark_price":snapshot.mark_price,"extreme":position.extreme,"excursion":excursion,"old_stop":old_stop,"new_stop":improved_stop,"old_order_id":old_order_id,"new_order_id":new_order_id,"reason":"trailing_take_profit"}),
+                json!({"ts_ms":now_ms,"event":"protection_updated","symbol":symbol,"side":position.side,"mark_price":snapshot.mark_price,"extreme":position.extreme,"excursion":excursion,"adverse_extreme":adverse,"max_adverse_excursion":max_adverse,"current_return":position.side as f64*(snapshot.mark_price/position.entry_price-1.0),"old_stop":old_stop,"new_stop":improved_stop,"old_order_id":old_order_id,"new_order_id":new_order_id,"reason":protection_reason}),
             )?;
             changed = true;
         }
-        if position.extreme != previous_extreme {
+        if position.extreme != previous_extreme || position.adverse_extreme != previous_adverse {
             changed = true;
         }
         state.positions.insert(symbol, position);
@@ -1011,8 +1218,29 @@ pub async fn run_altcoin_impulse(
         "跟踪止盈要求激活点 1%..=10%，跟踪距离 >=0.5% 且小于激活点"
     );
     anyhow::ensure!(
+        cfg.recovery_lock_adverse_pct >= 0.02
+            && cfg.recovery_lock_adverse_pct <= cfg.stop_pct
+            && cfg.recovery_lock_activation_pct > cfg.recovery_lock_pct
+            && cfg.recovery_lock_activation_pct < cfg.trail_activation_pct
+            && cfg.recovery_lock_pct >= 0.0,
+        "修复锁盈要求：不利波动 2%..=初始止损，且 0 <= 锁定收益 < 修复收益 < 跟踪激活点"
+    );
+    anyhow::ensure!(
         cfg.max_entry_slippage_pct > 0.0 && cfg.max_entry_slippage_pct <= 0.03,
         "最大入场滑点必须在 0%..=3%"
+    );
+    anyhow::ensure!(
+        cfg.overextension_long_return_1h > cfg.min_return_1h
+            && cfg.overextension_long_return_1h < cfg.max_return_1h,
+        "过度延伸追多阈值必须位于 1h 启动区间内部"
+    );
+    anyhow::ensure!(
+        cfg.max_daily_entry_bonus <= cfg.max_daily_entries,
+        "临时开仓加额不能超过基础每日开仓上限"
+    );
+    anyhow::ensure!(
+        (15..=300).contains(&cfg.max_signal_age_seconds),
+        "入场执行窗口必须在 15..=300 秒"
     );
     observer_cfg.validate()?;
     let base_text = std::fs::read_to_string(&args.config)?;
@@ -1056,8 +1284,58 @@ pub async fn run_altcoin_impulse(
         .ok()
         .and_then(|bytes| serde_json::from_slice(&bytes).ok())
         .unwrap_or_else(|| PersistedState::new(initial_cash, now_ms));
+    // 兼容升级前的状态文件：从现金、累计已实现盈亏和费用还原策略起始权益，
+    // 并从既有 scan 日志回填日权益，部署升级后无需清空历史即可看到曲线。
+    if state.initial_equity <= 0.0 || !state.initial_equity.is_finite() {
+        state.initial_equity = state.cash - state.realized_pnl + state.fees;
+    }
+    if state.equity_curve.is_empty() {
+        state.equity_curve = load_daily_equity(&event_path);
+    }
+    if state.daily_entry_bonus > cfg.max_daily_entry_bonus {
+        let previous_bonus = state.daily_entry_bonus;
+        state.daily_entry_bonus = cfg.max_daily_entry_bonus;
+        append_event(
+            &event_path,
+            json!({
+                "ts_ms":now_ms,
+                "event":"daily_entry_bonus_clamped",
+                "previous_bonus":previous_bonus,
+                "new_bonus":state.daily_entry_bonus,
+                "reason":"configured_safety_cap"
+            }),
+        )?;
+        save_state(&state_path, &state)?;
+    }
     if state.recent_trades.is_empty() {
         state.recent_trades = load_recent_trades(&event_path);
+    }
+    let mut phase_migrations = Vec::new();
+    for position in state.positions.values_mut() {
+        let historical_return = state.recent_trades.iter().rev().find_map(|event| {
+            (event["event"] == "entry"
+                && event["symbol"] == position.symbol
+                && event["ts_ms"].as_i64() == Some(position.entry_ms))
+            .then(|| event["signal"]["return_1h"].as_f64())
+            .flatten()
+        });
+        let Some(return_1h) = historical_return else {
+            continue;
+        };
+        let migrated = entry_phase(position.side, return_1h, cfg.overextension_long_return_1h);
+        if position.entry_phase != migrated {
+            position.entry_phase = migrated.to_owned();
+            phase_migrations.push((position.symbol.clone(), return_1h, migrated));
+        }
+    }
+    if !phase_migrations.is_empty() {
+        for (symbol, return_1h, migrated) in phase_migrations {
+            append_event(
+                &event_path,
+                json!({"ts_ms":now_ms,"event":"position_entry_phase_migrated","symbol":symbol,"return_1h":return_1h,"entry_phase":migrated}),
+            )?;
+        }
+        save_state(&state_path, &state)?;
     }
     if let Some(client) = rest.as_ref() {
         let external: Vec<_> = client
@@ -1173,6 +1451,38 @@ pub async fn run_altcoin_impulse(
                 Err(e) => warn!(error=%e, "候选任务失败"),
             }
         }
+        // 旧状态文件没有 adverse_extreme。升级时用入场后的闭合 K 线重建一次，
+        // 避免正在持有的仓位因重启而丢失“曾经深跌”的价格路径记忆。
+        let mut reconstructed = Vec::new();
+        for position in state.positions.values_mut() {
+            if position.adverse_extreme.is_some() {
+                continue;
+            }
+            let adverse = bars_by_symbol
+                .get(&position.symbol)
+                .into_iter()
+                .flatten()
+                .filter(|bar| bar.open_ms >= position.entry_ms)
+                .map(|bar| if position.side > 0 { bar.low } else { bar.high })
+                .fold(position.entry_price, |value, price| {
+                    if position.side > 0 {
+                        value.min(price)
+                    } else {
+                        value.max(price)
+                    }
+                });
+            position.adverse_extreme = Some(adverse);
+            reconstructed.push((position.symbol.clone(), adverse));
+        }
+        if !reconstructed.is_empty() {
+            for (symbol, adverse) in &reconstructed {
+                append_event(
+                    &event_path,
+                    json!({"ts_ms":scan_ms,"event":"position_path_reconstructed","symbol":symbol,"adverse_extreme":adverse,"source":"closed_15m_since_entry"}),
+                )?;
+            }
+            save_state(&state_path, &state)?;
+        }
         let mut prices: HashMap<String, f64> = bars_by_symbol
             .iter()
             .filter_map(|(s, b)| b.last().map(|x| (s.clone(), x.close)))
@@ -1200,6 +1510,9 @@ pub async fn run_altcoin_impulse(
             state.daily_entries = 0;
             state.daily_entry_bonus = 0;
             state.daily_risk_resets = 0;
+            state.overextension_long_blocked = false;
+            state.overextension_long_losses = 0;
+            state.last_overextension_loss_ms = None;
         }
         if take_control_commands(&mut daily_risk_reset, &mut handled_risk_reset) > 0 {
             apply_daily_risk_reset(&mut state, current_equity, scan_ms, &event_path)?;
@@ -1208,7 +1521,13 @@ pub async fn run_altcoin_impulse(
         let bonus_commands =
             take_control_commands(&mut daily_entry_bonus, &mut handled_entry_bonus);
         for _ in 0..bonus_commands {
-            apply_daily_entry_bonus(&mut state, cfg.max_daily_entries, scan_ms, &event_path)?;
+            apply_daily_entry_bonus(
+                &mut state,
+                cfg.max_daily_entries,
+                cfg.max_daily_entry_bonus,
+                scan_ms,
+                &event_path,
+            )?;
         }
         if bonus_commands > 0 {
             save_state(&state_path, &state)?;
@@ -1245,8 +1564,29 @@ pub async fn run_altcoin_impulse(
                 } else {
                     position.extreme.min(bar.low)
                 };
+                let adverse_price = if position.side > 0 { bar.low } else { bar.high };
+                let adverse = update_adverse_extreme(
+                    position.side,
+                    position.adverse_extreme,
+                    position.entry_price,
+                    adverse_price,
+                );
+                position.adverse_extreme = Some(adverse);
                 let excursion =
                     position.side as f64 * (position.extreme / position.entry_price - 1.0);
+                if let Some(recovery_stop) = recovery_profit_lock_stop(
+                    position.side,
+                    position.entry_price,
+                    position.stop_price,
+                    bar.close,
+                    adverse_excursion(position.side, position.entry_price, adverse),
+                    cfg.recovery_lock_adverse_pct,
+                    cfg.recovery_lock_activation_pct,
+                    cfg.recovery_lock_pct,
+                ) {
+                    position.stop_price = recovery_stop;
+                    position.protection_reason = "recovery_profit_lock".to_owned();
+                }
                 if excursion >= cfg.trail_activation_pct {
                     let trail = position.extreme * (1.0 - position.side as f64 * cfg.trail_pct);
                     position.stop_price = if position.side > 0 {
@@ -1280,12 +1620,14 @@ pub async fn run_altcoin_impulse(
                     );
                     let reason = if timed {
                         "time"
-                    } else if position.protection_reason == "trailing_take_profit" {
-                        "trailing_take_profit"
                     } else {
-                        "initial_stop"
+                        match position.protection_reason.as_str() {
+                            "trailing_take_profit" => "trailing_take_profit",
+                            "recovery_profit_lock" => "recovery_profit_lock",
+                            _ => "initial_stop",
+                        }
                     };
-                    let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"reason":reason,"price":exit,"qty":position.qty,"pnl":pnl,"fee":fee});
+                    let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":reason,"price":exit,"qty":position.qty,"pnl":pnl,"fee":fee,"overextension_long_blocked":state.overextension_long_blocked});
                     append_event(&event_path, event.clone())?;
                     state.record_trade(event);
                 } else {
@@ -1316,6 +1658,18 @@ pub async fn run_altcoin_impulse(
             .into_iter()
             .filter_map(|(s, bars)| evaluate(s, &bars, &cfg))
             .collect();
+        // 历史验证假设在信号 K 线闭合后的下一根开盘成交。仓位刚释放时不得
+        // 回头追一个已经运行数分钟的旧突破，否则线上执行口径会偏离回测，
+        // 也容易在冲高末端接盘。过期信号保留在观测日志中，但不再具备下单资格。
+        let max_signal_age_ms = cfg.max_signal_age_seconds as i64 * 1_000;
+        for candidate in &mut candidates {
+            if signal_age_ms(scan_ms, candidate.signal_ms) > max_signal_age_ms {
+                candidate.blockers.push(format!(
+                    "已超过 {} 秒入场执行窗口",
+                    cfg.max_signal_age_seconds
+                ));
+            }
+        }
         candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
         // OI、现货同步与永续溢价先作为观察字段完整记录，不在尚未历史验证前
         // 偷偷增加硬门槛。仅丰富最接近的 10 个，控制公共 API 权重。
@@ -1328,6 +1682,25 @@ pub async fn run_altcoin_impulse(
         while let Some(Ok((index, candidate))) = enrich.join_next().await {
             candidates[index] = candidate;
         }
+        let overextension_long_open = state
+            .positions
+            .values()
+            .any(|position| position.entry_phase == "overextended_long");
+        for candidate in &mut candidates {
+            if candidate.entry_phase != "overextended_long" {
+                continue;
+            }
+            if state.overextension_long_blocked {
+                candidate
+                    .blockers
+                    .push("当日过度延伸追多已发生亏损，同类入场熔断".into());
+            }
+            if overextension_long_open {
+                candidate
+                    .blockers
+                    .push("已有一笔过度延伸追多票，禁止同类风险叠加".into());
+            }
+        }
         // 仓位管理可能刚刚产生止损/时间退出，必须用更新后的现金重新计算，
         // 避免同一扫描周期在触发日损门槛后又开出新仓。
         let managed_equity = equity(&state, &prices);
@@ -1337,6 +1710,7 @@ pub async fn run_altcoin_impulse(
         let effective_daily_limit = cfg
             .max_daily_entries
             .saturating_add(state.daily_entry_bonus);
+        let mut overextension_slot_taken = overextension_long_open;
         for candidate in candidates.iter().filter(|c| c.eligible()) {
             eligible_count += 1;
             if state.positions.len() >= cfg.max_positions
@@ -1346,6 +1720,7 @@ pub async fn run_altcoin_impulse(
                 break;
             }
             if state.positions.contains_key(&candidate.symbol)
+                || (candidate.entry_phase == "overextended_long" && overextension_slot_taken)
                 || state
                     .cooldown_until
                     .get(&candidate.symbol)
@@ -1632,14 +2007,19 @@ pub async fn run_altcoin_impulse(
                     entry_fee: fee,
                     initial_notional: qty * entry,
                     extreme: entry,
+                    adverse_extreme: Some(entry),
                     stop_price: stop,
                     last_bar_ms: candidate.signal_ms,
                     protection_order_id,
                     protection_reason: default_protection_reason(),
                     exchange_leverage: Some(actual_leverage),
+                    entry_phase: candidate.entry_phase.clone(),
                 },
             );
-            let event = json!({"ts_ms":scan_ms,"event":"entry","symbol":candidate.symbol,"side":candidate.side,"signal":candidate,"entry_price":entry,"qty":qty,"notional":qty*entry,"requested_leverage":cfg.exchange_leverage,"actual_leverage":actual_leverage,"margin_estimate":qty*entry/actual_leverage as f64,"risk_usd":qty*entry*cfg.stop_pct,"fee":fee});
+            if candidate.entry_phase == "overextended_long" {
+                overextension_slot_taken = true;
+            }
+            let event = json!({"ts_ms":scan_ms,"event":"entry","symbol":candidate.symbol,"side":candidate.side,"entry_phase":candidate.entry_phase,"signal_age_ms":signal_age_ms(scan_ms,candidate.signal_ms),"max_signal_age_ms":max_signal_age_ms,"signal":candidate,"entry_price":entry,"qty":qty,"notional":qty*entry,"requested_leverage":cfg.exchange_leverage,"actual_leverage":actual_leverage,"margin_estimate":qty*entry/actual_leverage as f64,"risk_usd":qty*entry*cfg.stop_pct,"fee":fee});
             append_event(&event_path, event.clone())?;
             state.record_trade(event);
         }
@@ -1648,6 +2028,8 @@ pub async fn run_altcoin_impulse(
         let position_status =
             build_position_status(&state, &prices, rest.as_ref(), valuation_ms).await;
         let current_equity = state.cash + positions_unrealized(&position_status);
+        record_daily_equity(&mut state.equity_curve, valuation_ms, current_equity);
+        save_state(&state_path, &state)?;
         let reversal_observer = observer_status(&state.reversal_observer, &observer_cfg, scan_ms);
         append_event(
             &event_path,
@@ -1657,7 +2039,16 @@ pub async fn run_altcoin_impulse(
                 "equity":current_equity, "daily_entries":state.daily_entries,
                 "base_max_daily_entries":cfg.max_daily_entries,
                 "daily_entry_bonus":state.daily_entry_bonus,
+                "max_daily_entry_bonus":cfg.max_daily_entry_bonus,
                 "max_daily_entries":effective_daily_limit,
+                "max_signal_age_seconds":cfg.max_signal_age_seconds,
+                "recovery_lock_adverse_pct":cfg.recovery_lock_adverse_pct,
+                "recovery_lock_activation_pct":cfg.recovery_lock_activation_pct,
+                "recovery_lock_pct":cfg.recovery_lock_pct,
+                "overextension_long_return_1h":cfg.overextension_long_return_1h,
+                "overextension_long_blocked":state.overextension_long_blocked,
+                "overextension_long_losses":state.overextension_long_losses,
+                "last_overextension_loss_ms":state.last_overextension_loss_ms,
                 "daily_loss_blocked":daily_loss_blocked,
                 "positions":position_status,
                 "candidates":candidates.iter().take(10).collect::<Vec<_>>(),
@@ -1694,10 +2085,29 @@ pub async fn run_altcoin_impulse(
         status_payload["altcoin_impulse"]["daily_risk_baseline_equity"] =
             json!(state.day_start_equity);
         status_payload["altcoin_impulse"]["base_max_daily_entries"] = json!(cfg.max_daily_entries);
+        status_payload["altcoin_impulse"]["max_daily_entry_bonus"] =
+            json!(cfg.max_daily_entry_bonus);
+        status_payload["altcoin_impulse"]["max_signal_age_seconds"] =
+            json!(cfg.max_signal_age_seconds);
+        status_payload["altcoin_impulse"]["recovery_lock_adverse_pct"] =
+            json!(cfg.recovery_lock_adverse_pct);
+        status_payload["altcoin_impulse"]["recovery_lock_activation_pct"] =
+            json!(cfg.recovery_lock_activation_pct);
+        status_payload["altcoin_impulse"]["recovery_lock_pct"] = json!(cfg.recovery_lock_pct);
+        status_payload["altcoin_impulse"]["overextension_long_return_1h"] =
+            json!(cfg.overextension_long_return_1h);
+        status_payload["altcoin_impulse"]["overextension_long_blocked"] =
+            json!(state.overextension_long_blocked);
+        status_payload["altcoin_impulse"]["overextension_long_losses"] =
+            json!(state.overextension_long_losses);
+        status_payload["altcoin_impulse"]["last_overextension_loss_ms"] =
+            json!(state.last_overextension_loss_ms);
         status_payload["altcoin_impulse"]["daily_entry_bonus"] = json!(state.daily_entry_bonus);
         status_payload["altcoin_impulse"]["daily_risk_resets"] = json!(state.daily_risk_resets);
         status_payload["altcoin_impulse"]["last_daily_risk_reset_ms"] =
             json!(state.last_daily_risk_reset_ms);
+        status_payload["altcoin_impulse"]["initial_equity"] = json!(state.initial_equity);
+        status_payload["altcoin_impulse"]["equity_curve"] = json!(state.equity_curve);
         if let Some(tx) = &status_tx {
             let _ = tx.send(status_payload.clone());
         }
@@ -1737,6 +2147,7 @@ pub async fn run_altcoin_impulse(
                 let refreshed =
                     build_position_status(&state, &prices, Some(client), refresh_ms).await;
                 let refreshed_equity = state.cash + positions_unrealized(&refreshed);
+                record_daily_equity(&mut state.equity_curve, refresh_ms, refreshed_equity);
                 if take_control_commands(&mut daily_risk_reset, &mut handled_risk_reset) > 0 {
                     apply_daily_risk_reset(&mut state, refreshed_equity, refresh_ms, &event_path)?;
                     save_state(&state_path, &state)?;
@@ -1761,6 +2172,7 @@ pub async fn run_altcoin_impulse(
                     apply_daily_entry_bonus(
                         &mut state,
                         cfg.max_daily_entries,
+                        cfg.max_daily_entry_bonus,
                         refresh_ms,
                         &event_path,
                     )?;
@@ -1775,8 +2187,15 @@ pub async fn run_altcoin_impulse(
                 }
                 status_payload["uptime_s"] = json!((refresh_ms - started_ms) / 1000);
                 status_payload["equity"] = json!(refreshed_equity);
+                status_payload["altcoin_impulse"]["equity_curve"] = json!(state.equity_curve);
                 status_payload["altcoin_impulse"]["positions"] = json!(refreshed);
                 status_payload["altcoin_impulse"]["last_valuation_ms"] = json!(refresh_ms);
+                status_payload["altcoin_impulse"]["overextension_long_blocked"] =
+                    json!(state.overextension_long_blocked);
+                status_payload["altcoin_impulse"]["overextension_long_losses"] =
+                    json!(state.overextension_long_losses);
+                status_payload["altcoin_impulse"]["last_overextension_loss_ms"] =
+                    json!(state.last_overextension_loss_ms);
                 if let Some(tx) = &status_tx {
                     let _ = tx.send(status_payload.clone());
                 }
@@ -1797,8 +2216,10 @@ pub async fn run_altcoin_impulse(
 #[cfg(test)]
 mod tests {
     use super::{
-        apply_daily_entry_bonus, apply_daily_risk_reset, clamp_entry_guard_price,
-        detected_exit_reason, realtime_trailing_stop, PersistedState, Position,
+        adverse_excursion, apply_daily_entry_bonus, apply_daily_risk_reset,
+        clamp_entry_guard_price, detected_exit_reason, entry_phase, realtime_trailing_stop,
+        record_daily_equity, record_exit, recovery_profit_lock_stop, signal_age_ms,
+        update_adverse_extreme, PersistedState, Position,
     };
 
     #[test]
@@ -1814,6 +2235,18 @@ mod tests {
     }
 
     #[test]
+    fn daily_equity_keeps_the_latest_point_per_utc_day() {
+        let mut curve = Vec::new();
+        record_daily_equity(&mut curve, 1_000, 1_000.0);
+        record_daily_equity(&mut curve, 2_000, 1_025.0);
+        record_daily_equity(&mut curve, super::DAY_MS + 1_000, 980.0);
+        assert_eq!(curve.len(), 2);
+        assert_eq!(curve[0].ts_ms, 2_000);
+        assert_eq!(curve[0].equity, 1_025.0);
+        assert_eq!(curve[1].equity, 980.0);
+    }
+
+    #[test]
     fn detected_exit_uses_persisted_protection_stage() {
         let mut position = Position {
             symbol: "TESTUSDT".into(),
@@ -1824,11 +2257,13 @@ mod tests {
             entry_fee: 0.1,
             initial_notional: 100.0,
             extreme: 1.0,
+            adverse_extreme: Some(1.0),
             stop_price: 0.95,
             last_bar_ms: 1,
             protection_order_id: Some(42),
             protection_reason: "initial_stop".into(),
             exchange_leverage: Some(10),
+            entry_phase: "standard_impulse".into(),
         };
         assert_eq!(detected_exit_reason(&position, 0.949, true), "initial_stop");
         position.stop_price = 1.10;
@@ -1840,6 +2275,12 @@ mod tests {
         assert_eq!(
             detected_exit_reason(&position, 1.25, true),
             "manual_or_external"
+        );
+        position.stop_price = 1.0025;
+        position.protection_reason = "recovery_profit_lock".into();
+        assert_eq!(
+            detected_exit_reason(&position, 1.002, true),
+            "recovery_profit_lock"
         );
         assert_eq!(detected_exit_reason(&position, 1.10, false), "unknown");
     }
@@ -1866,11 +2307,28 @@ mod tests {
     }
 
     #[test]
+    fn recovery_lock_requires_both_adverse_path_and_recovery() {
+        let adverse = update_adverse_extreme(1, Some(100.0), 100.0, 96.5);
+        assert!((adverse_excursion(1, 100.0, adverse) - 0.035).abs() < 1e-10);
+        assert_eq!(
+            recovery_profit_lock_stop(1, 100.0, 95.0, 100.9, 0.035, 0.03, 0.01, 0.0025),
+            None
+        );
+        let long =
+            recovery_profit_lock_stop(1, 100.0, 95.0, 101.0, 0.035, 0.03, 0.01, 0.0025).unwrap();
+        assert!((long - 100.25).abs() < 1e-10);
+        let short =
+            recovery_profit_lock_stop(-1, 100.0, 105.0, 99.0, 0.035, 0.03, 0.01, 0.0025).unwrap();
+        assert!((short - 99.75).abs() < 1e-10);
+    }
+
+    #[test]
     fn manual_daily_reset_preserves_entries_and_rebases_equity() {
         let now_ms = 1_800_000_000_000i64;
         let mut state = PersistedState::new(1_000.0, now_ms);
         state.day_start_equity = 1_200.0;
         state.daily_entries = 4;
+        state.overextension_long_blocked = true;
         let path = std::env::temp_dir().join(format!(
             "greed-daily-risk-reset-{}-{}.jsonl",
             std::process::id(),
@@ -1880,13 +2338,48 @@ mod tests {
         assert_eq!(state.day_start_equity, 950.0);
         assert_eq!(state.daily_entries, 4);
         assert_eq!(state.daily_risk_resets, 1);
+        assert!(
+            state.overextension_long_blocked,
+            "手动总风控重置不得清除同类失败熔断"
+        );
         let log = std::fs::read_to_string(&path).unwrap();
         assert!(log.contains("daily_risk_reset"));
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
-    fn temporary_daily_entry_bonus_increases_by_two_and_caps_at_double() {
+    fn losing_overextended_long_latches_only_its_entry_style() {
+        assert_eq!(entry_phase(1, 0.1199, 0.12), "standard_impulse");
+        assert_eq!(entry_phase(1, 0.12, 0.12), "overextended_long");
+        assert_eq!(entry_phase(-1, -0.30, 0.12), "standard_impulse");
+        let now_ms = 1_800_000_000_000i64;
+        let mut state = PersistedState::new(1_000.0, now_ms);
+        let position = Position {
+            symbol: "PUMPUSDT".into(),
+            side: 1,
+            qty: 100.0,
+            entry_ms: now_ms - 1_000,
+            entry_price: 1.0,
+            entry_fee: 0.1,
+            initial_notional: 100.0,
+            extreme: 1.0,
+            adverse_extreme: Some(0.95),
+            stop_price: 0.95,
+            last_bar_ms: now_ms,
+            protection_order_id: None,
+            protection_reason: "initial_stop".into(),
+            exchange_leverage: Some(10),
+            entry_phase: "overextended_long".into(),
+        };
+        let pnl = record_exit(&mut state, &position, now_ms, 8, 0.95, 100.0, 0.0);
+        assert!(pnl < 0.0);
+        assert!(state.overextension_long_blocked);
+        assert_eq!(state.overextension_long_losses, 1);
+        assert_eq!(state.last_overextension_loss_ms, Some(now_ms));
+    }
+
+    #[test]
+    fn temporary_daily_entry_bonus_increases_by_two_and_caps_at_configured_limit() {
         let now_ms = 1_800_000_000_000i64;
         let mut state = PersistedState::new(1_000.0, now_ms);
         let path = std::env::temp_dir().join(format!(
@@ -1895,10 +2388,10 @@ mod tests {
             now_ms
         ));
         for _ in 0..4 {
-            apply_daily_entry_bonus(&mut state, 6, now_ms, path.to_str().unwrap()).unwrap();
+            apply_daily_entry_bonus(&mut state, 6, 2, now_ms, path.to_str().unwrap()).unwrap();
         }
-        assert_eq!(state.daily_entry_bonus, 6);
-        assert_eq!(6 + state.daily_entry_bonus, 12);
+        assert_eq!(state.daily_entry_bonus, 2);
+        assert_eq!(6 + state.daily_entry_bonus, 8);
         let log = std::fs::read_to_string(&path).unwrap();
         assert!(log.contains("daily_entry_limit_increased"));
         let _ = std::fs::remove_file(path);
@@ -1916,6 +2409,13 @@ mod tests {
     }
 
     #[test]
+    fn signal_age_never_goes_negative_and_has_an_inclusive_boundary() {
+        assert_eq!(signal_age_ms(1_000, 1_001), 0);
+        assert_eq!(signal_age_ms(121_000, 1_000), 120_000);
+        assert!(signal_age_ms(121_001, 1_000) > 120_000);
+    }
+
+    #[test]
     fn deployed_altcoin_config_enables_observer_without_changing_live_strategy() {
         let strategy: super::StrategyFile = toml::from_str(include_str!(
             "../../../config/strategy-altcoin-impulse.toml"
@@ -1924,6 +2424,12 @@ mod tests {
         assert!(strategy.altcoin_impulse.enabled);
         assert!(strategy.altcoin_reversal_observer.enabled);
         assert_eq!(strategy.altcoin_impulse.max_daily_entries, 6);
+        assert_eq!(strategy.altcoin_impulse.max_daily_entry_bonus, 2);
+        assert_eq!(strategy.altcoin_impulse.max_signal_age_seconds, 120);
+        assert_eq!(strategy.altcoin_impulse.recovery_lock_adverse_pct, 0.03);
+        assert_eq!(strategy.altcoin_impulse.recovery_lock_activation_pct, 0.01);
+        assert_eq!(strategy.altcoin_impulse.recovery_lock_pct, 0.0025);
+        assert_eq!(strategy.altcoin_impulse.overextension_long_return_1h, 0.12);
         assert_eq!(strategy.altcoin_reversal_observer.gross_multiple, 1.0);
         strategy.altcoin_reversal_observer.validate().unwrap();
     }
