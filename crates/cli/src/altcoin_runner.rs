@@ -65,6 +65,22 @@ pub struct AltcoinImpulseConfig {
     pub max_entry_slippage_pct: f64,
     #[serde(default = "default_max_signal_age_seconds")]
     pub max_signal_age_seconds: u64,
+    #[serde(default = "default_confirmation_window_bars")]
+    pub confirmation_window_bars: u32,
+    #[serde(default = "default_retest_touch_pct")]
+    pub retest_touch_pct: f64,
+    #[serde(default = "default_retest_invalidation_pct")]
+    pub retest_invalidation_pct: f64,
+    #[serde(default = "default_reclaim_pct")]
+    pub reclaim_pct: f64,
+    #[serde(default = "default_extreme_direct_return_1h")]
+    pub extreme_direct_return_1h: f64,
+    #[serde(default = "default_extreme_direct_return_4h")]
+    pub extreme_direct_return_4h: f64,
+    #[serde(default = "default_extreme_direct_volume_ratio")]
+    pub extreme_direct_volume_ratio: f64,
+    #[serde(default = "default_extreme_direct_risk_scale")]
+    pub extreme_direct_risk_scale: f64,
     pub min_24h_volume_usd: f64,
     pub min_return_1h: f64,
     pub max_return_1h: f64,
@@ -103,7 +119,7 @@ pub(crate) struct Bar {
     pub(crate) quote_volume: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct Candidate {
     symbol: String,
     signal_ms: i64,
@@ -117,11 +133,26 @@ struct Candidate {
     volume_24h: f64,
     score: f64,
     entry_phase: String,
+    #[serde(default)]
+    breakout_level: f64,
+    #[serde(default = "default_entry_trigger")]
+    entry_trigger: String,
+    #[serde(default = "default_risk_scale")]
+    risk_scale: f64,
     blockers: Vec<String>,
     spot_return_1h: Option<f64>,
     oi_change_1h: Option<f64>,
     funding_rate: Option<f64>,
     perp_premium: Option<f64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingEntry {
+    candidate: Candidate,
+    breakout_level: f64,
+    expires_ms: i64,
+    last_checked_close_ms: i64,
+    retest_seen: bool,
 }
 
 impl Candidate {
@@ -170,6 +201,46 @@ fn default_max_daily_entry_bonus() -> u32 {
 
 fn default_max_signal_age_seconds() -> u64 {
     120
+}
+
+fn default_confirmation_window_bars() -> u32 {
+    4
+}
+
+fn default_retest_touch_pct() -> f64 {
+    0.01
+}
+
+fn default_retest_invalidation_pct() -> f64 {
+    0.015
+}
+
+fn default_reclaim_pct() -> f64 {
+    0.002
+}
+
+fn default_extreme_direct_return_1h() -> f64 {
+    0.18
+}
+
+fn default_extreme_direct_return_4h() -> f64 {
+    0.25
+}
+
+fn default_extreme_direct_volume_ratio() -> f64 {
+    6.0
+}
+
+fn default_extreme_direct_risk_scale() -> f64 {
+    0.33
+}
+
+fn default_entry_trigger() -> String {
+    "breakout_detected".to_owned()
+}
+
+fn default_risk_scale() -> f64 {
+    1.0
 }
 
 fn default_recovery_lock_adverse_pct() -> f64 {
@@ -293,6 +364,8 @@ struct PersistedState {
     positions: HashMap<String, Position>,
     cooldown_until: HashMap<String, i64>,
     seen_signal: HashMap<String, i64>,
+    #[serde(default)]
+    pending_entries: HashMap<String, PendingEntry>,
     day: i64,
     day_start_equity: f64,
     daily_entries: u32,
@@ -332,6 +405,7 @@ impl PersistedState {
             positions: HashMap::new(),
             cooldown_until: HashMap::new(),
             seen_signal: HashMap::new(),
+            pending_entries: HashMap::new(),
             day: now_ms / DAY_MS,
             day_start_equity: cash,
             daily_entries: 0,
@@ -425,6 +499,59 @@ fn entry_phase(
         "overextended_long"
     } else {
         "standard_impulse"
+    }
+}
+
+fn is_extreme_direct(candidate: &Candidate, cfg: &AltcoinImpulseConfig) -> bool {
+    let directional_1h = candidate.side as f64 * candidate.return_1h;
+    let directional_4h = candidate.side as f64 * candidate.return_4h;
+    candidate.volume_ratio >= cfg.extreme_direct_volume_ratio
+        && (directional_1h >= cfg.extreme_direct_return_1h
+            || directional_4h >= cfg.extreme_direct_return_4h)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingDecision {
+    Waiting,
+    RetestSeen,
+    Confirmed,
+    Invalidated,
+}
+
+fn pending_decision(
+    side: i32,
+    breakout: f64,
+    bar: &Bar,
+    retest_seen: bool,
+    cfg: &AltcoinImpulseConfig,
+) -> PendingDecision {
+    let touch = if side > 0 {
+        bar.low <= breakout * (1.0 + cfg.retest_touch_pct)
+    } else {
+        bar.high >= breakout * (1.0 - cfg.retest_touch_pct)
+    };
+    let holds = if side > 0 {
+        bar.low >= breakout * (1.0 - cfg.retest_invalidation_pct)
+    } else {
+        bar.high <= breakout * (1.0 + cfg.retest_invalidation_pct)
+    };
+    if !holds {
+        return PendingDecision::Invalidated;
+    }
+    if !touch && !retest_seen {
+        return PendingDecision::Waiting;
+    }
+    let reclaimed = if side > 0 {
+        bar.close >= breakout * (1.0 + cfg.reclaim_pct) && bar.close > bar.open
+    } else {
+        bar.close <= breakout * (1.0 - cfg.reclaim_pct) && bar.close < bar.open
+    };
+    if reclaimed {
+        PendingDecision::Confirmed
+    } else if touch {
+        PendingDecision::RetestSeen
+    } else {
+        PendingDecision::Waiting
     }
 }
 
@@ -543,6 +670,9 @@ fn evaluate(symbol: String, bars: &[Bar], cfg: &AltcoinImpulseConfig) -> Option<
             cfg.overextension_long_return_4h,
         )
         .to_owned(),
+        breakout_level: if side > 0 { prior_high } else { prior_low },
+        entry_trigger: default_entry_trigger(),
+        risk_scale: 1.0,
         blockers,
         spot_return_1h: None,
         oi_change_1h: None,
@@ -1523,6 +1653,23 @@ pub async fn run_altcoin_impulse(
         (15..=300).contains(&cfg.max_signal_age_seconds),
         "入场执行窗口必须在 15..=300 秒"
     );
+    anyhow::ensure!(
+        (2..=8).contains(&cfg.confirmation_window_bars)
+            && (0.002..=0.03).contains(&cfg.retest_touch_pct)
+            && cfg.retest_invalidation_pct >= cfg.retest_touch_pct
+            && cfg.retest_invalidation_pct <= 0.05
+            && (0.0..=0.01).contains(&cfg.reclaim_pct),
+        "回踩/反抽确认参数不合法"
+    );
+    anyhow::ensure!(
+        cfg.extreme_direct_return_1h > cfg.overextension_long_return_1h
+            && cfg.extreme_direct_return_1h < cfg.max_return_1h
+            && cfg.extreme_direct_return_4h > cfg.overextension_long_return_4h
+            && cfg.extreme_direct_return_4h < cfg.max_return_4h
+            && cfg.extreme_direct_volume_ratio >= cfg.min_volume_ratio
+            && (0.1..=0.5).contains(&cfg.extreme_direct_risk_scale),
+        "极端延续直入参数不合法"
+    );
     observer_cfg.validate()?;
     let base_text = std::fs::read_to_string(&args.config)?;
     let collector = CollectorConfig::from_toml_str(&base_text)?;
@@ -1725,6 +1872,13 @@ pub async fn run_altcoin_impulse(
         shortlist.truncate(cfg.scan_limit);
         // 已持仓标的即使跌出动量扫描池也必须继续取价、跟踪止损和时间退出。
         for symbol in state.positions.keys() {
+            if !shortlist.iter().any(|(item, _)| item == symbol) {
+                shortlist.push((symbol.clone(), f64::INFINITY));
+            }
+        }
+        // 已经进入“突破 -> 回踩/反抽确认”状态机的标的必须持续取 K 线，
+        // 即使它暂时跌出 24h 动量榜，否则候选会永远卡在等待确认。
+        for symbol in state.pending_entries.keys() {
             if !shortlist.iter().any(|(item, _)| item == symbol) {
                 shortlist.push((symbol.clone(), f64::INFINITY));
             }
@@ -1986,8 +2140,8 @@ pub async fn run_altcoin_impulse(
         }
 
         let mut candidates: Vec<Candidate> = bars_by_symbol
-            .into_iter()
-            .filter_map(|(s, bars)| evaluate(s, &bars, &cfg))
+            .iter()
+            .filter_map(|(s, bars)| evaluate(s.clone(), bars, &cfg))
             .collect();
         if let Some(symbols) = execution_symbols.as_ref() {
             for candidate in &mut candidates {
@@ -1998,9 +2152,9 @@ pub async fn run_altcoin_impulse(
                 }
             }
         }
-        // 历史验证假设在信号 K 线闭合后的下一根开盘成交。仓位刚释放时不得
-        // 回头追一个已经运行数分钟的旧突破，否则线上执行口径会偏离回测，
-        // 也容易在冲高末端接盘。过期信号保留在观测日志中，但不再具备下单资格。
+        // 原始突破只能在刚闭合时登记为待确认候选；极端延续探针也只能在这个
+        // 窗口直接执行。回踩/反抽确认产生的是一枚新的闭合 K 线信号，因此同样
+        // 受此执行时效约束，避免重启或仓位释放后回头追旧结构。
         let max_signal_age_ms = cfg.max_signal_age_seconds as i64 * 1_000;
         for candidate in &mut candidates {
             if signal_age_ms(scan_ms, candidate.signal_ms) > max_signal_age_ms {
@@ -2057,13 +2211,149 @@ pub async fn run_altcoin_impulse(
         let managed_equity = equity(&state, &prices);
         let daily_loss_blocked =
             managed_equity < state.day_start_equity * (1.0 - cfg.daily_loss_limit);
-        let mut eligible_count = 0usize;
         let effective_daily_limit = cfg
             .max_daily_entries
             .saturating_add(state.daily_entry_bonus);
         let mut overextension_slot_taken = overextension_long_open;
-        for candidate in candidates.iter().filter(|c| c.eligible()) {
-            eligible_count += 1;
+        let mut execution_candidates = Vec::new();
+
+        // 先推进已有候选。确认只读取信号之后已经闭合的 K 线，绝不使用未来数据：
+        // 多头要求回踩突破位后重新收强，空头镜像为反抽跌破位后重新收弱。
+        let pending_symbols: Vec<String> = state.pending_entries.keys().cloned().collect();
+        for symbol in pending_symbols {
+            let Some(mut pending) = state.pending_entries.get(&symbol).cloned() else {
+                continue;
+            };
+            let mut terminal = None;
+            if let Some(bars) = bars_by_symbol.get(&symbol) {
+                let unchecked: Vec<&Bar> = bars
+                    .iter()
+                    .filter(|bar| {
+                        bar.close_ms > pending.last_checked_close_ms
+                            && bar.close_ms > pending.candidate.signal_ms
+                    })
+                    .collect();
+                for bar in unchecked {
+                    if bar.close_ms > pending.expires_ms {
+                        terminal = Some((
+                            "entry_setup_expired",
+                            None,
+                            "确认窗口内没有形成回踩/反抽后的重新启动",
+                        ));
+                        break;
+                    }
+                    pending.last_checked_close_ms = bar.close_ms;
+                    match pending_decision(
+                        pending.candidate.side,
+                        pending.breakout_level,
+                        bar,
+                        pending.retest_seen,
+                        &cfg,
+                    ) {
+                        PendingDecision::Invalidated => {
+                            terminal = Some((
+                                "entry_setup_invalidated",
+                                None,
+                                "价格穿透突破位容忍区，原启动结构失效",
+                            ));
+                            break;
+                        }
+                        PendingDecision::Confirmed => {
+                            if signal_age_ms(scan_ms, bar.close_ms) > max_signal_age_ms {
+                                terminal = Some((
+                                    "entry_setup_expired",
+                                    None,
+                                    "确认 K 线已超过实时执行窗口，不在重启后追旧确认",
+                                ));
+                                break;
+                            }
+                            let mut confirmed = pending.candidate.clone();
+                            confirmed.signal_ms = bar.close_ms;
+                            confirmed.price = bar.close;
+                            confirmed.entry_trigger = "retest_reclaim_confirmed".to_owned();
+                            confirmed.risk_scale = 1.0;
+                            confirmed.blockers.clear();
+                            terminal = Some((
+                                "entry_setup_confirmed",
+                                Some(confirmed),
+                                "回踩/反抽守住突破位并重新顺向收盘",
+                            ));
+                            break;
+                        }
+                        PendingDecision::RetestSeen => {
+                            if !pending.retest_seen {
+                                pending.retest_seen = true;
+                                append_event(
+                                    &event_path,
+                                    json!({"ts_ms":scan_ms,"event":"entry_setup_retest_seen","symbol":symbol,"side":pending.candidate.side,"breakout_level":pending.breakout_level,"bar":{"open_ms":bar.open_ms,"close_ms":bar.close_ms,"open":bar.open,"high":bar.high,"low":bar.low,"close":bar.close},"reason":"已触及突破区，等待重新顺向收盘"}),
+                                )?;
+                            }
+                        }
+                        PendingDecision::Waiting => {}
+                    }
+                }
+            }
+            if terminal.is_none() && scan_ms > pending.expires_ms {
+                terminal = Some(("entry_setup_expired", None, "确认窗口到期"));
+            }
+            if let Some((event_name, confirmed, reason)) = terminal {
+                append_event(
+                    &event_path,
+                    json!({"ts_ms":scan_ms,"event":event_name,"symbol":symbol,"side":pending.candidate.side,"origin_signal_ms":pending.candidate.signal_ms,"breakout_level":pending.breakout_level,"expires_ms":pending.expires_ms,"retest_seen":pending.retest_seen,"reason":reason}),
+                )?;
+                state.pending_entries.remove(&symbol);
+                if let Some(confirmed) = confirmed {
+                    execution_candidates.push(confirmed);
+                }
+            } else {
+                state.pending_entries.insert(symbol, pending);
+            }
+        }
+
+        // 新突破先登记候选。只有真正极端且放量足够的延续段允许直接小仓探路；
+        // 该分支对多空完全镜像，并通过 risk_scale 降低单次错误追价的代价。
+        for candidate in candidates.iter().filter(|candidate| candidate.eligible()) {
+            if state.positions.contains_key(&candidate.symbol)
+                || state.pending_entries.contains_key(&candidate.symbol)
+                || state.seen_signal.get(&candidate.symbol).copied() == Some(candidate.signal_ms)
+            {
+                continue;
+            }
+            state
+                .seen_signal
+                .insert(candidate.symbol.clone(), candidate.signal_ms);
+            if is_extreme_direct(candidate, &cfg) {
+                let mut direct = candidate.clone();
+                direct.entry_trigger = "extreme_continuation_probe".to_owned();
+                direct.risk_scale = cfg.extreme_direct_risk_scale;
+                append_event(
+                    &event_path,
+                    json!({"ts_ms":scan_ms,"event":"extreme_direct_probe_selected","symbol":direct.symbol,"side":direct.side,"signal_ms":direct.signal_ms,"breakout_level":direct.breakout_level,"risk_scale":direct.risk_scale,"return_1h":direct.return_1h,"return_4h":direct.return_4h,"volume_ratio":direct.volume_ratio}),
+                )?;
+                execution_candidates.push(direct);
+            } else {
+                let expires_ms =
+                    candidate.signal_ms + cfg.confirmation_window_bars as i64 * 15 * 60_000;
+                state.pending_entries.insert(
+                    candidate.symbol.clone(),
+                    PendingEntry {
+                        candidate: candidate.clone(),
+                        breakout_level: candidate.breakout_level,
+                        expires_ms,
+                        last_checked_close_ms: candidate.signal_ms,
+                        retest_seen: false,
+                    },
+                );
+                append_event(
+                    &event_path,
+                    json!({"ts_ms":scan_ms,"event":"entry_setup_pending","symbol":candidate.symbol,"side":candidate.side,"signal_ms":candidate.signal_ms,"breakout_level":candidate.breakout_level,"signal_price":candidate.price,"expires_ms":expires_ms,"confirmation_window_bars":cfg.confirmation_window_bars,"retest_touch_pct":cfg.retest_touch_pct,"retest_invalidation_pct":cfg.retest_invalidation_pct,"reclaim_pct":cfg.reclaim_pct,"signal":candidate}),
+                )?;
+            }
+        }
+
+        execution_candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+        let eligible_count = execution_candidates.len();
+        for candidate in &execution_candidates {
             if state.positions.len() >= cfg.max_positions
                 || state.daily_entries >= effective_daily_limit
                 || daily_loss_blocked
@@ -2072,22 +2362,21 @@ pub async fn run_altcoin_impulse(
             }
             if state.positions.contains_key(&candidate.symbol)
                 || (candidate.entry_phase == "overextended_long" && overextension_slot_taken)
+                || (candidate.entry_phase == "overextended_long"
+                    && state.overextension_long_blocked)
                 || state
                     .cooldown_until
                     .get(&candidate.symbol)
                     .copied()
                     .unwrap_or(0)
                     > scan_ms
-                || state.seen_signal.get(&candidate.symbol).copied() == Some(candidate.signal_ms)
             {
                 continue;
             }
-            state
-                .seen_signal
-                .insert(candidate.symbol.clone(), candidate.signal_ms);
             let gross: f64 = state.positions.values().map(|p| p.initial_notional).sum();
             let risk_distance = cfg.stop_pct + cfg.risk_execution_buffer_pct;
-            let notional = (managed_equity * cfg.risk_per_trade / risk_distance)
+            let notional = (managed_equity * cfg.risk_per_trade * candidate.risk_scale
+                / risk_distance)
                 .min((managed_equity * cfg.max_gross_multiple - gross).max(0.0));
             if notional < 20.0 {
                 continue;
@@ -2374,7 +2663,7 @@ pub async fn run_altcoin_impulse(
             if candidate.entry_phase == "overextended_long" {
                 overextension_slot_taken = true;
             }
-            let event = json!({"ts_ms":scan_ms,"event":"entry","symbol":candidate.symbol,"side":candidate.side,"entry_phase":candidate.entry_phase,"signal_age_ms":signal_age_ms(scan_ms,candidate.signal_ms),"max_signal_age_ms":max_signal_age_ms,"signal":candidate,"entry_price":entry,"qty":qty,"notional":qty*entry,"requested_leverage":cfg.exchange_leverage,"actual_leverage":actual_leverage,"margin_estimate":qty*entry/actual_leverage as f64,"risk_usd":qty*entry*risk_distance,"price_stop_risk_usd":qty*entry*cfg.stop_pct,"risk_execution_buffer_pct":cfg.risk_execution_buffer_pct,"fee":fee});
+            let event = json!({"ts_ms":scan_ms,"event":"entry","symbol":candidate.symbol,"side":candidate.side,"entry_phase":candidate.entry_phase,"entry_trigger":candidate.entry_trigger,"risk_scale":candidate.risk_scale,"signal_age_ms":signal_age_ms(scan_ms,candidate.signal_ms),"max_signal_age_ms":max_signal_age_ms,"signal":candidate,"entry_price":entry,"qty":qty,"notional":qty*entry,"requested_leverage":cfg.exchange_leverage,"actual_leverage":actual_leverage,"margin_estimate":qty*entry/actual_leverage as f64,"risk_usd":qty*entry*risk_distance,"price_stop_risk_usd":qty*entry*cfg.stop_pct,"risk_execution_buffer_pct":cfg.risk_execution_buffer_pct,"fee":fee});
             append_event(&event_path, event.clone())?;
             state.record_trade(event);
         }
@@ -2397,6 +2686,14 @@ pub async fn run_altcoin_impulse(
                 "max_daily_entry_bonus":cfg.max_daily_entry_bonus,
                 "max_daily_entries":effective_daily_limit,
                 "max_signal_age_seconds":cfg.max_signal_age_seconds,
+                "confirmation_window_bars":cfg.confirmation_window_bars,
+                "retest_touch_pct":cfg.retest_touch_pct,
+                "retest_invalidation_pct":cfg.retest_invalidation_pct,
+                "reclaim_pct":cfg.reclaim_pct,
+                "extreme_direct_return_1h":cfg.extreme_direct_return_1h,
+                "extreme_direct_return_4h":cfg.extreme_direct_return_4h,
+                "extreme_direct_volume_ratio":cfg.extreme_direct_volume_ratio,
+                "extreme_direct_risk_scale":cfg.extreme_direct_risk_scale,
                 "risk_execution_buffer_pct":cfg.risk_execution_buffer_pct,
                 "partial_take_profit_fraction":cfg.partial_take_profit_fraction,
                 "failed_breakout_window_minutes":cfg.failed_breakout_window_minutes,
@@ -2412,6 +2709,7 @@ pub async fn run_altcoin_impulse(
                 "overextension_long_losses":state.overextension_long_losses,
                 "last_overextension_loss_ms":state.last_overextension_loss_ms,
                 "daily_loss_blocked":daily_loss_blocked,
+                "pending_entries":state.pending_entries.values().collect::<Vec<_>>(),
                 "positions":position_status,
                 "candidates":candidates.iter().take(10).collect::<Vec<_>>(),
                 "reversal_observer":reversal_observer
@@ -2424,7 +2722,7 @@ pub async fn run_altcoin_impulse(
             "equity":current_equity, "cash":state.cash, "position":Value::Null,
             "n_intents":state.total_entries, "n_fills":state.total_entries + state.total_exits,
             "altcoin_impulse": {
-                "stage": if daily_loss_blocked {"risk_blocked"} else if eligible_count>0 {"execution"} else if shortlist_count>0 {"confirmation"} else {"scan"},
+                "stage": if daily_loss_blocked {"risk_blocked"} else if eligible_count>0 {"execution"} else if !state.pending_entries.is_empty() {"confirmation"} else {"scan"},
                 "universe_count":spot_symbols.intersection(&active).count(), "shortlist_count":shortlist_count,
                 "eligible_count":eligible_count, "last_scan_ms":scan_ms,
                 "exchange_leverage":cfg.exchange_leverage, "risk_per_trade":cfg.risk_per_trade,
@@ -2446,11 +2744,27 @@ pub async fn run_altcoin_impulse(
         });
         status_payload["altcoin_impulse"]["daily_risk_baseline_equity"] =
             json!(state.day_start_equity);
+        status_payload["altcoin_impulse"]["pending_entries"] =
+            json!(state.pending_entries.values().collect::<Vec<_>>());
         status_payload["altcoin_impulse"]["base_max_daily_entries"] = json!(cfg.max_daily_entries);
         status_payload["altcoin_impulse"]["max_daily_entry_bonus"] =
             json!(cfg.max_daily_entry_bonus);
         status_payload["altcoin_impulse"]["max_signal_age_seconds"] =
             json!(cfg.max_signal_age_seconds);
+        status_payload["altcoin_impulse"]["confirmation_window_bars"] =
+            json!(cfg.confirmation_window_bars);
+        status_payload["altcoin_impulse"]["retest_touch_pct"] = json!(cfg.retest_touch_pct);
+        status_payload["altcoin_impulse"]["retest_invalidation_pct"] =
+            json!(cfg.retest_invalidation_pct);
+        status_payload["altcoin_impulse"]["reclaim_pct"] = json!(cfg.reclaim_pct);
+        status_payload["altcoin_impulse"]["extreme_direct_return_1h"] =
+            json!(cfg.extreme_direct_return_1h);
+        status_payload["altcoin_impulse"]["extreme_direct_return_4h"] =
+            json!(cfg.extreme_direct_return_4h);
+        status_payload["altcoin_impulse"]["extreme_direct_volume_ratio"] =
+            json!(cfg.extreme_direct_volume_ratio);
+        status_payload["altcoin_impulse"]["extreme_direct_risk_scale"] =
+            json!(cfg.extreme_direct_risk_scale);
         status_payload["altcoin_impulse"]["cooldown_hours"] = json!(cfg.cooldown_hours);
         status_payload["altcoin_impulse"]["risk_execution_buffer_pct"] =
             json!(cfg.risk_execution_buffer_pct);
@@ -2537,7 +2851,7 @@ pub async fn run_altcoin_impulse(
                         json!(state.last_daily_risk_reset_ms);
                     status_payload["altcoin_impulse"]["stage"] = json!(if eligible_count > 0 {
                         "execution"
-                    } else if shortlist_count > 0 {
+                    } else if !state.pending_entries.is_empty() {
                         "confirmation"
                     } else {
                         "scan"
@@ -2595,22 +2909,22 @@ mod tests {
     use super::{
         adverse_excursion, apply_daily_entry_bonus, apply_daily_risk_reset,
         clamp_entry_guard_price, detected_exit_reason, entry_phase, failed_breakout,
-        realtime_trailing_stop, recently_exited_symbol, record_daily_equity, record_exit,
-        record_partial_exit, recovery_profit_lock_stop, signal_age_ms, update_adverse_extreme,
-        PersistedState, Position,
+        pending_decision, realtime_trailing_stop, recently_exited_symbol, record_daily_equity,
+        record_exit, record_partial_exit, recovery_profit_lock_stop, signal_age_ms,
+        update_adverse_extreme, Bar, PendingDecision, PersistedState, Position,
     };
 
     #[test]
     fn exchange_leverage_does_not_change_stop_risk() {
         let equity: f64 = 1_000.0;
-        let risk: f64 = 0.06;
+        let risk: f64 = 0.08;
         let stop: f64 = 0.05;
         let execution_buffer: f64 = 0.006;
         let leverage: f64 = 10.0;
         let notional = equity * risk / (stop + execution_buffer);
-        assert!((notional - 1_071.4285714285713).abs() < 1e-10);
-        assert!((notional / leverage - 107.14285714285714).abs() < 1e-10);
-        assert!((notional * (stop + execution_buffer) - 60.0).abs() < 1e-10);
+        assert!((notional - 1_428.5714285714284).abs() < 1e-10);
+        assert!((notional / leverage - 142.85714285714283).abs() < 1e-10);
+        assert!((notional * (stop + execution_buffer) - 80.0).abs() < 1e-10);
     }
 
     #[test]
@@ -2920,6 +3234,40 @@ mod tests {
     }
 
     #[test]
+    fn retest_confirmation_is_mirrored_for_long_and_short() {
+        let strategy: super::StrategyFile = toml::from_str(include_str!(
+            "../../../config/strategy-altcoin-impulse.toml"
+        ))
+        .unwrap();
+        let cfg = strategy.altcoin_impulse;
+        let bar = |open: f64, high: f64, low: f64, close: f64| Bar {
+            open_ms: 1,
+            close_ms: 2,
+            open,
+            high,
+            low,
+            close,
+            quote_volume: 1.0,
+        };
+        assert_eq!(
+            pending_decision(1, 100.0, &bar(99.8, 101.0, 99.5, 100.4), false, &cfg),
+            PendingDecision::Confirmed
+        );
+        assert_eq!(
+            pending_decision(-1, 100.0, &bar(100.2, 100.5, 99.0, 99.6), false, &cfg),
+            PendingDecision::Confirmed
+        );
+        assert_eq!(
+            pending_decision(1, 100.0, &bar(100.0, 100.5, 98.4, 98.8), false, &cfg),
+            PendingDecision::Invalidated
+        );
+        assert_eq!(
+            pending_decision(-1, 100.0, &bar(100.0, 101.6, 99.5, 101.2), false, &cfg),
+            PendingDecision::Invalidated
+        );
+    }
+
+    #[test]
     fn deployed_altcoin_config_enables_observer_without_changing_live_strategy() {
         let strategy: super::StrategyFile = toml::from_str(include_str!(
             "../../../config/strategy-altcoin-impulse.toml"
@@ -2928,9 +3276,15 @@ mod tests {
         assert!(strategy.altcoin_impulse.enabled);
         assert!(strategy.altcoin_reversal_observer.enabled);
         assert_eq!(strategy.altcoin_impulse.max_daily_entries, 6);
+        assert_eq!(strategy.altcoin_impulse.risk_per_trade, 0.08);
         assert_eq!(strategy.altcoin_impulse.max_daily_entry_bonus, 4);
         assert_eq!(strategy.altcoin_impulse.cooldown_hours, 4);
         assert_eq!(strategy.altcoin_impulse.max_signal_age_seconds, 120);
+        assert_eq!(strategy.altcoin_impulse.confirmation_window_bars, 4);
+        assert_eq!(strategy.altcoin_impulse.retest_touch_pct, 0.01);
+        assert_eq!(strategy.altcoin_impulse.retest_invalidation_pct, 0.015);
+        assert_eq!(strategy.altcoin_impulse.reclaim_pct, 0.002);
+        assert_eq!(strategy.altcoin_impulse.extreme_direct_risk_scale, 0.33);
         assert_eq!(strategy.altcoin_impulse.recovery_lock_adverse_pct, 0.03);
         assert_eq!(strategy.altcoin_impulse.recovery_lock_activation_pct, 0.01);
         assert_eq!(strategy.altcoin_impulse.recovery_lock_pct, 0.0025);
