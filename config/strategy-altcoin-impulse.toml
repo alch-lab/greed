@@ -20,10 +20,10 @@ daily_loss_limit = 0.04
 max_gross_multiple = 4.0
 
 stop_pct = 0.038
-# 亏损分段：标记价到 -1% 时先市价减仓 33%，剩余仓位继续由交易所 -3.8%
+# 亏损分段：标记价到 -1% 时先市价减仓 50%，剩余仓位继续由交易所 -3.8%
 # STOP_MARKET 保护。该动作每笔只执行一次，多空完全镜像。
 loss_trim_trigger_pct = 0.01
-loss_trim_fraction = 0.33
+loss_trim_fraction = 0.50
 # 仓位预算额外计入 0.6% 执行成本；STOP_MARKET 极端跳空仍无法保证绝对封顶。
 risk_execution_buffer_pct = 0.006
 # 日志显示短促行情常在 +2%～+4% 后反转；达到 +2% 即开始按峰值回撤 1% 保护。
@@ -53,7 +53,9 @@ confirmation_window_bars = 4
 retest_touch_pct = 0.01
 retest_invalidation_pct = 0.015
 reclaim_pct = 0.002
-# 只有极端延续允许不等待回测，以 33% 风险探路；阈值也按方向绝对值镜像。
+# 近期前向/三日回放中，极端延续直接追单持续拖累收益与盈亏比，先关闭该分支。
+# 阈值继续保留用于日志与后续影子研究，但不会产生真实订单。
+extreme_direct_enabled = false
 extreme_direct_return_1h = 0.18
 extreme_direct_return_4h = 0.25
 extreme_direct_volume_ratio = 6.0

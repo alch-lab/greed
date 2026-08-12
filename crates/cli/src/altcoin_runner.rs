@@ -77,6 +77,8 @@ pub struct AltcoinImpulseConfig {
     pub retest_invalidation_pct: f64,
     #[serde(default = "default_reclaim_pct")]
     pub reclaim_pct: f64,
+    #[serde(default = "default_extreme_direct_enabled")]
+    pub extreme_direct_enabled: bool,
     #[serde(default = "default_extreme_direct_return_1h")]
     pub extreme_direct_return_1h: f64,
     #[serde(default = "default_extreme_direct_return_4h")]
@@ -247,6 +249,10 @@ fn default_reclaim_pct() -> f64 {
 
 fn default_extreme_direct_return_1h() -> f64 {
     0.18
+}
+
+fn default_extreme_direct_enabled() -> bool {
+    true
 }
 
 fn default_extreme_direct_return_4h() -> f64 {
@@ -2497,7 +2503,7 @@ pub async fn run_altcoin_impulse(
             state
                 .seen_signal
                 .insert(candidate.symbol.clone(), candidate.signal_ms);
-            if is_extreme_direct(candidate, &cfg) {
+            if cfg.extreme_direct_enabled && is_extreme_direct(candidate, &cfg) {
                 let mut direct = candidate.clone();
                 direct.entry_trigger = "extreme_continuation_probe".to_owned();
                 direct.risk_scale = cfg.extreme_direct_risk_scale;
@@ -2506,6 +2512,11 @@ pub async fn run_altcoin_impulse(
                     json!({"ts_ms":scan_ms,"event":"extreme_direct_probe_selected","symbol":direct.symbol,"side":direct.side,"signal_ms":direct.signal_ms,"breakout_level":direct.breakout_level,"risk_scale":direct.risk_scale,"return_1h":direct.return_1h,"return_4h":direct.return_4h,"volume_ratio":direct.volume_ratio}),
                 )?;
                 execution_candidates.push(direct);
+            } else if is_extreme_direct(candidate, &cfg) {
+                append_event(
+                    &event_path,
+                    json!({"ts_ms":scan_ms,"event":"extreme_direct_observed","symbol":candidate.symbol,"side":candidate.side,"signal_ms":candidate.signal_ms,"return_1h":candidate.return_1h,"return_4h":candidate.return_4h,"volume_ratio":candidate.volume_ratio,"reason":"极端延续直接追单已关闭，仅记录观察"}),
+                )?;
             } else {
                 let expires_ms =
                     candidate.signal_ms + cfg.confirmation_window_bars as i64 * 15 * 60_000;
@@ -3059,6 +3070,8 @@ pub async fn run_altcoin_impulse(
         status_payload["altcoin_impulse"]["loss_trim_trigger_pct"] =
             json!(cfg.loss_trim_trigger_pct);
         status_payload["altcoin_impulse"]["loss_trim_fraction"] = json!(cfg.loss_trim_fraction);
+        status_payload["altcoin_impulse"]["extreme_direct_enabled"] =
+            json!(cfg.extreme_direct_enabled);
         status_payload["altcoin_impulse"]["max_spread_bps"] = json!(cfg.max_spread_bps);
         status_payload["altcoin_impulse"]["min_contract_age_days"] =
             json!(cfg.min_contract_age_days);
@@ -3588,7 +3601,8 @@ mod tests {
         assert_eq!(strategy.altcoin_impulse.risk_per_trade, 0.08);
         assert_eq!(strategy.altcoin_impulse.stop_pct, 0.038);
         assert_eq!(strategy.altcoin_impulse.loss_trim_trigger_pct, 0.01);
-        assert_eq!(strategy.altcoin_impulse.loss_trim_fraction, 0.33);
+        assert_eq!(strategy.altcoin_impulse.loss_trim_fraction, 0.50);
+        assert!(!strategy.altcoin_impulse.extreme_direct_enabled);
         assert_eq!(strategy.altcoin_impulse.max_spread_bps, 10.0);
         assert_eq!(strategy.altcoin_impulse.min_contract_age_days, 7);
         assert_eq!(strategy.altcoin_impulse.max_entry_impact_bps, 15.0);
