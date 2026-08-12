@@ -63,6 +63,52 @@ pub struct PositionRisk {
     pub unrealized_profit: f64,
 }
 
+/// 下单前从实际执行端点测得的可成交性。价格信号可以来自主网，但 paper/live
+/// 是否允许下单必须以真正承接订单的盘口和成交流为准。
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize)]
+pub struct LiquiditySnapshot {
+    pub measured_at_ms: i64,
+    pub bid: f64,
+    pub ask: f64,
+    pub spread_bps: f64,
+    pub bid_depth_usd: f64,
+    pub ask_depth_usd: f64,
+    pub entry_impact_bps: Option<f64>,
+    pub exit_impact_bps: Option<f64>,
+    pub recent_trade_count: usize,
+    pub unique_trade_prices: usize,
+    pub last_trade_age_ms: i64,
+}
+
+fn parse_level(value: &serde_json::Value) -> Option<(f64, f64)> {
+    Some((
+        value.get(0)?.as_str()?.parse().ok()?,
+        value.get(1)?.as_str()?.parse().ok()?,
+    ))
+}
+
+fn sweep_impact_bps(levels: &[serde_json::Value], notional: f64, reference: f64) -> Option<f64> {
+    if notional <= 0.0 || reference <= 0.0 {
+        return None;
+    }
+    let mut remaining = notional;
+    let mut base_qty = 0.0;
+    let mut spent = 0.0;
+    for level in levels {
+        let (price, qty) = parse_level(level)?;
+        let available = price * qty;
+        let used = remaining.min(available);
+        base_qty += used / price;
+        spent += used;
+        remaining -= used;
+        if remaining <= 1e-8 {
+            let average = spent / base_qty;
+            return Some((average / reference - 1.0).abs() * 10_000.0);
+        }
+    }
+    None
+}
+
 /// 向下取整到步长的整数倍（币安要求 price/qty 对齐 tick/step）。
 pub fn floor_to_step(x: f64, step: f64) -> f64 {
     if step <= 0.0 {
@@ -350,6 +396,86 @@ impl RestClient {
             })
             .filter_map(|item| item["symbol"].as_str().map(str::to_owned))
             .collect())
+    }
+
+    /// 用执行端点的 100 档盘口和最近聚合成交评估目标名义仓位是否可双向成交。
+    pub async fn liquidity_snapshot(
+        &self,
+        symbol: &str,
+        entry_side: i32,
+        notional: f64,
+        depth_band_pct: f64,
+        trade_window_ms: i64,
+    ) -> Result<LiquiditySnapshot, RestError> {
+        let depth_url = format!("{}/fapi/v1/depth?symbol={symbol}&limit=100", self.base);
+        let trades_url = format!("{}/fapi/v1/aggTrades?symbol={symbol}&limit=1000", self.base);
+        let (depth, trades) =
+            tokio::try_join!(self.get_json(&depth_url), self.get_json(&trades_url))?;
+        let bids = depth["bids"]
+            .as_array()
+            .ok_or_else(|| RestError::Data(format!("{symbol} depth 缺 bids")))?;
+        let asks = depth["asks"]
+            .as_array()
+            .ok_or_else(|| RestError::Data(format!("{symbol} depth 缺 asks")))?;
+        let (bid, _) = bids
+            .first()
+            .and_then(parse_level)
+            .ok_or_else(|| RestError::Data(format!("{symbol} 买盘为空")))?;
+        let (ask, _) = asks
+            .first()
+            .and_then(parse_level)
+            .ok_or_else(|| RestError::Data(format!("{symbol} 卖盘为空")))?;
+        let mid = (bid + ask) / 2.0;
+        let bid_depth_usd: f64 = bids
+            .iter()
+            .filter_map(parse_level)
+            .take_while(|(price, _)| *price >= mid * (1.0 - depth_band_pct))
+            .map(|(price, qty)| price * qty)
+            .sum();
+        let ask_depth_usd: f64 = asks
+            .iter()
+            .filter_map(parse_level)
+            .take_while(|(price, _)| *price <= mid * (1.0 + depth_band_pct))
+            .map(|(price, qty)| price * qty)
+            .sum();
+        let (entry_levels, entry_reference, exit_levels, exit_reference) = if entry_side > 0 {
+            (asks, ask, bids, bid)
+        } else {
+            (bids, bid, asks, ask)
+        };
+        let now_ms = self.ts();
+        let cutoff = now_ms.saturating_sub(trade_window_ms);
+        let recent: Vec<_> = trades
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|trade| trade["T"].as_i64().is_some_and(|ts| ts >= cutoff))
+            .collect();
+        let last_trade_ms = trades
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|trade| trade["T"].as_i64())
+            .max()
+            .unwrap_or(0);
+        let unique_trade_prices = recent
+            .iter()
+            .filter_map(|trade| trade["p"].as_str())
+            .collect::<HashSet<_>>()
+            .len();
+        Ok(LiquiditySnapshot {
+            measured_at_ms: now_ms,
+            bid,
+            ask,
+            spread_bps: (ask / bid - 1.0) * 10_000.0,
+            bid_depth_usd,
+            ask_depth_usd,
+            entry_impact_bps: sweep_impact_bps(entry_levels, notional, entry_reference),
+            exit_impact_bps: sweep_impact_bps(exit_levels, notional, exit_reference),
+            recent_trade_count: recent.len(),
+            unique_trade_prices,
+            last_trade_age_ms: now_ms.saturating_sub(last_trade_ms),
+        })
     }
 
     /// 设置杠杆（启动时调用一次）。
@@ -715,6 +841,18 @@ mod tests {
         assert_eq!(quantity_string("MARKET", 123.456, &filters), "123");
         assert_eq!(quantity_string("STOP_MARKET", 123.456, &filters), "123");
         assert_eq!(quantity_string("LIMIT", 123.456, &filters), "123.456");
+    }
+
+    #[test]
+    fn sweep_impact_requires_full_notional_and_measures_vwap() {
+        let asks = serde_json::json!([["100.0", "5.0"], ["101.0", "10.0"]]);
+        let levels = asks.as_array().unwrap();
+        assert_eq!(sweep_impact_bps(levels, 2_000.0, 100.0), None);
+        let impact = sweep_impact_bps(levels, 1_000.0, 100.0).unwrap();
+        assert!(
+            impact > 49.0 && impact < 51.0,
+            "half the notional fills 1% higher"
+        );
     }
 
     #[test]

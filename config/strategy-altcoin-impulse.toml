@@ -60,6 +60,19 @@ extreme_direct_volume_ratio = 6.0
 extreme_direct_risk_scale = 0.33
 
 min_24h_volume_usd = 5000000.0
+# 只扫描同名现货 + USDT 永续的山寨币；排除 BTC/ETH/BNB/SOL/XRP，
+# 同时排除刚上市不足 7 天的永续、盘前和指数。
+min_contract_age_days = 7
+# 下单前在实际执行端点硬检验可成交性；主网信号再强，也不能绕过这些门槛。
+max_spread_bps = 10.0
+max_entry_impact_bps = 15.0
+max_exit_impact_bps = 20.0
+depth_band_pct = 0.005
+min_depth_multiple = 10.0
+recent_trade_window_seconds = 60
+min_recent_trades = 30
+min_unique_trade_prices = 8
+max_last_trade_age_seconds = 5
 min_return_1h = 0.04
 max_return_1h = 0.45
 # 1h 涨幅达到 12% 或 4h 涨幅达到 15% 视为“过度延伸追多票”。历史上这类
