@@ -10,6 +10,7 @@
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
+use std::collections::HashSet;
 use thiserror::Error;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -330,6 +331,25 @@ impl RestClient {
             .get_json(&format!("{}/fapi/v1/exchangeInfo", self.base))
             .await?;
         parse_symbol_filters(&v, symbol)
+    }
+
+    /// 当前端点实际支持交易的 USDT 永续集合。测试网与主网的上币集合不同，
+    /// 扫描器必须先按执行端点过滤，不能等到 setLeverage 才发现无效 symbol。
+    pub async fn active_usdt_perpetual_symbols(&self) -> Result<HashSet<String>, RestError> {
+        let value = self
+            .get_json(&format!("{}/fapi/v1/exchangeInfo", self.base))
+            .await?;
+        Ok(value["symbols"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|item| {
+                item["status"] == "TRADING"
+                    && item["contractType"] == "PERPETUAL"
+                    && item["quoteAsset"] == "USDT"
+            })
+            .filter_map(|item| item["symbol"].as_str().map(str::to_owned))
+            .collect())
     }
 
     /// 设置杠杆（启动时调用一次）。

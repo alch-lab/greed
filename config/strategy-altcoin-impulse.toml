@@ -25,8 +25,13 @@ risk_execution_buffer_pct = 0.006
 # 日志显示短促行情常在 +2%～+4% 后反转；达到 +2% 即开始按峰值回撤 1% 保护。
 trail_activation_pct = 0.02
 trail_pct = 0.01
-# 首次达到 +2% 时市价兑现 50%，剩余仓位继续使用上述跟踪保护。
-partial_take_profit_fraction = 0.50
+# 首次达到 +2% 时市价兑现 33%，让约 2/3 仓位继续参与趋势。
+partial_take_profit_fraction = 0.33
+# 失败突破退出：仅限入场最初 15 分钟；若最大顺向幅度始终不足 0.5%，
+# 当前价格却逆向达到 3%，不再等待完整 5% 初始止损。
+failed_breakout_window_minutes = 15
+failed_breakout_adverse_pct = 0.03
+failed_breakout_max_mfe_pct = 0.005
 # 纯价格路径保护：若持仓曾逆向达到 3%，随后修复到盈利 1%，
 # 将保护抬到入场价顺向 0.25%；不依赖持仓时间。
 recovery_lock_adverse_pct = 0.03

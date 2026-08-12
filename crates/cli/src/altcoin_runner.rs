@@ -47,6 +47,12 @@ pub struct AltcoinImpulseConfig {
     pub trail_pct: f64,
     #[serde(default = "default_partial_take_profit_fraction")]
     pub partial_take_profit_fraction: f64,
+    #[serde(default = "default_failed_breakout_window_minutes")]
+    pub failed_breakout_window_minutes: u32,
+    #[serde(default = "default_failed_breakout_adverse_pct")]
+    pub failed_breakout_adverse_pct: f64,
+    #[serde(default = "default_failed_breakout_max_mfe_pct")]
+    pub failed_breakout_max_mfe_pct: f64,
     #[serde(default = "default_recovery_lock_adverse_pct")]
     pub recovery_lock_adverse_pct: f64,
     #[serde(default = "default_recovery_lock_activation_pct")]
@@ -195,7 +201,19 @@ fn default_risk_execution_buffer_pct() -> f64 {
 }
 
 fn default_partial_take_profit_fraction() -> f64 {
-    0.5
+    0.33
+}
+
+fn default_failed_breakout_window_minutes() -> u32 {
+    15
+}
+
+fn default_failed_breakout_adverse_pct() -> f64 {
+    0.03
+}
+
+fn default_failed_breakout_max_mfe_pct() -> f64 {
+    0.005
 }
 
 fn default_entry_phase() -> String {
@@ -229,6 +247,24 @@ fn detected_exit_reason(position: &Position, exit_price: f64, reconciled: bool) 
     } else {
         "manual_or_external"
     }
+}
+
+fn failed_breakout(
+    position: &Position,
+    mark_price: f64,
+    now_ms: i64,
+    window_minutes: u32,
+    adverse_pct: f64,
+    max_mfe_pct: f64,
+) -> bool {
+    if position.partial_take_profit_done || now_ms < position.entry_ms {
+        return false;
+    }
+    let age_ms = now_ms - position.entry_ms;
+    let within_window = age_ms <= window_minutes as i64 * 60_000;
+    let current_return = position.side as f64 * (mark_price / position.entry_price - 1.0);
+    let mfe = position.side as f64 * (position.extreme / position.entry_price - 1.0);
+    within_window && current_return <= -adverse_pct && mfe < max_mfe_pct
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1163,6 +1199,50 @@ async fn manage_live_positions(
         let excursion = position.side as f64 * (position.extreme / position.entry_price - 1.0);
         let current_return =
             position.side as f64 * (snapshot.mark_price / position.entry_price - 1.0);
+        if failed_breakout(
+            &position,
+            snapshot.mark_price,
+            now_ms,
+            cfg.failed_breakout_window_minutes,
+            cfg.failed_breakout_adverse_pct,
+            cfg.failed_breakout_max_mfe_pct,
+        ) {
+            let filters = client.symbol_filters(&symbol).await?;
+            let side = if position.side > 0 { "SELL" } else { "BUY" };
+            // reduceOnly 市价退出先成交，再清理旧保护，避免撤单与平仓之间出现裸仓窗口。
+            let order = client
+                .place_order(
+                    &symbol,
+                    side,
+                    "MARKET",
+                    snapshot.position_amt.abs(),
+                    None,
+                    None,
+                    true,
+                    &filters,
+                )
+                .await?;
+            let (exit, exit_qty, fee) = wait_fill(client, &symbol, order).await?;
+            if let Err(error) = client.cancel_all_open_orders(&symbol).await {
+                warn!(symbol=%symbol, error=%error, "失败突破已平仓，但清理旧保护单失败");
+            }
+            let exit_qty = exit_qty.min(position.qty);
+            let pnl = record_exit(
+                state,
+                &position,
+                now_ms,
+                cfg.cooldown_hours,
+                exit,
+                exit_qty,
+                fee,
+            );
+            let trade_pnl = position.realized_partial_pnl + pnl;
+            let event = json!({"ts_ms":now_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"failed_breakout","price":exit,"qty":exit_qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"hold_ms":now_ms-position.entry_ms,"current_return":current_return,"max_favorable_excursion":excursion,"failed_breakout_window_minutes":cfg.failed_breakout_window_minutes,"failed_breakout_adverse_pct":cfg.failed_breakout_adverse_pct,"failed_breakout_max_mfe_pct":cfg.failed_breakout_max_mfe_pct,"overextension_long_blocked":state.overextension_long_blocked});
+            append_event(event_path, event.clone())?;
+            state.record_trade(event);
+            changed = true;
+            continue;
+        }
         // 只按“当前仍有的浮盈”兑现，不能因历史上曾到过 +2%、现在已回落而补卖。
         if !position.partial_take_profit_done && current_return >= cfg.trail_activation_pct {
             let filters = client.symbol_filters(&symbol).await?;
@@ -1396,6 +1476,19 @@ pub async fn run_altcoin_impulse(
         "第一段止盈比例必须在 25%..=75%"
     );
     anyhow::ensure!(
+        (5..=30).contains(&cfg.failed_breakout_window_minutes),
+        "失败突破观察窗口必须在 5..=30 分钟"
+    );
+    anyhow::ensure!(
+        cfg.failed_breakout_adverse_pct >= 0.02 && cfg.failed_breakout_adverse_pct < cfg.stop_pct,
+        "失败突破逆向阈值必须 >=2% 且小于初始止损"
+    );
+    anyhow::ensure!(
+        cfg.failed_breakout_max_mfe_pct >= 0.0
+            && cfg.failed_breakout_max_mfe_pct < cfg.trail_activation_pct,
+        "失败突破最大顺向幅度必须小于跟踪止盈激活点"
+    );
+    anyhow::ensure!(
         cfg.recovery_lock_adverse_pct >= 0.02
             && cfg.recovery_lock_adverse_pct <= cfg.stop_pct
             && cfg.recovery_lock_activation_pct > cfg.recovery_lock_pct
@@ -1585,6 +1678,11 @@ pub async fn run_altcoin_impulse(
     let excluded: HashSet<&str> = ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT"]
         .into_iter()
         .collect();
+    let execution_symbols = if let Some(client) = rest.as_ref() {
+        Some(client.active_usdt_perpetual_symbols().await?)
+    } else {
+        None
+    };
 
     loop {
         if *shutdown.borrow() {
@@ -1613,6 +1711,9 @@ pub async fn run_altcoin_impulse(
                 let volume = t["quoteVolume"].as_str()?.parse::<f64>().ok()?;
                 let change = t["priceChangePercent"].as_str()?.parse::<f64>().ok()?.abs();
                 (active.contains(&symbol)
+                    && execution_symbols
+                        .as_ref()
+                        .is_none_or(|symbols| symbols.contains(&symbol))
                     && spot_symbols.contains(&symbol)
                     && !excluded.contains(symbol.as_str())
                     && volume >= cfg.min_24h_volume_usd
@@ -1818,9 +1919,19 @@ pub async fn run_altcoin_impulse(
                 } else {
                     bar.high >= position.stop_price
                 };
+                let failed = failed_breakout(
+                    &position,
+                    bar.close,
+                    scan_ms,
+                    cfg.failed_breakout_window_minutes,
+                    cfg.failed_breakout_adverse_pct,
+                    cfg.failed_breakout_max_mfe_pct,
+                );
                 let timed = scan_ms - position.entry_ms >= cfg.max_hold_hours as i64 * 3_600_000;
-                if stopped || timed {
-                    let exit = if stopped {
+                if failed || stopped || timed {
+                    let exit = if failed {
+                        bar.close
+                    } else if stopped {
                         position.stop_price
                     } else {
                         bar.close
@@ -1836,7 +1947,9 @@ pub async fn run_altcoin_impulse(
                         fee,
                     );
                     let trade_pnl = position.realized_partial_pnl + pnl;
-                    let reason = if timed {
+                    let reason = if failed {
+                        "failed_breakout"
+                    } else if timed {
                         "time"
                     } else {
                         match position.protection_reason.as_str() {
@@ -1876,6 +1989,15 @@ pub async fn run_altcoin_impulse(
             .into_iter()
             .filter_map(|(s, bars)| evaluate(s, &bars, &cfg))
             .collect();
+        if let Some(symbols) = execution_symbols.as_ref() {
+            for candidate in &mut candidates {
+                if !symbols.contains(&candidate.symbol) {
+                    candidate
+                        .blockers
+                        .push("当前 Binance 执行端点不支持该永续合约".into());
+                }
+            }
+        }
         // 历史验证假设在信号 K 线闭合后的下一根开盘成交。仓位刚释放时不得
         // 回头追一个已经运行数分钟的旧突破，否则线上执行口径会偏离回测，
         // 也容易在冲高末端接盘。过期信号保留在观测日志中，但不再具备下单资格。
@@ -2277,6 +2399,9 @@ pub async fn run_altcoin_impulse(
                 "max_signal_age_seconds":cfg.max_signal_age_seconds,
                 "risk_execution_buffer_pct":cfg.risk_execution_buffer_pct,
                 "partial_take_profit_fraction":cfg.partial_take_profit_fraction,
+                "failed_breakout_window_minutes":cfg.failed_breakout_window_minutes,
+                "failed_breakout_adverse_pct":cfg.failed_breakout_adverse_pct,
+                "failed_breakout_max_mfe_pct":cfg.failed_breakout_max_mfe_pct,
                 "recovery_lock_adverse_pct":cfg.recovery_lock_adverse_pct,
                 "recovery_lock_activation_pct":cfg.recovery_lock_activation_pct,
                 "recovery_lock_pct":cfg.recovery_lock_pct,
@@ -2331,6 +2456,12 @@ pub async fn run_altcoin_impulse(
             json!(cfg.risk_execution_buffer_pct);
         status_payload["altcoin_impulse"]["partial_take_profit_fraction"] =
             json!(cfg.partial_take_profit_fraction);
+        status_payload["altcoin_impulse"]["failed_breakout_window_minutes"] =
+            json!(cfg.failed_breakout_window_minutes);
+        status_payload["altcoin_impulse"]["failed_breakout_adverse_pct"] =
+            json!(cfg.failed_breakout_adverse_pct);
+        status_payload["altcoin_impulse"]["failed_breakout_max_mfe_pct"] =
+            json!(cfg.failed_breakout_max_mfe_pct);
         status_payload["altcoin_impulse"]["recovery_lock_adverse_pct"] =
             json!(cfg.recovery_lock_adverse_pct);
         status_payload["altcoin_impulse"]["recovery_lock_activation_pct"] =
@@ -2463,9 +2594,10 @@ pub async fn run_altcoin_impulse(
 mod tests {
     use super::{
         adverse_excursion, apply_daily_entry_bonus, apply_daily_risk_reset,
-        clamp_entry_guard_price, detected_exit_reason, entry_phase, realtime_trailing_stop,
-        recently_exited_symbol, record_daily_equity, record_exit, record_partial_exit,
-        recovery_profit_lock_stop, signal_age_ms, update_adverse_extreme, PersistedState, Position,
+        clamp_entry_guard_price, detected_exit_reason, entry_phase, failed_breakout,
+        realtime_trailing_stop, recently_exited_symbol, record_daily_equity, record_exit,
+        record_partial_exit, recovery_profit_lock_stop, signal_age_ms, update_adverse_extreme,
+        PersistedState, Position,
     };
 
     #[test]
@@ -2518,6 +2650,66 @@ mod tests {
         assert_eq!(state.total_exits, 1);
         assert_eq!(state.wins, 1);
         assert!(state.positions.is_empty());
+    }
+
+    #[test]
+    fn failed_breakout_only_fires_early_without_prior_follow_through() {
+        let now_ms = 1_800_000_000_000i64;
+        let mut position = Position {
+            symbol: "TESTUSDT".into(),
+            side: 1,
+            qty: 100.0,
+            entry_ms: now_ms,
+            entry_price: 100.0,
+            entry_fee: 0.1,
+            initial_notional: 10_000.0,
+            extreme: 100.4,
+            adverse_extreme: Some(97.0),
+            stop_price: 95.0,
+            last_bar_ms: now_ms,
+            protection_order_id: None,
+            protection_reason: "initial_stop".into(),
+            exchange_leverage: Some(10),
+            entry_phase: "standard_impulse".into(),
+            partial_take_profit_done: false,
+            last_partial_exit_ms: None,
+            realized_partial_pnl: 0.0,
+        };
+        assert!(failed_breakout(
+            &position,
+            97.0,
+            now_ms + 10 * 60_000,
+            15,
+            0.03,
+            0.005
+        ));
+        position.extreme = 100.6;
+        assert!(!failed_breakout(
+            &position,
+            97.0,
+            now_ms + 10 * 60_000,
+            15,
+            0.03,
+            0.005
+        ));
+        position.extreme = 100.4;
+        assert!(!failed_breakout(
+            &position,
+            97.0,
+            now_ms + 16 * 60_000,
+            15,
+            0.03,
+            0.005
+        ));
+        position.partial_take_profit_done = true;
+        assert!(!failed_breakout(
+            &position,
+            96.0,
+            now_ms + 10 * 60_000,
+            15,
+            0.03,
+            0.005
+        ));
     }
 
     #[test]
