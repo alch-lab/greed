@@ -19,7 +19,11 @@ max_daily_entry_bonus = 4
 daily_loss_limit = 0.04
 max_gross_multiple = 4.0
 
-stop_pct = 0.05
+stop_pct = 0.038
+# 亏损分段：标记价到 -1% 时先市价减仓 33%，剩余仓位继续由交易所 -3.8%
+# STOP_MARKET 保护。该动作每笔只执行一次，多空完全镜像。
+loss_trim_trigger_pct = 0.01
+loss_trim_fraction = 0.33
 # 仓位预算额外计入 0.6% 执行成本；STOP_MARKET 极端跳空仍无法保证绝对封顶。
 risk_execution_buffer_pct = 0.006
 # 日志显示短促行情常在 +2%～+4% 后反转；达到 +2% 即开始按峰值回撤 1% 保护。
@@ -28,7 +32,7 @@ trail_pct = 0.01
 # 首次达到 +2% 时市价兑现 33%，让约 2/3 仓位继续参与趋势。
 partial_take_profit_fraction = 0.33
 # 失败突破退出：仅限入场最初 15 分钟；若最大顺向幅度始终不足 0.5%，
-# 当前价格却逆向达到 3%，不再等待完整 5% 初始止损。
+# 当前价格却逆向达到 3%，不再等待完整 3.8% 初始止损。
 failed_breakout_window_minutes = 15
 failed_breakout_adverse_pct = 0.03
 failed_breakout_max_mfe_pct = 0.005

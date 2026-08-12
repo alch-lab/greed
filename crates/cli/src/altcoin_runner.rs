@@ -41,6 +41,10 @@ pub struct AltcoinImpulseConfig {
     pub daily_loss_limit: f64,
     pub max_gross_multiple: f64,
     pub stop_pct: f64,
+    #[serde(default = "default_loss_trim_trigger_pct")]
+    pub loss_trim_trigger_pct: f64,
+    #[serde(default = "default_loss_trim_fraction")]
+    pub loss_trim_fraction: f64,
     #[serde(default = "default_risk_execution_buffer_pct")]
     pub risk_execution_buffer_pct: f64,
     pub trail_activation_pct: f64,
@@ -186,6 +190,8 @@ struct Position {
     #[serde(default)]
     partial_take_profit_done: bool,
     #[serde(default)]
+    loss_trim_done: bool,
+    #[serde(default)]
     last_partial_exit_ms: Option<i64>,
     #[serde(default)]
     realized_partial_pnl: f64,
@@ -269,6 +275,14 @@ fn default_overextension_reentry_lookback_hours() -> u32 {
 
 fn default_risk_execution_buffer_pct() -> f64 {
     0.006
+}
+
+fn default_loss_trim_trigger_pct() -> f64 {
+    0.01
+}
+
+fn default_loss_trim_fraction() -> f64 {
+    0.33
 }
 
 fn default_partial_take_profit_fraction() -> f64 {
@@ -923,6 +937,7 @@ async fn build_position_status(
             "protection_reason":position.protection_reason,
             "entry_phase":position.entry_phase,
             "partial_take_profit_done":position.partial_take_profit_done,
+            "loss_trim_done":position.loss_trim_done,
             "realized_partial_pnl":position.realized_partial_pnl,
             "max_favorable_excursion_pct": position.side as f64 * (position.extreme / position.entry_price - 1.0),
             "max_adverse_excursion_pct": adverse_excursion(position.side, position.entry_price, adverse),
@@ -1373,6 +1388,65 @@ async fn manage_live_positions(
             changed = true;
             continue;
         }
+        // 亏损侧第一段保护：先成交减仓，再用剩余真实仓位替换交易所硬止损。
+        // 新保护确认前不撤旧保护，失败时旧全量 reduceOnly 止损仍然有效。
+        if !position.loss_trim_done && current_return <= -cfg.loss_trim_trigger_pct {
+            let filters = client.symbol_filters(&symbol).await?;
+            let side = if position.side > 0 { "SELL" } else { "BUY" };
+            let target_qty = snapshot.position_amt.abs() * cfg.loss_trim_fraction;
+            let order = client
+                .place_order(
+                    &symbol, side, "MARKET", target_qty, None, None, true, &filters,
+                )
+                .await?;
+            let (exit, exit_qty, fee) = wait_fill(client, &symbol, order).await?;
+            let exit_qty = exit_qty.min(position.qty);
+            let partial_pnl = record_partial_exit(state, &mut position, exit, exit_qty, fee);
+            position.loss_trim_done = true;
+            position.last_partial_exit_ms = Some(chrono::Utc::now().timestamp_millis());
+            state.positions.insert(symbol.clone(), position.clone());
+
+            let remaining = match client.position_risk(&symbol).await {
+                Ok(snapshot) => snapshot.position_amt.abs(),
+                Err(error) => {
+                    warn!(symbol=%symbol, error=%error, "亏损减仓后仓位查询失败，暂用成交回报推算余量");
+                    position.qty
+                }
+            };
+            managed_qty = remaining;
+            let replacement = client
+                .place_order(
+                    &symbol,
+                    side,
+                    "STOP_MARKET",
+                    remaining,
+                    None,
+                    Some(position.stop_price),
+                    true,
+                    &filters,
+                )
+                .await;
+            match replacement {
+                Ok(new_order_id) => {
+                    if let Some(old_order_id) = position.protection_order_id {
+                        if let Err(error) = client.cancel_algo_order(&symbol, old_order_id).await {
+                            warn!(symbol=%symbol, old_order_id, error=%error, "亏损减仓后新保护已生效，但旧保护撤销失败");
+                        }
+                    }
+                    position.protection_order_id = Some(new_order_id);
+                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"loss_trim","trigger_return":-cfg.loss_trim_trigger_pct,"configured_fraction":cfg.loss_trim_fraction,"price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"stop_price":position.stop_price,"new_order_id":new_order_id,"protection_replaced":true});
+                    append_event(event_path, event.clone())?;
+                    state.record_trade(event);
+                }
+                Err(error) => {
+                    warn!(symbol=%symbol, error=%error, "亏损减仓已成交，剩余仓位保护替换失败；保留原交易所止损并等待下轮重试");
+                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"loss_trim","trigger_return":-cfg.loss_trim_trigger_pct,"configured_fraction":cfg.loss_trim_fraction,"price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"stop_price":position.stop_price,"protection_replaced":false,"protection_error":error.to_string()});
+                    append_event(event_path, event.clone())?;
+                    state.record_trade(event);
+                }
+            }
+            changed = true;
+        }
         // 只按“当前仍有的浮盈”兑现，不能因历史上曾到过 +2%、现在已回落而补卖。
         if !position.partial_take_profit_done && current_return >= cfg.trail_activation_pct {
             let filters = client.symbol_filters(&symbol).await?;
@@ -1589,6 +1663,12 @@ pub async fn run_altcoin_impulse(
     anyhow::ensure!(
         cfg.stop_pct >= 0.03 && cfg.stop_pct <= 0.12,
         "止损必须在 3%..=12%"
+    );
+    anyhow::ensure!(
+        cfg.loss_trim_trigger_pct >= 0.005
+            && cfg.loss_trim_trigger_pct < cfg.stop_pct
+            && (0.20..=0.60).contains(&cfg.loss_trim_fraction),
+        "亏损第一段要求：触发点 >=0.5% 且小于初始止损，减仓比例 20%..=60%"
     );
     anyhow::ensure!(
         cfg.risk_execution_buffer_pct >= 0.001 && cfg.risk_execution_buffer_pct <= 0.02,
@@ -2031,6 +2111,29 @@ pub async fn run_altcoin_impulse(
                 position.adverse_extreme = Some(adverse);
                 let excursion =
                     position.side as f64 * (position.extreme / position.entry_price - 1.0);
+                let current_return =
+                    position.side as f64 * (bar.close / position.entry_price - 1.0);
+                let hard_stop_hit = if position.side > 0 {
+                    bar.low <= position.stop_price
+                } else {
+                    bar.high >= position.stop_price
+                };
+                if !hard_stop_hit
+                    && !position.loss_trim_done
+                    && current_return <= -cfg.loss_trim_trigger_pct
+                {
+                    let exit = position.entry_price
+                        * (1.0 - position.side as f64 * cfg.loss_trim_trigger_pct);
+                    let qty = position.qty * cfg.loss_trim_fraction;
+                    let fee = qty * exit * 0.0005;
+                    let partial_pnl =
+                        record_partial_exit(&mut state, &mut position, exit, qty, fee);
+                    position.loss_trim_done = true;
+                    position.last_partial_exit_ms = Some(scan_ms);
+                    let event = json!({"ts_ms":scan_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"loss_trim","trigger_return":-cfg.loss_trim_trigger_pct,"configured_fraction":cfg.loss_trim_fraction,"price":exit,"qty":qty,"remaining_qty":position.qty,"pnl":partial_pnl,"fee":fee,"stop_price":position.stop_price,"dry_fill":true});
+                    append_event(&event_path, event.clone())?;
+                    state.record_trade(event);
+                }
                 if !position.partial_take_profit_done && excursion >= cfg.trail_activation_pct {
                     let exit = position.entry_price
                         * (1.0 + position.side as f64 * cfg.trail_activation_pct);
@@ -2656,6 +2759,7 @@ pub async fn run_altcoin_impulse(
                     exchange_leverage: Some(actual_leverage),
                     entry_phase: candidate.entry_phase.clone(),
                     partial_take_profit_done: false,
+                    loss_trim_done: false,
                     last_partial_exit_ms: None,
                     realized_partial_pnl: 0.0,
                 },
@@ -2695,6 +2799,8 @@ pub async fn run_altcoin_impulse(
                 "extreme_direct_volume_ratio":cfg.extreme_direct_volume_ratio,
                 "extreme_direct_risk_scale":cfg.extreme_direct_risk_scale,
                 "risk_execution_buffer_pct":cfg.risk_execution_buffer_pct,
+                "loss_trim_trigger_pct":cfg.loss_trim_trigger_pct,
+                "loss_trim_fraction":cfg.loss_trim_fraction,
                 "partial_take_profit_fraction":cfg.partial_take_profit_fraction,
                 "failed_breakout_window_minutes":cfg.failed_breakout_window_minutes,
                 "failed_breakout_adverse_pct":cfg.failed_breakout_adverse_pct,
@@ -2768,6 +2874,9 @@ pub async fn run_altcoin_impulse(
         status_payload["altcoin_impulse"]["cooldown_hours"] = json!(cfg.cooldown_hours);
         status_payload["altcoin_impulse"]["risk_execution_buffer_pct"] =
             json!(cfg.risk_execution_buffer_pct);
+        status_payload["altcoin_impulse"]["loss_trim_trigger_pct"] =
+            json!(cfg.loss_trim_trigger_pct);
+        status_payload["altcoin_impulse"]["loss_trim_fraction"] = json!(cfg.loss_trim_fraction);
         status_payload["altcoin_impulse"]["partial_take_profit_fraction"] =
             json!(cfg.partial_take_profit_fraction);
         status_payload["altcoin_impulse"]["failed_breakout_window_minutes"] =
@@ -2918,12 +3027,12 @@ mod tests {
     fn exchange_leverage_does_not_change_stop_risk() {
         let equity: f64 = 1_000.0;
         let risk: f64 = 0.08;
-        let stop: f64 = 0.05;
+        let stop: f64 = 0.038;
         let execution_buffer: f64 = 0.006;
         let leverage: f64 = 10.0;
         let notional = equity * risk / (stop + execution_buffer);
-        assert!((notional - 1_428.5714285714284).abs() < 1e-10);
-        assert!((notional / leverage - 142.85714285714283).abs() < 1e-10);
+        assert!((notional - 1_818.181818181818).abs() < 1e-10);
+        assert!((notional / leverage - 181.8181818181818).abs() < 1e-10);
         assert!((notional * (stop + execution_buffer) - 80.0).abs() < 1e-10);
     }
 
@@ -2948,6 +3057,7 @@ mod tests {
             exchange_leverage: Some(10),
             entry_phase: "standard_impulse".into(),
             partial_take_profit_done: false,
+            loss_trim_done: false,
             last_partial_exit_ms: None,
             realized_partial_pnl: 0.0,
         };
@@ -2986,6 +3096,7 @@ mod tests {
             exchange_leverage: Some(10),
             entry_phase: "standard_impulse".into(),
             partial_take_profit_done: false,
+            loss_trim_done: false,
             last_partial_exit_ms: None,
             realized_partial_pnl: 0.0,
         };
@@ -3057,6 +3168,7 @@ mod tests {
             exchange_leverage: Some(10),
             entry_phase: "standard_impulse".into(),
             partial_take_profit_done: false,
+            loss_trim_done: false,
             last_partial_exit_ms: None,
             realized_partial_pnl: 0.0,
         };
@@ -3173,6 +3285,7 @@ mod tests {
             exchange_leverage: Some(10),
             entry_phase: "overextended_long".into(),
             partial_take_profit_done: false,
+            loss_trim_done: false,
             last_partial_exit_ms: None,
             realized_partial_pnl: 0.0,
         };
@@ -3277,6 +3390,9 @@ mod tests {
         assert!(strategy.altcoin_reversal_observer.enabled);
         assert_eq!(strategy.altcoin_impulse.max_daily_entries, 6);
         assert_eq!(strategy.altcoin_impulse.risk_per_trade, 0.08);
+        assert_eq!(strategy.altcoin_impulse.stop_pct, 0.038);
+        assert_eq!(strategy.altcoin_impulse.loss_trim_trigger_pct, 0.01);
+        assert_eq!(strategy.altcoin_impulse.loss_trim_fraction, 0.33);
         assert_eq!(strategy.altcoin_impulse.max_daily_entry_bonus, 4);
         assert_eq!(strategy.altcoin_impulse.cooldown_hours, 4);
         assert_eq!(strategy.altcoin_impulse.max_signal_age_seconds, 120);
