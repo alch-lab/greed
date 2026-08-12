@@ -177,6 +177,35 @@ pub struct ShadowLeg {
     pub modeled_net_return: Option<f64>,
     pub funding_return: Option<f64>,
     pub funding_complete: Option<bool>,
+    #[serde(default)]
+    pub exit_variants: Vec<ShadowExitVariant>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowExitVariant {
+    pub id: String,
+    pub label: String,
+    pub remaining_fraction: f64,
+    pub realized_net_return: f64,
+    pub extreme_price: f64,
+    pub stop_price: f64,
+    pub breakeven_armed: bool,
+    pub trail_armed: bool,
+    pub partial_taken: bool,
+    pub partial_ms: Option<i64>,
+    pub exit_ms: Option<i64>,
+    pub exit_price: Option<f64>,
+    pub exit_reason: Option<String>,
+    pub modeled_net_return: Option<f64>,
+    pub funding_complete: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ShadowVariantOutcome {
+    pub id: String,
+    pub label: String,
+    pub basket_return: f64,
+    pub pnl_usdt: f64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -191,6 +220,8 @@ pub struct ShadowBasket {
     pub gate_mean_at_entry: f64,
     pub gate_profit_factor_at_entry: f64,
     pub legs: Vec<ShadowLeg>,
+    #[serde(default)]
+    pub exit_experiment_version: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -206,6 +237,8 @@ pub struct ShadowOutcome {
     pub funding_complete: bool,
     pub gate_enabled_at_entry: bool,
     pub symbols: Vec<String>,
+    #[serde(default)]
+    pub exit_variants: Vec<ShadowVariantOutcome>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -256,6 +289,118 @@ struct RankResult {
     candidates: Vec<ReversalCandidate>,
     requested: usize,
     successful: usize,
+}
+
+const EXIT_EXPERIMENT_VERSION: u32 = 1;
+
+fn new_exit_variants(entry_price: f64, stop_pct: f64) -> Vec<ShadowExitVariant> {
+    [
+        ("baseline", "8% 止损 / 24h"),
+        ("breakeven_5", "+5% 后保本"),
+        ("trail_8", "+8% 后 4% 跟踪"),
+        ("staged", "+5% 平 33% / +8% 跟踪"),
+    ]
+    .into_iter()
+    .map(|(id, label)| ShadowExitVariant {
+        id: id.into(),
+        label: label.into(),
+        remaining_fraction: 1.0,
+        realized_net_return: 0.0,
+        extreme_price: entry_price,
+        stop_price: entry_price * (1.0 + stop_pct),
+        breakeven_armed: false,
+        trail_armed: false,
+        partial_taken: false,
+        partial_ms: None,
+        exit_ms: None,
+        exit_price: None,
+        exit_reason: None,
+        modeled_net_return: None,
+        funding_complete: true,
+    })
+    .collect()
+}
+
+fn modeled_short_leg_return(
+    entry_price: f64,
+    raw_exit: f64,
+    fee_bps: f64,
+    slippage_bps: f64,
+) -> f64 {
+    let fee = fee_bps / 10_000.0;
+    let slip = slippage_bps / 10_000.0;
+    let modeled_entry = entry_price * (1.0 - slip);
+    let modeled_exit = raw_exit * (1.0 + slip);
+    1.0 - modeled_exit / modeled_entry - fee - fee * modeled_exit / modeled_entry
+}
+
+fn update_exit_variant(
+    variant: &mut ShadowExitVariant,
+    entry_price: f64,
+    due_ms: i64,
+    bar: &Bar,
+    cfg: &AltcoinReversalObserverConfig,
+) {
+    if variant.exit_ms.is_some() {
+        return;
+    }
+    variant.extreme_price = variant.extreme_price.min(bar.low);
+    let favorable = 1.0 - variant.extreme_price / entry_price;
+
+    if matches!(variant.id.as_str(), "breakeven_5" | "staged") && favorable >= 0.05 {
+        variant.breakeven_armed = true;
+        variant.stop_price = variant.stop_price.min(entry_price);
+    }
+    if variant.id == "staged" && favorable >= 0.05 && !variant.partial_taken {
+        let fraction = 0.33;
+        variant.realized_net_return += fraction
+            * modeled_short_leg_return(
+                entry_price,
+                entry_price * 0.95,
+                cfg.fee_bps_per_side,
+                cfg.slippage_bps_per_side,
+            );
+        variant.remaining_fraction -= fraction;
+        variant.partial_taken = true;
+        variant.partial_ms = Some(bar.close_ms);
+    }
+    if matches!(variant.id.as_str(), "trail_8" | "staged") && favorable >= 0.08 {
+        variant.trail_armed = true;
+        variant.stop_price = variant.stop_price.min(variant.extreme_price * 1.04);
+    }
+
+    let (exit_price, reason, exit_ms) = if bar.open_ms >= due_ms {
+        (bar.open, "time", bar.open_ms)
+    } else if bar.high >= variant.stop_price {
+        (
+            if bar.open >= variant.stop_price {
+                bar.open
+            } else {
+                variant.stop_price
+            },
+            if variant.trail_armed {
+                "trailing"
+            } else if variant.breakeven_armed {
+                "breakeven"
+            } else {
+                "stop"
+            },
+            bar.close_ms,
+        )
+    } else {
+        return;
+    };
+    let remaining = variant.remaining_fraction
+        * modeled_short_leg_return(
+            entry_price,
+            exit_price,
+            cfg.fee_bps_per_side,
+            cfg.slippage_bps_per_side,
+        );
+    variant.exit_ms = Some(exit_ms);
+    variant.exit_price = Some(exit_price);
+    variant.exit_reason = Some(reason.into());
+    variant.modeled_net_return = Some(variant.realized_net_return + remaining);
 }
 
 fn gate_metrics(state: &ReversalObserverState, cfg: &AltcoinReversalObserverConfig) -> GateMetrics {
@@ -338,6 +483,37 @@ pub fn observer_status(
     now_ms: i64,
 ) -> Value {
     let gate = gate_metrics(state, cfg);
+    let experiment_results = [
+        ("baseline", "8% 止损 / 24h"),
+        ("breakeven_5", "+5% 后保本"),
+        ("trail_8", "+8% 后 4% 跟踪"),
+        ("staged", "+5% 平 33% / +8% 跟踪"),
+    ]
+    .into_iter()
+    .map(|(id, label)| {
+        let values = state
+            .outcomes
+            .iter()
+            .filter_map(|outcome| {
+                outcome
+                    .exit_variants
+                    .iter()
+                    .find(|variant| variant.id == id)
+                    .map(|variant| variant.basket_return)
+            })
+            .collect::<Vec<_>>();
+        let mean = if values.is_empty() {
+            0.0
+        } else {
+            values.iter().sum::<f64>() / values.len() as f64
+        };
+        let compounded_return = values
+            .iter()
+            .fold(1.0, |equity, value| equity * (1.0 + value))
+            - 1.0;
+        json!({"id":id,"label":label,"samples":values.len(),"mean_return":mean,"compounded_return":compounded_return})
+    })
+    .collect::<Vec<_>>();
     let stage = if state.active_basket.is_some() {
         "tracking"
     } else if state.last_evaluation_day == Some(now_ms / DAY_MS) {
@@ -359,6 +535,7 @@ pub fn observer_status(
         "active_basket":state.active_basket,
         "completed_baskets":state.outcomes.len(),
         "recent_outcomes":state.outcomes.iter().rev().take(10).collect::<Vec<_>>(),
+        "exit_experiment":{"version":EXIT_EXPERIMENT_VERSION,"applies_from_next_basket":state.active_basket.as_ref().is_some_and(|basket| basket.exit_experiment_version==0),"results":experiment_results},
         "shadow_initial_equity":cfg.shadow_capital_usdt,
         "shadow_equity":if state.shadow_equity > 0.0 {state.shadow_equity} else {cfg.shadow_capital_usdt},
         "shadow_return":if state.shadow_equity > 0.0 {state.shadow_equity/cfg.shadow_capital_usdt-1.0} else {0.0},
@@ -495,10 +672,15 @@ async fn mark_price(http: reqwest::Client, symbol: String) -> Result<(String, f6
     Ok((symbol, mark))
 }
 
-async fn funding_return(http: &reqwest::Client, leg: &ShadowLeg, exit_ms: i64) -> Result<f64> {
+async fn funding_return_for_period(
+    http: &reqwest::Client,
+    symbol: &str,
+    entry_ms: i64,
+    exit_ms: i64,
+) -> Result<f64> {
     let url = format!(
         "{FUTURES_BASE}/fapi/v1/fundingRate?symbol={}&startTime={}&endTime={}&limit=100",
-        leg.symbol, leg.entry_ms, exit_ms
+        symbol, entry_ms, exit_ms
     );
     let rows = get_json(http, &url).await?;
     let sum = rows
@@ -509,6 +691,10 @@ async fn funding_return(http: &reqwest::Client, leg: &ShadowLeg, exit_ms: i64) -
         .sum::<f64>();
     // 正资金费：多头付、空头收；本策略固定做空。
     Ok(sum)
+}
+
+async fn funding_return(http: &reqwest::Client, leg: &ShadowLeg, exit_ms: i64) -> Result<f64> {
+    funding_return_for_period(http, &leg.symbol, leg.entry_ms, exit_ms).await
 }
 
 async fn finish_leg(
@@ -574,6 +760,9 @@ async fn update_active_basket(
             leg.mae = leg.mae.max(bar.high / leg.entry_price - 1.0);
             changed = true;
             let due_ms = leg.entry_ms + cfg.hold_hours as i64 * 3_600_000;
+            for variant in &mut leg.exit_variants {
+                update_exit_variant(variant, leg.entry_price, due_ms, bar, cfg);
+            }
             if bar.open_ms >= due_ms {
                 finish_leg(http, leg, bar.open_ms, bar.open, "time", cfg).await;
             } else if bar.high >= leg.stop_price {
@@ -585,6 +774,50 @@ async fn update_active_basket(
                 finish_leg(http, leg, bar.close_ms, raw_exit, "stop", cfg).await;
             }
             if leg.exit_ms.is_some() {
+                let funding_symbol = leg.symbol.clone();
+                let funding_entry_ms = leg.entry_ms;
+                for variant in &mut leg.exit_variants {
+                    let Some(exit_ms) = variant.exit_ms else {
+                        continue;
+                    };
+                    let funding =
+                        funding_return_for_period(http, &funding_symbol, funding_entry_ms, exit_ms)
+                            .await;
+                    match funding {
+                        Ok(total_funding) => {
+                            let weighted_funding = if let Some(partial_ms) = variant.partial_ms {
+                                let before = funding_return_for_period(
+                                    http,
+                                    &funding_symbol,
+                                    funding_entry_ms,
+                                    partial_ms,
+                                )
+                                .await;
+                                match before {
+                                    Ok(before_partial) => {
+                                        before_partial
+                                            + (total_funding - before_partial)
+                                                * variant.remaining_fraction
+                                    }
+                                    Err(error) => {
+                                        warn!(symbol=%leg.symbol, variant=%variant.id, error=%error, "影子退出实验分段资金费拉取失败");
+                                        variant.funding_complete = false;
+                                        total_funding * variant.remaining_fraction
+                                    }
+                                }
+                            } else {
+                                total_funding
+                            };
+                            if let Some(net) = variant.modeled_net_return.as_mut() {
+                                *net += weighted_funding;
+                            }
+                        }
+                        Err(error) => {
+                            warn!(symbol=%leg.symbol, variant=%variant.id, error=%error, "影子退出实验资金费拉取失败");
+                            variant.funding_complete = false;
+                        }
+                    }
+                }
                 append_event(
                     event_path,
                     json!({"ts_ms":now_ms,"event":"reversal_observer_leg_exit","mode":"observation_only","leg":leg}),
@@ -600,6 +833,40 @@ async fn update_active_basket(
             .map(|leg| leg.notional / basket.start_equity * leg.modeled_net_return.unwrap_or(0.0))
             .sum::<f64>();
         let pnl_usdt = basket.start_equity * basket_return;
+        let variant_ids = basket
+            .legs
+            .first()
+            .map(|leg| {
+                leg.exit_variants
+                    .iter()
+                    .map(|variant| (variant.id.clone(), variant.label.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        let exit_variants = variant_ids
+            .into_iter()
+            .map(|(id, label)| {
+                let variant_return = basket
+                    .legs
+                    .iter()
+                    .map(|leg| {
+                        let value = leg
+                            .exit_variants
+                            .iter()
+                            .find(|variant| variant.id == id)
+                            .and_then(|variant| variant.modeled_net_return)
+                            .unwrap_or_else(|| leg.modeled_net_return.unwrap_or(0.0));
+                        leg.notional / basket.start_equity * value
+                    })
+                    .sum::<f64>();
+                ShadowVariantOutcome {
+                    id,
+                    label,
+                    basket_return: variant_return,
+                    pnl_usdt: basket.start_equity * variant_return,
+                }
+            })
+            .collect::<Vec<_>>();
         state.shadow_equity = (basket.start_equity + pnl_usdt).max(0.01);
         let outcome = ShadowOutcome {
             signal_day: basket.signal_day,
@@ -625,6 +892,7 @@ async fn update_active_basket(
                 .all(|leg| leg.funding_complete == Some(true)),
             gate_enabled_at_entry: basket.gate_enabled_at_entry,
             symbols: basket.legs.iter().map(|leg| leg.symbol.clone()).collect(),
+            exit_variants,
         };
         append_event(
             event_path,
@@ -794,6 +1062,7 @@ async fn evaluate_and_open(
                 modeled_net_return: None,
                 funding_return: None,
                 funding_complete: None,
+                exit_variants: new_exit_variants(entry_price, cfg.stop_pct),
             }
         })
         .collect();
@@ -808,6 +1077,7 @@ async fn evaluate_and_open(
         gate_mean_at_entry: gate.mean,
         gate_profit_factor_at_entry: gate.profit_factor,
         legs,
+        exit_experiment_version: EXIT_EXPERIMENT_VERSION,
     };
     state.last_reason = if gate.enabled {
         "门控通过；本模块仍只生成影子交易，不会向币安下单".into()
@@ -909,6 +1179,53 @@ mod tests {
         assert!(value > 0.047 && value < 0.049);
     }
 
+    #[test]
+    fn exit_variants_diverge_after_profit_then_reversal() {
+        let cfg = AltcoinReversalObserverConfig {
+            enabled: true,
+            ..Default::default()
+        };
+        let entry = 100.0;
+        let due = DAY_MS;
+        let mut variants = new_exit_variants(entry, cfg.stop_pct);
+        let favorable = Bar {
+            open_ms: 0,
+            close_ms: BAR_MS - 1,
+            open: 100.0,
+            high: 101.0,
+            low: 90.0,
+            close: 92.0,
+            quote_volume: 1.0,
+        };
+        for variant in &mut variants {
+            update_exit_variant(variant, entry, due, &favorable, &cfg);
+        }
+        let reversal = Bar {
+            open_ms: BAR_MS,
+            close_ms: 2 * BAR_MS - 1,
+            open: 92.0,
+            high: 101.0,
+            low: 91.0,
+            close: 100.5,
+            quote_volume: 1.0,
+        };
+        for variant in &mut variants {
+            update_exit_variant(variant, entry, due, &reversal, &cfg);
+        }
+        let baseline = variants.iter().find(|item| item.id == "baseline").unwrap();
+        let breakeven = variants
+            .iter()
+            .find(|item| item.id == "breakeven_5")
+            .unwrap();
+        let trailing = variants.iter().find(|item| item.id == "trail_8").unwrap();
+        let staged = variants.iter().find(|item| item.id == "staged").unwrap();
+        assert!(baseline.exit_ms.is_none());
+        assert_eq!(breakeven.exit_reason.as_deref(), Some("breakeven"));
+        assert_eq!(trailing.exit_reason.as_deref(), Some("trailing"));
+        assert!(staged.partial_taken);
+        assert!(staged.modeled_net_return.unwrap() > breakeven.modeled_net_return.unwrap());
+    }
+
     fn outcome(index: usize, basket_return: f64) -> ShadowOutcome {
         ShadowOutcome {
             signal_day: index as i64,
@@ -922,6 +1239,7 @@ mod tests {
             funding_complete: true,
             gate_enabled_at_entry: false,
             symbols: vec!["TESTUSDT".into()],
+            exit_variants: Vec::new(),
         }
     }
 }
