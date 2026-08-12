@@ -1,8 +1,8 @@
 # 山寨币放量突破（独立高风险 sleeve）
 #
 # 10x 仅是交易所保证金杠杆。仓位按风险预算 /（止损距离 + 执行缓冲）计算：
-# 1000 USDT × 10% / (5% + 0.6%) ≈ 1786 USDT 名义仓位，约占 179 USDT 保证金。
-# 0.6% 为止损滑点和开平仓费用预留，避免名义 10% 风险在成交后系统性超标。
+# 1000 USDT × 6% / (5% + 0.6%) ≈ 1071 USDT 名义仓位，约占 107 USDT 保证金。
+# 0.6% 为止损滑点和开平仓费用预留，避免名义 6% 风险在成交后系统性超标。
 
 [altcoin_impulse]
 enabled = true
@@ -10,7 +10,7 @@ capital_usdt = 1000.0
 exchange_leverage = 10
 # 标的不支持 10x 时自动回退，最低接受 5x；再低会因保证金占用过高而跳过。
 min_exchange_leverage = 5
-risk_per_trade = 0.10
+risk_per_trade = 0.06
 max_positions = 2
 max_daily_entries = 6
 # 手动按钮每次增加 2 笔，最多当日额外 4 笔：默认 6 笔可扩到 8/10 笔。
@@ -25,6 +25,8 @@ risk_execution_buffer_pct = 0.006
 # 日志显示短促行情常在 +2%～+4% 后反转；达到 +2% 即开始按峰值回撤 1% 保护。
 trail_activation_pct = 0.02
 trail_pct = 0.01
+# 首次达到 +2% 时市价兑现 50%，剩余仓位继续使用上述跟踪保护。
+partial_take_profit_fraction = 0.50
 # 纯价格路径保护：若持仓曾逆向达到 3%，随后修复到盈利 1%，
 # 将保护抬到入场价顺向 0.25%；不依赖持仓时间。
 recovery_lock_adverse_pct = 0.03

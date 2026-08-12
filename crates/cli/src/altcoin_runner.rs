@@ -45,6 +45,8 @@ pub struct AltcoinImpulseConfig {
     pub risk_execution_buffer_pct: f64,
     pub trail_activation_pct: f64,
     pub trail_pct: f64,
+    #[serde(default = "default_partial_take_profit_fraction")]
+    pub partial_take_profit_fraction: f64,
     #[serde(default = "default_recovery_lock_adverse_pct")]
     pub recovery_lock_adverse_pct: f64,
     #[serde(default = "default_recovery_lock_activation_pct")]
@@ -144,6 +146,12 @@ struct Position {
     exchange_leverage: Option<u32>,
     #[serde(default = "default_entry_phase")]
     entry_phase: String,
+    #[serde(default)]
+    partial_take_profit_done: bool,
+    #[serde(default)]
+    last_partial_exit_ms: Option<i64>,
+    #[serde(default)]
+    realized_partial_pnl: f64,
 }
 
 fn default_max_entry_slippage_pct() -> f64 {
@@ -186,6 +194,10 @@ fn default_risk_execution_buffer_pct() -> f64 {
     0.006
 }
 
+fn default_partial_take_profit_fraction() -> f64 {
+    0.5
+}
+
 fn default_entry_phase() -> String {
     "standard_impulse".to_owned()
 }
@@ -211,6 +223,7 @@ fn detected_exit_reason(position: &Position, exit_price: f64, reconciled: bool) 
         match position.protection_reason.as_str() {
             "trailing_take_profit" => "trailing_take_profit",
             "recovery_profit_lock" => "recovery_profit_lock",
+            "partial_take_profit_break_even" => "partial_take_profit_break_even",
             _ => "initial_stop",
         }
     } else {
@@ -616,7 +629,7 @@ fn load_recent_trades(path: &str) -> Vec<Value> {
         .filter(|event| {
             matches!(
                 event["event"].as_str(),
-                Some("entry" | "exit" | "exit_detected")
+                Some("entry" | "partial_exit" | "exit" | "exit_detected")
             )
         })
         .collect();
@@ -743,6 +756,8 @@ async fn build_position_status(
             "protection_order_id":position.protection_order_id,
             "protection_reason":position.protection_reason,
             "entry_phase":position.entry_phase,
+            "partial_take_profit_done":position.partial_take_profit_done,
+            "realized_partial_pnl":position.realized_partial_pnl,
             "max_favorable_excursion_pct": position.side as f64 * (position.extreme / position.entry_price - 1.0),
             "max_adverse_excursion_pct": adverse_excursion(position.side, position.entry_price, adverse),
             "exchange_leverage":position.exchange_leverage,
@@ -912,7 +927,13 @@ async fn closing_fill(
         .user_trades(&position.symbol, 0)
         .await?
         .into_iter()
-        .filter(|fill| fill.time >= position.entry_ms && fill.side == closing_side)
+        .filter(|fill| {
+            fill.time
+                > position
+                    .last_partial_exit_ms
+                    .unwrap_or(position.entry_ms - 1)
+                && fill.side == closing_side
+        })
         .collect();
     let qty: f64 = fills
         .iter()
@@ -942,14 +963,15 @@ fn record_exit(
     fee: f64,
 ) -> f64 {
     let pnl = position.side as f64 * qty * (exit - position.entry_price) - position.entry_fee - fee;
+    let trade_pnl = position.realized_partial_pnl + pnl;
     state.cash += position.side as f64 * qty * (exit - position.entry_price) - fee;
     state.realized_pnl += pnl;
     state.fees += fee;
     state.total_exits += 1;
-    if pnl > 0.0 {
+    if trade_pnl > 0.0 {
         state.wins += 1;
     }
-    if position.entry_phase == "overextended_long" && pnl < 0.0 {
+    if position.entry_phase == "overextended_long" && trade_pnl < 0.0 {
         state.overextension_long_blocked = true;
         state.overextension_long_losses = state.overextension_long_losses.saturating_add(1);
         state.last_overextension_loss_ms = Some(now_ms);
@@ -959,6 +981,30 @@ fn record_exit(
         position.symbol.clone(),
         now_ms + cooldown_hours as i64 * 3_600_000,
     );
+    pnl
+}
+
+fn record_partial_exit(
+    state: &mut PersistedState,
+    position: &mut Position,
+    exit: f64,
+    qty: f64,
+    fee: f64,
+) -> f64 {
+    let qty = qty.min(position.qty);
+    let entry_fee_share = if position.qty > 0.0 {
+        position.entry_fee * (qty / position.qty)
+    } else {
+        0.0
+    };
+    let pnl = position.side as f64 * qty * (exit - position.entry_price) - entry_fee_share - fee;
+    state.cash += position.side as f64 * qty * (exit - position.entry_price) - fee;
+    state.realized_pnl += pnl;
+    state.fees += fee;
+    position.qty -= qty;
+    position.entry_fee -= entry_fee_share;
+    position.initial_notional = position.qty * position.entry_price;
+    position.realized_partial_pnl += pnl;
     pnl
 }
 
@@ -1035,6 +1081,7 @@ async fn manage_live_positions(
             continue;
         };
         let snapshot = client.position_risk(&symbol).await?;
+        let mut managed_qty = snapshot.position_amt.abs();
         if snapshot.position_amt.abs() <= 1e-12 {
             if let Err(error) = client.cancel_all_open_orders(&symbol).await {
                 warn!(symbol=%symbol, error=%error, "仓位已平，但清理残留保护单失败");
@@ -1057,7 +1104,8 @@ async fn manage_live_positions(
                 exit_qty,
                 exit_fee,
             );
-            let event = json!({"ts_ms":now_ms,"event":"exit_detected","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"price":exit,"qty":exit_qty,"pnl":pnl,"fee":exit_fee,"reason":reason,"protection_order_id":position.protection_order_id,"stop_price":position.stop_price,"trade_reconciled":true,"overextension_long_blocked":state.overextension_long_blocked});
+            let trade_pnl = position.realized_partial_pnl + pnl;
+            let event = json!({"ts_ms":now_ms,"event":"exit_detected","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"price":exit,"qty":exit_qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":exit_fee,"reason":reason,"protection_order_id":position.protection_order_id,"stop_price":position.stop_price,"trade_reconciled":true,"overextension_long_blocked":state.overextension_long_blocked});
             append_event(event_path, event.clone())?;
             state.record_trade(event);
             changed = true;
@@ -1084,7 +1132,8 @@ async fn manage_live_positions(
                 exit_qty,
                 fee,
             );
-            let event = json!({"ts_ms":now_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"time","price":exit,"qty":exit_qty,"pnl":pnl,"fee":fee,"hold_ms":now_ms-position.entry_ms,"overextension_long_blocked":state.overextension_long_blocked});
+            let trade_pnl = position.realized_partial_pnl + pnl;
+            let event = json!({"ts_ms":now_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"time","price":exit,"qty":exit_qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"hold_ms":now_ms-position.entry_ms,"overextension_long_blocked":state.overextension_long_blocked});
             append_event(event_path, event.clone())?;
             state.record_trade(event);
             changed = true;
@@ -1112,6 +1161,73 @@ async fn manage_live_positions(
         );
         position.extreme = new_extreme;
         let excursion = position.side as f64 * (position.extreme / position.entry_price - 1.0);
+        let current_return =
+            position.side as f64 * (snapshot.mark_price / position.entry_price - 1.0);
+        // 只按“当前仍有的浮盈”兑现，不能因历史上曾到过 +2%、现在已回落而补卖。
+        if !position.partial_take_profit_done && current_return >= cfg.trail_activation_pct {
+            let filters = client.symbol_filters(&symbol).await?;
+            let side = if position.side > 0 { "SELL" } else { "BUY" };
+            let target_qty = snapshot.position_amt.abs() * cfg.partial_take_profit_fraction;
+            let order = client
+                .place_order(
+                    &symbol, side, "MARKET", target_qty, None, None, true, &filters,
+                )
+                .await?;
+            let (exit, exit_qty, fee) = wait_fill(client, &symbol, order).await?;
+            let exit_qty = exit_qty.min(position.qty);
+            let partial_pnl = record_partial_exit(state, &mut position, exit, exit_qty, fee);
+            position.partial_take_profit_done = true;
+            // 使用成交确认后的墙钟，避免最终平仓对账再次把这笔部分成交累计进去。
+            position.last_partial_exit_ms = Some(chrono::Utc::now().timestamp_millis());
+            // 从这一刻起交易所已经少了一段仓位；先把本地状态同步，后续任何 API
+            // 调用失败时，外层错误分支保存的也不会再是旧的全仓数量。
+            state.positions.insert(symbol.clone(), position.clone());
+
+            // 剩余仓位先挂入场附近的保护，确认成功后才撤原始止损。
+            let remaining = match client.position_risk(&symbol).await {
+                Ok(snapshot) => snapshot.position_amt.abs(),
+                Err(error) => {
+                    warn!(symbol=%symbol, error=%error, "第一段止盈后仓位查询失败，暂用成交回报推算的余量");
+                    position.qty
+                }
+            };
+            managed_qty = remaining;
+            let break_even_stop = position.entry_price;
+            let replacement = client
+                .place_order(
+                    &symbol,
+                    side,
+                    "STOP_MARKET",
+                    remaining,
+                    None,
+                    Some(break_even_stop),
+                    true,
+                    &filters,
+                )
+                .await;
+            match replacement {
+                Ok(new_order_id) => {
+                    if let Some(old_order_id) = position.protection_order_id {
+                        if let Err(error) = client.cancel_algo_order(&symbol, old_order_id).await {
+                            warn!(symbol=%symbol, old_order_id, error=%error, "分段止盈后新保护已生效，但旧保护撤销失败");
+                        }
+                    }
+                    position.protection_order_id = Some(new_order_id);
+                    position.stop_price = break_even_stop;
+                    position.protection_reason = "partial_take_profit_break_even".to_owned();
+                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"partial_take_profit","price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"new_stop":break_even_stop,"new_order_id":new_order_id,"protection_replaced":true});
+                    append_event(event_path, event.clone())?;
+                    state.record_trade(event);
+                }
+                Err(error) => {
+                    warn!(symbol=%symbol, error=%error, "第一段止盈已成交，保本保护替换失败；保留原交易所止损并等待下轮重试");
+                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"partial_take_profit","price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"new_stop":position.stop_price,"protection_replaced":false,"protection_error":error.to_string()});
+                    append_event(event_path, event.clone())?;
+                    state.record_trade(event);
+                }
+            }
+            changed = true;
+        }
         let recovery_stop = recovery_profit_lock_stop(
             position.side,
             position.entry_price,
@@ -1139,6 +1255,13 @@ async fn manage_live_positions(
             (None, Some(recovery)) => (Some(recovery), "recovery_profit_lock"),
             (None, None) => (None, "initial_stop"),
         };
+        let improved_stop = improved_stop.map(|stop| {
+            if position.side > 0 {
+                stop.max(position.stop_price)
+            } else {
+                stop.min(position.stop_price)
+            }
+        });
         if let Some(improved_stop) = improved_stop {
             let filters = client.symbol_filters(&symbol).await?;
             let side = if position.side > 0 { "SELL" } else { "BUY" };
@@ -1148,7 +1271,7 @@ async fn manage_live_positions(
                     &symbol,
                     side,
                     "STOP_MARKET",
-                    snapshot.position_amt.abs(),
+                    managed_qty,
                     None,
                     Some(improved_stop),
                     true,
@@ -1267,6 +1390,10 @@ pub async fn run_altcoin_impulse(
             && cfg.trail_pct >= 0.005
             && cfg.trail_pct < cfg.trail_activation_pct,
         "跟踪止盈要求激活点 1%..=10%，跟踪距离 >=0.5% 且小于激活点"
+    );
+    anyhow::ensure!(
+        cfg.partial_take_profit_fraction >= 0.25 && cfg.partial_take_profit_fraction <= 0.75,
+        "第一段止盈比例必须在 25%..=75%"
     );
     anyhow::ensure!(
         cfg.recovery_lock_adverse_pct >= 0.02
@@ -1616,6 +1743,9 @@ pub async fn run_altcoin_impulse(
                         &event_path,
                         json!({"ts_ms":scan_ms,"event":"position_management_error","reason":error.to_string(),"original_protection_retained":true}),
                     )?;
+                    // 部分止盈可能已经在交易所成交；即使随后查询或保护单替换失败，
+                    // 也必须把已发生的本地数量与盈亏变更立即持久化。
+                    save_state(&state_path, &state)?;
                 }
             }
         } else {
@@ -1646,6 +1776,21 @@ pub async fn run_altcoin_impulse(
                 position.adverse_extreme = Some(adverse);
                 let excursion =
                     position.side as f64 * (position.extreme / position.entry_price - 1.0);
+                if !position.partial_take_profit_done && excursion >= cfg.trail_activation_pct {
+                    let exit = position.entry_price
+                        * (1.0 + position.side as f64 * cfg.trail_activation_pct);
+                    let qty = position.qty * cfg.partial_take_profit_fraction;
+                    let fee = qty * exit * 0.0005;
+                    let partial_pnl =
+                        record_partial_exit(&mut state, &mut position, exit, qty, fee);
+                    position.partial_take_profit_done = true;
+                    position.last_partial_exit_ms = Some(scan_ms);
+                    position.stop_price = position.entry_price;
+                    position.protection_reason = "partial_take_profit_break_even".to_owned();
+                    let event = json!({"ts_ms":scan_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"partial_take_profit","price":exit,"qty":qty,"remaining_qty":position.qty,"pnl":partial_pnl,"fee":fee,"new_stop":position.stop_price,"dry_fill":true});
+                    append_event(&event_path, event.clone())?;
+                    state.record_trade(event);
+                }
                 if let Some(recovery_stop) = recovery_profit_lock_stop(
                     position.side,
                     position.entry_price,
@@ -1690,6 +1835,7 @@ pub async fn run_altcoin_impulse(
                         position.qty,
                         fee,
                     );
+                    let trade_pnl = position.realized_partial_pnl + pnl;
                     let reason = if timed {
                         "time"
                     } else {
@@ -1699,7 +1845,7 @@ pub async fn run_altcoin_impulse(
                             _ => "initial_stop",
                         }
                     };
-                    let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":reason,"price":exit,"qty":position.qty,"pnl":pnl,"fee":fee,"overextension_long_blocked":state.overextension_long_blocked});
+                    let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":reason,"price":exit,"qty":position.qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"overextension_long_blocked":state.overextension_long_blocked});
                     append_event(&event_path, event.clone())?;
                     state.record_trade(event);
                 } else {
@@ -2098,6 +2244,9 @@ pub async fn run_altcoin_impulse(
                     protection_reason: default_protection_reason(),
                     exchange_leverage: Some(actual_leverage),
                     entry_phase: candidate.entry_phase.clone(),
+                    partial_take_profit_done: false,
+                    last_partial_exit_ms: None,
+                    realized_partial_pnl: 0.0,
                 },
             );
             if candidate.entry_phase == "overextended_long" {
@@ -2127,6 +2276,7 @@ pub async fn run_altcoin_impulse(
                 "max_daily_entries":effective_daily_limit,
                 "max_signal_age_seconds":cfg.max_signal_age_seconds,
                 "risk_execution_buffer_pct":cfg.risk_execution_buffer_pct,
+                "partial_take_profit_fraction":cfg.partial_take_profit_fraction,
                 "recovery_lock_adverse_pct":cfg.recovery_lock_adverse_pct,
                 "recovery_lock_activation_pct":cfg.recovery_lock_activation_pct,
                 "recovery_lock_pct":cfg.recovery_lock_pct,
@@ -2179,6 +2329,8 @@ pub async fn run_altcoin_impulse(
         status_payload["altcoin_impulse"]["cooldown_hours"] = json!(cfg.cooldown_hours);
         status_payload["altcoin_impulse"]["risk_execution_buffer_pct"] =
             json!(cfg.risk_execution_buffer_pct);
+        status_payload["altcoin_impulse"]["partial_take_profit_fraction"] =
+            json!(cfg.partial_take_profit_fraction);
         status_payload["altcoin_impulse"]["recovery_lock_adverse_pct"] =
             json!(cfg.recovery_lock_adverse_pct);
         status_payload["altcoin_impulse"]["recovery_lock_activation_pct"] =
@@ -2312,21 +2464,60 @@ mod tests {
     use super::{
         adverse_excursion, apply_daily_entry_bonus, apply_daily_risk_reset,
         clamp_entry_guard_price, detected_exit_reason, entry_phase, realtime_trailing_stop,
-        recently_exited_symbol, record_daily_equity, record_exit, recovery_profit_lock_stop,
-        signal_age_ms, update_adverse_extreme, PersistedState, Position,
+        recently_exited_symbol, record_daily_equity, record_exit, record_partial_exit,
+        recovery_profit_lock_stop, signal_age_ms, update_adverse_extreme, PersistedState, Position,
     };
 
     #[test]
     fn exchange_leverage_does_not_change_stop_risk() {
         let equity: f64 = 1_000.0;
-        let risk: f64 = 0.10;
+        let risk: f64 = 0.06;
         let stop: f64 = 0.05;
         let execution_buffer: f64 = 0.006;
         let leverage: f64 = 10.0;
         let notional = equity * risk / (stop + execution_buffer);
-        assert!((notional - 1_785.7142857142858).abs() < 1e-10);
-        assert!((notional / leverage - 178.57142857142858).abs() < 1e-10);
-        assert!((notional * (stop + execution_buffer) - 100.0).abs() < 1e-10);
+        assert!((notional - 1_071.4285714285713).abs() < 1e-10);
+        assert!((notional / leverage - 107.14285714285714).abs() < 1e-10);
+        assert!((notional * (stop + execution_buffer) - 60.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn partial_exit_realizes_half_and_preserves_final_trade_accounting() {
+        let now_ms = 1_800_000_000_000i64;
+        let mut state = PersistedState::new(1_000.0, now_ms);
+        let mut position = Position {
+            symbol: "TESTUSDT".into(),
+            side: 1,
+            qty: 100.0,
+            entry_ms: now_ms - 1_000,
+            entry_price: 10.0,
+            entry_fee: 0.5,
+            initial_notional: 1_000.0,
+            extreme: 10.2,
+            adverse_extreme: Some(10.0),
+            stop_price: 9.5,
+            last_bar_ms: now_ms,
+            protection_order_id: None,
+            protection_reason: "initial_stop".into(),
+            exchange_leverage: Some(10),
+            entry_phase: "standard_impulse".into(),
+            partial_take_profit_done: false,
+            last_partial_exit_ms: None,
+            realized_partial_pnl: 0.0,
+        };
+        // 50 个单位在 +2% 兑现：毛利 10，扣一半入场费 0.25 和退出费 0.255。
+        let partial = record_partial_exit(&mut state, &mut position, 10.2, 50.0, 0.255);
+        assert!((partial - 9.495).abs() < 1e-10);
+        assert!((position.qty - 50.0).abs() < 1e-10);
+        assert!((position.entry_fee - 0.25).abs() < 1e-10);
+        assert!((state.realized_pnl - 9.495).abs() < 1e-10);
+
+        let final_leg = record_exit(&mut state, &position, now_ms, 4, 10.1, 50.0, 0.2525);
+        assert!((final_leg - 4.4975).abs() < 1e-10);
+        assert!((position.realized_partial_pnl + final_leg - 13.9925).abs() < 1e-10);
+        assert_eq!(state.total_exits, 1);
+        assert_eq!(state.wins, 1);
+        assert!(state.positions.is_empty());
     }
 
     #[test]
@@ -2359,6 +2550,9 @@ mod tests {
             protection_reason: "initial_stop".into(),
             exchange_leverage: Some(10),
             entry_phase: "standard_impulse".into(),
+            partial_take_profit_done: false,
+            last_partial_exit_ms: None,
+            realized_partial_pnl: 0.0,
         };
         assert_eq!(detected_exit_reason(&position, 0.949, true), "initial_stop");
         position.stop_price = 1.10;
@@ -2472,6 +2666,9 @@ mod tests {
             protection_reason: "initial_stop".into(),
             exchange_leverage: Some(10),
             entry_phase: "overextended_long".into(),
+            partial_take_profit_done: false,
+            last_partial_exit_ms: None,
+            realized_partial_pnl: 0.0,
         };
         let pnl = record_exit(&mut state, &position, now_ms, 8, 0.95, 100.0, 0.0);
         assert!(pnl < 0.0);
