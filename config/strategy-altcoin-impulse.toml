@@ -1,8 +1,8 @@
 # 山寨币放量突破（独立高风险 sleeve）
 #
-# 10x 仅是交易所保证金杠杆。仓位按 risk_per_trade / stop_pct 计算：
-# 1000 USDT × 10% / 5% = 2000 USDT 名义仓位，约占 200 USDT 保证金。
-# 不允许把 1000 USDT 直接开成 10000 USDT；一次 5% 止损约损失 100 USDT（10% 本金）。
+# 10x 仅是交易所保证金杠杆。仓位按风险预算 /（止损距离 + 执行缓冲）计算：
+# 1000 USDT × 10% / (5% + 0.6%) ≈ 1786 USDT 名义仓位，约占 179 USDT 保证金。
+# 0.6% 为止损滑点和开平仓费用预留，避免名义 10% 风险在成交后系统性超标。
 
 [altcoin_impulse]
 enabled = true
@@ -20,6 +20,8 @@ daily_loss_limit = 0.04
 max_gross_multiple = 4.0
 
 stop_pct = 0.05
+# 仓位预算额外计入 0.6% 执行成本；STOP_MARKET 极端跳空仍无法保证绝对封顶。
+risk_execution_buffer_pct = 0.006
 # 日志显示短促行情常在 +2%～+4% 后反转；达到 +2% 即开始按峰值回撤 1% 保护。
 trail_activation_pct = 0.02
 trail_pct = 0.01
@@ -38,9 +40,12 @@ max_signal_age_seconds = 120
 min_24h_volume_usd = 5000000.0
 min_return_1h = 0.04
 max_return_1h = 0.45
-# 1h 顺向涨幅达到 12% 视为“过度延伸追多票”。历史上这类交易并非
-# 永久负期望，因此保留第一枪；但同类票一旦当日亏损，熔断后续追多。
+# 1h 涨幅达到 12% 或 4h 涨幅达到 15% 视为“过度延伸追多票”。历史上这类
+# 交易并非永久负期望，因此保留第一枪；但同类票一旦当日亏损，熔断后续追多。
 overextension_long_return_1h = 0.12
+overextension_long_return_4h = 0.15
+# 同币最近 24 小时已经平过仓时，不再于过度延伸区二次追涨；普通新启动仍可重入。
+overextension_reentry_lookback_hours = 24
 min_return_4h = 0.06
 max_return_4h = 1.20
 min_volume_ratio = 3.0
