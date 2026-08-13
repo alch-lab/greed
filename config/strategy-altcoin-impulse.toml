@@ -1,8 +1,9 @@
 # 山寨币放量突破（独立高风险 sleeve）
 #
 # 10x 仅是交易所保证金杠杆。仓位按风险预算 /（止损距离 + 执行缓冲）计算：
-# 1000 USDT × 1% / (1.5% + 0.5%) = 500 USDT 名义仓位，约占 50 USDT 保证金。
-# 最多两仓约 1x 权益总名义价值；Paper 探索期先控制假突破的组合损失。
+# 1000 USDT × 4% / (1.0% + 0.5%) = 2667 USDT 风险目标，但 2.5× 总名义上限
+# 会把单仓压到约 2500 USDT（无其他持仓时），约占 250 USDT 保证金。
+# 总名义价值不超过 2.5x 权益；4% 当日回撤门槛仍会锁死后续新仓。
 
 [altcoin_impulse]
 enabled = true
@@ -10,13 +11,13 @@ capital_usdt = 1000.0
 exchange_leverage = 10
 # 标的不支持 10x 时自动回退，最低接受 5x；再低会因保证金占用过高而跳过。
 min_exchange_leverage = 5
-risk_per_trade = 0.01
+risk_per_trade = 0.04
 max_positions = 2
-max_daily_entries = 6
-# 模拟盘固定最多 6 笔/日，不允许从前端临时追加开仓额度。
+max_daily_entries = 10
+# 模拟盘固定最多 10 笔/北京时间自然日，不允许从前端临时追加开仓额度。
 max_daily_entry_bonus = 0
 daily_loss_limit = 0.04
-max_gross_multiple = 1.0
+max_gross_multiple = 2.5
 # 模拟盘持续运行，不设盈利上限，也不因首个 7 天窗口结束而停止开仓。
 # 下面的 7 天窗口只用于首周亏损保护。
 first_week_duration_days = 7
@@ -25,20 +26,20 @@ first_week_loss_limit = 0.12
 # dry 模式每次开/平仓各施加 5bp 不利滑点；手续费仍按单边 5bp 另计。
 dry_slippage_bps = 5.0
 
-stop_pct = 0.015
-# 高进攻模式不做亏损分段，直接由交易所 1.5% STOP_MARKET 全仓止损。
+stop_pct = 0.010
+# 高进攻模式不做亏损分段，直接由交易所 1.0% STOP_MARKET 全仓止损。
 # 下列旧参数仅用于兼容状态结构，loss_trim_enabled=false 时不参与执行。
 loss_trim_trigger_pct = 0.01
 loss_trim_fraction = 0.50
 loss_trim_enabled = false
 # 仓位预算额外计入 0.5% 执行成本；STOP_MARKET 极端跳空仍无法保证绝对封顶。
 risk_execution_buffer_pct = 0.005
-# 达到 +1.2% 时先兑现一半，剩余仓位按峰值回撤 0.5% 保护。
-trail_activation_pct = 0.012
+# 达到 +1.5% 时先兑现 33%，剩余仓位按峰值回撤 0.5% 保护。
+trail_activation_pct = 0.015
 trail_pct = 0.005
-# 首次达到 +1.2% 时市价兑现 50%。
-partial_take_profit_fraction = 0.50
-# 旧失败突破分支关闭，避免与 1.5% 硬止损重复。
+# 首次达到 +1.5% 时市价兑现 33%，让更多仓位继续参与趋势。
+partial_take_profit_fraction = 0.33
+# 旧失败突破分支关闭，避免与 1.0% 硬止损重复。
 failed_breakout_window_minutes = 15
 failed_breakout_adverse_pct = 0.03
 failed_breakout_max_mfe_pct = 0.005
@@ -83,6 +84,8 @@ min_depth_multiple = 10.0
 recent_trade_window_seconds = 60
 min_recent_trades = 30
 min_unique_trade_prices = 8
+# 价格档位数受 tick size 影响很大，只做观测告警，不单独否决下单。
+unique_trade_prices_hard = false
 max_last_trade_age_seconds = 5
 min_return_1h = 0.04
 max_return_1h = 0.30
@@ -112,7 +115,7 @@ allow_live = false
 # 排名，虚拟做空前 5 名并记录 24h 路径。滚动门控只标记是否具备历史优势，
 # 不会改变上面的放量突破策略，也不占用它的持仓或每日开仓额度。
 [altcoin_reversal_observer]
-enabled = false
+enabled = true
 shadow_capital_usdt = 1000.0
 gross_multiple = 1.0
 lookback_days = 7

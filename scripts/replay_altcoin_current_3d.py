@@ -18,6 +18,7 @@ import time
 import tomllib
 import urllib.parse
 import urllib.request
+import urllib.error
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
@@ -30,6 +31,11 @@ SPOT_DATA = "https://data-api.binance.vision"
 MINUTE_MS = 60_000
 BAR_MS = 15 * MINUTE_MS
 DAY_MS = 86_400_000
+BEIJING_OFFSET_MS = 8 * 60 * 60 * 1000
+
+
+def risk_day(ts_ms: int) -> int:
+    return (ts_ms + BEIJING_OFFSET_MS) // DAY_MS
 
 
 @dataclass(frozen=True)
@@ -101,7 +107,14 @@ def get_url_json(base: str, path: str, params: dict[str, object] | None = None) 
                 return json.load(response)
         except Exception as error:
             last_error = error
-            time.sleep(0.4 * (2**attempt))
+            # Binance applies request-weight throttles to bulk historical
+            # klines. Back off much more aggressively on 429 so a validation
+            # run does not fail after downloading most of the universe.
+            if isinstance(error, urllib.error.HTTPError) and error.code == 429:
+                retry_after = error.headers.get("Retry-After")
+                time.sleep(float(retry_after) if retry_after else 5.0 * (attempt + 1))
+            else:
+                time.sleep(0.4 * (2**attempt))
     assert last_error is not None
     raise last_error
 
@@ -267,8 +280,10 @@ def pending_decision(pending: Pending, bar: Bar, cfg: dict[str, object]) -> str:
     holds = bar.low >= breakout * (1.0 - invalidation_pct) if side > 0 else bar.high <= breakout * (1.0 + invalidation_pct)
     if not holds:
         return "invalid"
-    if not touch and not pending.retest_seen:
-        return "waiting"
+    # Match production: the first bar that touches the breakout only records
+    # the retest.  A later closed bar must provide the directional reclaim.
+    if not pending.retest_seen:
+        return "retest" if touch else "waiting"
     reclaimed = (
         bar.close >= breakout * (1.0 + reclaim_pct) and bar.close > bar.open
         if side > 0
@@ -300,7 +315,7 @@ def replay(
     trades: list[dict[str, object]] = []
     partials: list[dict[str, object]] = []
     daily_entries = 0
-    day = start_ms // DAY_MS
+    day = risk_day(start_ms)
     day_start_equity = cash
     daily_loss_blocked = False
     overextended_loss_block = False
@@ -354,7 +369,7 @@ def replay(
 
     first_bar = (start_ms // BAR_MS + 1) * BAR_MS
     for ts in range((start_ms // MINUTE_MS) * MINUTE_MS, end_ms, MINUTE_MS):
-        current_day = ts // DAY_MS
+        current_day = risk_day(ts)
         if current_day != day:
             day = current_day
             daily_entries = 0
@@ -565,6 +580,11 @@ def main() -> None:
     parser.add_argument("--output", default="out/altcoin-current-3d.json")
     parser.add_argument("--quiet", action="store_true")
     parser.add_argument("--compare", action="store_true")
+    parser.add_argument(
+        "--exit-grid",
+        action="store_true",
+        help="compare stop/partial/trailing exits while keeping the entry model fixed",
+    )
     args = parser.parse_args()
     with Path(args.strategy).open("rb") as handle:
         cfg = tomllib.load(handle)["altcoin_impulse"]
@@ -574,7 +594,7 @@ def main() -> None:
     fetch_start = start_ms - 8 * DAY_MS
     symbols = universe(end_ms)
     bars_15m: dict[str, list[Bar]] = {}
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         jobs = [pool.submit(fetch_15m, symbol, fetch_start, end_ms) for symbol in symbols]
         for count, job in enumerate(as_completed(jobs), 1):
             symbol, bars = job.result()
@@ -582,6 +602,22 @@ def main() -> None:
             if count % 100 == 0:
                 print(f"15m {count}/{len(symbols)}", flush=True)
     configs = {"current": cfg}
+    if args.exit_grid:
+        for stop_pct in (0.010, 0.012, 0.015):
+            for activation_pct in (0.010, 0.012, 0.015):
+                for trail_pct in (0.005, 0.0075):
+                    for partial_fraction in (0.33, 0.50):
+                        name = (
+                            f"s{stop_pct * 100:.1f}_a{activation_pct * 100:.1f}_"
+                            f"t{trail_pct * 100:.2f}_p{partial_fraction * 100:.0f}"
+                        )
+                        configs[name] = {
+                            **cfg,
+                            "stop_pct": stop_pct,
+                            "trail_activation_pct": activation_pct,
+                            "trail_pct": trail_pct,
+                            "partial_take_profit_fraction": partial_fraction,
+                        }
     if args.compare:
         confirm = {**cfg, "direct_entry_enabled": False}
         quality = {
@@ -615,10 +651,16 @@ def main() -> None:
                 "confirmation_quality_no_overextension": quality_no_overextension,
             }
         )
-    batches_by_variant = {
-        name: build_signal_batches(bars_15m, start_ms, end_ms, variant_cfg)
-        for name, variant_cfg in configs.items()
-    }
+    if args.exit_grid:
+        # Exit-only variants share precisely the same signal stream. Reusing it both
+        # speeds up the search and prevents accidental entry-model drift.
+        shared_batches = build_signal_batches(bars_15m, start_ms, end_ms, cfg)
+        batches_by_variant = {name: shared_batches for name in configs}
+    else:
+        batches_by_variant = {
+            name: build_signal_batches(bars_15m, start_ms, end_ms, variant_cfg)
+            for name, variant_cfg in configs.items()
+        }
     signal_symbols = sorted(
         {
             signal.symbol
@@ -628,7 +670,7 @@ def main() -> None:
         }
     )
     minute_bars: dict[str, list[Bar]] = {}
-    with ThreadPoolExecutor(max_workers=8) as pool:
+    with ThreadPoolExecutor(max_workers=4) as pool:
         jobs = [pool.submit(fetch_1m, symbol, start_ms - BAR_MS, end_ms) for symbol in signal_symbols]
         for job in as_completed(jobs):
             symbol, bars = job.result()
@@ -647,16 +689,35 @@ def main() -> None:
         "assumptions": {
             "capital": 1000,
             "fees_and_slippage": "5bp fee + 5bp slippage per side",
-            "position": "2% equity risk / 2% risk distance; max gross 2x; max 2",
-            "limits": "10 entries per UTC day; 4h per-symbol cooldown; latched 4% daily loss halt",
-            "entry": "eligible closed 15m 24h breakout enters directly",
-            "exit": "1.5% hard stop; +1.2% take 50%; 0.5% trailing; 2h max",
+            "position": (
+                f"{float(cfg['risk_per_trade'])*100:.1f}% equity risk budget / "
+                f"{(float(cfg['stop_pct'])+float(cfg['risk_execution_buffer_pct']))*100:.1f}% "
+                f"risk distance; max gross {float(cfg['max_gross_multiple']):.1f}x; "
+                f"max {int(cfg['max_positions'])}"
+            ),
+            "limits": (
+                f"{int(cfg['max_daily_entries'])} entries per Asia/Shanghai calendar day; "
+                f"{int(cfg['cooldown_hours'])}h per-symbol cooldown; "
+                f"latched {float(cfg['daily_loss_limit'])*100:.1f}% daily loss halt"
+            ),
+            "entry": (
+                "eligible closed 15m 24h breakout enters directly"
+                if bool(cfg["direct_entry_enabled"])
+                else "breakout, later retest bar, then a separate directional reclaim bar"
+            ),
+            "exit": (
+                f"{float(cfg['stop_pct'])*100:.1f}% hard stop; "
+                f"+{float(cfg['trail_activation_pct'])*100:.1f}% take "
+                f"{float(cfg['partial_take_profit_fraction'])*100:.0f}%; "
+                f"{float(cfg['trail_pct'])*100:.1f}% trailing; "
+                f"{int(cfg['max_hold_hours'])}h max"
+            ),
             "historical_l2": "UNAVAILABLE: spread/depth/impact/recent-trade gate not applied",
             "intrabar": "1m conservative stop-first; same-minute trailing retrace counted",
         },
         "current": current,
     }
-    if args.compare:
+    if args.compare or args.exit_grid:
         report["comparison"] = {
             name: {
                 "parameters": {
@@ -665,6 +726,7 @@ def main() -> None:
                     "min_efficiency": variant_cfg["min_efficiency"],
                     "min_close_location": variant_cfg["min_close_location"],
                     "max_daily_entries": variant_cfg["max_daily_entries"],
+                    "stop_pct": variant_cfg["stop_pct"],
                     "trail_activation_pct": variant_cfg["trail_activation_pct"],
                     "trail_pct": variant_cfg["trail_pct"],
                     "partial_take_profit_fraction": variant_cfg["partial_take_profit_fraction"],

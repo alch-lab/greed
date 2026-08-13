@@ -514,7 +514,9 @@ pub fn observer_status(
         json!({"id":id,"label":label,"samples":values.len(),"mean_return":mean,"compounded_return":compounded_return})
     })
     .collect::<Vec<_>>();
-    let stage = if state.active_basket.is_some() {
+    let stage = if !cfg.enabled {
+        "disabled"
+    } else if state.active_basket.is_some() {
         "tracking"
     } else if state.last_evaluation_day == Some(now_ms / DAY_MS) {
         "waiting_next_day"
@@ -526,7 +528,7 @@ pub fn observer_status(
         "mode":"observation_only",
         "strategy_id":"R7_short_N5_mid_S8_W20_PF1.20",
         "stage":stage,
-        "reason":state.last_reason,
+        "reason":if cfg.enabled {state.last_reason.as_str()} else {"配置已关闭；以下为停用前保留的历史数据"},
         "last_evaluation_ms":state.last_evaluation_ms,
         "next_evaluation_ms":next_evaluation_ms(state, cfg, now_ms),
         "universe_count":state.universe_count,
@@ -1148,6 +1150,19 @@ mod tests {
         let gate = gate_metrics(&state, &cfg);
         assert!(gate.ready);
         assert!(gate.enabled);
+    }
+
+    #[test]
+    fn disabled_status_does_not_look_like_a_running_observer() {
+        let cfg = AltcoinReversalObserverConfig::default();
+        let mut state = ReversalObserverState::default();
+        state.outcomes.push(outcome(0, 0.02));
+        state.last_reason = "停用前的旧结论".into();
+        let status = observer_status(&state, &cfg, DAY_MS);
+        assert_eq!(status["enabled"], false);
+        assert_eq!(status["stage"], "disabled");
+        assert_eq!(status["reason"], "配置已关闭；以下为停用前保留的历史数据");
+        assert_eq!(status["completed_baskets"], 1);
     }
 
     #[test]

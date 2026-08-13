@@ -25,6 +25,11 @@ use crate::trade_runner::{TradeArgs, TradeMode};
 const FUTURES_BASE: &str = "https://fapi.binance.com";
 const SPOT_BASE: &str = "https://api.binance.com";
 const DAY_MS: i64 = 86_400_000;
+const BEIJING_OFFSET_MS: i64 = 8 * 60 * 60 * 1_000;
+
+fn risk_day(ts_ms: i64) -> i64 {
+    ts_ms.saturating_add(BEIJING_OFFSET_MS).div_euclid(DAY_MS)
+}
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AltcoinImpulseConfig {
@@ -120,6 +125,10 @@ pub struct AltcoinImpulseConfig {
     pub min_recent_trades: usize,
     #[serde(default = "default_min_unique_trade_prices")]
     pub min_unique_trade_prices: usize,
+    /// 成交价档位数容易受币种 tick size 影响。默认仅记录告警；只有显式开启时
+    /// 才能单独否决一个在成交笔数、点差、深度和冲击上均合格的候选。
+    #[serde(default)]
+    pub unique_trade_prices_hard: bool,
     #[serde(default = "default_max_last_trade_age_seconds")]
     pub max_last_trade_age_seconds: u64,
     pub min_return_1h: f64,
@@ -548,7 +557,7 @@ impl PersistedState {
             cooldown_until: HashMap::new(),
             seen_signal: HashMap::new(),
             pending_entries: HashMap::new(),
-            day: now_ms / DAY_MS,
+            day: risk_day(now_ms),
             day_start_equity: cash,
             daily_entries: 0,
             daily_entry_bonus: 0,
@@ -761,8 +770,14 @@ fn pending_decision(
     if !holds {
         return PendingDecision::Invalidated;
     }
-    if !touch && !retest_seen {
-        return PendingDecision::Waiting;
+    // 首次触及只负责把状态推进到 RetestSeen。重新启动必须发生在随后闭合的
+    // 另一根 K 线上，避免用同一根 K 的 high/low/close 臆测盘中先后顺序。
+    if !retest_seen {
+        return if touch {
+            PendingDecision::RetestSeen
+        } else {
+            PendingDecision::Waiting
+        };
     }
     let reclaimed = if side > 0 {
         bar.close >= breakout * (1.0 + cfg.reclaim_pct) && bar.close > bar.open
@@ -1405,7 +1420,7 @@ fn apply_daily_risk_reset(
     event_path: &str,
 ) -> Result<()> {
     let previous_baseline = state.day_start_equity;
-    state.day = now_ms / DAY_MS;
+    state.day = risk_day(now_ms);
     state.day_start_equity = current_equity;
     state.daily_loss_latched = false;
     state.daily_risk_resets += 1;
@@ -2312,7 +2327,7 @@ pub async fn run_altcoin_impulse(
             )?;
             save_state(&state_path, &state)?;
         }
-        let current_day = scan_ms / DAY_MS;
+        let current_day = risk_day(scan_ms);
         if current_day != state.day {
             state.day = current_day;
             state.day_start_equity = current_equity;
@@ -2633,7 +2648,7 @@ pub async fn run_altcoin_impulse(
             state.daily_loss_latched = true;
             append_event(
                 &event_path,
-                json!({"ts_ms":scan_ms,"event":"daily_loss_latched","equity":managed_equity,"baseline_equity":state.day_start_equity,"limit_pct":cfg.daily_loss_limit,"reason":"当日回撤门槛触发，锁死新开仓直到下个 UTC 日或手动重置"}),
+                json!({"ts_ms":scan_ms,"event":"daily_loss_latched","equity":managed_equity,"baseline_equity":state.day_start_equity,"limit_pct":cfg.daily_loss_limit,"risk_day_timezone":"Asia/Shanghai","reason":"当日回撤门槛触发，锁死新开仓直到下个北京时间自然日或手动重置"}),
             )?;
             save_state(&state_path, &state)?;
         }
@@ -2908,7 +2923,9 @@ pub async fn run_altcoin_impulse(
                         cfg.min_recent_trades
                     ));
                 }
-                if liquidity.unique_trade_prices < cfg.min_unique_trade_prices {
+                let unique_trade_prices_warning =
+                    liquidity.unique_trade_prices < cfg.min_unique_trade_prices;
+                if cfg.unique_trade_prices_hard && unique_trade_prices_warning {
                     blockers.push(format!(
                         "近 {} 秒仅 {} 个成交价，要求 ≥{}",
                         cfg.recent_trade_window_seconds,
@@ -2925,7 +2942,7 @@ pub async fn run_altcoin_impulse(
                 }
                 append_event(
                     &event_path,
-                    json!({"ts_ms":scan_ms,"event":"liquidity_check","symbol":candidate.symbol,"side":candidate.side,"target_notional":notional,"passed":blockers.is_empty(),"blockers":&blockers,"snapshot":liquidity,"limits":{"max_spread_bps":cfg.max_spread_bps,"max_entry_impact_bps":cfg.max_entry_impact_bps,"max_exit_impact_bps":cfg.max_exit_impact_bps,"depth_band_pct":cfg.depth_band_pct,"min_depth_multiple":cfg.min_depth_multiple,"recent_trade_window_seconds":cfg.recent_trade_window_seconds,"min_recent_trades":cfg.min_recent_trades,"min_unique_trade_prices":cfg.min_unique_trade_prices,"max_last_trade_age_seconds":cfg.max_last_trade_age_seconds}}),
+                    json!({"ts_ms":scan_ms,"event":"liquidity_check","symbol":candidate.symbol,"side":candidate.side,"target_notional":notional,"passed":blockers.is_empty(),"blockers":&blockers,"observations":if unique_trade_prices_warning {vec![format!("近 {} 秒仅 {} 个成交价，参考值 ≥{}；其他可成交性指标合格时不单独否决",cfg.recent_trade_window_seconds,liquidity.unique_trade_prices,cfg.min_unique_trade_prices)]} else {Vec::<String>::new()},"snapshot":liquidity,"limits":{"max_spread_bps":cfg.max_spread_bps,"max_entry_impact_bps":cfg.max_entry_impact_bps,"max_exit_impact_bps":cfg.max_exit_impact_bps,"depth_band_pct":cfg.depth_band_pct,"min_depth_multiple":cfg.min_depth_multiple,"recent_trade_window_seconds":cfg.recent_trade_window_seconds,"min_recent_trades":cfg.min_recent_trades,"min_unique_trade_prices":cfg.min_unique_trade_prices,"unique_trade_prices_hard":cfg.unique_trade_prices_hard,"max_last_trade_age_seconds":cfg.max_last_trade_age_seconds}}),
                 )?;
                 if !blockers.is_empty() {
                     let reason = blockers.join(" / ");
@@ -3370,6 +3387,8 @@ pub async fn run_altcoin_impulse(
         status_payload["altcoin_impulse"]["min_recent_trades"] = json!(cfg.min_recent_trades);
         status_payload["altcoin_impulse"]["min_unique_trade_prices"] =
             json!(cfg.min_unique_trade_prices);
+        status_payload["altcoin_impulse"]["unique_trade_prices_hard"] =
+            json!(cfg.unique_trade_prices_hard);
         status_payload["altcoin_impulse"]["max_last_trade_age_seconds"] =
             json!(cfg.max_last_trade_age_seconds);
         status_payload["altcoin_impulse"]["partial_take_profit_fraction"] =
@@ -3696,6 +3715,14 @@ mod tests {
     }
 
     #[test]
+    fn risk_day_rolls_over_at_beijing_midnight() {
+        // 2026-08-13 15:59:59 UTC = 23:59:59 Asia/Shanghai.
+        let before = 1_786_636_799_999i64;
+        let after = before + 1;
+        assert_eq!(super::risk_day(after), super::risk_day(before) + 1);
+    }
+
+    #[test]
     fn detected_exit_uses_persisted_protection_stage() {
         let mut position = Position {
             symbol: "TESTUSDT".into(),
@@ -3941,10 +3968,18 @@ mod tests {
         };
         assert_eq!(
             pending_decision(1, 100.0, &bar(99.8, 101.0, 99.5, 100.4), false, &cfg),
-            PendingDecision::Confirmed
+            PendingDecision::RetestSeen
         );
         assert_eq!(
             pending_decision(-1, 100.0, &bar(100.2, 100.5, 99.0, 99.6), false, &cfg),
+            PendingDecision::RetestSeen
+        );
+        assert_eq!(
+            pending_decision(1, 100.0, &bar(100.1, 101.0, 100.05, 100.4), true, &cfg),
+            PendingDecision::Confirmed
+        );
+        assert_eq!(
+            pending_decision(-1, 100.0, &bar(99.9, 99.95, 99.0, 99.6), true, &cfg),
             PendingDecision::Confirmed
         );
         assert_eq!(
@@ -3964,18 +3999,18 @@ mod tests {
         ))
         .unwrap();
         assert!(strategy.altcoin_impulse.enabled);
-        assert!(!strategy.altcoin_reversal_observer.enabled);
-        assert_eq!(strategy.altcoin_impulse.max_daily_entries, 6);
+        assert!(strategy.altcoin_reversal_observer.enabled);
+        assert_eq!(strategy.altcoin_impulse.max_daily_entries, 10);
         assert_eq!(strategy.altcoin_impulse.max_daily_entry_bonus, 0);
-        assert_eq!(strategy.altcoin_impulse.risk_per_trade, 0.01);
-        assert_eq!(strategy.altcoin_impulse.stop_pct, 0.015);
-        assert_eq!(strategy.altcoin_impulse.max_gross_multiple, 1.0);
+        assert_eq!(strategy.altcoin_impulse.risk_per_trade, 0.04);
+        assert_eq!(strategy.altcoin_impulse.stop_pct, 0.010);
+        assert_eq!(strategy.altcoin_impulse.max_gross_multiple, 2.5);
         assert_eq!(strategy.altcoin_impulse.first_week_duration_days, 7);
         assert_eq!(strategy.altcoin_impulse.first_week_loss_limit, 0.12);
         assert_eq!(strategy.altcoin_impulse.dry_slippage_bps, 5.0);
-        assert_eq!(strategy.altcoin_impulse.trail_activation_pct, 0.012);
+        assert_eq!(strategy.altcoin_impulse.trail_activation_pct, 0.015);
         assert_eq!(strategy.altcoin_impulse.trail_pct, 0.005);
-        assert_eq!(strategy.altcoin_impulse.partial_take_profit_fraction, 0.50);
+        assert_eq!(strategy.altcoin_impulse.partial_take_profit_fraction, 0.33);
         assert_eq!(strategy.altcoin_impulse.max_hold_hours, 2);
         assert_eq!(strategy.altcoin_impulse.loss_trim_trigger_pct, 0.01);
         assert!(!strategy.altcoin_impulse.loss_trim_enabled);
@@ -3991,6 +4026,7 @@ mod tests {
         assert_eq!(strategy.altcoin_impulse.min_depth_multiple, 10.0);
         assert_eq!(strategy.altcoin_impulse.min_recent_trades, 30);
         assert_eq!(strategy.altcoin_impulse.min_unique_trade_prices, 8);
+        assert!(!strategy.altcoin_impulse.unique_trade_prices_hard);
         assert_eq!(strategy.altcoin_impulse.cooldown_hours, 4);
         assert_eq!(strategy.altcoin_impulse.max_signal_age_seconds, 120);
         assert_eq!(strategy.altcoin_impulse.confirmation_window_bars, 4);
