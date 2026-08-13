@@ -420,19 +420,27 @@ async fn trade_start(
 async fn trade_reset_daily_risk(
     State(st): State<Arc<AppState>>,
 ) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
-    let (mode, running, task_state, reset) = {
+    let (mode, running, task_state, first_week_protected, reset) = {
         let guard = st.trade.lock().await;
         let handle = guard
             .as_ref()
             .ok_or((StatusCode::CONFLICT, "当前没有运行中的交易".into()))?;
-        let task_state = {
+        let (task_state, first_week_protected) = {
             let status = handle.status_rx.borrow();
-            status["state"].as_str().unwrap_or("unknown").to_owned()
+            (
+                status["state"].as_str().unwrap_or("unknown").to_owned(),
+                status["altcoin_impulse"]["first_week"]["window_complete"].as_bool() == Some(false)
+                    && status["altcoin_impulse"]["first_week"]["loss_limit_pct"]
+                        .as_f64()
+                        .unwrap_or(0.0)
+                        > 0.0,
+            )
         };
         (
             handle.mode,
             handle.running.load(Ordering::SeqCst),
             task_state,
+            first_week_protected,
             handle.daily_risk_reset.clone(),
         )
     };
@@ -449,6 +457,12 @@ async fn trade_reset_daily_risk(
         return Err((
             StatusCode::FORBIDDEN,
             "实盘禁止从前端人工重置当日风控".into(),
+        ));
+    }
+    if first_week_protected {
+        return Err((
+            StatusCode::FORBIDDEN,
+            "首周保护窗口内禁止人工重置 4% 日回撤锁；已有仓位仍按保护单退出".into(),
         ));
     }
     let reset = reset.ok_or((StatusCode::BAD_REQUEST, "当前策略不支持重置当日风控".into()))?;

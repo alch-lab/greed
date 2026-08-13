@@ -1,8 +1,8 @@
 # 山寨币放量突破（独立高风险 sleeve）
 #
 # 10x 仅是交易所保证金杠杆。仓位按风险预算 /（止损距离 + 执行缓冲）计算：
-# 1000 USDT × 8% / (5% + 0.6%) ≈ 1429 USDT 名义仓位，约占 143 USDT 保证金。
-# 0.6% 为止损滑点和开平仓费用预留，避免名义 8% 风险在成交后系统性超标。
+# 1000 USDT × 1% / (1.5% + 0.5%) = 500 USDT 名义仓位，约占 50 USDT 保证金。
+# 最多两仓约 1x 权益总名义价值；Paper 探索期先控制假突破的组合损失。
 
 [altcoin_impulse]
 enabled = true
@@ -10,45 +10,54 @@ capital_usdt = 1000.0
 exchange_leverage = 10
 # 标的不支持 10x 时自动回退，最低接受 5x；再低会因保证金占用过高而跳过。
 min_exchange_leverage = 5
-risk_per_trade = 0.08
+risk_per_trade = 0.01
 max_positions = 2
 max_daily_entries = 6
-# 手动按钮每次增加 2 笔，最多当日额外 4 笔：默认 6 笔可扩到 8/10 笔。
-# 额外额度只扩大机会数，不绕过 4% 当日权益回撤和同币 4 小时冷却。
-max_daily_entry_bonus = 4
+# 模拟盘固定最多 6 笔/日，不允许从前端临时追加开仓额度。
+max_daily_entry_bonus = 0
 daily_loss_limit = 0.04
-max_gross_multiple = 4.0
+max_gross_multiple = 1.0
+# 模拟盘持续运行，不设盈利上限，也不因首个 7 天窗口结束而停止开仓。
+# 下面的 7 天窗口只用于首周亏损保护。
+first_week_duration_days = 7
+# 首周累计权益回撤达到 12% 时锁死新开仓；已有仓位继续由保护单管理。
+first_week_loss_limit = 0.12
+# dry 模式每次开/平仓各施加 5bp 不利滑点；手续费仍按单边 5bp 另计。
+dry_slippage_bps = 5.0
 
-stop_pct = 0.038
-# 亏损分段：标记价到 -1% 时先市价减仓 50%，剩余仓位继续由交易所 -3.8%
-# STOP_MARKET 保护。该动作每笔只执行一次，多空完全镜像。
+stop_pct = 0.015
+# 高进攻模式不做亏损分段，直接由交易所 1.5% STOP_MARKET 全仓止损。
+# 下列旧参数仅用于兼容状态结构，loss_trim_enabled=false 时不参与执行。
 loss_trim_trigger_pct = 0.01
 loss_trim_fraction = 0.50
-# 仓位预算额外计入 0.6% 执行成本；STOP_MARKET 极端跳空仍无法保证绝对封顶。
-risk_execution_buffer_pct = 0.006
-# 日志显示短促行情常在 +2%～+4% 后反转；达到 +2% 即开始按峰值回撤 1% 保护。
-trail_activation_pct = 0.02
-trail_pct = 0.01
-# 首次达到 +2% 时市价兑现 33%，让约 2/3 仓位继续参与趋势。
-partial_take_profit_fraction = 0.33
-# 失败突破退出：仅限入场最初 15 分钟；若最大顺向幅度始终不足 0.5%，
-# 当前价格却逆向达到 3%，不再等待完整 3.8% 初始止损。
+loss_trim_enabled = false
+# 仓位预算额外计入 0.5% 执行成本；STOP_MARKET 极端跳空仍无法保证绝对封顶。
+risk_execution_buffer_pct = 0.005
+# 达到 +1.2% 时先兑现一半，剩余仓位按峰值回撤 0.5% 保护。
+trail_activation_pct = 0.012
+trail_pct = 0.005
+# 首次达到 +1.2% 时市价兑现 50%。
+partial_take_profit_fraction = 0.50
+# 旧失败突破分支关闭，避免与 1.5% 硬止损重复。
 failed_breakout_window_minutes = 15
 failed_breakout_adverse_pct = 0.03
 failed_breakout_max_mfe_pct = 0.005
-# 纯价格路径保护：若持仓曾逆向达到 3%，随后修复到盈利 1%，
-# 将保护抬到入场价顺向 0.25%；不依赖持仓时间。
+failed_breakout_enabled = false
+# 旧修复锁盈分支关闭，退出只保留硬止损、分批止盈、跟踪和 2h 时间退出。
 recovery_lock_adverse_pct = 0.03
 recovery_lock_activation_pct = 0.01
 recovery_lock_pct = 0.0025
-max_hold_hours = 6
+recovery_lock_enabled = false
+max_hold_hours = 2
 cooldown_hours = 4
 # 信号价到实际可成交价最多允许 1.5% 不利偏移；超出则 IOC 限价单不追。
 max_entry_slippage_pct = 0.015
 # 只成交刚闭合的突破信号；仓位释放后不追逐已运行数分钟的旧 K 线。
 max_signal_age_seconds = 120
-# 标准突破不再在信号收盘裸追：最多等待 4 根 15m K 线，要求回踩/反抽突破位
-# 1% 范围、不得穿透 1.5%，随后重新顺向收在突破位外 0.2%。多空完全镜像。
+# 三日回放显示直接追突破的假信号过多；先等待回踩/反抽守住后重新顺向收盘。
+direct_entry_enabled = false
+# 最多等待 4 根 15m K；允许触及突破位 1%，不得反向穿透 1.5%，
+# 随后须重新顺向收在突破位外 0.2%。
 confirmation_window_bars = 4
 retest_touch_pct = 0.01
 retest_invalidation_pct = 0.015
@@ -76,18 +85,20 @@ min_recent_trades = 30
 min_unique_trade_prices = 8
 max_last_trade_age_seconds = 5
 min_return_1h = 0.04
-max_return_1h = 0.45
+max_return_1h = 0.30
 # 1h 涨幅达到 12% 或 4h 涨幅达到 15% 视为“过度延伸追多票”。历史上这类
-# 交易并非永久负期望，因此保留第一枪；但同类票一旦当日亏损，熔断后续追多。
+# 票在相邻六日验证中拖累结果，Paper 阶段关闭，仍保留分类日志供后续复核。
 overextension_long_return_1h = 0.12
 overextension_long_return_4h = 0.15
+overextension_long_enabled = false
 # 同币最近 24 小时已经平过仓时，不再于过度延伸区二次追涨；普通新启动仍可重入。
 overextension_reentry_lookback_hours = 24
 min_return_4h = 0.06
-max_return_4h = 1.20
-min_volume_ratio = 3.0
-min_efficiency = 0.35
-min_close_location = 0.60
+max_return_4h = 0.60
+# 收紧启动质量，减少放量不足、路径反复和尾盘回落的假突破。
+min_volume_ratio = 4.0
+min_efficiency = 0.45
+min_close_location = 0.70
 
 # 先按当前 24h 活跃度选出扫描池，再用 7 天滚动基线做因果判断。
 scan_limit = 60
@@ -101,7 +112,7 @@ allow_live = false
 # 排名，虚拟做空前 5 名并记录 24h 路径。滚动门控只标记是否具备历史优势，
 # 不会改变上面的放量突破策略，也不占用它的持仓或每日开仓额度。
 [altcoin_reversal_observer]
-enabled = true
+enabled = false
 shadow_capital_usdt = 1000.0
 gross_multiple = 1.0
 lookback_days = 7

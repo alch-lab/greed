@@ -40,6 +40,12 @@ pub struct AltcoinImpulseConfig {
     pub max_daily_entry_bonus: u32,
     pub daily_loss_limit: f64,
     pub max_gross_multiple: f64,
+    #[serde(default = "default_first_week_duration_days")]
+    pub first_week_duration_days: u32,
+    #[serde(default)]
+    pub first_week_loss_limit: f64,
+    #[serde(default = "default_dry_slippage_bps")]
+    pub dry_slippage_bps: f64,
     pub stop_pct: f64,
     #[serde(default = "default_loss_trim_trigger_pct")]
     pub loss_trim_trigger_pct: f64,
@@ -69,6 +75,14 @@ pub struct AltcoinImpulseConfig {
     pub max_entry_slippage_pct: f64,
     #[serde(default = "default_max_signal_age_seconds")]
     pub max_signal_age_seconds: u64,
+    #[serde(default)]
+    pub direct_entry_enabled: bool,
+    #[serde(default = "default_true")]
+    pub loss_trim_enabled: bool,
+    #[serde(default = "default_true")]
+    pub failed_breakout_enabled: bool,
+    #[serde(default = "default_true")]
+    pub recovery_lock_enabled: bool,
     #[serde(default = "default_confirmation_window_bars")]
     pub confirmation_window_bars: u32,
     #[serde(default = "default_retest_touch_pct")]
@@ -114,6 +128,8 @@ pub struct AltcoinImpulseConfig {
     pub overextension_long_return_1h: f64,
     #[serde(default = "default_overextension_long_return_4h")]
     pub overextension_long_return_4h: f64,
+    #[serde(default = "default_true")]
+    pub overextension_long_enabled: bool,
     #[serde(default = "default_overextension_reentry_lookback_hours")]
     pub overextension_reentry_lookback_hours: u32,
     pub min_return_4h: f64,
@@ -223,12 +239,42 @@ fn default_max_entry_slippage_pct() -> f64 {
     0.015
 }
 
+fn default_first_week_duration_days() -> u32 {
+    7
+}
+
+fn default_dry_slippage_bps() -> f64 {
+    5.0
+}
+
+fn adverse_fill_price(price: f64, side: i32, slippage_bps: f64, opening: bool) -> f64 {
+    let direction = if opening { side } else { -side };
+    price * (1.0 + direction as f64 * slippage_bps / 10_000.0)
+}
+
+fn existing_stop_raw_fill(side: i32, stop_price: f64, bar: &Bar) -> Option<f64> {
+    let hit = if side > 0 {
+        bar.low <= stop_price
+    } else {
+        bar.high >= stop_price
+    };
+    if !hit {
+        return None;
+    }
+    let gapped = (side > 0 && bar.open < stop_price) || (side < 0 && bar.open > stop_price);
+    Some(if gapped { bar.open } else { stop_price })
+}
+
 fn default_max_daily_entry_bonus() -> u32 {
     4
 }
 
 fn default_max_signal_age_seconds() -> u64 {
     120
+}
+
+fn default_true() -> bool {
+    true
 }
 
 fn default_confirmation_window_bars() -> u32 {
@@ -423,6 +469,21 @@ struct EquityPoint {
     equity: f64,
 }
 
+#[derive(Debug, Clone, Serialize, PartialEq)]
+struct FirstWeekProgress {
+    started_ms: i64,
+    ends_ms: i64,
+    elapsed_days: f64,
+    start_equity: f64,
+    current_equity: f64,
+    current_profit_usdt: f64,
+    loss_limit_pct: f64,
+    loss_limit_reached: bool,
+    realized_average_per_day_usdt: f64,
+    window_complete: bool,
+    entries_blocked: bool,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct PersistedState {
     cash: f64,
@@ -444,6 +505,16 @@ struct PersistedState {
     daily_entry_bonus: u32,
     #[serde(default)]
     daily_risk_resets: u32,
+    #[serde(default)]
+    daily_loss_latched: bool,
+    #[serde(default)]
+    first_week_started_ms: i64,
+    #[serde(default)]
+    first_week_start_equity: f64,
+    #[serde(default)]
+    first_week_complete_latched: bool,
+    #[serde(default)]
+    first_week_loss_latched: bool,
     #[serde(default)]
     last_daily_risk_reset_ms: Option<i64>,
     #[serde(default)]
@@ -482,6 +553,11 @@ impl PersistedState {
             daily_entries: 0,
             daily_entry_bonus: 0,
             daily_risk_resets: 0,
+            daily_loss_latched: false,
+            first_week_started_ms: 0,
+            first_week_start_equity: 0.0,
+            first_week_complete_latched: false,
+            first_week_loss_latched: false,
             last_daily_risk_reset_ms: None,
             overextension_long_blocked: false,
             overextension_long_losses: 0,
@@ -512,6 +588,82 @@ impl PersistedState {
             self.recent_trades.drain(..self.recent_trades.len() - 100);
         }
     }
+}
+
+fn first_week_progress(
+    state: &PersistedState,
+    cfg: &AltcoinImpulseConfig,
+    current_equity: f64,
+    now_ms: i64,
+) -> FirstWeekProgress {
+    let duration_ms = cfg.first_week_duration_days as i64 * DAY_MS;
+    let ends_ms = state.first_week_started_ms.saturating_add(duration_ms);
+    let elapsed_ms = now_ms
+        .saturating_sub(state.first_week_started_ms)
+        .clamp(0, duration_ms);
+    let elapsed_days = elapsed_ms as f64 / DAY_MS as f64;
+    let current_profit_usdt = current_equity - state.first_week_start_equity;
+    let window_complete = state.first_week_complete_latched || now_ms >= ends_ms;
+    let loss_limit_reached = cfg.first_week_loss_limit > 0.0
+        && (state.first_week_loss_latched
+            || (now_ms <= ends_ms
+                && current_profit_usdt
+                    <= -(state.first_week_start_equity * cfg.first_week_loss_limit)));
+    FirstWeekProgress {
+        started_ms: state.first_week_started_ms,
+        ends_ms,
+        elapsed_days,
+        start_equity: state.first_week_start_equity,
+        current_equity,
+        current_profit_usdt,
+        loss_limit_pct: cfg.first_week_loss_limit,
+        loss_limit_reached,
+        realized_average_per_day_usdt: if elapsed_days > 0.0 {
+            current_profit_usdt / elapsed_days
+        } else {
+            0.0
+        },
+        window_complete,
+        entries_blocked: loss_limit_reached,
+    }
+}
+
+fn update_first_week_latches(
+    state: &mut PersistedState,
+    cfg: &AltcoinImpulseConfig,
+    current_equity: f64,
+    now_ms: i64,
+    event_path: &str,
+) -> Result<bool> {
+    let progress = first_week_progress(state, cfg, current_equity, now_ms);
+    let mut changed = false;
+    if progress.window_complete && !state.first_week_complete_latched {
+        state.first_week_complete_latched = true;
+        changed = true;
+        append_event(
+            event_path,
+            json!({
+                "ts_ms":now_ms,"event":"first_week_window_complete",
+                "profit_usdt":progress.current_profit_usdt,
+                "entries_halted":false
+            }),
+        )?;
+    }
+    if progress.loss_limit_reached && !state.first_week_loss_latched {
+        state.first_week_loss_latched = true;
+        changed = true;
+        append_event(
+            event_path,
+            json!({
+                "ts_ms":now_ms,"event":"first_week_loss_limit_reached",
+                "profit_usdt":progress.current_profit_usdt,
+                "loss_limit_pct":cfg.first_week_loss_limit,
+                "equity":current_equity,
+                "entries_halted":true
+            }),
+        )?;
+    }
+    Ok(changed)
 }
 
 fn parse_num(v: &Value, index: usize) -> Result<f64> {
@@ -1255,6 +1407,7 @@ fn apply_daily_risk_reset(
     let previous_baseline = state.day_start_equity;
     state.day = now_ms / DAY_MS;
     state.day_start_equity = current_equity;
+    state.daily_loss_latched = false;
     state.daily_risk_resets += 1;
     state.last_daily_risk_reset_ms = Some(now_ms);
     append_event(
@@ -1401,14 +1554,16 @@ async fn manage_live_positions(
         let excursion = position.side as f64 * (position.extreme / position.entry_price - 1.0);
         let current_return =
             position.side as f64 * (snapshot.mark_price / position.entry_price - 1.0);
-        if failed_breakout(
-            &position,
-            snapshot.mark_price,
-            now_ms,
-            cfg.failed_breakout_window_minutes,
-            cfg.failed_breakout_adverse_pct,
-            cfg.failed_breakout_max_mfe_pct,
-        ) {
+        if cfg.failed_breakout_enabled
+            && failed_breakout(
+                &position,
+                snapshot.mark_price,
+                now_ms,
+                cfg.failed_breakout_window_minutes,
+                cfg.failed_breakout_adverse_pct,
+                cfg.failed_breakout_max_mfe_pct,
+            )
+        {
             let filters = client.symbol_filters(&symbol).await?;
             let side = if position.side > 0 { "SELL" } else { "BUY" };
             // reduceOnly 市价退出先成交，再清理旧保护，避免撤单与平仓之间出现裸仓窗口。
@@ -1447,7 +1602,10 @@ async fn manage_live_positions(
         }
         // 亏损侧第一段保护：先成交减仓，再用剩余真实仓位替换交易所硬止损。
         // 新保护确认前不撤旧保护，失败时旧全量 reduceOnly 止损仍然有效。
-        if !position.loss_trim_done && current_return <= -cfg.loss_trim_trigger_pct {
+        if cfg.loss_trim_enabled
+            && !position.loss_trim_done
+            && current_return <= -cfg.loss_trim_trigger_pct
+        {
             let filters = client.symbol_filters(&symbol).await?;
             let side = if position.side > 0 { "SELL" } else { "BUY" };
             let target_qty = snapshot.position_amt.abs() * cfg.loss_trim_fraction;
@@ -1569,16 +1727,21 @@ async fn manage_live_positions(
             }
             changed = true;
         }
-        let recovery_stop = recovery_profit_lock_stop(
-            position.side,
-            position.entry_price,
-            position.stop_price,
-            snapshot.mark_price,
-            max_adverse,
-            cfg.recovery_lock_adverse_pct,
-            cfg.recovery_lock_activation_pct,
-            cfg.recovery_lock_pct,
-        );
+        let recovery_stop = cfg
+            .recovery_lock_enabled
+            .then(|| {
+                recovery_profit_lock_stop(
+                    position.side,
+                    position.entry_price,
+                    position.stop_price,
+                    snapshot.mark_price,
+                    max_adverse,
+                    cfg.recovery_lock_adverse_pct,
+                    cfg.recovery_lock_activation_pct,
+                    cfg.recovery_lock_pct,
+                )
+            })
+            .flatten();
         let (improved_stop, protection_reason) = match (improved_stop, recovery_stop) {
             (Some(trailing), Some(recovery)) => {
                 let trailing_is_tighter = if position.side > 0 {
@@ -1706,6 +1869,12 @@ pub async fn run_altcoin_impulse(
     });
     anyhow::ensure!(cfg.enabled, "altcoin_impulse.enabled=false");
     anyhow::ensure!(
+        (0.0..=0.50).contains(&cfg.first_week_loss_limit)
+            && (0.0..=100.0).contains(&cfg.dry_slippage_bps)
+            && (1..=30).contains(&cfg.first_week_duration_days),
+        "首周累计亏损上限必须在 0%..=50%、dry 单边滑点必须在 0..=100bp，且保护窗口必须在 1..=30 天"
+    );
+    anyhow::ensure!(
         (1..=20).contains(&cfg.exchange_leverage),
         "exchange_leverage 必须在 1..=20"
     );
@@ -1718,13 +1887,14 @@ pub async fn run_altcoin_impulse(
         "山寨币策略单笔风险必须在 0%..=10%"
     );
     anyhow::ensure!(
-        cfg.stop_pct >= 0.03 && cfg.stop_pct <= 0.12,
-        "止损必须在 3%..=12%"
+        cfg.stop_pct >= 0.01 && cfg.stop_pct <= 0.12,
+        "止损必须在 1%..=12%"
     );
     anyhow::ensure!(
-        cfg.loss_trim_trigger_pct >= 0.005
-            && cfg.loss_trim_trigger_pct < cfg.stop_pct
-            && (0.20..=0.60).contains(&cfg.loss_trim_fraction),
+        !cfg.loss_trim_enabled
+            || (cfg.loss_trim_trigger_pct >= 0.005
+                && cfg.loss_trim_trigger_pct < cfg.stop_pct
+                && (0.20..=0.60).contains(&cfg.loss_trim_fraction)),
         "亏损第一段要求：触发点 >=0.5% 且小于初始止损，减仓比例 20%..=60%"
     );
     anyhow::ensure!(
@@ -1763,8 +1933,10 @@ pub async fn run_altcoin_impulse(
         "失败突破观察窗口必须在 5..=30 分钟"
     );
     anyhow::ensure!(
-        cfg.failed_breakout_adverse_pct >= 0.02 && cfg.failed_breakout_adverse_pct < cfg.stop_pct,
-        "失败突破逆向阈值必须 >=2% 且小于初始止损"
+        !cfg.failed_breakout_enabled
+            || (cfg.failed_breakout_adverse_pct >= 0.01
+                && cfg.failed_breakout_adverse_pct < cfg.stop_pct),
+        "失败突破逆向阈值必须 >=1% 且小于初始止损"
     );
     anyhow::ensure!(
         cfg.failed_breakout_max_mfe_pct >= 0.0
@@ -1772,12 +1944,13 @@ pub async fn run_altcoin_impulse(
         "失败突破最大顺向幅度必须小于跟踪止盈激活点"
     );
     anyhow::ensure!(
-        cfg.recovery_lock_adverse_pct >= 0.02
-            && cfg.recovery_lock_adverse_pct <= cfg.stop_pct
-            && cfg.recovery_lock_activation_pct > cfg.recovery_lock_pct
-            && cfg.recovery_lock_activation_pct < cfg.trail_activation_pct
-            && cfg.recovery_lock_pct >= 0.0,
-        "修复锁盈要求：不利波动 2%..=初始止损，且 0 <= 锁定收益 < 修复收益 < 跟踪激活点"
+        !cfg.recovery_lock_enabled
+            || (cfg.recovery_lock_adverse_pct >= 0.01
+                && cfg.recovery_lock_adverse_pct <= cfg.stop_pct
+                && cfg.recovery_lock_activation_pct > cfg.recovery_lock_pct
+                && cfg.recovery_lock_activation_pct < cfg.trail_activation_pct
+                && cfg.recovery_lock_pct >= 0.0),
+        "修复锁盈要求：不利波动 1%..=初始止损，且 0 <= 锁定收益 < 修复收益 < 跟踪激活点"
     );
     anyhow::ensure!(
         cfg.max_entry_slippage_pct > 0.0 && cfg.max_entry_slippage_pct <= 0.03,
@@ -1890,6 +2063,15 @@ pub async fn run_altcoin_impulse(
     }
     if state.recent_trades.is_empty() {
         state.recent_trades = load_recent_trades(&event_path);
+    }
+    if cfg.direct_entry_enabled && !state.pending_entries.is_empty() {
+        let discarded = state.pending_entries.len();
+        state.pending_entries.clear();
+        append_event(
+            &event_path,
+            json!({"ts_ms":now_ms,"event":"pending_entries_cleared","count":discarded,"reason":"direct_entry_enabled"}),
+        )?;
+        save_state(&state_path, &state)?;
     }
     let mut phase_migrations = Vec::new();
     for position in state.positions.values_mut() {
@@ -2115,6 +2297,21 @@ pub async fn run_altcoin_impulse(
             }
         }
         let current_equity = equity(&state, &prices);
+        if state.first_week_started_ms <= 0 || state.first_week_start_equity <= 0.0 {
+            state.first_week_started_ms = scan_ms;
+            state.first_week_start_equity = current_equity;
+            state.first_week_complete_latched = false;
+            state.first_week_loss_latched = false;
+            append_event(
+                &event_path,
+                json!({
+                    "ts_ms":scan_ms,"event":"first_week_window_started",
+                    "start_equity":current_equity,
+                    "duration_days":cfg.first_week_duration_days
+                }),
+            )?;
+            save_state(&state_path, &state)?;
+        }
         let current_day = scan_ms / DAY_MS;
         if current_day != state.day {
             state.day = current_day;
@@ -2122,6 +2319,7 @@ pub async fn run_altcoin_impulse(
             state.daily_entries = 0;
             state.daily_entry_bonus = 0;
             state.daily_risk_resets = 0;
+            state.daily_loss_latched = false;
             state.overextension_long_blocked = false;
             state.overextension_long_losses = 0;
             state.last_overextension_loss_ms = None;
@@ -2191,30 +2389,58 @@ pub async fn run_altcoin_impulse(
                     position.side as f64 * (position.extreme / position.entry_price - 1.0);
                 let current_return =
                     position.side as f64 * (bar.close / position.entry_price - 1.0);
-                let hard_stop_hit = if position.side > 0 {
-                    bar.low <= position.stop_price
-                } else {
-                    bar.high >= position.stop_price
-                };
-                if !hard_stop_hit
+                // 15m OHLC 无法知道同一根 K 线的高低点先后。已经生效的保护单
+                // 必须优先于本根才可能触发的止盈/跟踪更新，避免用未来高点美化结果。
+                if let Some(raw_exit) =
+                    existing_stop_raw_fill(position.side, position.stop_price, bar)
+                {
+                    let exit =
+                        adverse_fill_price(raw_exit, position.side, cfg.dry_slippage_bps, false);
+                    let fee = position.qty * exit * 0.0005;
+                    let pnl = record_exit(
+                        &mut state,
+                        &position,
+                        scan_ms,
+                        cfg.cooldown_hours,
+                        exit,
+                        position.qty,
+                        fee,
+                    );
+                    let trade_pnl = position.realized_partial_pnl + pnl;
+                    let reason = match position.protection_reason.as_str() {
+                        "trailing_take_profit" => "trailing_take_profit",
+                        "recovery_profit_lock" => "recovery_profit_lock",
+                        "partial_take_profit_break_even" => "partial_take_profit_break_even",
+                        _ => "initial_stop",
+                    };
+                    let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":reason,"price":exit,"raw_price":raw_exit,"qty":position.qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true,"intrabar_policy":"existing_stop_first","overextension_long_blocked":state.overextension_long_blocked});
+                    append_event(&event_path, event.clone())?;
+                    state.record_trade(event);
+                    continue;
+                }
+                if cfg.loss_trim_enabled
                     && !position.loss_trim_done
                     && current_return <= -cfg.loss_trim_trigger_pct
                 {
-                    let exit = position.entry_price
+                    let raw_exit = position.entry_price
                         * (1.0 - position.side as f64 * cfg.loss_trim_trigger_pct);
+                    let exit =
+                        adverse_fill_price(raw_exit, position.side, cfg.dry_slippage_bps, false);
                     let qty = position.qty * cfg.loss_trim_fraction;
                     let fee = qty * exit * 0.0005;
                     let partial_pnl =
                         record_partial_exit(&mut state, &mut position, exit, qty, fee);
                     position.loss_trim_done = true;
                     position.last_partial_exit_ms = Some(scan_ms);
-                    let event = json!({"ts_ms":scan_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"loss_trim","trigger_return":-cfg.loss_trim_trigger_pct,"configured_fraction":cfg.loss_trim_fraction,"price":exit,"qty":qty,"remaining_qty":position.qty,"pnl":partial_pnl,"fee":fee,"stop_price":position.stop_price,"dry_fill":true});
+                    let event = json!({"ts_ms":scan_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"loss_trim","trigger_return":-cfg.loss_trim_trigger_pct,"configured_fraction":cfg.loss_trim_fraction,"price":exit,"raw_price":raw_exit,"qty":qty,"remaining_qty":position.qty,"pnl":partial_pnl,"fee":fee,"stop_price":position.stop_price,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true});
                     append_event(&event_path, event.clone())?;
                     state.record_trade(event);
                 }
                 if !position.partial_take_profit_done && excursion >= cfg.trail_activation_pct {
-                    let exit = position.entry_price
+                    let raw_exit = position.entry_price
                         * (1.0 + position.side as f64 * cfg.trail_activation_pct);
+                    let exit =
+                        adverse_fill_price(raw_exit, position.side, cfg.dry_slippage_bps, false);
                     let qty = position.qty * cfg.partial_take_profit_fraction;
                     let fee = qty * exit * 0.0005;
                     let partial_pnl =
@@ -2223,22 +2449,24 @@ pub async fn run_altcoin_impulse(
                     position.last_partial_exit_ms = Some(scan_ms);
                     position.stop_price = position.entry_price;
                     position.protection_reason = "partial_take_profit_break_even".to_owned();
-                    let event = json!({"ts_ms":scan_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"partial_take_profit","price":exit,"qty":qty,"remaining_qty":position.qty,"pnl":partial_pnl,"fee":fee,"new_stop":position.stop_price,"dry_fill":true});
+                    let event = json!({"ts_ms":scan_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"partial_take_profit","price":exit,"raw_price":raw_exit,"qty":qty,"remaining_qty":position.qty,"pnl":partial_pnl,"fee":fee,"new_stop":position.stop_price,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true});
                     append_event(&event_path, event.clone())?;
                     state.record_trade(event);
                 }
-                if let Some(recovery_stop) = recovery_profit_lock_stop(
-                    position.side,
-                    position.entry_price,
-                    position.stop_price,
-                    bar.close,
-                    adverse_excursion(position.side, position.entry_price, adverse),
-                    cfg.recovery_lock_adverse_pct,
-                    cfg.recovery_lock_activation_pct,
-                    cfg.recovery_lock_pct,
-                ) {
-                    position.stop_price = recovery_stop;
-                    position.protection_reason = "recovery_profit_lock".to_owned();
+                if cfg.recovery_lock_enabled {
+                    if let Some(recovery_stop) = recovery_profit_lock_stop(
+                        position.side,
+                        position.entry_price,
+                        position.stop_price,
+                        bar.close,
+                        adverse_excursion(position.side, position.entry_price, adverse),
+                        cfg.recovery_lock_adverse_pct,
+                        cfg.recovery_lock_activation_pct,
+                        cfg.recovery_lock_pct,
+                    ) {
+                        position.stop_price = recovery_stop;
+                        position.protection_reason = "recovery_profit_lock".to_owned();
+                    }
                 }
                 if excursion >= cfg.trail_activation_pct {
                     let trail = position.extreme * (1.0 - position.side as f64 * cfg.trail_pct);
@@ -2254,23 +2482,26 @@ pub async fn run_altcoin_impulse(
                 } else {
                     bar.high >= position.stop_price
                 };
-                let failed = failed_breakout(
-                    &position,
-                    bar.close,
-                    scan_ms,
-                    cfg.failed_breakout_window_minutes,
-                    cfg.failed_breakout_adverse_pct,
-                    cfg.failed_breakout_max_mfe_pct,
-                );
+                let failed = cfg.failed_breakout_enabled
+                    && failed_breakout(
+                        &position,
+                        bar.close,
+                        scan_ms,
+                        cfg.failed_breakout_window_minutes,
+                        cfg.failed_breakout_adverse_pct,
+                        cfg.failed_breakout_max_mfe_pct,
+                    );
                 let timed = scan_ms - position.entry_ms >= cfg.max_hold_hours as i64 * 3_600_000;
                 if failed || stopped || timed {
-                    let exit = if failed {
+                    let raw_exit = if failed {
                         bar.close
                     } else if stopped {
                         position.stop_price
                     } else {
                         bar.close
                     };
+                    let exit =
+                        adverse_fill_price(raw_exit, position.side, cfg.dry_slippage_bps, false);
                     let fee = position.qty * exit * 0.0005;
                     let pnl = record_exit(
                         &mut state,
@@ -2290,10 +2521,11 @@ pub async fn run_altcoin_impulse(
                         match position.protection_reason.as_str() {
                             "trailing_take_profit" => "trailing_take_profit",
                             "recovery_profit_lock" => "recovery_profit_lock",
+                            "partial_take_profit_break_even" => "partial_take_profit_break_even",
                             _ => "initial_stop",
                         }
                     };
-                    let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":reason,"price":exit,"qty":position.qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"overextension_long_blocked":state.overextension_long_blocked});
+                    let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":reason,"price":exit,"raw_price":raw_exit,"qty":position.qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true,"overextension_long_blocked":state.overextension_long_blocked});
                     append_event(&event_path, event.clone())?;
                     state.record_trade(event);
                 } else {
@@ -2365,6 +2597,11 @@ pub async fn run_altcoin_impulse(
             if candidate.entry_phase != "overextended_long" {
                 continue;
             }
+            if !cfg.overextension_long_enabled {
+                candidate
+                    .blockers
+                    .push("Paper 探索期关闭过度延伸追多".into());
+            }
             if state.overextension_long_blocked {
                 candidate
                     .blockers
@@ -2390,8 +2627,21 @@ pub async fn run_altcoin_impulse(
         // 仓位管理可能刚刚产生止损/时间退出，必须用更新后的现金重新计算，
         // 避免同一扫描周期在触发日损门槛后又开出新仓。
         let managed_equity = equity(&state, &prices);
-        let daily_loss_blocked =
+        let crossed_daily_loss =
             managed_equity < state.day_start_equity * (1.0 - cfg.daily_loss_limit);
+        if crossed_daily_loss && !state.daily_loss_latched {
+            state.daily_loss_latched = true;
+            append_event(
+                &event_path,
+                json!({"ts_ms":scan_ms,"event":"daily_loss_latched","equity":managed_equity,"baseline_equity":state.day_start_equity,"limit_pct":cfg.daily_loss_limit,"reason":"当日回撤门槛触发，锁死新开仓直到下个 UTC 日或手动重置"}),
+            )?;
+            save_state(&state_path, &state)?;
+        }
+        if update_first_week_latches(&mut state, &cfg, managed_equity, scan_ms, &event_path)? {
+            save_state(&state_path, &state)?;
+        }
+        let daily_loss_blocked = state.daily_loss_latched;
+        let first_week = first_week_progress(&state, &cfg, managed_equity, scan_ms);
         let effective_daily_limit = cfg
             .max_daily_entries
             .saturating_add(state.daily_entry_bonus);
@@ -2503,7 +2753,16 @@ pub async fn run_altcoin_impulse(
             state
                 .seen_signal
                 .insert(candidate.symbol.clone(), candidate.signal_ms);
-            if cfg.extreme_direct_enabled && is_extreme_direct(candidate, &cfg) {
+            if cfg.direct_entry_enabled {
+                let mut direct = candidate.clone();
+                direct.entry_trigger = "direct_breakout".to_owned();
+                direct.risk_scale = 1.0;
+                append_event(
+                    &event_path,
+                    json!({"ts_ms":scan_ms,"event":"direct_breakout_selected","symbol":direct.symbol,"side":direct.side,"signal_ms":direct.signal_ms,"breakout_level":direct.breakout_level,"return_1h":direct.return_1h,"return_4h":direct.return_4h,"volume_ratio":direct.volume_ratio}),
+                )?;
+                execution_candidates.push(direct);
+            } else if cfg.extreme_direct_enabled && is_extreme_direct(candidate, &cfg) {
                 let mut direct = candidate.clone();
                 direct.entry_trigger = "extreme_continuation_probe".to_owned();
                 direct.risk_scale = cfg.extreme_direct_risk_scale;
@@ -2543,10 +2802,12 @@ pub async fn run_altcoin_impulse(
             if state.positions.len() >= cfg.max_positions
                 || state.daily_entries >= effective_daily_limit
                 || daily_loss_blocked
+                || first_week.entries_blocked
             {
                 break;
             }
             if state.positions.contains_key(&candidate.symbol)
+                || (candidate.entry_phase == "overextended_long" && !cfg.overextension_long_enabled)
                 || (candidate.entry_phase == "overextended_long" && overextension_slot_taken)
                 || (candidate.entry_phase == "overextended_long"
                     && state.overextension_long_blocked)
@@ -2679,7 +2940,7 @@ pub async fn run_altcoin_impulse(
             }
             let mut entry = candidate.price;
             let mut qty = notional / entry;
-            let mut fee = notional * 0.0005;
+            let fee;
             let mut protection_order_id = None;
             let mut actual_leverage = cfg.exchange_leverage;
             if let Some(client) = rest.as_ref() {
@@ -2926,6 +3187,11 @@ pub async fn run_altcoin_impulse(
                         continue;
                     }
                 }
+            } else {
+                entry =
+                    adverse_fill_price(candidate.price, candidate.side, cfg.dry_slippage_bps, true);
+                qty = notional / entry;
+                fee = qty * entry * 0.0005;
             }
             let stop = entry * (1.0 - candidate.side as f64 * cfg.stop_pct);
             state.last_execution_issue = None;
@@ -2972,48 +3238,56 @@ pub async fn run_altcoin_impulse(
         record_daily_equity(&mut state.equity_curve, valuation_ms, current_equity);
         save_state(&state_path, &state)?;
         let reversal_observer = observer_status(&state.reversal_observer, &observer_cfg, scan_ms);
-        append_event(
-            &event_path,
-            json!({
-                "ts_ms":scan_ms, "event":"scan", "universe_count":spot_symbols.intersection(&active).filter(|symbol| !excluded.contains(symbol.as_str())).count(),
-                "shortlist_count":shortlist_count, "eligible_count":eligible_count,
-                "equity":current_equity, "daily_entries":state.daily_entries,
-                "base_max_daily_entries":cfg.max_daily_entries,
-                "daily_entry_bonus":state.daily_entry_bonus,
-                "max_daily_entry_bonus":cfg.max_daily_entry_bonus,
-                "max_daily_entries":effective_daily_limit,
-                "max_signal_age_seconds":cfg.max_signal_age_seconds,
-                "confirmation_window_bars":cfg.confirmation_window_bars,
-                "retest_touch_pct":cfg.retest_touch_pct,
-                "retest_invalidation_pct":cfg.retest_invalidation_pct,
-                "reclaim_pct":cfg.reclaim_pct,
-                "extreme_direct_return_1h":cfg.extreme_direct_return_1h,
-                "extreme_direct_return_4h":cfg.extreme_direct_return_4h,
-                "extreme_direct_volume_ratio":cfg.extreme_direct_volume_ratio,
-                "extreme_direct_risk_scale":cfg.extreme_direct_risk_scale,
-                "risk_execution_buffer_pct":cfg.risk_execution_buffer_pct,
-                "loss_trim_trigger_pct":cfg.loss_trim_trigger_pct,
-                "loss_trim_fraction":cfg.loss_trim_fraction,
-                "partial_take_profit_fraction":cfg.partial_take_profit_fraction,
-                "failed_breakout_window_minutes":cfg.failed_breakout_window_minutes,
-                "failed_breakout_adverse_pct":cfg.failed_breakout_adverse_pct,
-                "failed_breakout_max_mfe_pct":cfg.failed_breakout_max_mfe_pct,
-                "recovery_lock_adverse_pct":cfg.recovery_lock_adverse_pct,
-                "recovery_lock_activation_pct":cfg.recovery_lock_activation_pct,
-                "recovery_lock_pct":cfg.recovery_lock_pct,
-                "overextension_long_return_1h":cfg.overextension_long_return_1h,
-                "overextension_long_return_4h":cfg.overextension_long_return_4h,
-                "overextension_reentry_lookback_hours":cfg.overextension_reentry_lookback_hours,
-                "overextension_long_blocked":state.overextension_long_blocked,
-                "overextension_long_losses":state.overextension_long_losses,
-                "last_overextension_loss_ms":state.last_overextension_loss_ms,
-                "daily_loss_blocked":daily_loss_blocked,
-                "pending_entries":state.pending_entries.values().collect::<Vec<_>>(),
-                "positions":position_status,
-                "candidates":candidates.iter().take(10).collect::<Vec<_>>(),
-                "reversal_observer":reversal_observer
-            }),
-        )?;
+        let mut scan_event = json!({
+            "ts_ms":scan_ms, "event":"scan", "universe_count":spot_symbols.intersection(&active).filter(|symbol| !excluded.contains(symbol.as_str())).count(),
+            "shortlist_count":shortlist_count, "eligible_count":eligible_count,
+            "equity":current_equity, "daily_entries":state.daily_entries,
+            "base_max_daily_entries":cfg.max_daily_entries,
+            "daily_entry_bonus":state.daily_entry_bonus,
+            "max_daily_entry_bonus":cfg.max_daily_entry_bonus,
+            "max_daily_entries":effective_daily_limit,
+            "max_signal_age_seconds":cfg.max_signal_age_seconds,
+            "confirmation_window_bars":cfg.confirmation_window_bars,
+            "retest_touch_pct":cfg.retest_touch_pct,
+            "retest_invalidation_pct":cfg.retest_invalidation_pct,
+            "reclaim_pct":cfg.reclaim_pct,
+            "extreme_direct_return_1h":cfg.extreme_direct_return_1h,
+            "extreme_direct_return_4h":cfg.extreme_direct_return_4h,
+            "extreme_direct_volume_ratio":cfg.extreme_direct_volume_ratio,
+            "extreme_direct_risk_scale":cfg.extreme_direct_risk_scale,
+            "risk_execution_buffer_pct":cfg.risk_execution_buffer_pct,
+            "loss_trim_trigger_pct":cfg.loss_trim_trigger_pct,
+            "loss_trim_fraction":cfg.loss_trim_fraction,
+            "partial_take_profit_fraction":cfg.partial_take_profit_fraction,
+            "failed_breakout_window_minutes":cfg.failed_breakout_window_minutes,
+            "failed_breakout_adverse_pct":cfg.failed_breakout_adverse_pct,
+            "failed_breakout_max_mfe_pct":cfg.failed_breakout_max_mfe_pct,
+            "recovery_lock_adverse_pct":cfg.recovery_lock_adverse_pct,
+            "recovery_lock_activation_pct":cfg.recovery_lock_activation_pct,
+            "recovery_lock_pct":cfg.recovery_lock_pct,
+            "overextension_long_return_1h":cfg.overextension_long_return_1h,
+            "overextension_long_return_4h":cfg.overextension_long_return_4h,
+            "overextension_reentry_lookback_hours":cfg.overextension_reentry_lookback_hours,
+            "overextension_long_blocked":state.overextension_long_blocked,
+            "overextension_long_losses":state.overextension_long_losses,
+            "last_overextension_loss_ms":state.last_overextension_loss_ms,
+            "daily_loss_blocked":daily_loss_blocked,
+            "pending_entries":state.pending_entries.values().collect::<Vec<_>>(),
+            "positions":position_status,
+            "candidates":candidates.iter().take(10).collect::<Vec<_>>(),
+            "reversal_observer":reversal_observer
+        });
+        scan_event["max_positions"] = json!(cfg.max_positions);
+        scan_event["max_gross_multiple"] = json!(cfg.max_gross_multiple);
+        scan_event["trail_activation_pct"] = json!(cfg.trail_activation_pct);
+        scan_event["trail_pct"] = json!(cfg.trail_pct);
+        scan_event["max_hold_hours"] = json!(cfg.max_hold_hours);
+        scan_event["overextension_long_enabled"] = json!(cfg.overextension_long_enabled);
+        scan_event["min_volume_ratio"] = json!(cfg.min_volume_ratio);
+        scan_event["min_efficiency"] = json!(cfg.min_efficiency);
+        scan_event["min_close_location"] = json!(cfg.min_close_location);
+        scan_event["first_week"] = json!(&first_week);
+        append_event(&event_path, scan_event)?;
         let mut status_payload = json!({
             "state":"running", "mode":mode.as_str(), "started_at_ms":started_ms,
             "uptime_s":(scan_ms-started_ms)/1000, "strategy_name":args.strategy,
@@ -3021,7 +3295,7 @@ pub async fn run_altcoin_impulse(
             "equity":current_equity, "cash":state.cash, "position":Value::Null,
             "n_intents":state.total_entries, "n_fills":state.total_entries + state.total_exits,
             "altcoin_impulse": {
-                "stage": if daily_loss_blocked {"risk_blocked"} else if eligible_count>0 {"execution"} else if !state.pending_entries.is_empty() {"confirmation"} else {"scan"},
+                "stage": if daily_loss_blocked || first_week.entries_blocked {"risk_blocked"} else if eligible_count>0 {"execution"} else if !state.pending_entries.is_empty() {"confirmation"} else {"scan"},
                 "universe_count":spot_symbols.intersection(&active).filter(|symbol| !excluded.contains(symbol.as_str())).count(), "shortlist_count":shortlist_count,
                 "eligible_count":eligible_count, "last_scan_ms":scan_ms,
                 "exchange_leverage":cfg.exchange_leverage, "risk_per_trade":cfg.risk_per_trade,
@@ -3029,7 +3303,8 @@ pub async fn run_altcoin_impulse(
                 "margin_per_trade_estimate":current_equity*cfg.risk_per_trade/(cfg.stop_pct+cfg.risk_execution_buffer_pct)/cfg.exchange_leverage as f64,
                 "worst_loss_per_trade_estimate":current_equity*cfg.risk_per_trade,
                 "daily_entries":state.daily_entries, "max_daily_entries":effective_daily_limit,
-                "daily_loss_blocked":daily_loss_blocked, "positions":position_status,
+                "daily_loss_blocked":daily_loss_blocked,
+                "positions":position_status,
                 "last_valuation_ms":valuation_ms,
                 "valuation_source": if rest.is_some() {"binance_position_risk"} else {"closed_15m_fallback"},
                 "total_entries":state.total_entries, "total_exits":state.total_exits, "wins":state.wins,
@@ -3041,6 +3316,11 @@ pub async fn run_altcoin_impulse(
                 "journal":event_path,
             }
         });
+        status_payload["altcoin_impulse"]["entry_blocked"] =
+            json!(daily_loss_blocked || first_week.entries_blocked);
+        status_payload["altcoin_impulse"]["max_positions"] = json!(cfg.max_positions);
+        status_payload["altcoin_impulse"]["max_gross_multiple"] = json!(cfg.max_gross_multiple);
+        status_payload["altcoin_impulse"]["first_week"] = json!(&first_week);
         status_payload["altcoin_impulse"]["daily_risk_baseline_equity"] =
             json!(state.day_start_equity);
         status_payload["altcoin_impulse"]["pending_entries"] =
@@ -3050,6 +3330,12 @@ pub async fn run_altcoin_impulse(
             json!(cfg.max_daily_entry_bonus);
         status_payload["altcoin_impulse"]["max_signal_age_seconds"] =
             json!(cfg.max_signal_age_seconds);
+        status_payload["altcoin_impulse"]["direct_entry_enabled"] = json!(cfg.direct_entry_enabled);
+        status_payload["altcoin_impulse"]["loss_trim_enabled"] = json!(cfg.loss_trim_enabled);
+        status_payload["altcoin_impulse"]["failed_breakout_enabled"] =
+            json!(cfg.failed_breakout_enabled);
+        status_payload["altcoin_impulse"]["recovery_lock_enabled"] =
+            json!(cfg.recovery_lock_enabled);
         status_payload["altcoin_impulse"]["confirmation_window_bars"] =
             json!(cfg.confirmation_window_bars);
         status_payload["altcoin_impulse"]["retest_touch_pct"] = json!(cfg.retest_touch_pct);
@@ -3088,6 +3374,9 @@ pub async fn run_altcoin_impulse(
             json!(cfg.max_last_trade_age_seconds);
         status_payload["altcoin_impulse"]["partial_take_profit_fraction"] =
             json!(cfg.partial_take_profit_fraction);
+        status_payload["altcoin_impulse"]["trail_activation_pct"] = json!(cfg.trail_activation_pct);
+        status_payload["altcoin_impulse"]["trail_pct"] = json!(cfg.trail_pct);
+        status_payload["altcoin_impulse"]["max_hold_hours"] = json!(cfg.max_hold_hours);
         status_payload["altcoin_impulse"]["failed_breakout_window_minutes"] =
             json!(cfg.failed_breakout_window_minutes);
         status_payload["altcoin_impulse"]["failed_breakout_adverse_pct"] =
@@ -3103,6 +3392,11 @@ pub async fn run_altcoin_impulse(
             json!(cfg.overextension_long_return_1h);
         status_payload["altcoin_impulse"]["overextension_long_return_4h"] =
             json!(cfg.overextension_long_return_4h);
+        status_payload["altcoin_impulse"]["overextension_long_enabled"] =
+            json!(cfg.overextension_long_enabled);
+        status_payload["altcoin_impulse"]["min_volume_ratio"] = json!(cfg.min_volume_ratio);
+        status_payload["altcoin_impulse"]["min_efficiency"] = json!(cfg.min_efficiency);
+        status_payload["altcoin_impulse"]["min_close_location"] = json!(cfg.min_close_location);
         status_payload["altcoin_impulse"]["overextension_reentry_lookback_hours"] =
             json!(cfg.overextension_reentry_lookback_hours);
         status_payload["altcoin_impulse"]["overextension_long_blocked"] =
@@ -3160,7 +3454,8 @@ pub async fn run_altcoin_impulse(
                 if take_control_commands(&mut daily_risk_reset, &mut handled_risk_reset) > 0 {
                     apply_daily_risk_reset(&mut state, refreshed_equity, refresh_ms, &event_path)?;
                     save_state(&state_path, &state)?;
-                    status_payload["altcoin_impulse"]["daily_loss_blocked"] = json!(false);
+                    status_payload["altcoin_impulse"]["daily_loss_blocked"] =
+                        json!(state.daily_loss_latched);
                     status_payload["altcoin_impulse"]["daily_risk_baseline_equity"] =
                         json!(state.day_start_equity);
                     status_payload["altcoin_impulse"]["daily_risk_resets"] =
@@ -3196,7 +3491,24 @@ pub async fn run_altcoin_impulse(
                 }
                 status_payload["uptime_s"] = json!((refresh_ms - started_ms) / 1000);
                 status_payload["equity"] = json!(refreshed_equity);
+                if update_first_week_latches(
+                    &mut state,
+                    &cfg,
+                    refreshed_equity,
+                    refresh_ms,
+                    &event_path,
+                )? {
+                    save_state(&state_path, &state)?;
+                }
+                let refreshed_first_week =
+                    first_week_progress(&state, &cfg, refreshed_equity, refresh_ms);
                 status_payload["altcoin_impulse"]["equity_curve"] = json!(state.equity_curve);
+                status_payload["altcoin_impulse"]["first_week"] = json!(&refreshed_first_week);
+                status_payload["altcoin_impulse"]["entry_blocked"] =
+                    json!(state.daily_loss_latched || refreshed_first_week.entries_blocked);
+                if state.daily_loss_latched || refreshed_first_week.entries_blocked {
+                    status_payload["altcoin_impulse"]["stage"] = json!("risk_blocked");
+                }
                 status_payload["altcoin_impulse"]["positions"] = json!(refreshed);
                 status_payload["altcoin_impulse"]["last_valuation_ms"] = json!(refresh_ms);
                 status_payload["altcoin_impulse"]["overextension_long_blocked"] =
@@ -3225,11 +3537,12 @@ pub async fn run_altcoin_impulse(
 #[cfg(test)]
 mod tests {
     use super::{
-        adverse_excursion, apply_daily_entry_bonus, apply_daily_risk_reset,
-        clamp_entry_guard_price, detected_exit_reason, entry_phase, failed_breakout,
-        pending_decision, realtime_trailing_stop, recently_exited_symbol, record_daily_equity,
-        record_exit, record_partial_exit, recovery_profit_lock_stop, signal_age_ms,
-        update_adverse_extreme, Bar, PendingDecision, PersistedState, Position,
+        adverse_excursion, adverse_fill_price, apply_daily_entry_bonus, apply_daily_risk_reset,
+        clamp_entry_guard_price, detected_exit_reason, entry_phase, existing_stop_raw_fill,
+        failed_breakout, first_week_progress, pending_decision, realtime_trailing_stop,
+        recently_exited_symbol, record_daily_equity, record_exit, record_partial_exit,
+        recovery_profit_lock_stop, signal_age_ms, update_adverse_extreme, Bar, PendingDecision,
+        PersistedState, Position,
     };
 
     #[test]
@@ -3243,6 +3556,30 @@ mod tests {
         assert!((notional - 1_818.181818181818).abs() < 1e-10);
         assert!((notional / leverage - 181.8181818181818).abs() < 1e-10);
         assert!((notional * (stop + execution_buffer) - 80.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn dry_slippage_is_adverse_for_every_side_and_fill_direction() {
+        assert_eq!(adverse_fill_price(100.0, 1, 5.0, true), 100.05);
+        assert_eq!(adverse_fill_price(100.0, 1, 5.0, false), 99.95);
+        assert_eq!(adverse_fill_price(100.0, -1, 5.0, true), 99.95);
+        assert_eq!(adverse_fill_price(100.0, -1, 5.0, false), 100.05);
+    }
+
+    #[test]
+    fn dry_existing_stop_wins_over_same_bar_profit_excursion() {
+        let bar = Bar {
+            open_ms: 1,
+            close_ms: 2,
+            open: 100.0,
+            high: 103.0,
+            low: 98.0,
+            close: 102.0,
+            quote_volume: 1.0,
+        };
+        assert_eq!(existing_stop_raw_fill(1, 99.0, &bar), Some(99.0));
+        let gap = Bar { open: 98.0, ..bar };
+        assert_eq!(existing_stop_raw_fill(1, 99.0, &gap), Some(98.0));
     }
 
     #[test]
@@ -3444,6 +3781,7 @@ mod tests {
         let mut state = PersistedState::new(1_000.0, now_ms);
         state.day_start_equity = 1_200.0;
         state.daily_entries = 4;
+        state.daily_loss_latched = true;
         state.overextension_long_blocked = true;
         let path = std::env::temp_dir().join(format!(
             "greed-daily-risk-reset-{}-{}.jsonl",
@@ -3454,6 +3792,7 @@ mod tests {
         assert_eq!(state.day_start_equity, 950.0);
         assert_eq!(state.daily_entries, 4);
         assert_eq!(state.daily_risk_resets, 1);
+        assert!(!state.daily_loss_latched);
         assert!(
             state.overextension_long_blocked,
             "手动总风控重置不得清除同类失败熔断"
@@ -3461,6 +3800,35 @@ mod tests {
         let log = std::fs::read_to_string(&path).unwrap();
         assert!(log.contains("daily_risk_reset"));
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn open_ended_paper_run_has_no_profit_or_window_entry_cap() {
+        let strategy: super::StrategyFile = toml::from_str(include_str!(
+            "../../../config/strategy-altcoin-impulse.toml"
+        ))
+        .unwrap();
+        let cfg = strategy.altcoin_impulse;
+        let started_ms = 1_800_000_000_000i64;
+        let mut state = PersistedState::new(1_000.0, started_ms);
+        state.first_week_started_ms = started_ms;
+        state.first_week_start_equity = 1_000.0;
+
+        let profitable =
+            first_week_progress(&state, &cfg, 10_000.0, started_ms + 6 * super::DAY_MS);
+        assert!(!profitable.entries_blocked);
+
+        let expired = first_week_progress(&state, &cfg, 1_100.0, started_ms + 7 * super::DAY_MS);
+        assert!(expired.window_complete);
+        assert!(!expired.entries_blocked);
+
+        let loss_limit = first_week_progress(&state, &cfg, 880.0, started_ms + 2 * super::DAY_MS);
+        assert!(loss_limit.loss_limit_reached);
+        assert!(loss_limit.entries_blocked);
+
+        let late_loss = first_week_progress(&state, &cfg, 800.0, started_ms + 8 * super::DAY_MS);
+        assert!(!late_loss.loss_limit_reached);
+        assert!(!late_loss.entries_blocked);
     }
 
     #[test]
@@ -3590,17 +3958,30 @@ mod tests {
     }
 
     #[test]
-    fn deployed_altcoin_config_enables_observer_without_changing_live_strategy() {
+    fn deployed_altcoin_config_is_open_ended_paper_ready() {
         let strategy: super::StrategyFile = toml::from_str(include_str!(
             "../../../config/strategy-altcoin-impulse.toml"
         ))
         .unwrap();
         assert!(strategy.altcoin_impulse.enabled);
-        assert!(strategy.altcoin_reversal_observer.enabled);
+        assert!(!strategy.altcoin_reversal_observer.enabled);
         assert_eq!(strategy.altcoin_impulse.max_daily_entries, 6);
-        assert_eq!(strategy.altcoin_impulse.risk_per_trade, 0.08);
-        assert_eq!(strategy.altcoin_impulse.stop_pct, 0.038);
+        assert_eq!(strategy.altcoin_impulse.max_daily_entry_bonus, 0);
+        assert_eq!(strategy.altcoin_impulse.risk_per_trade, 0.01);
+        assert_eq!(strategy.altcoin_impulse.stop_pct, 0.015);
+        assert_eq!(strategy.altcoin_impulse.max_gross_multiple, 1.0);
+        assert_eq!(strategy.altcoin_impulse.first_week_duration_days, 7);
+        assert_eq!(strategy.altcoin_impulse.first_week_loss_limit, 0.12);
+        assert_eq!(strategy.altcoin_impulse.dry_slippage_bps, 5.0);
+        assert_eq!(strategy.altcoin_impulse.trail_activation_pct, 0.012);
+        assert_eq!(strategy.altcoin_impulse.trail_pct, 0.005);
+        assert_eq!(strategy.altcoin_impulse.partial_take_profit_fraction, 0.50);
+        assert_eq!(strategy.altcoin_impulse.max_hold_hours, 2);
         assert_eq!(strategy.altcoin_impulse.loss_trim_trigger_pct, 0.01);
+        assert!(!strategy.altcoin_impulse.loss_trim_enabled);
+        assert!(!strategy.altcoin_impulse.failed_breakout_enabled);
+        assert!(!strategy.altcoin_impulse.recovery_lock_enabled);
+        assert!(!strategy.altcoin_impulse.direct_entry_enabled);
         assert_eq!(strategy.altcoin_impulse.loss_trim_fraction, 0.50);
         assert!(!strategy.altcoin_impulse.extreme_direct_enabled);
         assert_eq!(strategy.altcoin_impulse.max_spread_bps, 10.0);
@@ -3610,7 +3991,6 @@ mod tests {
         assert_eq!(strategy.altcoin_impulse.min_depth_multiple, 10.0);
         assert_eq!(strategy.altcoin_impulse.min_recent_trades, 30);
         assert_eq!(strategy.altcoin_impulse.min_unique_trade_prices, 8);
-        assert_eq!(strategy.altcoin_impulse.max_daily_entry_bonus, 4);
         assert_eq!(strategy.altcoin_impulse.cooldown_hours, 4);
         assert_eq!(strategy.altcoin_impulse.max_signal_age_seconds, 120);
         assert_eq!(strategy.altcoin_impulse.confirmation_window_bars, 4);
@@ -3623,13 +4003,17 @@ mod tests {
         assert_eq!(strategy.altcoin_impulse.recovery_lock_pct, 0.0025);
         assert_eq!(strategy.altcoin_impulse.overextension_long_return_1h, 0.12);
         assert_eq!(strategy.altcoin_impulse.overextension_long_return_4h, 0.15);
+        assert!(!strategy.altcoin_impulse.overextension_long_enabled);
+        assert_eq!(strategy.altcoin_impulse.min_volume_ratio, 4.0);
+        assert_eq!(strategy.altcoin_impulse.min_efficiency, 0.45);
+        assert_eq!(strategy.altcoin_impulse.min_close_location, 0.70);
         assert_eq!(
             strategy
                 .altcoin_impulse
                 .overextension_reentry_lookback_hours,
             24
         );
-        assert_eq!(strategy.altcoin_impulse.risk_execution_buffer_pct, 0.006);
+        assert_eq!(strategy.altcoin_impulse.risk_execution_buffer_pct, 0.005);
         assert_eq!(strategy.altcoin_reversal_observer.gross_multiple, 1.0);
         strategy.altcoin_reversal_observer.validate().unwrap();
     }
