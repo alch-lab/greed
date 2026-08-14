@@ -1,9 +1,7 @@
-# 山寨币放量突破（独立高风险 sleeve）
-#
-# 10x 仅是交易所保证金杠杆。仓位按风险预算 /（止损距离 + 执行缓冲）计算：
-# 1000 USDT × 4% / (1.0% + 0.5%) = 2667 USDT 风险目标，但 2.5× 总名义上限
-# 会把单仓压到约 2500 USDT（无其他持仓时），约占 250 USDT 保证金。
-# 总名义价值不超过 2.5x 权益；4% 当日回撤门槛仍会锁死后续新仓。
+# 山寨币 6h 横截面反转（独立高风险 sleeve）
+# 每个 UTC 4 小时边界，在过去 24h 成交额 >=5000 万美元的现货+永续币池中，
+# 做空 6h 涨幅前二、做多跌幅后二，持有 4h。四腿美元中性，总名义 0.75x 权益。
+# 最近 10 个完整影子篮子必须合计盈利且 PF>=1 才执行；日内权益回撤 4% 后停开。
 
 [altcoin_impulse]
 enabled = true
@@ -11,13 +9,13 @@ capital_usdt = 1000.0
 exchange_leverage = 10
 # 标的不支持 10x 时自动回退，最低接受 5x；再低会因保证金占用过高而跳过。
 min_exchange_leverage = 5
-risk_per_trade = 0.04
-max_positions = 2
-max_daily_entries = 10
-# 模拟盘固定最多 10 笔/北京时间自然日，不允许从前端临时追加开仓额度。
+risk_per_trade = 0.0084375
+max_positions = 4
+max_daily_entries = 24
+# 模拟盘固定最多 24 条开仓腿/北京时间自然日（6 个完整篮子），不允许临时加额。
 max_daily_entry_bonus = 0
 daily_loss_limit = 0.04
-max_gross_multiple = 2.5
+max_gross_multiple = 0.75
 # 模拟盘持续运行，不设盈利上限，也不因首个 7 天窗口结束而停止开仓。
 # 下面的 7 天窗口只用于首周亏损保护。
 first_week_duration_days = 7
@@ -26,53 +24,48 @@ first_week_loss_limit = 0.12
 # dry 模式每次开/平仓各施加 5bp 不利滑点；手续费仍按单边 5bp 另计。
 dry_slippage_bps = 5.0
 
-stop_pct = 0.010
-# 高进攻模式不做亏损分段，直接由交易所 1.0% STOP_MARKET 全仓止损。
-# 下列旧参数仅用于兼容状态结构，loss_trim_enabled=false 时不参与执行。
+stop_pct = 0.040
+# 每腿入场后立即挂 4% STOP_MARKET。fixed_time_exit_only=true，因此下面的旧突破
+# 退出参数只为兼容配置结构，不参与横截面策略执行。
 loss_trim_trigger_pct = 0.01
 loss_trim_fraction = 0.50
 loss_trim_enabled = false
 # 仓位预算额外计入 0.5% 执行成本；STOP_MARKET 极端跳空仍无法保证绝对封顶。
 risk_execution_buffer_pct = 0.005
-# 达到 +1.5% 时先兑现 33%，剩余仓位按峰值回撤 0.5% 保护。
 trail_activation_pct = 0.015
 trail_pct = 0.005
-# 首次达到 +1.5% 时市价兑现 33%，让更多仓位继续参与趋势。
 partial_take_profit_fraction = 0.33
-# 旧失败突破分支关闭，避免与 1.0% 硬止损重复。
 failed_breakout_window_minutes = 15
 failed_breakout_adverse_pct = 0.03
 failed_breakout_max_mfe_pct = 0.005
 failed_breakout_enabled = false
-# 旧修复锁盈分支关闭，退出只保留硬止损、分批止盈、跟踪和 2h 时间退出。
 recovery_lock_adverse_pct = 0.03
 recovery_lock_activation_pct = 0.01
 recovery_lock_pct = 0.0025
 recovery_lock_enabled = false
-max_hold_hours = 2
-cooldown_hours = 4
+max_hold_hours = 4
+cooldown_hours = 0
 # 信号价到实际可成交价最多允许 1.5% 不利偏移；超出则 IOC 限价单不追。
 max_entry_slippage_pct = 0.015
-# 只成交刚闭合的突破信号；仓位释放后不追逐已运行数分钟的旧 K 线。
+# 只在 4 小时边界后的 120 秒执行刚形成的横截面，避免追旧排名。
 max_signal_age_seconds = 120
-# 三日回放显示直接追突破的假信号过多；先等待回踩/反抽守住后重新顺向收盘。
-direct_entry_enabled = false
-# 最多等待 4 根 15m K；允许触及突破位 1%，不得反向穿透 1.5%，
-# 随后须重新顺向收在突破位外 0.2%。
+# 横截面门控通过后直接执行，不进入旧突破模型的回踩状态机。
+direct_entry_enabled = true
+fixed_time_exit_only = true
+# 以下确认字段只用于旧状态文件兼容。
 confirmation_window_bars = 4
 retest_touch_pct = 0.01
 retest_invalidation_pct = 0.015
 reclaim_pct = 0.002
-# 近期前向/三日回放中，极端延续直接追单持续拖累收益与盈亏比，先关闭该分支。
-# 阈值继续保留用于日志与后续影子研究，但不会产生真实订单。
+# 旧极端延续分支关闭。
 extreme_direct_enabled = false
 extreme_direct_return_1h = 0.18
 extreme_direct_return_4h = 0.25
 extreme_direct_volume_ratio = 6.0
 extreme_direct_risk_scale = 0.33
 
-min_24h_volume_usd = 5000000.0
-# 只扫描同名现货 + USDT 永续的山寨币；排除 BTC/ETH/BNB/SOL/XRP，
+min_24h_volume_usd = 50000000.0
+# 只扫描同名现货 + USDT 永续的山寨币；排除 BTC/ETH/BNB/SOL/XRP 及另外六个主流币，
 # 同时排除刚上市不足 7 天的永续、盘前和指数。
 min_contract_age_days = 7
 # 下单前在实际执行端点硬检验可成交性；主网信号再强，也不能绕过这些门槛。
@@ -89,45 +82,32 @@ unique_trade_prices_hard = false
 max_last_trade_age_seconds = 5
 min_return_1h = 0.04
 max_return_1h = 0.30
-# 1h 涨幅达到 12% 或 4h 涨幅达到 15% 视为“过度延伸追多票”。历史上这类
-# 票在相邻六日验证中拖累结果，Paper 阶段关闭，仍保留分类日志供后续复核。
+# 旧追多模型字段，不参与横截面策略。
 overextension_long_return_1h = 0.12
 overextension_long_return_4h = 0.15
 overextension_long_enabled = false
-# 同币最近 24 小时已经平过仓时，不再于过度延伸区二次追涨；普通新启动仍可重入。
 overextension_reentry_lookback_hours = 24
 min_return_4h = 0.06
 max_return_4h = 0.60
-# 收紧启动质量，减少放量不足、路径反复和尾盘回落的假突破。
 min_volume_ratio = 4.0
 min_efficiency = 0.45
 min_close_location = 0.70
 
-# 先按当前 24h 活跃度选出扫描池，再用 7 天滚动基线做因果判断。
-scan_limit = 60
+# 非横截面时的兼容扫描上限；横截面边界会扫描全部合格币种。
+scan_limit = 200
 poll_seconds = 60
 
 # 高风险模块默认禁止主网实盘；paper/dry 不受影响。
 allow_live = false
 
-# 7 日强势币横截面反转：仅做前向影子观测，绝不向交易所下单。
-# 每天 UTC 00:15（北京时间 08:15）对“同名现货 + USDT 永续”中等流动性币种
-# 排名，虚拟做空前 5 名并记录 24h 路径。滚动门控只标记是否具备历史优势，
-# 不会改变上面的放量突破策略，也不占用它的持仓或每日开仓额度。
-[altcoin_reversal_observer]
+[altcoin_cross_section]
 enabled = true
-shadow_capital_usdt = 1000.0
-gross_multiple = 1.0
-lookback_days = 7
-top_n = 5
-min_24h_volume_usd = 10000000.0
-max_24h_volume_usd = 150000000.0
-stop_pct = 0.08
-hold_hours = 24
-fee_bps_per_side = 5.0
-slippage_bps_per_side = 5.0
-gate_window = 20
-gate_min_mean_return = 0.0
-gate_min_profit_factor = 1.20
-# 超过 00:15 后 5 分钟不再补做当日影子入场，防止使用事后价格。
-entry_window_minutes = 5
+formation_hours = 6
+hold_hours = 4
+names_per_side = 2
+min_24h_volume_usd = 50000000.0
+gate_window = 10
+min_universe_size = 20
+gate_min_profit_factor = 1.0
+# 影子门控的每一边成本含 5bp taker fee + 5bp 不利滑点。
+assumed_cost_bps_per_side = 10.0

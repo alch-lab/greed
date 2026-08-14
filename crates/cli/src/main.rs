@@ -6,7 +6,6 @@
 //! - `trade`    → 模拟盘/实盘执行
 //! - `serve`    → HTTP 控制面（前端监控/启停/回测任务）
 
-mod altcoin_reversal_observer;
 mod altcoin_runner;
 mod serve;
 mod trade_runner;
