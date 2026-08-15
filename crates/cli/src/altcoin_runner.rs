@@ -36,6 +36,13 @@ pub struct AltcoinImpulseConfig {
     #[serde(default = "default_min_exchange_leverage")]
     pub min_exchange_leverage: u32,
     pub risk_per_trade: f64,
+    /// Directional multipliers applied after the base per-trade risk budget.
+    /// Keeping them explicit makes the portfolio-capacity decision observable
+    /// without changing the signal score or the exchange leverage.
+    #[serde(default = "default_risk_scale")]
+    pub long_risk_scale: f64,
+    #[serde(default = "default_risk_scale")]
+    pub short_risk_scale: f64,
     pub max_positions: usize,
     pub max_daily_entries: u32,
     #[serde(default = "default_max_daily_entry_bonus")]
@@ -2234,6 +2241,10 @@ pub async fn run_altcoin_impulse(
         "山寨币策略单笔风险必须在 0%..=10%"
     );
     anyhow::ensure!(
+        (0.25..=1.0).contains(&cfg.long_risk_scale) && (0.25..=1.0).contains(&cfg.short_risk_scale),
+        "山寨币多空风险系数必须在 0.25..=1.0"
+    );
+    anyhow::ensure!(
         cfg.stop_pct >= 0.01 && cfg.stop_pct <= 0.12,
         "止损必须在 1%..=12%"
     );
@@ -3253,7 +3264,13 @@ pub async fn run_altcoin_impulse(
             }
             let gross: f64 = state.positions.values().map(|p| p.initial_notional).sum();
             let risk_distance = cfg.stop_pct + cfg.risk_execution_buffer_pct;
-            let notional = (managed_equity * cfg.risk_per_trade * candidate.risk_scale
+            let direction_risk_scale = if candidate.side > 0 {
+                cfg.long_risk_scale
+            } else {
+                cfg.short_risk_scale
+            };
+            let effective_risk_scale = candidate.risk_scale * direction_risk_scale;
+            let notional = (managed_equity * cfg.risk_per_trade * effective_risk_scale
                 / risk_distance)
                 .min((managed_equity * cfg.max_gross_multiple - gross).max(0.0));
             if notional < 20.0 {
@@ -3659,7 +3676,7 @@ pub async fn run_altcoin_impulse(
             if candidate.entry_phase == "overextended_long" {
                 overextension_slot_taken = true;
             }
-            let event = json!({"ts_ms":scan_ms,"event":"entry","symbol":candidate.symbol,"side":candidate.side,"entry_phase":candidate.entry_phase,"entry_trigger":candidate.entry_trigger,"risk_scale":candidate.risk_scale,"signal_age_ms":signal_age_ms(scan_ms,candidate.signal_ms),"max_signal_age_ms":max_signal_age_ms,"signal":candidate,"entry_price":entry,"qty":qty,"notional":qty*entry,"requested_leverage":cfg.exchange_leverage,"actual_leverage":actual_leverage,"margin_estimate":qty*entry/actual_leverage as f64,"risk_usd":qty*entry*risk_distance,"price_stop_risk_usd":qty*entry*cfg.stop_pct,"risk_execution_buffer_pct":cfg.risk_execution_buffer_pct,"fee":fee});
+            let event = json!({"ts_ms":scan_ms,"event":"entry","symbol":candidate.symbol,"side":candidate.side,"entry_phase":candidate.entry_phase,"entry_trigger":candidate.entry_trigger,"risk_scale":candidate.risk_scale,"direction_risk_scale":direction_risk_scale,"effective_risk_scale":effective_risk_scale,"signal_age_ms":signal_age_ms(scan_ms,candidate.signal_ms),"max_signal_age_ms":max_signal_age_ms,"signal":candidate,"entry_price":entry,"qty":qty,"notional":qty*entry,"requested_leverage":cfg.exchange_leverage,"actual_leverage":actual_leverage,"margin_estimate":qty*entry/actual_leverage as f64,"risk_usd":qty*entry*risk_distance,"price_stop_risk_usd":qty*entry*cfg.stop_pct,"risk_execution_buffer_pct":cfg.risk_execution_buffer_pct,"fee":fee});
             append_event(&event_path, event.clone())?;
             state.record_trade(event);
         }
@@ -3764,6 +3781,8 @@ pub async fn run_altcoin_impulse(
         });
         scan_event["max_positions"] = json!(cfg.max_positions);
         scan_event["max_gross_multiple"] = json!(cfg.max_gross_multiple);
+        scan_event["long_risk_scale"] = json!(cfg.long_risk_scale);
+        scan_event["short_risk_scale"] = json!(cfg.short_risk_scale);
         scan_event["trail_activation_pct"] = json!(cfg.trail_activation_pct);
         scan_event["trail_pct"] = json!(cfg.trail_pct);
         scan_event["max_hold_hours"] = json!(cfg.max_hold_hours);
@@ -3806,6 +3825,16 @@ pub async fn run_altcoin_impulse(
         status_payload["altcoin_impulse"]["cross_section"] = state.cross_section_status.clone();
         status_payload["altcoin_impulse"]["max_positions"] = json!(cfg.max_positions);
         status_payload["altcoin_impulse"]["max_gross_multiple"] = json!(cfg.max_gross_multiple);
+        status_payload["altcoin_impulse"]["long_risk_scale"] = json!(cfg.long_risk_scale);
+        status_payload["altcoin_impulse"]["short_risk_scale"] = json!(cfg.short_risk_scale);
+        status_payload["altcoin_impulse"]["long_notional_estimate"] = json!(
+            current_equity * cfg.risk_per_trade * cfg.long_risk_scale
+                / (cfg.stop_pct + cfg.risk_execution_buffer_pct)
+        );
+        status_payload["altcoin_impulse"]["short_notional_estimate"] = json!(
+            current_equity * cfg.risk_per_trade * cfg.short_risk_scale
+                / (cfg.stop_pct + cfg.risk_execution_buffer_pct)
+        );
         status_payload["altcoin_impulse"]["first_week"] = json!(&first_week);
         status_payload["altcoin_impulse"]["daily_risk_baseline_equity"] =
             json!(state.day_start_equity);
@@ -4472,6 +4501,8 @@ mod tests {
         assert_eq!(strategy.altcoin_impulse.max_daily_entries, 10);
         assert_eq!(strategy.altcoin_impulse.max_daily_entry_bonus, 0);
         assert_eq!(strategy.altcoin_impulse.risk_per_trade, 0.04);
+        assert_eq!(strategy.altcoin_impulse.long_risk_scale, 0.75);
+        assert_eq!(strategy.altcoin_impulse.short_risk_scale, 1.0);
         assert_eq!(strategy.altcoin_impulse.stop_pct, 0.010);
         assert_eq!(strategy.altcoin_impulse.max_gross_multiple, 2.5);
         assert_eq!(strategy.altcoin_impulse.first_week_duration_days, 7);

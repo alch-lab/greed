@@ -9,6 +9,10 @@ exchange_leverage = 10
 # 标的不支持 10x 时自动回退，最低接受 5x；再低会因保证金占用过高而跳过。
 min_exchange_leverage = 5
 risk_per_trade = 0.04
+# 六日分钟级双窗口验证：多单约 2.0x 权益，给第二候选预留组合容量；
+# 空单样本较少但贡献更高，暂保留约 2.5x。两者仍受 max_gross_multiple 硬限制。
+long_risk_scale = 0.75
+short_risk_scale = 1.0
 max_positions = 2
 max_daily_entries = 10
 # 模拟盘固定最多 10 笔/北京时间自然日，不允许临时加额。
