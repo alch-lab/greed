@@ -166,8 +166,6 @@ pub struct AltcoinCrossSectionConfig {
     pub min_24h_volume_usd: f64,
     #[serde(default = "default_cross_gate_window")]
     pub gate_window: usize,
-    #[serde(default = "default_cross_min_universe")]
-    pub min_universe_size: usize,
     #[serde(default = "default_cross_gate_pf")]
     pub gate_min_profit_factor: f64,
     #[serde(default = "default_cross_assumed_cost_bps")]
@@ -183,7 +181,6 @@ impl Default for AltcoinCrossSectionConfig {
             names_per_side: default_cross_names_per_side(),
             min_24h_volume_usd: default_cross_min_volume(),
             gate_window: default_cross_gate_window(),
-            min_universe_size: default_cross_min_universe(),
             gate_min_profit_factor: default_cross_gate_pf(),
             assumed_cost_bps_per_side: default_cross_assumed_cost_bps(),
         }
@@ -204,9 +201,6 @@ fn default_cross_min_volume() -> f64 {
 }
 fn default_cross_gate_window() -> usize {
     10
-}
-fn default_cross_min_universe() -> usize {
-    20
 }
 fn default_cross_gate_pf() -> f64 {
     1.0
@@ -1194,12 +1188,17 @@ fn cross_section_analysis(
     cross: &AltcoinCrossSectionConfig,
     impulse: &AltcoinImpulseConfig,
 ) -> (Vec<Candidate>, Value) {
+    // The researched model only requires enough liquid names to form the
+    // complete two-long/two-short basket.  A separate 20-name floor was never
+    // part of the causal replay and can deadlock both the shadow gate and live
+    // execution when the point-in-time $50m universe contracts.
+    let min_universe_size = cross.names_per_side * 2;
     let mut history = Vec::new();
     let mut shadow_baskets = Vec::new();
     for offset in (1..=cross.gate_window).rev() {
         let entry_ms = boundary_ms - offset as i64 * cross.hold_hours as i64 * 3_600_000;
         let ranks = cross_ranks_at(bars_by_symbol, entry_ms, cross);
-        if ranks.len() < cross.min_universe_size {
+        if ranks.len() < min_universe_size {
             continue;
         }
         let Some(selected) = cross_selected(&ranks, cross.names_per_side) else {
@@ -1244,7 +1243,7 @@ fn cross_section_analysis(
         && history.iter().sum::<f64>() > 0.0
         && profit_factor >= cross.gate_min_profit_factor;
     let ranks = cross_ranks_at(bars_by_symbol, boundary_ms, cross);
-    let universe_ready = ranks.len() >= cross.min_universe_size;
+    let universe_ready = ranks.len() >= min_universe_size;
     let selected = universe_ready
         .then(|| cross_selected(&ranks, cross.names_per_side))
         .flatten()
@@ -1294,13 +1293,14 @@ fn cross_section_analysis(
     let next_boundary_ms = boundary_ms + cross.hold_hours as i64 * 3_600_000;
     let status = json!({
         "model":"6h_cross_section_reversal",
-        "stage": if !universe_ready {"ranking_incomplete"} else if !gate_ready {"warming_gate"} else if !gate_open {"gate_blocked"} else if selected_json.len() < cross.names_per_side*2 {"ranking_incomplete"} else {"ready_to_execute"},
+        "stage": if !universe_ready {"ranking_incomplete"} else if selected_json.len() < min_universe_size {"two_sided_extremes_missing"} else if !gate_ready {"warming_gate"} else if !gate_open {"gate_blocked"} else {"ready_to_execute"},
         "boundary_ms":boundary_ms,
         "next_boundary_ms":next_boundary_ms,
         "formation_hours":cross.formation_hours,
         "hold_hours":cross.hold_hours,
         "universe_count":ranks.len(),
-        "min_universe_size":cross.min_universe_size,
+        "min_universe_size":min_universe_size,
+        "universe_rule":"只要求足够组成完整的两多两空篮子；不再使用未经回测的 20 币硬门槛",
         "selected":selected_json,
         "ranked_extremes":ranked_extremes,
         "gate":{"ready":gate_ready,"open":gate_open,"samples":history.len(),"required_samples":cross.gate_window,"sum_return":history.iter().sum::<f64>(),"profit_factor":profit_factor,"required_profit_factor":cross.gate_min_profit_factor,"returns":history,"baskets":shadow_baskets},
@@ -2210,7 +2210,6 @@ pub async fn run_altcoin_impulse(
                 && cross_cfg.hold_hours == 4
                 && cross_cfg.names_per_side == 2
                 && cross_cfg.gate_window == 10
-                && cross_cfg.min_universe_size >= 20
                 && cross_cfg.min_24h_volume_usd >= 50_000_000.0
                 && (0.5..=2.0).contains(&cross_cfg.gate_min_profit_factor)
                 && (5.0..=25.0).contains(&cross_cfg.assumed_cost_bps_per_side)),
@@ -4505,7 +4504,6 @@ mod tests {
         assert_eq!(strategy.altcoin_cross_section.hold_hours, 4);
         assert_eq!(strategy.altcoin_cross_section.names_per_side, 2);
         assert_eq!(strategy.altcoin_cross_section.gate_window, 10);
-        assert_eq!(strategy.altcoin_cross_section.min_universe_size, 20);
         assert_eq!(
             strategy.altcoin_cross_section.min_24h_volume_usd,
             50_000_000.0
@@ -4567,15 +4565,14 @@ mod tests {
             bars_by_symbol.insert(symbol.to_owned(), bars);
         }
         let boundary_ms = 300 * 15 * 60_000;
-        let mut cross = strategy.altcoin_cross_section.clone();
-        cross.min_universe_size = 4;
         let (candidates, status) = super::cross_section_analysis(
             &bars_by_symbol,
             boundary_ms,
-            &cross,
+            &strategy.altcoin_cross_section,
             &strategy.altcoin_impulse,
         );
         assert_eq!(status["gate"]["samples"], 10);
+        assert_eq!(status["min_universe_size"], 4);
         assert_eq!(status["selected"].as_array().unwrap().len(), 4);
         assert!(candidates.is_empty(), "延续趋势下反转影子门控应关闭");
     }

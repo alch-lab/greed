@@ -107,7 +107,6 @@ hold_hours = 4
 names_per_side = 2
 min_24h_volume_usd = 50000000.0
 gate_window = 10
-min_universe_size = 20
 gate_min_profit_factor = 1.0
 # 影子门控的每一边成本含 5bp taker fee + 5bp 不利滑点。
 assumed_cost_bps_per_side = 10.0
