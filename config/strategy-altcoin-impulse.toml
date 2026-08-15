@@ -1,7 +1,6 @@
-# 山寨币 6h 横截面反转（独立高风险 sleeve）
-# 每个 UTC 4 小时边界，在过去 24h 成交额 >=5000 万美元的现货+永续币池中，
-# 做空 6h 涨幅前二、做多跌幅后二，持有 4h。四腿美元中性，总名义 0.75x 权益。
-# 最近 10 个完整影子篮子必须合计盈利且 PF>=1 才执行；日内权益回撤 4% 后停开。
+# 山寨币确认式放量突破（独立高风险 sleeve）
+# 以 109e769 的攻击型主线为基准：24h 突破后必须经历回踩/反抽，随后由独立
+# 15m K 线顺向收回才入场。保留后续版本的实时流动性、精度、杠杆回退和保护单修复。
 
 [altcoin_impulse]
 enabled = true
@@ -9,13 +8,13 @@ capital_usdt = 1000.0
 exchange_leverage = 10
 # 标的不支持 10x 时自动回退，最低接受 5x；再低会因保证金占用过高而跳过。
 min_exchange_leverage = 5
-risk_per_trade = 0.0084375
-max_positions = 4
-max_daily_entries = 24
-# 模拟盘固定最多 24 条开仓腿/北京时间自然日（6 个完整篮子），不允许临时加额。
+risk_per_trade = 0.04
+max_positions = 2
+max_daily_entries = 10
+# 模拟盘固定最多 10 笔/北京时间自然日，不允许临时加额。
 max_daily_entry_bonus = 0
 daily_loss_limit = 0.04
-max_gross_multiple = 0.75
+max_gross_multiple = 2.5
 # 模拟盘持续运行，不设盈利上限，也不因首个 7 天窗口结束而停止开仓。
 # 下面的 7 天窗口只用于首周亏损保护。
 first_week_duration_days = 7
@@ -24,9 +23,8 @@ first_week_loss_limit = 0.12
 # dry 模式每次开/平仓各施加 5bp 不利滑点；手续费仍按单边 5bp 另计。
 dry_slippage_bps = 5.0
 
-stop_pct = 0.040
-# 每腿入场后立即挂 4% STOP_MARKET。fixed_time_exit_only=true，因此下面的旧突破
-# 退出参数只为兼容配置结构，不参与横截面策略执行。
+stop_pct = 0.010
+# 每仓立即挂 1% STOP_MARKET；达到 +1.5% 先兑现 33%，剩余仓位按峰值回撤 0.5% 保护。
 loss_trim_trigger_pct = 0.01
 loss_trim_fraction = 0.50
 loss_trim_enabled = false
@@ -43,16 +41,15 @@ recovery_lock_adverse_pct = 0.03
 recovery_lock_activation_pct = 0.01
 recovery_lock_pct = 0.0025
 recovery_lock_enabled = false
-max_hold_hours = 4
-cooldown_hours = 0
+max_hold_hours = 2
+cooldown_hours = 4
 # 信号价到实际可成交价最多允许 1.5% 不利偏移；超出则 IOC 限价单不追。
 max_entry_slippage_pct = 0.015
-# 只在 4 小时边界后的 120 秒执行刚形成的横截面，避免追旧排名。
+# 只成交刚闭合的确认信号，避免仓位释放后追逐旧 K 线。
 max_signal_age_seconds = 120
-# 横截面门控通过后直接执行，不进入旧突破模型的回踩状态机。
-direct_entry_enabled = true
-fixed_time_exit_only = true
-# 以下确认字段只用于旧状态文件兼容。
+# 突破后等待回踩/反抽守住，再由后续独立 K 线顺向收回。
+direct_entry_enabled = false
+fixed_time_exit_only = false
 confirmation_window_bars = 4
 retest_touch_pct = 0.01
 retest_invalidation_pct = 0.015
@@ -64,7 +61,7 @@ extreme_direct_return_4h = 0.25
 extreme_direct_volume_ratio = 6.0
 extreme_direct_risk_scale = 0.33
 
-min_24h_volume_usd = 50000000.0
+min_24h_volume_usd = 5000000.0
 # 只扫描同名现货 + USDT 永续的山寨币；排除 BTC/ETH/BNB/SOL/XRP 及另外六个主流币，
 # 同时排除刚上市不足 7 天的永续、盘前和指数。
 min_contract_age_days = 7
@@ -82,7 +79,7 @@ unique_trade_prices_hard = false
 max_last_trade_age_seconds = 5
 min_return_1h = 0.04
 max_return_1h = 0.30
-# 旧追多模型字段，不参与横截面策略。
+# 过度延伸追多仍关闭，避免在脉冲末端接盘。
 overextension_long_return_1h = 0.12
 overextension_long_return_4h = 0.15
 overextension_long_enabled = false
@@ -93,20 +90,13 @@ min_volume_ratio = 4.0
 min_efficiency = 0.45
 min_close_location = 0.70
 
-# 非横截面时的兼容扫描上限；横截面边界会扫描全部合格币种。
-scan_limit = 200
+# 先按当前活跃度筛选，再进行因果信号判断。
+scan_limit = 60
 poll_seconds = 60
 
 # 高风险模块默认禁止主网实盘；paper/dry 不受影响。
 allow_live = false
 
 [altcoin_cross_section]
-enabled = true
-formation_hours = 6
-hold_hours = 4
-names_per_side = 2
-min_24h_volume_usd = 50000000.0
-gate_window = 10
-gate_min_profit_factor = 1.0
-# 影子门控的每一边成本含 5bp taker fee + 5bp 不利滑点。
-assumed_cost_bps_per_side = 10.0
+# 横截面反转不占真实仓位；当前真实执行恢复确认式放量突破。
+enabled = false

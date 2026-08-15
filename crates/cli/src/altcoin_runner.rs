@@ -2410,6 +2410,21 @@ pub async fn run_altcoin_impulse(
     if state.recent_trades.is_empty() {
         state.recent_trades = load_recent_trades(&event_path);
     }
+    if !cross_cfg.enabled && !state.cross_section_status.is_null() {
+        state.cross_section_status = Value::Null;
+        state.seen_signal.remove("__cross_section__");
+        append_event(
+            &event_path,
+            json!({
+                "ts_ms":now_ms,
+                "event":"strategy_mode_changed",
+                "from":"cross_section_reversal",
+                "to":"confirmed_volume_breakout",
+                "reason":"恢复 109e769 确认式放量突破主线并保留后续执行修复"
+            }),
+        )?;
+        save_state(&state_path, &state)?;
+    }
     if cfg.direct_entry_enabled && !state.pending_entries.is_empty() {
         let discarded = state.pending_entries.len();
         state.pending_entries.clear();
@@ -2484,7 +2499,12 @@ pub async fn run_altcoin_impulse(
         leverage = cfg.exchange_leverage,
         capital = initial_cash,
         cross_section = cross_cfg.enabled,
-        "启动独立山寨币横截面反转策略"
+        strategy = if cross_cfg.enabled {
+            "cross_section_reversal"
+        } else {
+            "confirmed_volume_breakout"
+        },
+        "启动独立山寨币策略"
     );
     append_event(
         &event_path,
@@ -4448,25 +4468,25 @@ mod tests {
         ))
         .unwrap();
         assert!(strategy.altcoin_impulse.enabled);
-        assert!(strategy.altcoin_cross_section.enabled);
-        assert_eq!(strategy.altcoin_impulse.max_daily_entries, 24);
+        assert!(!strategy.altcoin_cross_section.enabled);
+        assert_eq!(strategy.altcoin_impulse.max_daily_entries, 10);
         assert_eq!(strategy.altcoin_impulse.max_daily_entry_bonus, 0);
-        assert_eq!(strategy.altcoin_impulse.risk_per_trade, 0.0084375);
-        assert_eq!(strategy.altcoin_impulse.stop_pct, 0.040);
-        assert_eq!(strategy.altcoin_impulse.max_gross_multiple, 0.75);
+        assert_eq!(strategy.altcoin_impulse.risk_per_trade, 0.04);
+        assert_eq!(strategy.altcoin_impulse.stop_pct, 0.010);
+        assert_eq!(strategy.altcoin_impulse.max_gross_multiple, 2.5);
         assert_eq!(strategy.altcoin_impulse.first_week_duration_days, 7);
         assert_eq!(strategy.altcoin_impulse.first_week_loss_limit, 0.12);
         assert_eq!(strategy.altcoin_impulse.dry_slippage_bps, 5.0);
         assert_eq!(strategy.altcoin_impulse.trail_activation_pct, 0.015);
         assert_eq!(strategy.altcoin_impulse.trail_pct, 0.005);
         assert_eq!(strategy.altcoin_impulse.partial_take_profit_fraction, 0.33);
-        assert_eq!(strategy.altcoin_impulse.max_hold_hours, 4);
+        assert_eq!(strategy.altcoin_impulse.max_hold_hours, 2);
         assert_eq!(strategy.altcoin_impulse.loss_trim_trigger_pct, 0.01);
         assert!(!strategy.altcoin_impulse.loss_trim_enabled);
         assert!(!strategy.altcoin_impulse.failed_breakout_enabled);
         assert!(!strategy.altcoin_impulse.recovery_lock_enabled);
-        assert!(strategy.altcoin_impulse.direct_entry_enabled);
-        assert!(strategy.altcoin_impulse.fixed_time_exit_only);
+        assert!(!strategy.altcoin_impulse.direct_entry_enabled);
+        assert!(!strategy.altcoin_impulse.fixed_time_exit_only);
         assert_eq!(strategy.altcoin_impulse.loss_trim_fraction, 0.50);
         assert!(!strategy.altcoin_impulse.extreme_direct_enabled);
         assert_eq!(strategy.altcoin_impulse.max_spread_bps, 10.0);
@@ -4477,7 +4497,7 @@ mod tests {
         assert_eq!(strategy.altcoin_impulse.min_recent_trades, 30);
         assert_eq!(strategy.altcoin_impulse.min_unique_trade_prices, 8);
         assert!(!strategy.altcoin_impulse.unique_trade_prices_hard);
-        assert_eq!(strategy.altcoin_impulse.cooldown_hours, 0);
+        assert_eq!(strategy.altcoin_impulse.cooldown_hours, 4);
         assert_eq!(strategy.altcoin_impulse.max_signal_age_seconds, 120);
         assert_eq!(strategy.altcoin_impulse.confirmation_window_bars, 4);
         assert_eq!(strategy.altcoin_impulse.retest_touch_pct, 0.01);
