@@ -3781,6 +3781,11 @@ pub async fn run_altcoin_impulse(
         });
         scan_event["max_positions"] = json!(cfg.max_positions);
         scan_event["max_gross_multiple"] = json!(cfg.max_gross_multiple);
+        scan_event["execution_model"] = json!(if cross_cfg.enabled {
+            "cross_section_reversal"
+        } else {
+            "confirmed_volume_breakout"
+        });
         scan_event["long_risk_scale"] = json!(cfg.long_risk_scale);
         scan_event["short_risk_scale"] = json!(cfg.short_risk_scale);
         scan_event["trail_activation_pct"] = json!(cfg.trail_activation_pct);
@@ -3823,6 +3828,11 @@ pub async fn run_altcoin_impulse(
         status_payload["altcoin_impulse"]["entry_blocked"] =
             json!(daily_loss_blocked || first_week.entries_blocked);
         status_payload["altcoin_impulse"]["cross_section"] = state.cross_section_status.clone();
+        status_payload["altcoin_impulse"]["execution_model"] = json!(if cross_cfg.enabled {
+            "cross_section_reversal"
+        } else {
+            "confirmed_volume_breakout"
+        });
         status_payload["altcoin_impulse"]["max_positions"] = json!(cfg.max_positions);
         status_payload["altcoin_impulse"]["max_gross_multiple"] = json!(cfg.max_gross_multiple);
         status_payload["altcoin_impulse"]["long_risk_scale"] = json!(cfg.long_risk_scale);
