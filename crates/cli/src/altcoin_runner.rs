@@ -647,6 +647,10 @@ struct PersistedState {
     recent_trades: Vec<Value>,
     #[serde(default)]
     cross_section_status: Value,
+    #[serde(default)]
+    latest_signal_microstructure: Value,
+    #[serde(default)]
+    latest_confirmation_microstructure: Value,
 }
 
 impl PersistedState {
@@ -682,6 +686,8 @@ impl PersistedState {
             last_execution_issue: None,
             recent_trades: Vec::new(),
             cross_section_status: Value::Null,
+            latest_signal_microstructure: Value::Null,
+            latest_confirmation_microstructure: Value::Null,
         }
     }
 
@@ -3249,11 +3255,9 @@ pub async fn run_altcoin_impulse(
                     )
                     .await
                 {
-                    Ok(snapshot) => append_event(
-                        &event_path,
-                        json!({
+                    Ok(snapshot) => {
+                        let observation = json!({
                             "ts_ms":scan_ms,
-                            "event":"entry_microstructure_observation",
                             "stage":"signal",
                             "symbol":candidate.symbol,
                             "side":candidate.side,
@@ -3261,8 +3265,12 @@ pub async fn run_altcoin_impulse(
                             "target_notional":observation_notional,
                             "source":"execution_endpoint_rest_agg_trades_and_depth",
                             "snapshot":snapshot
-                        }),
-                    )?,
+                        });
+                        state.latest_signal_microstructure = observation.clone();
+                        let mut event = observation;
+                        event["event"] = json!("entry_microstructure_observation");
+                        append_event(&event_path, event)?;
+                    }
                     Err(error) => append_event(
                         &event_path,
                         json!({
@@ -3504,6 +3512,17 @@ pub async fn run_altcoin_impulse(
                         cfg.max_last_trade_age_seconds
                     ));
                 }
+                state.latest_confirmation_microstructure = json!({
+                    "ts_ms":scan_ms,
+                    "stage":"confirmation",
+                    "symbol":candidate.symbol,
+                    "side":candidate.side,
+                    "origin_signal_ms":candidate.signal_ms,
+                    "target_notional":notional,
+                    "source":"execution_endpoint_rest_agg_trades_and_depth",
+                    "passed":blockers.is_empty(),
+                    "snapshot":liquidity
+                });
                 append_event(
                     &event_path,
                     json!({"ts_ms":scan_ms,"event":"liquidity_check","microstructure_stage":"confirmation","microstructure_source":"execution_endpoint_rest_agg_trades_and_depth","origin_signal_ms":candidate.signal_ms,"symbol":candidate.symbol,"side":candidate.side,"target_notional":notional,"passed":blockers.is_empty(),"blockers":&blockers,"observations":if unique_trade_prices_warning {vec![format!("近 {} 秒仅 {} 个成交价，参考值 ≥{}；其他可成交性指标合格时不单独否决",cfg.recent_trade_window_seconds,liquidity.unique_trade_prices,cfg.min_unique_trade_prices)]} else {Vec::<String>::new()},"snapshot":liquidity,"limits":{"max_spread_bps":cfg.max_spread_bps,"max_entry_impact_bps":cfg.max_entry_impact_bps,"max_exit_impact_bps":cfg.max_exit_impact_bps,"depth_band_pct":cfg.depth_band_pct,"min_depth_multiple":cfg.min_depth_multiple,"recent_trade_window_seconds":cfg.recent_trade_window_seconds,"min_recent_trades":cfg.min_recent_trades,"min_unique_trade_prices":cfg.min_unique_trade_prices,"unique_trade_prices_hard":cfg.unique_trade_prices_hard,"max_last_trade_age_seconds":cfg.max_last_trade_age_seconds}}),
@@ -3953,6 +3972,11 @@ pub async fn run_altcoin_impulse(
                 "total_entries":state.total_entries, "total_exits":state.total_exits, "wins":state.wins,
                 "rejected_entries":state.rejected_entries, "last_execution_issue":state.last_execution_issue,
                 "recent_trades":state.recent_trades,
+                "microstructure": {
+                    "observation_only": true,
+                    "signal": state.latest_signal_microstructure,
+                    "confirmation": state.latest_confirmation_microstructure
+                },
                 "realized_pnl":state.realized_pnl, "fees":state.fees,
                 "candidates":candidates.into_iter().take(10).collect::<Vec<_>>(),
                 "journal":event_path,
