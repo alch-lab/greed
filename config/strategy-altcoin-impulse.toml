@@ -13,6 +13,10 @@ risk_per_trade = 0.04
 # 空单样本较少但贡献更高，暂保留约 2.5x。两者仍受 max_gross_multiple 硬限制。
 long_risk_scale = 0.75
 short_risk_scale = 1.0
+# 顺向拥挤保护：做多时检查正资金费率/正溢价，做空时镜像检查负值。
+# ACEUSDT 复盘中的 -0.997% 资金费率与 -1.26% 永续折价会被该门槛拦截。
+max_directional_funding_rate = 0.003
+max_directional_premium = 0.010
 max_positions = 2
 max_daily_entries = 10
 # 模拟盘固定最多 10 笔/北京时间自然日，不允许临时加额。

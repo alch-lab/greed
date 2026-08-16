@@ -46,6 +46,13 @@ class Variant:
     slippage_bps: float = 5.0
     entry_guard_pct: float | None = None
     volatility_target_pct: float | None = None
+    confirmation_bars: int | None = None
+    refresh_pending: bool = False
+    retest_touch_pct: float | None = None
+    reclaim_pct: float | None = None
+    max_gross_multiple: float | None = None
+    max_positions: int | None = None
+    cooldown_hours: int | None = None
 
 
 @dataclass
@@ -106,6 +113,12 @@ def replay_variant(batches, bars_15m, minute_bars, start_ms, end_ms, cfg, varian
     daily_loss_blocked = False
     peak = cash
     max_drawdown = 0.0
+    pending_cfg = {
+        **cfg,
+        "retest_touch_pct": variant.retest_touch_pct or cfg["retest_touch_pct"],
+        "reclaim_pct": variant.reclaim_pct or cfg["reclaim_pct"],
+    }
+    confirmation_bars = variant.confirmation_bars or int(cfg["confirmation_window_bars"])
 
     def equity() -> float:
         return cash + sum(p.signal.side * p.qty * (p.mark - p.entry) for p in positions.values())
@@ -132,7 +145,8 @@ def replay_variant(batches, bars_15m, minute_bars, start_ms, end_ms, cfg, varian
         cash += p.signal.side * p.qty * (price - p.entry) - fee
         pnl = p.partial_pnl + final
         completed_pnls.append(pnl)
-        cooldown[symbol] = ts + int(cfg["cooldown_hours"]) * 60 * rp.MINUTE_MS
+        cooldown_hours = variant.cooldown_hours or int(cfg["cooldown_hours"])
+        cooldown[symbol] = ts + cooldown_hours * 60 * rp.MINUTE_MS
         mfe = p.signal.side * (p.extreme / p.entry - 1.0)
         mae = -p.signal.side * (p.adverse / p.entry - 1.0)
         trades.append({
@@ -201,7 +215,7 @@ def replay_variant(batches, bars_15m, minute_bars, start_ms, end_ms, cfg, varian
                 if item.last_checked_ms > item.expires_ms:
                     del pending[symbol]
                     continue
-                decision = rp.pending_decision(item, bar, cfg)
+                decision = rp.pending_decision(item, bar, pending_cfg)
                 if decision == "invalid":
                     del pending[symbol]
                 elif decision == "retest":
@@ -214,10 +228,16 @@ def replay_variant(batches, bars_15m, minute_bars, start_ms, end_ms, cfg, varian
                     executable.append(signal)
                     del pending[symbol]
             for signal in batches.get(ts, []):
-                if signal.symbol in positions or signal.symbol in pending or seen.get(signal.symbol) == signal.signal_ms:
+                if signal.symbol in positions or seen.get(signal.symbol) == signal.signal_ms:
                     continue
                 seen[signal.symbol] = signal.signal_ms
-                pending[signal.symbol] = rp.Pending(signal, signal.signal_ms + int(cfg["confirmation_window_bars"]) * rp.BAR_MS, signal.signal_ms)
+                if signal.symbol in pending and not variant.refresh_pending:
+                    continue
+                pending[signal.symbol] = rp.Pending(
+                    signal,
+                    signal.signal_ms + confirmation_bars * rp.BAR_MS,
+                    signal.signal_ms,
+                )
             executable.sort(key=lambda item: (-item.score, item.symbol))
         else:
             executable = []
@@ -225,7 +245,8 @@ def replay_variant(batches, bars_15m, minute_bars, start_ms, end_ms, cfg, varian
         if equity() < day_start_equity * (1.0 - float(cfg["daily_loss_limit"])):
             daily_loss_blocked = True
         for signal in executable:
-            if daily_loss_blocked or len(positions) >= int(cfg["max_positions"]) or daily_entries >= int(cfg["max_daily_entries"]):
+            max_positions = variant.max_positions or int(cfg["max_positions"])
+            if daily_loss_blocked or len(positions) >= max_positions or daily_entries >= int(cfg["max_daily_entries"]):
                 break
             if signal.symbol in positions or cooldown.get(signal.symbol, 0) > ts:
                 continue
@@ -251,7 +272,7 @@ def replay_variant(batches, bars_15m, minute_bars, start_ms, end_ms, cfg, varian
             direction_scale = variant.long_scale if signal.side > 0 else variant.short_scale
             if variant.volatility_target_pct is not None:
                 direction_scale *= min(1.0, max(0.60, variant.volatility_target_pct / max(volatility, 1e-12)))
-            gross_multiple = float(cfg["max_gross_multiple"])
+            gross_multiple = variant.max_gross_multiple or float(cfg["max_gross_multiple"])
             if variant.dynamic_mode == "last3":
                 if len(completed_pnls) < 3:
                     gross_multiple = 2.0
@@ -363,6 +384,17 @@ def main() -> None:
         Variant("long_065", long_scale=0.65),
         Variant("long_070", long_scale=0.70),
         Variant("long_075", long_scale=0.75),
+        Variant("long_075_window6", long_scale=0.75, confirmation_bars=6),
+        Variant("long_075_window8", long_scale=0.75, confirmation_bars=8),
+        Variant("long_075_refresh4", long_scale=0.75, refresh_pending=True),
+        Variant("long_075_refresh6", long_scale=0.75, confirmation_bars=6, refresh_pending=True),
+        Variant("long_075_touch125", long_scale=0.75, retest_touch_pct=0.0125),
+        Variant("long_075_reclaim10", long_scale=0.75, reclaim_pct=0.001),
+        Variant("long_075_gross300", long_scale=0.75, max_gross_multiple=3.0),
+        Variant("long_075_gross350", long_scale=0.75, max_gross_multiple=3.5),
+        Variant("long_075_positions3", long_scale=0.75, max_positions=3),
+        Variant("long_075_cooldown3", long_scale=0.75, cooldown_hours=3),
+        Variant("long_075_cooldown2", long_scale=0.75, cooldown_hours=2),
         Variant("long_080", long_scale=0.80),
         Variant("long_085", long_scale=0.85),
         Variant("long_090", long_scale=0.90),

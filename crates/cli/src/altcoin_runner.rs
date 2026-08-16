@@ -43,6 +43,13 @@ pub struct AltcoinImpulseConfig {
     pub long_risk_scale: f64,
     #[serde(default = "default_risk_scale")]
     pub short_risk_scale: f64,
+    /// Reject entries that add risk in the already-crowded direction.  The
+    /// sign is mirrored: positive funding/premium crowds longs, while negative
+    /// funding/premium crowds shorts.
+    #[serde(default = "default_max_directional_funding_rate")]
+    pub max_directional_funding_rate: f64,
+    #[serde(default = "default_max_directional_premium")]
+    pub max_directional_premium: f64,
     pub max_positions: usize,
     pub max_daily_entries: u32,
     #[serde(default = "default_max_daily_entry_bonus")]
@@ -392,6 +399,39 @@ fn default_entry_trigger() -> String {
 
 fn default_risk_scale() -> f64 {
     1.0
+}
+
+fn default_max_directional_funding_rate() -> f64 {
+    0.003
+}
+
+fn default_max_directional_premium() -> f64 {
+    0.01
+}
+
+fn directional_crowding_reason(
+    side: i32,
+    funding_rate: Option<f64>,
+    perp_premium: Option<f64>,
+    max_funding: f64,
+    max_premium: f64,
+) -> Option<String> {
+    let (Some(funding_rate), Some(perp_premium)) = (funding_rate, perp_premium) else {
+        return Some("资金费率或永续溢价不可用，方向拥挤保护拒绝开仓".to_owned());
+    };
+    let direction = side as f64;
+    let directional_funding = direction * funding_rate;
+    let directional_premium = direction * perp_premium;
+    if directional_funding > max_funding || directional_premium > max_premium {
+        return Some(format!(
+            "顺方向仓位过度拥挤：方向化资金费率 {:.4}% / 上限 {:.4}%，方向化永续偏离 {:.3}% / 上限 {:.3}%",
+            directional_funding * 100.0,
+            max_funding * 100.0,
+            directional_premium * 100.0,
+            max_premium * 100.0
+        ));
+    }
+    None
 }
 
 fn default_recovery_lock_adverse_pct() -> f64 {
@@ -2245,6 +2285,11 @@ pub async fn run_altcoin_impulse(
         "山寨币多空风险系数必须在 0.25..=1.0"
     );
     anyhow::ensure!(
+        (0.0005..=0.02).contains(&cfg.max_directional_funding_rate)
+            && (0.002..=0.05).contains(&cfg.max_directional_premium),
+        "方向拥挤保护要求资金费率上限 0.05%..=2%、永续偏离上限 0.2%..=5%"
+    );
+    anyhow::ensure!(
         cfg.stop_pct >= 0.01 && cfg.stop_pct <= 0.12,
         "止损必须在 1%..=12%"
     );
@@ -3223,6 +3268,36 @@ pub async fn run_altcoin_impulse(
             }
         }
 
+        // Confirmation can take up to an hour, so funding and basis must be
+        // refreshed at execution time. Fail closed when either datum is
+        // unavailable; stale positioning data must never bypass this gate.
+        if !cross_cfg.enabled && !execution_candidates.is_empty() {
+            let mut crowding_checked = Vec::with_capacity(execution_candidates.len());
+            for candidate in execution_candidates {
+                let candidate = enrich_candidate(http.clone(), candidate).await;
+                if let Some(reason) = directional_crowding_reason(
+                    candidate.side,
+                    candidate.funding_rate,
+                    candidate.perp_premium,
+                    cfg.max_directional_funding_rate,
+                    cfg.max_directional_premium,
+                ) {
+                    append_event(
+                        &event_path,
+                        json!({"ts_ms":scan_ms,"event":"entry_rejected","stage":"directional_crowding","symbol":candidate.symbol,"side":candidate.side,"reason":&reason,"funding_rate":candidate.funding_rate,"perp_premium":candidate.perp_premium,"limits":{"max_directional_funding_rate":cfg.max_directional_funding_rate,"max_directional_premium":cfg.max_directional_premium}}),
+                    )?;
+                    state.note_execution_issue(
+                        scan_ms,
+                        &candidate.symbol,
+                        "directional_crowding",
+                        reason,
+                    );
+                    continue;
+                }
+                crowding_checked.push(candidate);
+            }
+            execution_candidates = crowding_checked;
+        }
         execution_candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
         if cross_cfg.enabled && !execution_candidates.is_empty() {
             let required = cross_cfg.names_per_side * 2;
@@ -3788,6 +3863,8 @@ pub async fn run_altcoin_impulse(
         });
         scan_event["long_risk_scale"] = json!(cfg.long_risk_scale);
         scan_event["short_risk_scale"] = json!(cfg.short_risk_scale);
+        scan_event["max_directional_funding_rate"] = json!(cfg.max_directional_funding_rate);
+        scan_event["max_directional_premium"] = json!(cfg.max_directional_premium);
         scan_event["trail_activation_pct"] = json!(cfg.trail_activation_pct);
         scan_event["trail_pct"] = json!(cfg.trail_pct);
         scan_event["max_hold_hours"] = json!(cfg.max_hold_hours);
@@ -3837,6 +3914,10 @@ pub async fn run_altcoin_impulse(
         status_payload["altcoin_impulse"]["max_gross_multiple"] = json!(cfg.max_gross_multiple);
         status_payload["altcoin_impulse"]["long_risk_scale"] = json!(cfg.long_risk_scale);
         status_payload["altcoin_impulse"]["short_risk_scale"] = json!(cfg.short_risk_scale);
+        status_payload["altcoin_impulse"]["max_directional_funding_rate"] =
+            json!(cfg.max_directional_funding_rate);
+        status_payload["altcoin_impulse"]["max_directional_premium"] =
+            json!(cfg.max_directional_premium);
         status_payload["altcoin_impulse"]["long_notional_estimate"] = json!(
             current_equity * cfg.risk_per_trade * cfg.long_risk_scale
                 / (cfg.stop_pct + cfg.risk_execution_buffer_pct)
@@ -4065,12 +4146,24 @@ pub async fn run_altcoin_impulse(
 mod tests {
     use super::{
         adverse_excursion, adverse_fill_price, apply_daily_entry_bonus, apply_daily_risk_reset,
-        clamp_entry_guard_price, detected_exit_reason, entry_phase, existing_stop_raw_fill,
-        failed_breakout, first_week_progress, pending_decision, realtime_trailing_stop,
-        recently_exited_symbol, record_daily_equity, record_exit, record_partial_exit,
-        recovery_profit_lock_stop, signal_age_ms, update_adverse_extreme, Bar, PendingDecision,
-        PersistedState, Position,
+        clamp_entry_guard_price, detected_exit_reason, directional_crowding_reason, entry_phase,
+        existing_stop_raw_fill, failed_breakout, first_week_progress, pending_decision,
+        realtime_trailing_stop, recently_exited_symbol, record_daily_equity, record_exit,
+        record_partial_exit, recovery_profit_lock_stop, signal_age_ms, update_adverse_extreme, Bar,
+        PendingDecision, PersistedState, Position,
     };
+
+    #[test]
+    fn directional_crowding_guard_is_mirrored_and_fails_closed() {
+        assert!(
+            directional_crowding_reason(-1, Some(-0.00996952), Some(-0.01257), 0.003, 0.01)
+                .is_some()
+        );
+        assert!(directional_crowding_reason(1, Some(0.004), Some(0.002), 0.003, 0.01).is_some());
+        assert!(directional_crowding_reason(1, Some(-0.004), Some(-0.02), 0.003, 0.01).is_none());
+        assert!(directional_crowding_reason(-1, Some(0.004), Some(0.02), 0.003, 0.01).is_none());
+        assert!(directional_crowding_reason(1, None, Some(0.0), 0.003, 0.01).is_some());
+    }
 
     #[test]
     fn exchange_leverage_does_not_change_stop_risk() {
@@ -4513,6 +4606,8 @@ mod tests {
         assert_eq!(strategy.altcoin_impulse.risk_per_trade, 0.04);
         assert_eq!(strategy.altcoin_impulse.long_risk_scale, 0.75);
         assert_eq!(strategy.altcoin_impulse.short_risk_scale, 1.0);
+        assert_eq!(strategy.altcoin_impulse.max_directional_funding_rate, 0.003);
+        assert_eq!(strategy.altcoin_impulse.max_directional_premium, 0.01);
         assert_eq!(strategy.altcoin_impulse.stop_pct, 0.010);
         assert_eq!(strategy.altcoin_impulse.max_gross_multiple, 2.5);
         assert_eq!(strategy.altcoin_impulse.first_week_duration_days, 7);
