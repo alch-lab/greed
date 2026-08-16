@@ -107,6 +107,27 @@ pub struct AltcoinImpulseConfig {
     pub retest_invalidation_pct: f64,
     #[serde(default = "default_reclaim_pct")]
     pub reclaim_pct: f64,
+    /// Large breakout candles have already moved too far away from the old
+    /// 24h boundary.  For those setups, confirm a shallow pullback around the
+    /// signal close instead of waiting for a structurally stale boundary.
+    #[serde(default)]
+    pub adaptive_retest_enabled: bool,
+    #[serde(default = "default_vertical_overshoot_pct")]
+    pub vertical_overshoot_pct: f64,
+    #[serde(default = "default_vertical_retest_touch_pct")]
+    pub vertical_retest_touch_pct: f64,
+    #[serde(default = "default_vertical_retest_invalidation_pct")]
+    pub vertical_retest_invalidation_pct: f64,
+    #[serde(default = "default_vertical_reclaim_pct")]
+    pub vertical_reclaim_pct: f64,
+    #[serde(default = "default_vertical_max_entry_extension_pct")]
+    pub vertical_max_entry_extension_pct: f64,
+    #[serde(default)]
+    pub intrabar_vertical_retest_enabled: bool,
+    #[serde(default = "default_intrabar_min_pullback_pct")]
+    pub intrabar_min_pullback_pct: f64,
+    #[serde(default = "default_intrabar_rebound_pct")]
+    pub intrabar_rebound_pct: f64,
     #[serde(default = "default_extreme_direct_enabled")]
     pub extreme_direct_enabled: bool,
     #[serde(default = "default_extreme_direct_return_1h")]
@@ -298,6 +319,22 @@ struct Candidate {
 struct PendingEntry {
     candidate: Candidate,
     breakout_level: f64,
+    #[serde(default)]
+    retest_anchor: f64,
+    #[serde(default = "default_confirmation_mode")]
+    confirmation_mode: String,
+    #[serde(default)]
+    intrabar_touch_seen: bool,
+    #[serde(default)]
+    intrabar_touch_ms: Option<i64>,
+    #[serde(default)]
+    intrabar_extreme_price: Option<f64>,
+    #[serde(default)]
+    intrabar_last_price: Option<f64>,
+    #[serde(default)]
+    intrabar_confirmed_ms: Option<i64>,
+    #[serde(default)]
+    intrabar_confirmed_price: Option<f64>,
     expires_ms: i64,
     last_checked_close_ms: i64,
     retest_seen: bool,
@@ -407,6 +444,38 @@ fn default_retest_invalidation_pct() -> f64 {
 
 fn default_reclaim_pct() -> f64 {
     0.002
+}
+
+fn default_vertical_overshoot_pct() -> f64 {
+    0.035
+}
+
+fn default_vertical_retest_touch_pct() -> f64 {
+    0.005
+}
+
+fn default_vertical_retest_invalidation_pct() -> f64 {
+    0.015
+}
+
+fn default_vertical_reclaim_pct() -> f64 {
+    0.002
+}
+
+fn default_vertical_max_entry_extension_pct() -> f64 {
+    0.02
+}
+
+fn default_intrabar_rebound_pct() -> f64 {
+    0.003
+}
+
+fn default_intrabar_min_pullback_pct() -> f64 {
+    0.003
+}
+
+fn default_confirmation_mode() -> String {
+    "breakout_retest".to_owned()
 }
 
 fn default_extreme_direct_return_1h() -> f64 {
@@ -1078,22 +1147,103 @@ enum PendingDecision {
     Invalidated,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum IntrabarPendingDecision {
+    Waiting,
+    Touched,
+    Confirmed,
+    Invalidated,
+}
+
+fn intrabar_pending_decision(
+    side: i32,
+    anchor: f64,
+    price: f64,
+    touch_seen: bool,
+    extreme_price: Option<f64>,
+    last_price: Option<f64>,
+    cfg: &AltcoinImpulseConfig,
+) -> IntrabarPendingDecision {
+    let holds = if side > 0 {
+        price >= anchor * (1.0 - cfg.vertical_retest_invalidation_pct)
+    } else {
+        price <= anchor * (1.0 + cfg.vertical_retest_invalidation_pct)
+    };
+    if !holds {
+        return IntrabarPendingDecision::Invalidated;
+    }
+    let touch = if side > 0 {
+        price <= anchor * (1.0 - cfg.intrabar_min_pullback_pct)
+    } else {
+        price >= anchor * (1.0 + cfg.intrabar_min_pullback_pct)
+    };
+    if !touch_seen {
+        return if touch {
+            IntrabarPendingDecision::Touched
+        } else {
+            IntrabarPendingDecision::Waiting
+        };
+    }
+    let extreme = extreme_price.unwrap_or(price);
+    let directional_tick = last_price.is_some_and(|previous| {
+        if side > 0 {
+            price > previous
+        } else {
+            price < previous
+        }
+    });
+    let rebound = if side > 0 {
+        price >= extreme * (1.0 + cfg.intrabar_rebound_pct)
+    } else {
+        price <= extreme * (1.0 - cfg.intrabar_rebound_pct)
+    };
+    let reclaimed = if side > 0 {
+        price >= anchor * (1.0 + cfg.vertical_reclaim_pct)
+            && price <= anchor * (1.0 + cfg.vertical_max_entry_extension_pct)
+    } else {
+        price <= anchor * (1.0 - cfg.vertical_reclaim_pct)
+            && price >= anchor * (1.0 - cfg.vertical_max_entry_extension_pct)
+    };
+    if directional_tick && rebound && reclaimed {
+        IntrabarPendingDecision::Confirmed
+    } else {
+        IntrabarPendingDecision::Waiting
+    }
+}
+
 fn pending_decision(
     side: i32,
-    breakout: f64,
+    anchor: f64,
+    confirmation_mode: &str,
     bar: &Bar,
     retest_seen: bool,
     cfg: &AltcoinImpulseConfig,
 ) -> PendingDecision {
-    let touch = if side > 0 {
-        bar.low <= breakout * (1.0 + cfg.retest_touch_pct)
+    let vertical = confirmation_mode == "vertical_impulse_retest";
+    let touch_pct = if vertical {
+        cfg.vertical_retest_touch_pct
     } else {
-        bar.high >= breakout * (1.0 - cfg.retest_touch_pct)
+        cfg.retest_touch_pct
+    };
+    let invalidation_pct = if vertical {
+        cfg.vertical_retest_invalidation_pct
+    } else {
+        cfg.retest_invalidation_pct
+    };
+    let reclaim_pct = if vertical {
+        cfg.vertical_reclaim_pct
+    } else {
+        cfg.reclaim_pct
+    };
+    let touch = if side > 0 {
+        bar.low <= anchor * (1.0 + touch_pct)
+    } else {
+        bar.high >= anchor * (1.0 - touch_pct)
     };
     let holds = if side > 0 {
-        bar.low >= breakout * (1.0 - cfg.retest_invalidation_pct)
+        bar.low >= anchor * (1.0 - invalidation_pct)
     } else {
-        bar.high <= breakout * (1.0 + cfg.retest_invalidation_pct)
+        bar.high <= anchor * (1.0 + invalidation_pct)
     };
     if !holds {
         return PendingDecision::Invalidated;
@@ -1107,11 +1257,21 @@ fn pending_decision(
             PendingDecision::Waiting
         };
     }
-    let reclaimed = if side > 0 {
-        bar.close >= breakout * (1.0 + cfg.reclaim_pct) && bar.close > bar.open
+    let mut reclaimed = if side > 0 {
+        bar.close >= anchor * (1.0 + reclaim_pct) && bar.close > bar.open
     } else {
-        bar.close <= breakout * (1.0 - cfg.reclaim_pct) && bar.close < bar.open
+        bar.close <= anchor * (1.0 - reclaim_pct) && bar.close < bar.open
     };
+    // A shallow pullback is not permission to chase a second vertical leg.
+    // If the independent confirmation bar has already run too far away from
+    // the signal-price anchor, keep waiting rather than entering at the top.
+    if vertical {
+        reclaimed &= if side > 0 {
+            bar.close <= anchor * (1.0 + cfg.vertical_max_entry_extension_pct)
+        } else {
+            bar.close >= anchor * (1.0 - cfg.vertical_max_entry_extension_pct)
+        };
+    }
     if reclaimed {
         PendingDecision::Confirmed
     } else if touch {
@@ -1119,6 +1279,109 @@ fn pending_decision(
     } else {
         PendingDecision::Waiting
     }
+}
+
+fn confirmation_plan(candidate: &Candidate, cfg: &AltcoinImpulseConfig) -> (f64, String) {
+    let overshoot = if candidate.breakout_level > 0.0 {
+        candidate.side as f64 * (candidate.price / candidate.breakout_level - 1.0)
+    } else {
+        0.0
+    };
+    if cfg.adaptive_retest_enabled && overshoot >= cfg.vertical_overshoot_pct {
+        (candidate.price, "vertical_impulse_retest".to_owned())
+    } else {
+        (candidate.breakout_level, default_confirmation_mode())
+    }
+}
+
+async fn advance_intrabar_pending_entries(
+    state: &mut PersistedState,
+    client: &live::RestClient,
+    cfg: &AltcoinImpulseConfig,
+    now_ms: i64,
+    event_path: &str,
+) -> Result<bool> {
+    if !cfg.intrabar_vertical_retest_enabled {
+        return Ok(false);
+    }
+    let symbols: Vec<String> = state
+        .pending_entries
+        .iter()
+        .filter(|(_, pending)| {
+            pending.confirmation_mode == "vertical_impulse_retest"
+                && pending.intrabar_confirmed_ms.is_none()
+        })
+        .map(|(symbol, _)| symbol.clone())
+        .collect();
+    let mut rescan_now = false;
+    for symbol in symbols {
+        let price = match client.mark_price(&symbol).await {
+            Ok(price) if price.is_finite() && price > 0.0 => price,
+            Ok(_) => continue,
+            Err(error) => {
+                warn!(symbol=%symbol, error=%error, "盘中浅回踩标记价读取失败");
+                continue;
+            }
+        };
+        let Some(mut pending) = state.pending_entries.get(&symbol).cloned() else {
+            continue;
+        };
+        let anchor = if pending.retest_anchor > 0.0 {
+            pending.retest_anchor
+        } else {
+            pending.candidate.price
+        };
+        let decision = intrabar_pending_decision(
+            pending.candidate.side,
+            anchor,
+            price,
+            pending.intrabar_touch_seen,
+            pending.intrabar_extreme_price,
+            pending.intrabar_last_price,
+            cfg,
+        );
+        pending.intrabar_extreme_price = Some(match pending.intrabar_extreme_price {
+            Some(extreme) if pending.candidate.side > 0 => extreme.min(price),
+            Some(extreme) => extreme.max(price),
+            None => price,
+        });
+        pending.intrabar_last_price = Some(price);
+        match decision {
+            IntrabarPendingDecision::Invalidated => {
+                state.pending_entries.remove(&symbol);
+                append_event(
+                    event_path,
+                    json!({"ts_ms":now_ms,"event":"entry_setup_invalidated","symbol":symbol,"side":pending.candidate.side,"origin_signal_ms":pending.candidate.signal_ms,"confirmation_mode":pending.confirmation_mode,"retest_anchor":anchor,"observed_price":price,"source":"realtime_mark_price","reason":"盘中价格击穿垂直脉冲浅回踩失效线"}),
+                )?;
+                rescan_now = true;
+            }
+            IntrabarPendingDecision::Touched => {
+                pending.intrabar_touch_seen = true;
+                pending.intrabar_touch_ms = Some(now_ms);
+                pending.intrabar_extreme_price = Some(price);
+                state.pending_entries.insert(symbol.clone(), pending);
+                append_event(
+                    event_path,
+                    json!({"ts_ms":now_ms,"event":"entry_setup_intrabar_touch","symbol":symbol,"side":state.pending_entries[&symbol].candidate.side,"retest_anchor":anchor,"touch_price":price,"source":"realtime_mark_price","reason":"盘中首次触及垂直脉冲浅回踩区，等待后续实时收回"}),
+                )?;
+                rescan_now = true;
+            }
+            IntrabarPendingDecision::Confirmed => {
+                pending.intrabar_confirmed_ms = Some(now_ms);
+                pending.intrabar_confirmed_price = Some(price);
+                state.pending_entries.insert(symbol.clone(), pending);
+                append_event(
+                    event_path,
+                    json!({"ts_ms":now_ms,"event":"entry_setup_intrabar_confirmed","symbol":symbol,"side":state.pending_entries[&symbol].candidate.side,"retest_anchor":anchor,"touch_ms":state.pending_entries[&symbol].intrabar_touch_ms,"extreme_price":state.pending_entries[&symbol].intrabar_extreme_price,"confirmation_price":price,"rebound_pct":cfg.intrabar_rebound_pct,"max_entry_extension_pct":cfg.vertical_max_entry_extension_pct,"source":"realtime_mark_price","reason":"盘中浅回踩后按时间顺序重新收回，转交完整执行门槛"}),
+                )?;
+                rescan_now = true;
+            }
+            IntrabarPendingDecision::Waiting => {
+                state.pending_entries.insert(symbol, pending);
+            }
+        }
+    }
+    Ok(rescan_now)
 }
 
 fn recently_exited_symbol(
@@ -2722,6 +2985,18 @@ pub async fn run_altcoin_impulse(
         "回踩/反抽确认参数不合法"
     );
     anyhow::ensure!(
+        !cfg.adaptive_retest_enabled
+            || ((0.02..=0.10).contains(&cfg.vertical_overshoot_pct)
+                && (0.002..=0.02).contains(&cfg.vertical_retest_touch_pct)
+                && cfg.vertical_retest_invalidation_pct >= cfg.vertical_retest_touch_pct
+                && cfg.vertical_retest_invalidation_pct <= 0.05
+                && (0.0..=0.01).contains(&cfg.vertical_reclaim_pct)
+                && (0.01..=0.05).contains(&cfg.vertical_max_entry_extension_pct)
+                && (0.001..=0.02).contains(&cfg.intrabar_min_pullback_pct)
+                && (0.001..=0.02).contains(&cfg.intrabar_rebound_pct)),
+        "垂直脉冲自适应回踩参数不合法"
+    );
+    anyhow::ensure!(
         cfg.extreme_direct_return_1h > cfg.overextension_long_return_1h
             && cfg.extreme_direct_return_1h < cfg.max_return_1h
             && cfg.extreme_direct_return_4h > cfg.overextension_long_return_4h
@@ -2811,6 +3086,28 @@ pub async fn run_altcoin_impulse(
     }
     if state.recent_trades.is_empty() {
         state.recent_trades = load_recent_trades(&event_path);
+    }
+    // Upgrade pending entries created by a pre-adaptive binary in place.  Old
+    // state files deserialize the new anchor as zero; recompute the plan from
+    // the persisted candidate so deployment never requires deleting journals.
+    let mut pending_migrations = Vec::new();
+    for (symbol, pending) in &mut state.pending_entries {
+        if pending.retest_anchor > 0.0 {
+            continue;
+        }
+        let (anchor, mode) = confirmation_plan(&pending.candidate, &cfg);
+        pending.retest_anchor = anchor;
+        pending.confirmation_mode = mode.clone();
+        pending_migrations.push((symbol.clone(), anchor, mode));
+    }
+    if !pending_migrations.is_empty() {
+        for (symbol, anchor, mode) in &pending_migrations {
+            append_event(
+                &event_path,
+                json!({"ts_ms":now_ms,"event":"pending_entry_confirmation_migrated","symbol":symbol,"retest_anchor":anchor,"confirmation_mode":mode,"reason":"旧状态文件升级到自适应回踩模型"}),
+            )?;
+        }
+        save_state(&state_path, &state)?;
     }
     if !cross_cfg.enabled && !state.cross_section_status.is_null() {
         state.cross_section_status = Value::Null;
@@ -3638,71 +3935,109 @@ pub async fn run_altcoin_impulse(
                 continue;
             };
             let mut terminal = None;
-            if let Some(bars) = bars_by_symbol.get(&symbol) {
-                let unchecked: Vec<&Bar> = bars
-                    .iter()
-                    .filter(|bar| {
-                        bar.close_ms > pending.last_checked_close_ms
-                            && bar.close_ms > pending.candidate.signal_ms
-                    })
-                    .collect();
-                for bar in unchecked {
-                    if bar.close_ms > pending.expires_ms {
-                        terminal = Some((
-                            "entry_setup_expired",
-                            None,
-                            "确认窗口内没有形成回踩/反抽后的重新启动",
-                        ));
-                        break;
-                    }
-                    pending.last_checked_close_ms = bar.close_ms;
-                    match pending_decision(
-                        pending.candidate.side,
-                        pending.breakout_level,
-                        bar,
-                        pending.retest_seen,
-                        &cfg,
-                    ) {
-                        PendingDecision::Invalidated => {
+            if let (Some(confirmed_ms), Some(confirmed_price)) = (
+                pending.intrabar_confirmed_ms,
+                pending.intrabar_confirmed_price,
+            ) {
+                if signal_age_ms(scan_ms, confirmed_ms) > max_signal_age_ms {
+                    terminal = Some((
+                        "entry_setup_expired",
+                        None,
+                        "盘中收回确认已超过实时执行窗口",
+                    ));
+                } else {
+                    let mut confirmed = pending.candidate.clone();
+                    confirmed.signal_ms = confirmed_ms;
+                    confirmed.price = confirmed_price;
+                    confirmed.entry_trigger =
+                        "vertical_impulse_intrabar_reclaim_confirmed".to_owned();
+                    confirmed.risk_scale = 1.0;
+                    confirmed.blockers.clear();
+                    terminal = Some((
+                        "entry_setup_intrabar_execution",
+                        Some(confirmed),
+                        "盘中浅回踩按时间顺序收回，进入完整执行检查",
+                    ));
+                }
+            }
+            if terminal.is_none() {
+                if let Some(bars) = bars_by_symbol.get(&symbol) {
+                    let unchecked: Vec<&Bar> = bars
+                        .iter()
+                        .filter(|bar| {
+                            bar.close_ms > pending.last_checked_close_ms
+                                && bar.close_ms > pending.candidate.signal_ms
+                        })
+                        .collect();
+                    for bar in unchecked {
+                        if bar.close_ms > pending.expires_ms {
                             terminal = Some((
-                                "entry_setup_invalidated",
+                                "entry_setup_expired",
                                 None,
-                                "价格穿透突破位容忍区，原启动结构失效",
+                                "确认窗口内没有形成回踩/反抽后的重新启动",
                             ));
                             break;
                         }
-                        PendingDecision::Confirmed => {
-                            if signal_age_ms(scan_ms, bar.close_ms) > max_signal_age_ms {
+                        pending.last_checked_close_ms = bar.close_ms;
+                        let retest_anchor = if pending.retest_anchor > 0.0 {
+                            pending.retest_anchor
+                        } else {
+                            pending.breakout_level
+                        };
+                        match pending_decision(
+                            pending.candidate.side,
+                            retest_anchor,
+                            &pending.confirmation_mode,
+                            bar,
+                            pending.retest_seen,
+                            &cfg,
+                        ) {
+                            PendingDecision::Invalidated => {
                                 terminal = Some((
-                                    "entry_setup_expired",
+                                    "entry_setup_invalidated",
                                     None,
-                                    "确认 K 线已超过实时执行窗口，不在重启后追旧确认",
+                                    "价格穿透突破位容忍区，原启动结构失效",
                                 ));
                                 break;
                             }
-                            let mut confirmed = pending.candidate.clone();
-                            confirmed.signal_ms = bar.close_ms;
-                            confirmed.price = bar.close;
-                            confirmed.entry_trigger = "retest_reclaim_confirmed".to_owned();
-                            confirmed.risk_scale = 1.0;
-                            confirmed.blockers.clear();
-                            terminal = Some((
-                                "entry_setup_confirmed",
-                                Some(confirmed),
-                                "回踩/反抽守住突破位并重新顺向收盘",
-                            ));
-                            break;
-                        }
-                        PendingDecision::RetestSeen => {
-                            if !pending.retest_seen {
-                                pending.retest_seen = true;
-                                append_event(
-                                    &event_path,
-                                    json!({"ts_ms":scan_ms,"event":"entry_setup_retest_seen","symbol":symbol,"side":pending.candidate.side,"breakout_level":pending.breakout_level,"bar":{"open_ms":bar.open_ms,"close_ms":bar.close_ms,"open":bar.open,"high":bar.high,"low":bar.low,"close":bar.close},"reason":"已触及突破区，等待重新顺向收盘"}),
-                                )?;
+                            PendingDecision::Confirmed => {
+                                if signal_age_ms(scan_ms, bar.close_ms) > max_signal_age_ms {
+                                    terminal = Some((
+                                        "entry_setup_expired",
+                                        None,
+                                        "确认 K 线已超过实时执行窗口，不在重启后追旧确认",
+                                    ));
+                                    break;
+                                }
+                                let mut confirmed = pending.candidate.clone();
+                                confirmed.signal_ms = bar.close_ms;
+                                confirmed.price = bar.close;
+                                confirmed.entry_trigger =
+                                    if pending.confirmation_mode == "vertical_impulse_retest" {
+                                        "vertical_impulse_reclaim_confirmed".to_owned()
+                                    } else {
+                                        "retest_reclaim_confirmed".to_owned()
+                                    };
+                                confirmed.risk_scale = 1.0;
+                                confirmed.blockers.clear();
+                                terminal = Some((
+                                    "entry_setup_confirmed",
+                                    Some(confirmed),
+                                    "回踩/反抽守住突破位并重新顺向收盘",
+                                ));
+                                break;
                             }
+                            PendingDecision::RetestSeen => {
+                                if !pending.retest_seen {
+                                    pending.retest_seen = true;
+                                    append_event(
+                                        &event_path,
+                                        json!({"ts_ms":scan_ms,"event":"entry_setup_retest_seen","symbol":symbol,"side":pending.candidate.side,"breakout_level":pending.breakout_level,"retest_anchor":retest_anchor,"confirmation_mode":pending.confirmation_mode,"bar":{"open_ms":bar.open_ms,"close_ms":bar.close_ms,"open":bar.open,"high":bar.high,"low":bar.low,"close":bar.close},"reason":"已触及自适应回踩区，等待后续独立 K 线重新顺向收盘"}),
+                                    )?;
+                                }
+                            }
+                            PendingDecision::Waiting => {}
                         }
-                        PendingDecision::Waiting => {}
                     }
                 }
             }
@@ -3712,7 +4047,7 @@ pub async fn run_altcoin_impulse(
             if let Some((event_name, confirmed, reason)) = terminal {
                 append_event(
                     &event_path,
-                    json!({"ts_ms":scan_ms,"event":event_name,"symbol":symbol,"side":pending.candidate.side,"origin_signal_ms":pending.candidate.signal_ms,"breakout_level":pending.breakout_level,"expires_ms":pending.expires_ms,"retest_seen":pending.retest_seen,"reason":reason}),
+                    json!({"ts_ms":scan_ms,"event":event_name,"symbol":symbol,"side":pending.candidate.side,"origin_signal_ms":pending.candidate.signal_ms,"breakout_level":pending.breakout_level,"retest_anchor":pending.retest_anchor,"confirmation_mode":pending.confirmation_mode,"expires_ms":pending.expires_ms,"retest_seen":pending.retest_seen,"reason":reason}),
                 )?;
                 state.pending_entries.remove(&symbol);
                 if let Some(confirmed) = confirmed {
@@ -3819,11 +4154,21 @@ pub async fn run_altcoin_impulse(
             } else {
                 let expires_ms =
                     candidate.signal_ms + cfg.confirmation_window_bars as i64 * 15 * 60_000;
+                let (retest_anchor, confirmation_mode) = confirmation_plan(candidate, &cfg);
+                let vertical = confirmation_mode == "vertical_impulse_retest";
                 state.pending_entries.insert(
                     candidate.symbol.clone(),
                     PendingEntry {
                         candidate: candidate.clone(),
                         breakout_level: candidate.breakout_level,
+                        retest_anchor,
+                        confirmation_mode: confirmation_mode.clone(),
+                        intrabar_touch_seen: false,
+                        intrabar_touch_ms: None,
+                        intrabar_extreme_price: None,
+                        intrabar_last_price: None,
+                        intrabar_confirmed_ms: None,
+                        intrabar_confirmed_price: None,
                         expires_ms,
                         last_checked_close_ms: candidate.signal_ms,
                         retest_seen: false,
@@ -3831,7 +4176,7 @@ pub async fn run_altcoin_impulse(
                 );
                 append_event(
                     &event_path,
-                    json!({"ts_ms":scan_ms,"event":"entry_setup_pending","symbol":candidate.symbol,"side":candidate.side,"signal_ms":candidate.signal_ms,"breakout_level":candidate.breakout_level,"signal_price":candidate.price,"expires_ms":expires_ms,"confirmation_window_bars":cfg.confirmation_window_bars,"retest_touch_pct":cfg.retest_touch_pct,"retest_invalidation_pct":cfg.retest_invalidation_pct,"reclaim_pct":cfg.reclaim_pct,"signal":candidate}),
+                    json!({"ts_ms":scan_ms,"event":"entry_setup_pending","symbol":candidate.symbol,"side":candidate.side,"signal_ms":candidate.signal_ms,"breakout_level":candidate.breakout_level,"signal_price":candidate.price,"retest_anchor":retest_anchor,"confirmation_mode":confirmation_mode,"overshoot_pct":candidate.side as f64*(candidate.price/candidate.breakout_level-1.0),"expires_ms":expires_ms,"confirmation_window_bars":cfg.confirmation_window_bars,"retest_touch_pct":if vertical {cfg.vertical_retest_touch_pct} else {cfg.retest_touch_pct},"retest_invalidation_pct":if vertical {cfg.vertical_retest_invalidation_pct} else {cfg.retest_invalidation_pct},"reclaim_pct":if vertical {cfg.vertical_reclaim_pct} else {cfg.reclaim_pct},"signal":candidate}),
                 )?;
             }
         }
@@ -4526,6 +4871,18 @@ pub async fn run_altcoin_impulse(
         scan_event["short_risk_scale"] = json!(cfg.short_risk_scale);
         scan_event["max_directional_funding_rate"] = json!(cfg.max_directional_funding_rate);
         scan_event["max_directional_premium"] = json!(cfg.max_directional_premium);
+        scan_event["adaptive_retest_enabled"] = json!(cfg.adaptive_retest_enabled);
+        scan_event["vertical_overshoot_pct"] = json!(cfg.vertical_overshoot_pct);
+        scan_event["vertical_retest_touch_pct"] = json!(cfg.vertical_retest_touch_pct);
+        scan_event["vertical_retest_invalidation_pct"] =
+            json!(cfg.vertical_retest_invalidation_pct);
+        scan_event["vertical_reclaim_pct"] = json!(cfg.vertical_reclaim_pct);
+        scan_event["vertical_max_entry_extension_pct"] =
+            json!(cfg.vertical_max_entry_extension_pct);
+        scan_event["intrabar_vertical_retest_enabled"] =
+            json!(cfg.intrabar_vertical_retest_enabled);
+        scan_event["intrabar_min_pullback_pct"] = json!(cfg.intrabar_min_pullback_pct);
+        scan_event["intrabar_rebound_pct"] = json!(cfg.intrabar_rebound_pct);
         scan_event["trail_activation_pct"] = json!(cfg.trail_activation_pct);
         scan_event["trail_pct"] = json!(cfg.trail_pct);
         scan_event["max_hold_hours"] = json!(cfg.max_hold_hours);
@@ -4616,6 +4973,22 @@ pub async fn run_altcoin_impulse(
         status_payload["altcoin_impulse"]["retest_invalidation_pct"] =
             json!(cfg.retest_invalidation_pct);
         status_payload["altcoin_impulse"]["reclaim_pct"] = json!(cfg.reclaim_pct);
+        status_payload["altcoin_impulse"]["adaptive_retest_enabled"] =
+            json!(cfg.adaptive_retest_enabled);
+        status_payload["altcoin_impulse"]["vertical_overshoot_pct"] =
+            json!(cfg.vertical_overshoot_pct);
+        status_payload["altcoin_impulse"]["vertical_retest_touch_pct"] =
+            json!(cfg.vertical_retest_touch_pct);
+        status_payload["altcoin_impulse"]["vertical_retest_invalidation_pct"] =
+            json!(cfg.vertical_retest_invalidation_pct);
+        status_payload["altcoin_impulse"]["vertical_reclaim_pct"] = json!(cfg.vertical_reclaim_pct);
+        status_payload["altcoin_impulse"]["vertical_max_entry_extension_pct"] =
+            json!(cfg.vertical_max_entry_extension_pct);
+        status_payload["altcoin_impulse"]["intrabar_vertical_retest_enabled"] =
+            json!(cfg.intrabar_vertical_retest_enabled);
+        status_payload["altcoin_impulse"]["intrabar_min_pullback_pct"] =
+            json!(cfg.intrabar_min_pullback_pct);
+        status_payload["altcoin_impulse"]["intrabar_rebound_pct"] = json!(cfg.intrabar_rebound_pct);
         status_payload["altcoin_impulse"]["extreme_direct_return_1h"] =
             json!(cfg.extreme_direct_return_1h);
         status_payload["altcoin_impulse"]["extreme_direct_return_4h"] =
@@ -4720,6 +5093,31 @@ pub async fn run_altcoin_impulse(
                         append_event(
                             &event_path,
                             json!({"ts_ms":refresh_ms,"event":"position_management_error","reason":error.to_string(),"original_protection_retained":true}),
+                        )?;
+                    }
+                }
+                match advance_intrabar_pending_entries(
+                    &mut state,
+                    client,
+                    &cfg,
+                    refresh_ms,
+                    &event_path,
+                )
+                .await
+                {
+                    Ok(true) => {
+                        save_state(&state_path, &state)?;
+                        // A touch invalidation or a confirmed reclaim changes the
+                        // decision pipeline. Re-enter the outer loop immediately so
+                        // confirmation is executed without waiting for the 60s scan.
+                        break;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        warn!(error=%error, "盘中浅回踩状态更新失败，保留原候选等待下轮");
+                        append_event(
+                            &event_path,
+                            json!({"ts_ms":refresh_ms,"event":"intrabar_confirmation_error","reason":error.to_string(),"pending_preserved":true}),
                         )?;
                     }
                 }
@@ -4841,12 +5239,13 @@ pub async fn run_altcoin_impulse(
 mod tests {
     use super::{
         adverse_excursion, adverse_fill_price, apply_daily_entry_bonus, apply_daily_risk_reset,
-        clamp_entry_guard_price, detected_exit_reason, directional_crowding_reason, entry_phase,
-        evaluate, evaluate_pulse_impulse, existing_stop_raw_fill, failed_breakout,
-        first_week_progress, pending_decision, position_excursions, pulse_exhaustion_candidate,
-        realtime_trailing_stop, recently_exited_symbol, record_daily_equity, record_exit,
-        record_partial_exit, recovery_profit_lock_stop, signal_age_ms, update_adverse_extreme, Bar,
-        PendingDecision, PersistedState, Position, PulseExhaustionSetup,
+        clamp_entry_guard_price, confirmation_plan, default_entry_trigger, detected_exit_reason,
+        directional_crowding_reason, entry_phase, evaluate, evaluate_pulse_impulse,
+        existing_stop_raw_fill, failed_breakout, first_week_progress, intrabar_pending_decision,
+        pending_decision, position_excursions, pulse_exhaustion_candidate, realtime_trailing_stop,
+        recently_exited_symbol, record_daily_equity, record_exit, record_partial_exit,
+        recovery_profit_lock_stop, signal_age_ms, update_adverse_extreme, Bar, Candidate,
+        IntrabarPendingDecision, PendingDecision, PersistedState, Position, PulseExhaustionSetup,
     };
 
     #[test]
@@ -5390,28 +5789,153 @@ mod tests {
             quote_volume: 1.0,
         };
         assert_eq!(
-            pending_decision(1, 100.0, &bar(99.8, 101.0, 99.5, 100.4), false, &cfg),
+            pending_decision(
+                1,
+                100.0,
+                "breakout_retest",
+                &bar(99.8, 101.0, 99.5, 100.4),
+                false,
+                &cfg
+            ),
             PendingDecision::RetestSeen
         );
         assert_eq!(
-            pending_decision(-1, 100.0, &bar(100.2, 100.5, 99.0, 99.6), false, &cfg),
+            pending_decision(
+                -1,
+                100.0,
+                "breakout_retest",
+                &bar(100.2, 100.5, 99.0, 99.6),
+                false,
+                &cfg
+            ),
             PendingDecision::RetestSeen
         );
         assert_eq!(
-            pending_decision(1, 100.0, &bar(100.1, 101.0, 100.05, 100.4), true, &cfg),
+            pending_decision(
+                1,
+                100.0,
+                "breakout_retest",
+                &bar(100.1, 101.0, 100.05, 100.4),
+                true,
+                &cfg
+            ),
             PendingDecision::Confirmed
         );
         assert_eq!(
-            pending_decision(-1, 100.0, &bar(99.9, 99.95, 99.0, 99.6), true, &cfg),
+            pending_decision(
+                1,
+                107.5,
+                "vertical_impulse_retest",
+                &bar(107.7, 111.0, 107.6, 110.0),
+                true,
+                &cfg
+            ),
+            PendingDecision::RetestSeen
+        );
+
+        let vertical_candidate = Candidate {
+            symbol: "GIGGLEUSDT".to_owned(),
+            signal_ms: 1,
+            side: 1,
+            price: 33.50,
+            return_1h: 0.0859,
+            return_4h: 0.0916,
+            volume_ratio: 8.65,
+            efficiency: 0.98,
+            close_location: 0.86,
+            volume_24h: 1_000_000.0,
+            score: 1.0,
+            entry_phase: "standard_impulse".to_owned(),
+            breakout_level: 31.18,
+            entry_trigger: default_entry_trigger(),
+            risk_scale: 1.0,
+            blockers: vec![],
+            spot_return_1h: None,
+            oi_change_1h: None,
+            funding_rate: None,
+            perp_premium: None,
+        };
+        let (anchor, mode) = confirmation_plan(&vertical_candidate, &cfg);
+        assert_eq!(anchor, vertical_candidate.price);
+        assert_eq!(mode, "vertical_impulse_retest");
+        assert_eq!(
+            intrabar_pending_decision(1, 33.50, 33.55, false, None, None, &cfg),
+            IntrabarPendingDecision::Waiting
+        );
+        assert_eq!(
+            intrabar_pending_decision(1, 33.50, 33.20, false, None, None, &cfg),
+            IntrabarPendingDecision::Touched
+        );
+        assert_eq!(
+            intrabar_pending_decision(1, 33.50, 33.60, true, Some(33.20), Some(33.40), &cfg),
+            IntrabarPendingDecision::Confirmed
+        );
+        assert_eq!(
+            intrabar_pending_decision(1, 33.50, 36.08, true, Some(33.20), Some(35.80), &cfg),
+            IntrabarPendingDecision::Waiting
+        );
+        assert_eq!(
+            intrabar_pending_decision(1, 33.50, 32.47, true, Some(33.20), Some(33.07), &cfg),
+            IntrabarPendingDecision::Invalidated
+        );
+        assert_eq!(
+            pending_decision(
+                -1,
+                100.0,
+                "breakout_retest",
+                &bar(99.9, 99.95, 99.0, 99.6),
+                true,
+                &cfg
+            ),
             PendingDecision::Confirmed
         );
         assert_eq!(
-            pending_decision(1, 100.0, &bar(100.0, 100.5, 98.4, 98.8), false, &cfg),
+            pending_decision(
+                1,
+                100.0,
+                "breakout_retest",
+                &bar(100.0, 100.5, 98.4, 98.8),
+                false,
+                &cfg
+            ),
             PendingDecision::Invalidated
         );
         assert_eq!(
-            pending_decision(-1, 100.0, &bar(100.0, 101.6, 99.5, 101.2), false, &cfg),
+            pending_decision(
+                -1,
+                100.0,
+                "breakout_retest",
+                &bar(100.0, 101.6, 99.5, 101.2),
+                false,
+                &cfg
+            ),
             PendingDecision::Invalidated
+        );
+
+        // A vertical impulse is anchored at its signal close rather than the
+        // stale 24h boundary. The first shallow pullback only arms the setup;
+        // a later independent bar must still confirm direction.
+        assert_eq!(
+            pending_decision(
+                1,
+                107.5,
+                "vertical_impulse_retest",
+                &bar(107.6, 108.0, 107.1, 107.8),
+                false,
+                &cfg
+            ),
+            PendingDecision::RetestSeen
+        );
+        assert_eq!(
+            pending_decision(
+                1,
+                107.5,
+                "vertical_impulse_retest",
+                &bar(107.7, 108.4, 107.6, 108.1),
+                true,
+                &cfg
+            ),
+            PendingDecision::Confirmed
         );
     }
 
@@ -5461,6 +5985,21 @@ mod tests {
         assert_eq!(strategy.altcoin_impulse.retest_touch_pct, 0.01);
         assert_eq!(strategy.altcoin_impulse.retest_invalidation_pct, 0.015);
         assert_eq!(strategy.altcoin_impulse.reclaim_pct, 0.002);
+        assert!(strategy.altcoin_impulse.adaptive_retest_enabled);
+        assert_eq!(strategy.altcoin_impulse.vertical_overshoot_pct, 0.035);
+        assert_eq!(strategy.altcoin_impulse.vertical_retest_touch_pct, 0.005);
+        assert_eq!(
+            strategy.altcoin_impulse.vertical_retest_invalidation_pct,
+            0.015
+        );
+        assert_eq!(strategy.altcoin_impulse.vertical_reclaim_pct, 0.002);
+        assert_eq!(
+            strategy.altcoin_impulse.vertical_max_entry_extension_pct,
+            0.02
+        );
+        assert!(strategy.altcoin_impulse.intrabar_vertical_retest_enabled);
+        assert_eq!(strategy.altcoin_impulse.intrabar_min_pullback_pct, 0.003);
+        assert_eq!(strategy.altcoin_impulse.intrabar_rebound_pct, 0.003);
         assert_eq!(strategy.altcoin_impulse.extreme_direct_risk_scale, 0.33);
         assert!(strategy.altcoin_impulse.pulse_exhaustion_enabled);
         assert!(!strategy.altcoin_impulse.pulse_exhaustion_allow_live);

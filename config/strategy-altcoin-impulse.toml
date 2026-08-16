@@ -62,6 +62,21 @@ confirmation_window_bars = 4
 retest_touch_pct = 0.01
 retest_invalidation_pct = 0.015
 reclaim_pct = 0.002
+# 信号 K 已越过旧 24h 边界 3.5% 以上时，旧边界会变成过深且失真的
+# 回踩锚点。此时改用信号收盘价观察浅回踩；仍必须由下一根独立 15m K
+# 顺向收回，不允许在放量大阳/大阴线闭合后直接追单。
+adaptive_retest_enabled = true
+vertical_overshoot_pct = 0.035
+vertical_retest_touch_pct = 0.005
+vertical_retest_invalidation_pct = 0.015
+vertical_reclaim_pct = 0.002
+# 即使已经浅回踩，确认收盘距离信号锚点超过 2% 也不追第二段垂直拉升。
+vertical_max_entry_extension_pct = 0.02
+# 垂直脉冲候选每约 5 秒读取一次实时 markPrice：必须先观察到浅回踩，
+# 后续另一次采样从盘中极值反弹至少 0.3%，才可转交流动性与风控执行门槛。
+intrabar_vertical_retest_enabled = true
+intrabar_min_pullback_pct = 0.003
+intrabar_rebound_pct = 0.003
 # 旧极端延续分支关闭。
 extreme_direct_enabled = false
 extreme_direct_return_1h = 0.18
