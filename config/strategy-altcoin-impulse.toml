@@ -69,6 +69,22 @@ extreme_direct_return_4h = 0.25
 extreme_direct_volume_ratio = 6.0
 extreme_direct_risk_scale = 0.33
 
+# 独立小仓杠杆衰竭做空：极端上涨脉冲后，只观察紧随其后的第一根 15m K。
+# 六日因果回放的有效组合为：永续仍强、OI 快速堆积、现货跟随不足且冲高回落。
+# 仅 paper/dry 启用；它拥有独立的 1 个仓位槽和 0.5x 权益名义额度。
+pulse_exhaustion_enabled = true
+pulse_exhaustion_allow_live = false
+pulse_initial_return_1h = 0.06
+pulse_initial_volume_ratio = 10.0
+pulse_perp_return_1h = 0.06
+pulse_oi_change_1h = 0.20
+pulse_max_spot_perp_ratio = 1.10
+pulse_min_peak_retrace = 0.035
+pulse_max_close_location = 0.80
+pulse_risk_scale = 0.15
+pulse_max_positions = 1
+pulse_max_gross_multiple = 0.50
+
 min_24h_volume_usd = 5000000.0
 # 只扫描同名现货 + USDT 永续的山寨币；排除 BTC/ETH/BNB/SOL/XRP 及另外六个主流币，
 # 同时排除刚上市不足 7 天的永续、盘前和指数。
