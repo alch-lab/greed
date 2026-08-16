@@ -3222,6 +3222,62 @@ pub async fn run_altcoin_impulse(
             {
                 continue;
             }
+            // Capture the tape and book when the setup first appears. This is
+            // observation-only: historical tests show that same-direction
+            // second-level Delta is often terminal crowding, not a universally
+            // valid entry gate. The paired execution-time snapshot below lets
+            // us learn whether flow strengthening, fading or flipping improves
+            // this exact confirmed-retest strategy without suppressing trades.
+            if let Some(client) = rest.as_ref() {
+                let direction_risk_scale = if candidate.side > 0 {
+                    cfg.long_risk_scale
+                } else {
+                    cfg.short_risk_scale
+                };
+                let observation_notional = managed_equity
+                    * cfg.risk_per_trade
+                    * candidate.risk_scale
+                    * direction_risk_scale
+                    / (cfg.stop_pct + cfg.risk_execution_buffer_pct);
+                match client
+                    .liquidity_snapshot(
+                        &candidate.symbol,
+                        candidate.side,
+                        observation_notional.max(20.0),
+                        cfg.depth_band_pct,
+                        cfg.recent_trade_window_seconds as i64 * 1_000,
+                    )
+                    .await
+                {
+                    Ok(snapshot) => append_event(
+                        &event_path,
+                        json!({
+                            "ts_ms":scan_ms,
+                            "event":"entry_microstructure_observation",
+                            "stage":"signal",
+                            "symbol":candidate.symbol,
+                            "side":candidate.side,
+                            "origin_signal_ms":candidate.signal_ms,
+                            "target_notional":observation_notional,
+                            "source":"execution_endpoint_rest_agg_trades_and_depth",
+                            "snapshot":snapshot
+                        }),
+                    )?,
+                    Err(error) => append_event(
+                        &event_path,
+                        json!({
+                            "ts_ms":scan_ms,
+                            "event":"entry_microstructure_observation",
+                            "stage":"signal",
+                            "symbol":candidate.symbol,
+                            "side":candidate.side,
+                            "origin_signal_ms":candidate.signal_ms,
+                            "available":false,
+                            "error":error.to_string()
+                        }),
+                    )?,
+                }
+            }
             state
                 .seen_signal
                 .insert(candidate.symbol.clone(), candidate.signal_ms);
@@ -3450,7 +3506,7 @@ pub async fn run_altcoin_impulse(
                 }
                 append_event(
                     &event_path,
-                    json!({"ts_ms":scan_ms,"event":"liquidity_check","symbol":candidate.symbol,"side":candidate.side,"target_notional":notional,"passed":blockers.is_empty(),"blockers":&blockers,"observations":if unique_trade_prices_warning {vec![format!("近 {} 秒仅 {} 个成交价，参考值 ≥{}；其他可成交性指标合格时不单独否决",cfg.recent_trade_window_seconds,liquidity.unique_trade_prices,cfg.min_unique_trade_prices)]} else {Vec::<String>::new()},"snapshot":liquidity,"limits":{"max_spread_bps":cfg.max_spread_bps,"max_entry_impact_bps":cfg.max_entry_impact_bps,"max_exit_impact_bps":cfg.max_exit_impact_bps,"depth_band_pct":cfg.depth_band_pct,"min_depth_multiple":cfg.min_depth_multiple,"recent_trade_window_seconds":cfg.recent_trade_window_seconds,"min_recent_trades":cfg.min_recent_trades,"min_unique_trade_prices":cfg.min_unique_trade_prices,"unique_trade_prices_hard":cfg.unique_trade_prices_hard,"max_last_trade_age_seconds":cfg.max_last_trade_age_seconds}}),
+                    json!({"ts_ms":scan_ms,"event":"liquidity_check","microstructure_stage":"confirmation","microstructure_source":"execution_endpoint_rest_agg_trades_and_depth","origin_signal_ms":candidate.signal_ms,"symbol":candidate.symbol,"side":candidate.side,"target_notional":notional,"passed":blockers.is_empty(),"blockers":&blockers,"observations":if unique_trade_prices_warning {vec![format!("近 {} 秒仅 {} 个成交价，参考值 ≥{}；其他可成交性指标合格时不单独否决",cfg.recent_trade_window_seconds,liquidity.unique_trade_prices,cfg.min_unique_trade_prices)]} else {Vec::<String>::new()},"snapshot":liquidity,"limits":{"max_spread_bps":cfg.max_spread_bps,"max_entry_impact_bps":cfg.max_entry_impact_bps,"max_exit_impact_bps":cfg.max_exit_impact_bps,"depth_band_pct":cfg.depth_band_pct,"min_depth_multiple":cfg.min_depth_multiple,"recent_trade_window_seconds":cfg.recent_trade_window_seconds,"min_recent_trades":cfg.min_recent_trades,"min_unique_trade_prices":cfg.min_unique_trade_prices,"unique_trade_prices_hard":cfg.unique_trade_prices_hard,"max_last_trade_age_seconds":cfg.max_last_trade_age_seconds}}),
                 )?;
                 if !blockers.is_empty() {
                     let reason = blockers.join(" / ");

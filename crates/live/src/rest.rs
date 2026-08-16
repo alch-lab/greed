@@ -78,6 +78,75 @@ pub struct LiquiditySnapshot {
     pub recent_trade_count: usize,
     pub unique_trade_prices: usize,
     pub last_trade_age_ms: i64,
+    /// Returned aggregate-trade history coverage. A value below 60 seconds
+    /// means the REST limit was saturated and the 60-second flow fields are
+    /// deliberately left unavailable instead of reporting a biased sample.
+    pub trade_history_span_ms: i64,
+    pub depth_imbalance: Option<f64>,
+    pub trade_notional_60s: Option<f64>,
+    pub delta_usd_60s: Option<f64>,
+    pub delta_share_10s: Option<f64>,
+    pub delta_share_30s: Option<f64>,
+    pub delta_share_60s: Option<f64>,
+    pub large_trade_delta_share_60s: Option<f64>,
+    pub flow_persistence_60s: Option<f64>,
+    pub volume_acceleration_60s: Option<f64>,
+    pub trade_count_acceleration_60s: Option<f64>,
+    pub price_return_60s: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct AggTradePoint {
+    ts_ms: i64,
+    price: f64,
+    notional: f64,
+    signed_notional: f64,
+}
+
+fn parse_agg_trade(value: &serde_json::Value) -> Option<AggTradePoint> {
+    let price: f64 = value["p"].as_str()?.parse().ok()?;
+    let qty: f64 = value["q"].as_str()?.parse().ok()?;
+    let notional = price * qty;
+    // Binance `m=true` means the buyer was the maker, hence the aggressor sold.
+    let signed_notional = if value["m"].as_bool()? {
+        -notional
+    } else {
+        notional
+    };
+    Some(AggTradePoint {
+        ts_ms: value["T"].as_i64()?,
+        price,
+        notional,
+        signed_notional,
+    })
+}
+
+fn covered_window(
+    trades: &[AggTradePoint],
+    now_ms: i64,
+    window_ms: i64,
+) -> Option<Vec<&AggTradePoint>> {
+    let oldest = trades.iter().map(|trade| trade.ts_ms).min()?;
+    if oldest > now_ms.saturating_sub(window_ms) {
+        return None;
+    }
+    Some(
+        trades
+            .iter()
+            .filter(|trade| trade.ts_ms >= now_ms.saturating_sub(window_ms))
+            .collect(),
+    )
+}
+
+fn delta_share(trades: &[&AggTradePoint]) -> Option<f64> {
+    let total: f64 = trades.iter().map(|trade| trade.notional).sum();
+    (total > 0.0).then(|| {
+        trades
+            .iter()
+            .map(|trade| trade.signed_notional)
+            .sum::<f64>()
+            / total
+    })
 }
 
 fn parse_level(value: &serde_json::Value) -> Option<(f64, f64)> {
@@ -444,25 +513,122 @@ impl RestClient {
             (bids, bid, asks, ask)
         };
         let now_ms = self.ts();
-        let cutoff = now_ms.saturating_sub(trade_window_ms);
-        let recent: Vec<_> = trades
+        let mut parsed_trades: Vec<_> = trades
             .as_array()
             .into_iter()
             .flatten()
-            .filter(|trade| trade["T"].as_i64().is_some_and(|ts| ts >= cutoff))
+            .filter_map(parse_agg_trade)
             .collect();
-        let last_trade_ms = trades
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|trade| trade["T"].as_i64())
+        parsed_trades.sort_by_key(|trade| trade.ts_ms);
+        let cutoff = now_ms.saturating_sub(trade_window_ms);
+        let recent: Vec<_> = parsed_trades
+            .iter()
+            .filter(|trade| trade.ts_ms >= cutoff)
+            .collect();
+        let last_trade_ms = parsed_trades
+            .iter()
+            .map(|trade| trade.ts_ms)
             .max()
             .unwrap_or(0);
+        let oldest_trade_ms = parsed_trades
+            .iter()
+            .map(|trade| trade.ts_ms)
+            .min()
+            .unwrap_or(now_ms);
         let unique_trade_prices = recent
             .iter()
-            .filter_map(|trade| trade["p"].as_str())
+            .map(|trade| trade.price.to_bits())
             .collect::<HashSet<_>>()
             .len();
+
+        let window_10s = covered_window(&parsed_trades, now_ms, 10_000);
+        let window_30s = covered_window(&parsed_trades, now_ms, 30_000);
+        let window_60s = covered_window(&parsed_trades, now_ms, 60_000);
+        let delta_share_10s = window_10s.as_deref().and_then(delta_share);
+        let delta_share_30s = window_30s.as_deref().and_then(delta_share);
+        let delta_share_60s = window_60s.as_deref().and_then(delta_share);
+        let trade_notional_60s = window_60s
+            .as_ref()
+            .map(|window| window.iter().map(|trade| trade.notional).sum());
+        let delta_usd_60s = window_60s.as_ref().map(|window| {
+            window
+                .iter()
+                .map(|trade| trade.signed_notional)
+                .sum::<f64>()
+        });
+        let price_return_60s = window_60s.as_ref().and_then(|window| {
+            let first = window.first()?.price;
+            let last = window.last()?.price;
+            (first > 0.0).then_some(last / first - 1.0)
+        });
+        let large_trade_delta_share_60s = window_60s.as_ref().and_then(|window| {
+            if window.is_empty() {
+                return None;
+            }
+            let mut notionals: Vec<_> = window.iter().map(|trade| trade.notional).collect();
+            notionals.sort_by(f64::total_cmp);
+            let threshold = notionals[(notionals.len() * 9 / 10).min(notionals.len() - 1)];
+            let large: Vec<_> = window
+                .iter()
+                .copied()
+                .filter(|trade| trade.notional >= threshold)
+                .collect();
+            delta_share(&large)
+        });
+        let flow_persistence_60s = window_60s.as_ref().map(|window| {
+            let total_delta: f64 = window.iter().map(|trade| trade.signed_notional).sum();
+            if total_delta == 0.0 {
+                return 0.0;
+            }
+            let direction = total_delta.signum();
+            let aligned_bins = (0..6)
+                .filter(|bin| {
+                    let from = now_ms - (6 - bin) * 10_000;
+                    let to = from + 10_000;
+                    let bin_delta: f64 = window
+                        .iter()
+                        .filter(|trade| trade.ts_ms >= from && trade.ts_ms < to)
+                        .map(|trade| trade.signed_notional)
+                        .sum();
+                    bin_delta != 0.0 && bin_delta.signum() == direction
+                })
+                .count();
+            aligned_bins as f64 / 6.0
+        });
+
+        // Compare the latest minute with the preceding four-minute average.
+        // Requiring full five-minute coverage prevents the 1000-row REST cap
+        // from manufacturing an artificial acceleration signal.
+        let window_5m = covered_window(&parsed_trades, now_ms, 300_000);
+        let (volume_acceleration_60s, trade_count_acceleration_60s) = window_5m
+            .as_ref()
+            .map(|window| {
+                let recent_start = now_ms - 60_000;
+                let recent_volume: f64 = window
+                    .iter()
+                    .filter(|trade| trade.ts_ms >= recent_start)
+                    .map(|trade| trade.notional)
+                    .sum();
+                let prior_volume: f64 = window
+                    .iter()
+                    .filter(|trade| trade.ts_ms < recent_start)
+                    .map(|trade| trade.notional)
+                    .sum();
+                let recent_count = window
+                    .iter()
+                    .filter(|trade| trade.ts_ms >= recent_start)
+                    .count() as f64;
+                let prior_count = window
+                    .iter()
+                    .filter(|trade| trade.ts_ms < recent_start)
+                    .count() as f64;
+                (
+                    (prior_volume > 0.0).then_some(recent_volume / (prior_volume / 4.0)),
+                    (prior_count > 0.0).then_some(recent_count / (prior_count / 4.0)),
+                )
+            })
+            .unwrap_or((None, None));
+        let depth_total = bid_depth_usd + ask_depth_usd;
         Ok(LiquiditySnapshot {
             measured_at_ms: now_ms,
             bid,
@@ -475,6 +641,19 @@ impl RestClient {
             recent_trade_count: recent.len(),
             unique_trade_prices,
             last_trade_age_ms: now_ms.saturating_sub(last_trade_ms),
+            trade_history_span_ms: now_ms.saturating_sub(oldest_trade_ms),
+            depth_imbalance: (depth_total > 0.0)
+                .then_some((bid_depth_usd - ask_depth_usd) / depth_total),
+            trade_notional_60s,
+            delta_usd_60s,
+            delta_share_10s,
+            delta_share_30s,
+            delta_share_60s,
+            large_trade_delta_share_60s,
+            flow_persistence_60s,
+            volume_acceleration_60s,
+            trade_count_acceleration_60s,
+            price_return_60s,
         })
     }
 
@@ -853,6 +1032,21 @@ mod tests {
             impact > 49.0 && impact < 51.0,
             "half the notional fills 1% higher"
         );
+    }
+
+    #[test]
+    fn parses_aggressor_direction_and_refuses_partial_windows() {
+        let buy = serde_json::json!({"T": 99_000, "p":"100", "q":"2", "m":false});
+        let sell = serde_json::json!({"T": 99_500, "p":"100", "q":"1", "m":true});
+        let buy = parse_agg_trade(&buy).unwrap();
+        let sell = parse_agg_trade(&sell).unwrap();
+        assert_eq!(buy.signed_notional, 200.0);
+        assert_eq!(sell.signed_notional, -100.0);
+        assert!((delta_share(&[&buy, &sell]).unwrap() - 1.0 / 3.0).abs() < 1e-12);
+
+        let trades = vec![buy, sell];
+        assert!(covered_window(&trades, 100_000, 1_000).is_some());
+        assert!(covered_window(&trades, 100_000, 10_000).is_none());
     }
 
     #[test]
