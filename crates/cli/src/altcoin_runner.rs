@@ -1247,6 +1247,88 @@ fn evaluate(symbol: String, bars: &[Bar], cfg: &AltcoinImpulseConfig) -> Option<
     })
 }
 
+/// Build the arming observation for the independent leverage-exhaustion sleeve.
+///
+/// This deliberately does not reuse `evaluate`: the main strategy's 24h breakout,
+/// 4h return band, path efficiency and close-location rules describe continuation
+/// entries, not a leveraged pulse that may later become a short after exhaustion.
+fn evaluate_pulse_impulse(
+    symbol: String,
+    bars: &[Bar],
+    cfg: &AltcoinImpulseConfig,
+) -> Option<Candidate> {
+    if bars.len() < 7 * 96 + 17 {
+        return None;
+    }
+    let i = bars.len() - 1;
+    let close = bars[i].close;
+    let return_1h = close / bars[i - 4].close - 1.0;
+    let return_4h = close / bars[i - 16].close - 1.0;
+    let hour_volume = |end: usize| {
+        bars[end - 3..=end]
+            .iter()
+            .map(|bar| bar.quote_volume)
+            .sum::<f64>()
+    };
+    let current_hour_volume = hour_volume(i);
+    let historical: Vec<f64> = (i - 7 * 96..i)
+        .filter(|&end| end >= 3)
+        .map(hour_volume)
+        .collect();
+    let volume_ratio = current_hour_volume / median(historical).max(1.0);
+    let volume_24h = bars[i - 95..=i]
+        .iter()
+        .map(|bar| bar.quote_volume)
+        .sum::<f64>();
+    let spread = bars[i].high - bars[i].low;
+    let close_location = if spread > 0.0 {
+        (close - bars[i].low) / spread
+    } else {
+        0.5
+    };
+    let mut blockers = Vec::new();
+    if return_1h < cfg.pulse_initial_return_1h {
+        blockers.push(format!(
+            "独立脉冲 1h 涨幅 {:.1}% < {:.1}%",
+            return_1h * 100.0,
+            cfg.pulse_initial_return_1h * 100.0
+        ));
+    }
+    if volume_ratio < cfg.pulse_initial_volume_ratio {
+        blockers.push(format!(
+            "独立脉冲量比 {:.1}x < {:.1}x",
+            volume_ratio, cfg.pulse_initial_volume_ratio
+        ));
+    }
+    if volume_24h < cfg.min_24h_volume_usd {
+        blockers.push("24h 成交额不足".into());
+    }
+    let progress = (return_1h / cfg.pulse_initial_return_1h).clamp(0.0, 1.0)
+        + (volume_ratio / cfg.pulse_initial_volume_ratio).clamp(0.0, 1.0);
+    Some(Candidate {
+        symbol,
+        signal_ms: bars[i].close_ms,
+        side: 1,
+        price: close,
+        score: progress * (volume_24h / 1_000_000.0).ln_1p(),
+        return_1h,
+        return_4h,
+        volume_ratio,
+        efficiency: 1.0,
+        close_location,
+        volume_24h,
+        entry_phase: "pulse_impulse".to_owned(),
+        breakout_level: close,
+        entry_trigger: "independent_leverage_pulse".to_owned(),
+        risk_scale: cfg.pulse_risk_scale,
+        blockers,
+        spot_return_1h: None,
+        oi_change_1h: None,
+        funding_rate: None,
+        perp_premium: None,
+    })
+}
+
 async fn enrich_candidate(http: reqwest::Client, mut candidate: Candidate) -> Candidate {
     let spot_url = format!(
         "{SPOT_BASE}/api/v3/klines?symbol={}&interval=15m&limit=5&endTime={}",
@@ -3281,6 +3363,15 @@ pub async fn run_altcoin_impulse(
                 .filter_map(|(s, bars)| evaluate(s.clone(), bars, &cfg))
                 .collect()
         };
+        let mut pulse_initial_candidates: Vec<Candidate> =
+            if pulse_exhaustion_active && !cross_cfg.enabled {
+                bars_by_symbol
+                    .iter()
+                    .filter_map(|(symbol, bars)| evaluate_pulse_impulse(symbol.clone(), bars, &cfg))
+                    .collect()
+            } else {
+                Vec::new()
+            };
         if let Some(symbols) = execution_symbols.as_ref() {
             for candidate in &mut candidates {
                 if !symbols.contains(&candidate.symbol) {
@@ -3302,7 +3393,20 @@ pub async fn run_altcoin_impulse(
                 ));
             }
         }
+        for candidate in &mut pulse_initial_candidates {
+            if signal_age_ms(scan_ms, candidate.signal_ms) > max_signal_age_ms {
+                candidate.blockers.push(format!(
+                    "独立脉冲 K 已超过 {} 秒实时窗口",
+                    cfg.max_signal_age_seconds
+                ));
+            }
+        }
         candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+        pulse_initial_candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+        let nearest_pulse_initial = pulse_initial_candidates
+            .iter()
+            .find(|candidate| candidate.return_1h > 0.0)
+            .cloned();
         // OI、现货同步与永续溢价先作为观察字段完整记录，不在尚未历史验证前
         // 偷偷增加硬门槛。仅丰富最接近的 10 个，控制公共 API 权重。
         let enrich_count = if cross_cfg.enabled {
@@ -3321,15 +3425,14 @@ pub async fn run_altcoin_impulse(
 
         let mut pulse_execution_candidates = Vec::new();
         if pulse_exhaustion_active && !cross_cfg.enabled {
-            // Arm on the original extreme upward impulse.  This intentionally does not
-            // require the main strategy's retest/reclaim path: the next bar is evaluated
-            // by a separate, causal exhaustion model.
-            for candidate in candidates.iter().filter(|candidate| {
-                candidate.eligible()
-                    && candidate.side > 0
-                    && candidate.return_1h >= cfg.pulse_initial_return_1h
-                    && candidate.volume_ratio >= cfg.pulse_initial_volume_ratio
-            }) {
+            // Arm from a dedicated pulse observation.  Main-strategy continuation gates
+            // (24h breakout, 4h band, path efficiency and strong close) are intentionally
+            // absent: only the closed-bar pulse thresholds and the shared tradable
+            // universe are relevant before the next-bar exhaustion confirmation.
+            for candidate in pulse_initial_candidates
+                .iter()
+                .filter(|candidate| candidate.eligible())
+            {
                 if state.positions.contains_key(&candidate.symbol)
                     || state
                         .pulse_exhaustion_setups
@@ -3421,6 +3524,28 @@ pub async fn run_altcoin_impulse(
                     }),
                 )?;
                 if eligible {
+                    // A confirmed exhaustion short has precedence over an unfinished
+                    // continuation-long setup for the same symbol.  Keep the sleeves
+                    // independent while preventing contradictory orders on one account.
+                    let cancelled_main_pending = state.pending_entries.remove(&symbol).is_some();
+                    for regular in candidates
+                        .iter_mut()
+                        .filter(|regular| regular.symbol == symbol)
+                    {
+                        regular
+                            .blockers
+                            .push("独立衰竭做空已确认，取消同标的顺势候选".into());
+                    }
+                    if cancelled_main_pending {
+                        append_event(
+                            &event_path,
+                            json!({
+                                "ts_ms":scan_ms,"event":"strategy_conflict_resolved",
+                                "symbol":symbol,"winner":"pulse_exhaustion_short",
+                                "cancelled":"main_pending_continuation"
+                            }),
+                        )?;
+                    }
                     pulse_execution_candidates.push(candidate);
                 }
             }
@@ -4309,6 +4434,7 @@ pub async fn run_altcoin_impulse(
                 else if latest_pulse_rejected {"rejected"}
                 else {"scan"},
             "active_setups":state.pulse_exhaustion_setups.values().collect::<Vec<_>>(),
+            "nearest_initial_candidate":nearest_pulse_initial,
             "eligible_count":pulse_eligible_count,
             "latest_evaluation":state.latest_pulse_exhaustion,
             "position_count":pulse_position_count,
@@ -4695,11 +4821,11 @@ mod tests {
     use super::{
         adverse_excursion, adverse_fill_price, apply_daily_entry_bonus, apply_daily_risk_reset,
         clamp_entry_guard_price, detected_exit_reason, directional_crowding_reason, entry_phase,
-        existing_stop_raw_fill, failed_breakout, first_week_progress, pending_decision,
-        pulse_exhaustion_candidate, realtime_trailing_stop, recently_exited_symbol,
-        record_daily_equity, record_exit, record_partial_exit, recovery_profit_lock_stop,
-        signal_age_ms, update_adverse_extreme, Bar, PendingDecision, PersistedState, Position,
-        PulseExhaustionSetup,
+        evaluate, evaluate_pulse_impulse, existing_stop_raw_fill, failed_breakout,
+        first_week_progress, pending_decision, pulse_exhaustion_candidate, realtime_trailing_stop,
+        recently_exited_symbol, record_daily_equity, record_exit, record_partial_exit,
+        recovery_profit_lock_stop, signal_age_ms, update_adverse_extreme, Bar, PendingDecision,
+        PersistedState, Position, PulseExhaustionSetup,
     };
 
     #[test]
@@ -4767,6 +4893,49 @@ mod tests {
         let metrics = super::apply_pulse_exhaustion_gates(&mut candidate, retrace, &cfg);
         assert!(candidate.eligible(), "{:?}", candidate.blockers);
         assert_eq!(metrics["gates"]["oi_expansion"], true);
+    }
+
+    #[test]
+    fn pulse_arming_does_not_inherit_main_continuation_gates() {
+        let strategy: super::StrategyFile = toml::from_str(include_str!(
+            "../../../config/strategy-altcoin-impulse.toml"
+        ))
+        .unwrap();
+        let cfg = strategy.altcoin_impulse;
+        let mut bars: Vec<Bar> = (0..(7 * 96 + 17))
+            .map(|i| Bar {
+                open_ms: i as i64 * 900_000,
+                close_ms: i as i64 * 900_000 + 899_999,
+                open: 100.0,
+                high: 100.2,
+                low: 99.8,
+                close: 100.0,
+                quote_volume: 100_000.0,
+            })
+            .collect();
+        let last = bars.len() - 1;
+        // Keep a higher 24h high so the main breakout model rejects this symbol.
+        bars[last - 20].high = 110.0;
+        for bar in &mut bars[last - 3..=last] {
+            bar.quote_volume = 2_000_000.0;
+        }
+        bars[last].open = 105.5;
+        bars[last].high = 107.0;
+        bars[last].low = 105.0;
+        bars[last].close = 106.5;
+
+        let main = evaluate("PULSEUSDT".into(), &bars, &cfg).unwrap();
+        assert!(!main.eligible());
+        assert!(main
+            .blockers
+            .iter()
+            .any(|reason| reason == "未突破前 24h 高低点"));
+
+        let pulse = evaluate_pulse_impulse("PULSEUSDT".into(), &bars, &cfg).unwrap();
+        assert!(pulse.eligible(), "{:?}", pulse.blockers);
+        assert!(pulse.return_1h >= cfg.pulse_initial_return_1h);
+        assert!(pulse.volume_ratio >= cfg.pulse_initial_volume_ratio);
+        assert_eq!(pulse.entry_trigger, "independent_leverage_pulse");
     }
 
     #[test]
@@ -5248,7 +5417,8 @@ mod tests {
         assert!(!strategy.altcoin_impulse.pulse_exhaustion_allow_live);
         assert_eq!(strategy.altcoin_impulse.pulse_initial_return_1h, 0.06);
         assert_eq!(strategy.altcoin_impulse.pulse_initial_volume_ratio, 10.0);
-        assert_eq!(strategy.altcoin_impulse.pulse_oi_change_1h, 0.20);
+        assert_eq!(strategy.altcoin_impulse.pulse_oi_change_1h, 0.25);
+        assert_eq!(strategy.altcoin_impulse.pulse_min_peak_retrace, 0.045);
         assert_eq!(strategy.altcoin_impulse.pulse_risk_scale, 0.15);
         assert_eq!(strategy.altcoin_impulse.pulse_max_positions, 1);
         assert_eq!(strategy.altcoin_impulse.pulse_max_gross_multiple, 0.50);
