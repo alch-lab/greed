@@ -2738,9 +2738,9 @@ pub async fn run_altcoin_impulse(
             && (0.2..=1.5).contains(&cfg.pulse_max_spot_perp_ratio)
             && (0.01..=0.10).contains(&cfg.pulse_min_peak_retrace)
             && (0.2..=0.9).contains(&cfg.pulse_max_close_location)
-            && (0.05..=0.25).contains(&cfg.pulse_risk_scale)
+            && (0.05..=0.50).contains(&cfg.pulse_risk_scale)
             && (1..=2).contains(&cfg.pulse_max_positions)
-            && (0.1..=0.75).contains(&cfg.pulse_max_gross_multiple),
+            && (0.1..=1.50).contains(&cfg.pulse_max_gross_multiple),
         "杠杆衰竭做空参数不合法"
     );
     let base_text = std::fs::read_to_string(&args.config)?;
@@ -5468,9 +5468,9 @@ mod tests {
         assert_eq!(strategy.altcoin_impulse.pulse_initial_volume_ratio, 10.0);
         assert_eq!(strategy.altcoin_impulse.pulse_oi_change_1h, 0.25);
         assert_eq!(strategy.altcoin_impulse.pulse_min_peak_retrace, 0.045);
-        assert_eq!(strategy.altcoin_impulse.pulse_risk_scale, 0.15);
+        assert_eq!(strategy.altcoin_impulse.pulse_risk_scale, 0.375);
         assert_eq!(strategy.altcoin_impulse.pulse_max_positions, 1);
-        assert_eq!(strategy.altcoin_impulse.pulse_max_gross_multiple, 0.50);
+        assert_eq!(strategy.altcoin_impulse.pulse_max_gross_multiple, 1.00);
         assert_eq!(strategy.altcoin_impulse.recovery_lock_adverse_pct, 0.03);
         assert_eq!(strategy.altcoin_impulse.recovery_lock_activation_pct, 0.01);
         assert_eq!(strategy.altcoin_impulse.recovery_lock_pct, 0.0025);
