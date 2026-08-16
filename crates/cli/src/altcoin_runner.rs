@@ -1893,6 +1893,16 @@ fn adverse_excursion(side: i32, entry: f64, adverse_extreme: f64) -> f64 {
     (-side as f64 * (adverse_extreme / entry - 1.0)).max(0.0)
 }
 
+fn position_excursions(position: &Position) -> (f64, f64) {
+    let favorable =
+        (position.side as f64 * (position.extreme / position.entry_price - 1.0)).max(0.0);
+    let adverse = position
+        .adverse_extreme
+        .map(|price| adverse_excursion(position.side, position.entry_price, price))
+        .unwrap_or(0.0);
+    (favorable, adverse)
+}
+
 fn recovery_profit_lock_stop(
     side: i32,
     entry_price: f64,
@@ -2172,7 +2182,8 @@ async fn manage_live_positions(
                 exit_fee,
             );
             let trade_pnl = position.realized_partial_pnl + pnl;
-            let event = json!({"ts_ms":now_ms,"event":"exit_detected","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"price":exit,"qty":exit_qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":exit_fee,"reason":reason,"protection_order_id":position.protection_order_id,"stop_price":position.stop_price,"trade_reconciled":true,"overextension_long_blocked":state.overextension_long_blocked});
+            let (max_favorable_excursion, max_adverse_excursion) = position_excursions(&position);
+            let event = json!({"ts_ms":now_ms,"event":"exit_detected","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"price":exit,"qty":exit_qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":exit_fee,"reason":reason,"protection_order_id":position.protection_order_id,"stop_price":position.stop_price,"trade_reconciled":true,"hold_ms":now_ms-position.entry_ms,"max_favorable_excursion":max_favorable_excursion,"max_adverse_excursion":max_adverse_excursion,"overextension_long_blocked":state.overextension_long_blocked});
             append_event(event_path, event.clone())?;
             state.record_trade(event);
             changed = true;
@@ -2205,7 +2216,8 @@ async fn manage_live_positions(
             } else {
                 "time"
             };
-            let event = json!({"ts_ms":now_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":exit_reason,"price":exit,"qty":exit_qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"hold_ms":now_ms-position.entry_ms,"overextension_long_blocked":state.overextension_long_blocked});
+            let (max_favorable_excursion, max_adverse_excursion) = position_excursions(&position);
+            let event = json!({"ts_ms":now_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":exit_reason,"price":exit,"qty":exit_qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"hold_ms":now_ms-position.entry_ms,"max_favorable_excursion":max_favorable_excursion,"max_adverse_excursion":max_adverse_excursion,"overextension_long_blocked":state.overextension_long_blocked});
             append_event(event_path, event.clone())?;
             state.record_trade(event);
             changed = true;
@@ -2295,7 +2307,8 @@ async fn manage_live_positions(
                 fee,
             );
             let trade_pnl = position.realized_partial_pnl + pnl;
-            let event = json!({"ts_ms":now_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"failed_breakout","price":exit,"qty":exit_qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"hold_ms":now_ms-position.entry_ms,"current_return":current_return,"max_favorable_excursion":excursion,"failed_breakout_window_minutes":cfg.failed_breakout_window_minutes,"failed_breakout_adverse_pct":cfg.failed_breakout_adverse_pct,"failed_breakout_max_mfe_pct":cfg.failed_breakout_max_mfe_pct,"overextension_long_blocked":state.overextension_long_blocked});
+            let (_, max_adverse_excursion) = position_excursions(&position);
+            let event = json!({"ts_ms":now_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"failed_breakout","price":exit,"qty":exit_qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"hold_ms":now_ms-position.entry_ms,"current_return":current_return,"max_favorable_excursion":excursion,"max_adverse_excursion":max_adverse_excursion,"failed_breakout_window_minutes":cfg.failed_breakout_window_minutes,"failed_breakout_adverse_pct":cfg.failed_breakout_adverse_pct,"failed_breakout_max_mfe_pct":cfg.failed_breakout_max_mfe_pct,"overextension_long_blocked":state.overextension_long_blocked});
             append_event(event_path, event.clone())?;
             state.record_trade(event);
             changed = true;
@@ -3190,7 +3203,9 @@ pub async fn run_altcoin_impulse(
                         "partial_take_profit_break_even" => "partial_take_profit_break_even",
                         _ => "initial_stop",
                     };
-                    let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":reason,"price":exit,"raw_price":raw_exit,"qty":position.qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true,"intrabar_policy":"existing_stop_first","overextension_long_blocked":state.overextension_long_blocked});
+                    let (max_favorable_excursion, max_adverse_excursion) =
+                        position_excursions(&position);
+                    let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":reason,"price":exit,"raw_price":raw_exit,"qty":position.qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"hold_ms":scan_ms-position.entry_ms,"max_favorable_excursion":max_favorable_excursion,"max_adverse_excursion":max_adverse_excursion,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true,"intrabar_policy":"existing_stop_first","overextension_long_blocked":state.overextension_long_blocked});
                     append_event(&event_path, event.clone())?;
                     state.record_trade(event);
                     continue;
@@ -3216,7 +3231,9 @@ pub async fn run_altcoin_impulse(
                             position.qty,
                             fee,
                         );
-                        let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"scheduled_rebalance","price":exit,"raw_price":raw_exit,"qty":position.qty,"pnl":pnl,"trade_pnl":pnl,"fee":fee,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true});
+                        let (max_favorable_excursion, max_adverse_excursion) =
+                            position_excursions(&position);
+                        let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"scheduled_rebalance","price":exit,"raw_price":raw_exit,"qty":position.qty,"pnl":pnl,"trade_pnl":pnl,"fee":fee,"hold_ms":scan_ms-position.entry_ms,"max_favorable_excursion":max_favorable_excursion,"max_adverse_excursion":max_adverse_excursion,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true});
                         append_event(&event_path, event.clone())?;
                         state.record_trade(event);
                     } else {
@@ -3331,7 +3348,9 @@ pub async fn run_altcoin_impulse(
                             _ => "initial_stop",
                         }
                     };
-                    let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":reason,"price":exit,"raw_price":raw_exit,"qty":position.qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true,"overextension_long_blocked":state.overextension_long_blocked});
+                    let (max_favorable_excursion, max_adverse_excursion) =
+                        position_excursions(&position);
+                    let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":reason,"price":exit,"raw_price":raw_exit,"qty":position.qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"hold_ms":scan_ms-position.entry_ms,"max_favorable_excursion":max_favorable_excursion,"max_adverse_excursion":max_adverse_excursion,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true,"overextension_long_blocked":state.overextension_long_blocked});
                     append_event(&event_path, event.clone())?;
                     state.record_trade(event);
                 } else {
@@ -4434,6 +4453,8 @@ pub async fn run_altcoin_impulse(
                 else if latest_pulse_rejected {"rejected"}
                 else {"scan"},
             "active_setups":state.pulse_exhaustion_setups.values().collect::<Vec<_>>(),
+            "initial_candidate_count":pulse_initial_candidates.len(),
+            "initial_candidates":pulse_initial_candidates.iter().take(10).collect::<Vec<_>>(),
             "nearest_initial_candidate":nearest_pulse_initial,
             "eligible_count":pulse_eligible_count,
             "latest_evaluation":state.latest_pulse_exhaustion,
@@ -4822,10 +4843,10 @@ mod tests {
         adverse_excursion, adverse_fill_price, apply_daily_entry_bonus, apply_daily_risk_reset,
         clamp_entry_guard_price, detected_exit_reason, directional_crowding_reason, entry_phase,
         evaluate, evaluate_pulse_impulse, existing_stop_raw_fill, failed_breakout,
-        first_week_progress, pending_decision, pulse_exhaustion_candidate, realtime_trailing_stop,
-        recently_exited_symbol, record_daily_equity, record_exit, record_partial_exit,
-        recovery_profit_lock_stop, signal_age_ms, update_adverse_extreme, Bar, PendingDecision,
-        PersistedState, Position, PulseExhaustionSetup,
+        first_week_progress, pending_decision, position_excursions, pulse_exhaustion_candidate,
+        realtime_trailing_stop, recently_exited_symbol, record_daily_equity, record_exit,
+        record_partial_exit, recovery_profit_lock_stop, signal_age_ms, update_adverse_extreme, Bar,
+        PendingDecision, PersistedState, Position, PulseExhaustionSetup,
     };
 
     #[test]
@@ -4949,6 +4970,34 @@ mod tests {
         assert!((notional - 1_818.181818181818).abs() < 1e-10);
         assert!((notional / leverage - 181.8181818181818).abs() < 1e-10);
         assert!((notional * (stop + execution_buffer) - 80.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn completed_trade_excursions_preserve_mfe_and_mae() {
+        let position = Position {
+            symbol: "PATHUSDT".into(),
+            side: 1,
+            qty: 1.0,
+            entry_ms: 1,
+            entry_price: 100.0,
+            entry_fee: 0.0,
+            initial_notional: 100.0,
+            extreme: 106.0,
+            adverse_extreme: Some(97.0),
+            stop_price: 99.0,
+            last_bar_ms: 1,
+            protection_order_id: None,
+            protection_reason: "initial_stop".into(),
+            exchange_leverage: Some(10),
+            entry_phase: "pulse_exhaustion_short".into(),
+            partial_take_profit_done: false,
+            loss_trim_done: false,
+            last_partial_exit_ms: None,
+            realized_partial_pnl: 0.0,
+        };
+        let (mfe, mae) = position_excursions(&position);
+        assert!((mfe - 0.06).abs() < 1e-10);
+        assert!((mae - 0.03).abs() < 1e-10);
     }
 
     #[test]
