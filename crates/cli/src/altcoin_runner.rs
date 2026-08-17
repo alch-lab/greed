@@ -296,6 +296,10 @@ pub(crate) struct Bar {
 struct Candidate {
     symbol: String,
     signal_ms: i64,
+    /// Stable setup origin. `signal_ms` advances to the confirmation bar,
+    /// while this value keeps signal/confirmation/outcome attribution paired.
+    #[serde(default)]
+    setup_origin_ms: i64,
     side: i32,
     price: f64,
     return_1h: f64,
@@ -354,6 +358,22 @@ struct PulseExhaustionSetup {
     volume_24h: f64,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct MicrostructureTrial {
+    strategy: String,
+    symbol: String,
+    side: i32,
+    origin_signal_ms: i64,
+    reference_ms: i64,
+    reference_price: f64,
+    expires_ms: i64,
+    favorable_extreme: f64,
+    adverse_extreme: f64,
+    last_price: f64,
+    #[serde(default)]
+    executed: bool,
+}
+
 impl Candidate {
     fn eligible(&self) -> bool {
         self.blockers.is_empty()
@@ -364,6 +384,8 @@ impl Candidate {
 struct Position {
     symbol: String,
     side: i32,
+    #[serde(default)]
+    setup_origin_ms: i64,
     qty: f64,
     entry_ms: i64,
     entry_price: f64,
@@ -833,6 +855,16 @@ struct PersistedState {
     #[serde(default)]
     latest_confirmation_microstructure: Value,
     #[serde(default)]
+    latest_main_signal_microstructure: Value,
+    #[serde(default)]
+    latest_main_confirmation_microstructure: Value,
+    #[serde(default)]
+    latest_pulse_signal_microstructure: Value,
+    #[serde(default)]
+    latest_pulse_confirmation_microstructure: Value,
+    #[serde(default)]
+    microstructure_trials: HashMap<String, MicrostructureTrial>,
+    #[serde(default)]
     pulse_entries: u64,
     #[serde(default)]
     pulse_exits: u64,
@@ -880,6 +912,11 @@ impl PersistedState {
             cross_section_status: Value::Null,
             latest_signal_microstructure: Value::Null,
             latest_confirmation_microstructure: Value::Null,
+            latest_main_signal_microstructure: Value::Null,
+            latest_main_confirmation_microstructure: Value::Null,
+            latest_pulse_signal_microstructure: Value::Null,
+            latest_pulse_confirmation_microstructure: Value::Null,
+            microstructure_trials: HashMap::new(),
             pulse_entries: 0,
             pulse_exits: 0,
             pulse_wins: 0,
@@ -1081,6 +1118,7 @@ fn pulse_exhaustion_candidate(
         Candidate {
             symbol: setup.symbol.clone(),
             signal_ms: bar.close_ms,
+            setup_origin_ms: setup.origin_signal_ms,
             side: -1,
             price: bar.close,
             return_1h,
@@ -1521,6 +1559,7 @@ fn evaluate(symbol: String, bars: &[Bar], cfg: &AltcoinImpulseConfig) -> Option<
     Some(Candidate {
         symbol,
         signal_ms: bars[i].close_ms,
+        setup_origin_ms: bars[i].close_ms,
         side,
         price: close,
         return_1h,
@@ -1610,6 +1649,7 @@ fn evaluate_pulse_impulse(
     Some(Candidate {
         symbol,
         signal_ms: bars[i].close_ms,
+        setup_origin_ms: bars[i].close_ms,
         side: 1,
         price: close,
         score: progress * (volume_24h / 1_000_000.0).ln_1p(),
@@ -1910,6 +1950,7 @@ fn cross_section_analysis(
             .map(|(rank, side)| Candidate {
                 symbol: rank.symbol.clone(),
                 signal_ms,
+                setup_origin_ms: signal_ms,
                 side: *side,
                 price: bars_by_symbol[&rank.symbol][rank.signal_index].close,
                 return_1h: rank.trailing_return,
@@ -2057,6 +2098,100 @@ fn equity(state: &PersistedState, prices: &HashMap<String, f64>) -> f64 {
             .sum::<f64>()
 }
 
+fn candidate_origin_ms(candidate: &Candidate) -> i64 {
+    if candidate.setup_origin_ms > 0 {
+        candidate.setup_origin_ms
+    } else {
+        candidate.signal_ms
+    }
+}
+
+fn microstructure_trial_key(strategy: &str, symbol: &str, origin_signal_ms: i64) -> String {
+    format!("{strategy}:{symbol}:{origin_signal_ms}")
+}
+
+fn observe_microstructure_trial(
+    state: &mut PersistedState,
+    strategy: &str,
+    candidate: &Candidate,
+    reference_ms: i64,
+    reference_price: f64,
+    horizon_ms: i64,
+) {
+    let origin_signal_ms = candidate_origin_ms(candidate);
+    let key = microstructure_trial_key(strategy, &candidate.symbol, origin_signal_ms);
+    state
+        .microstructure_trials
+        .entry(key)
+        .or_insert(MicrostructureTrial {
+            strategy: strategy.to_owned(),
+            symbol: candidate.symbol.clone(),
+            side: candidate.side,
+            origin_signal_ms,
+            reference_ms,
+            reference_price,
+            expires_ms: reference_ms + horizon_ms,
+            favorable_extreme: reference_price,
+            adverse_extreme: reference_price,
+            last_price: reference_price,
+            executed: false,
+        });
+}
+
+fn update_microstructure_trials(
+    state: &mut PersistedState,
+    bars_by_symbol: &HashMap<String, Vec<Bar>>,
+    now_ms: i64,
+) -> Vec<Value> {
+    let keys: Vec<String> = state.microstructure_trials.keys().cloned().collect();
+    let mut completed = Vec::new();
+    for key in keys {
+        let Some(trial) = state.microstructure_trials.get_mut(&key) else {
+            continue;
+        };
+        if let Some(bars) = bars_by_symbol.get(&trial.symbol) {
+            for bar in bars
+                .iter()
+                .filter(|bar| bar.close_ms >= trial.reference_ms && bar.open_ms <= trial.expires_ms)
+            {
+                if trial.side > 0 {
+                    trial.favorable_extreme = trial.favorable_extreme.max(bar.high);
+                    trial.adverse_extreme = trial.adverse_extreme.min(bar.low);
+                } else {
+                    trial.favorable_extreme = trial.favorable_extreme.min(bar.low);
+                    trial.adverse_extreme = trial.adverse_extreme.max(bar.high);
+                }
+                trial.last_price = bar.close;
+            }
+        }
+        if now_ms < trial.expires_ms {
+            continue;
+        }
+        let mfe = trial.side as f64 * (trial.favorable_extreme / trial.reference_price - 1.0);
+        let mae = -trial.side as f64 * (trial.adverse_extreme / trial.reference_price - 1.0);
+        let final_return = trial.side as f64 * (trial.last_price / trial.reference_price - 1.0);
+        completed.push(json!({
+            "ts_ms":now_ms,
+            "event":"microstructure_outcome",
+            "strategy":trial.strategy,
+            "setup_id":key,
+            "symbol":trial.symbol,
+            "side":trial.side,
+            "origin_signal_ms":trial.origin_signal_ms,
+            "reference_ms":trial.reference_ms,
+            "reference_price":trial.reference_price,
+            "horizon_ms":trial.expires_ms-trial.reference_ms,
+            "executed":trial.executed,
+            "max_favorable_excursion":mfe.max(0.0),
+            "max_adverse_excursion":mae.max(0.0),
+            "final_return":final_return,
+            "last_price":trial.last_price
+        }));
+        state.microstructure_trials.remove(&key);
+    }
+    completed
+}
+
 async fn build_position_status(
     state: &PersistedState,
     prices: &HashMap<String, f64>,
@@ -2112,7 +2247,7 @@ async fn build_position_status(
             "protection_order_ids":protection_order_ids(position),
             "protection_order_count":protection_order_ids(position).len(),
             "protection_reason":position.protection_reason,
-            "entry_phase":position.entry_phase,
+            "entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,
             "partial_take_profit_done":position.partial_take_profit_done,
             "loss_trim_done":position.loss_trim_done,
             "realized_partial_pnl":position.realized_partial_pnl,
@@ -2594,7 +2729,7 @@ async fn manage_live_positions(
             );
             let trade_pnl = position.realized_partial_pnl + pnl;
             let (max_favorable_excursion, max_adverse_excursion) = position_excursions(&position);
-            let event = json!({"ts_ms":now_ms,"event":"exit_detected","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"price":exit,"qty":exit_qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":exit_fee,"reason":reason,"protection_order_id":position.protection_order_id,"stop_price":position.stop_price,"trade_reconciled":true,"hold_ms":now_ms-position.entry_ms,"max_favorable_excursion":max_favorable_excursion,"max_adverse_excursion":max_adverse_excursion,"overextension_long_blocked":state.overextension_long_blocked});
+            let event = json!({"ts_ms":now_ms,"event":"exit_detected","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"price":exit,"qty":exit_qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":exit_fee,"reason":reason,"protection_order_id":position.protection_order_id,"stop_price":position.stop_price,"trade_reconciled":true,"hold_ms":now_ms-position.entry_ms,"max_favorable_excursion":max_favorable_excursion,"max_adverse_excursion":max_adverse_excursion,"overextension_long_blocked":state.overextension_long_blocked});
             append_event(event_path, event.clone())?;
             state.record_trade(event);
             changed = true;
@@ -2626,7 +2761,7 @@ async fn manage_live_positions(
                 "time"
             };
             let (max_favorable_excursion, max_adverse_excursion) = position_excursions(&position);
-            let event = json!({"ts_ms":now_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":exit_reason,"price":exit,"qty":exit_qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"hold_ms":now_ms-position.entry_ms,"max_favorable_excursion":max_favorable_excursion,"max_adverse_excursion":max_adverse_excursion,"overextension_long_blocked":state.overextension_long_blocked});
+            let event = json!({"ts_ms":now_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":exit_reason,"price":exit,"qty":exit_qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"hold_ms":now_ms-position.entry_ms,"max_favorable_excursion":max_favorable_excursion,"max_adverse_excursion":max_adverse_excursion,"overextension_long_blocked":state.overextension_long_blocked});
             append_event(event_path, event.clone())?;
             state.record_trade(event);
             changed = true;
@@ -2712,7 +2847,7 @@ async fn manage_live_positions(
             );
             let trade_pnl = position.realized_partial_pnl + pnl;
             let (_, max_adverse_excursion) = position_excursions(&position);
-            let event = json!({"ts_ms":now_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"failed_breakout","price":exit,"qty":exit_qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"hold_ms":now_ms-position.entry_ms,"current_return":current_return,"max_favorable_excursion":excursion,"max_adverse_excursion":max_adverse_excursion,"failed_breakout_window_minutes":cfg.failed_breakout_window_minutes,"failed_breakout_adverse_pct":cfg.failed_breakout_adverse_pct,"failed_breakout_max_mfe_pct":cfg.failed_breakout_max_mfe_pct,"overextension_long_blocked":state.overextension_long_blocked});
+            let event = json!({"ts_ms":now_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":"failed_breakout","price":exit,"qty":exit_qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"hold_ms":now_ms-position.entry_ms,"current_return":current_return,"max_favorable_excursion":excursion,"max_adverse_excursion":max_adverse_excursion,"failed_breakout_window_minutes":cfg.failed_breakout_window_minutes,"failed_breakout_adverse_pct":cfg.failed_breakout_adverse_pct,"failed_breakout_max_mfe_pct":cfg.failed_breakout_max_mfe_pct,"overextension_long_blocked":state.overextension_long_blocked});
             append_event(event_path, event.clone())?;
             state.record_trade(event);
             changed = true;
@@ -2761,13 +2896,13 @@ async fn manage_live_positions(
                         warn!(symbol=%symbol, old_order_id, error=%error, "亏损减仓后新保护已生效，但旧保护撤销失败");
                     }
                     set_protection_order_ids(&mut position, new_order_ids.clone());
-                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"loss_trim","trigger_return":-cfg.loss_trim_trigger_pct,"trigger_mark_price":trigger_mark_price,"execution_slippage_bps":position.side as f64*(exit/trigger_mark_price-1.0)*-10_000.0,"configured_fraction":cfg.loss_trim_fraction,"price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"stop_price":position.stop_price,"old_order_ids":old_order_ids,"new_order_ids":new_order_ids,"protection_replaced":true});
+                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":"loss_trim","trigger_return":-cfg.loss_trim_trigger_pct,"trigger_mark_price":trigger_mark_price,"execution_slippage_bps":position.side as f64*(exit/trigger_mark_price-1.0)*-10_000.0,"configured_fraction":cfg.loss_trim_fraction,"price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"stop_price":position.stop_price,"old_order_ids":old_order_ids,"new_order_ids":new_order_ids,"protection_replaced":true});
                     append_event(event_path, event.clone())?;
                     state.record_trade(event);
                 }
                 Err(error) => {
                     warn!(symbol=%symbol, error=%error, "亏损减仓已成交，剩余仓位保护替换失败；保留原交易所止损并等待下轮重试");
-                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"loss_trim","trigger_return":-cfg.loss_trim_trigger_pct,"configured_fraction":cfg.loss_trim_fraction,"price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"stop_price":position.stop_price,"protection_replaced":false,"protection_error":error.to_string()});
+                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":"loss_trim","trigger_return":-cfg.loss_trim_trigger_pct,"configured_fraction":cfg.loss_trim_fraction,"price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"stop_price":position.stop_price,"protection_replaced":false,"protection_error":error.to_string()});
                     append_event(event_path, event.clone())?;
                     state.record_trade(event);
                 }
@@ -2819,13 +2954,13 @@ async fn manage_live_positions(
                     set_protection_order_ids(&mut position, new_order_ids.clone());
                     position.stop_price = break_even_stop;
                     position.protection_reason = "partial_take_profit_break_even".to_owned();
-                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"partial_take_profit","trigger_return":current_return,"trigger_mark_price":trigger_mark_price,"trigger_extreme":trigger_extreme,"execution_slippage_bps":position.side as f64*(exit/trigger_mark_price-1.0)*-10_000.0,"price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"new_stop":break_even_stop,"old_order_ids":old_order_ids,"new_order_ids":new_order_ids,"protection_replaced":true});
+                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":"partial_take_profit","trigger_return":current_return,"trigger_mark_price":trigger_mark_price,"trigger_extreme":trigger_extreme,"execution_slippage_bps":position.side as f64*(exit/trigger_mark_price-1.0)*-10_000.0,"price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"new_stop":break_even_stop,"old_order_ids":old_order_ids,"new_order_ids":new_order_ids,"protection_replaced":true});
                     append_event(event_path, event.clone())?;
                     state.record_trade(event);
                 }
                 Err(error) => {
                     warn!(symbol=%symbol, error=%error, "第一段止盈已成交，保本保护替换失败；保留原交易所止损并等待下轮重试");
-                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"partial_take_profit","price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"new_stop":position.stop_price,"protection_replaced":false,"protection_error":error.to_string()});
+                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":"partial_take_profit","price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"new_stop":position.stop_price,"protection_replaced":false,"protection_error":error.to_string()});
                     append_event(event_path, event.clone())?;
                     state.record_trade(event);
                 }
@@ -2907,7 +3042,7 @@ async fn manage_live_positions(
                 );
                 let trade_pnl = position.realized_partial_pnl + pnl;
                 let (_, max_adverse_excursion) = position_excursions(&position);
-                let event = json!({"ts_ms":now_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":protection_reason,"price":exit,"qty":exit_qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"hold_ms":now_ms-position.entry_ms,"mark_price":snapshot.mark_price,"crossed_stop":improved_stop,"max_favorable_excursion":excursion,"max_adverse_excursion":max_adverse_excursion,"direct_market_exit":true});
+                let event = json!({"ts_ms":now_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":protection_reason,"price":exit,"qty":exit_qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"hold_ms":now_ms-position.entry_ms,"mark_price":snapshot.mark_price,"crossed_stop":improved_stop,"max_favorable_excursion":excursion,"max_adverse_excursion":max_adverse_excursion,"direct_market_exit":true});
                 append_event(event_path, event.clone())?;
                 state.record_trade(event);
                 changed = true;
@@ -3458,6 +3593,12 @@ pub async fn run_altcoin_impulse(
                 shortlist.push((symbol.clone(), f64::INFINITY));
             }
         }
+        // 观测样本在两小时结果窗口内持续取价，候选即使跌出榜单也不能丢失标签。
+        for trial in state.microstructure_trials.values() {
+            if !shortlist.iter().any(|(item, _)| item == &trial.symbol) {
+                shortlist.push((trial.symbol.clone(), f64::INFINITY));
+            }
+        }
         let shortlist_count = shortlist.len();
         let mut set = tokio::task::JoinSet::new();
         let kline_limit = Arc::new(tokio::sync::Semaphore::new(20));
@@ -3478,6 +3619,9 @@ pub async fn run_altcoin_impulse(
                 Ok(Err(e)) => warn!(error=%e, "候选 K 线拉取失败"),
                 Err(e) => warn!(error=%e, "候选任务失败"),
             }
+        }
+        for outcome in update_microstructure_trials(&mut state, &bars_by_symbol, scan_ms) {
+            append_event(&event_path, outcome)?;
         }
         // 旧状态文件没有 adverse_extreme。升级时用入场后的闭合 K 线重建一次，
         // 避免正在持有的仓位因重启而丢失“曾经深跌”的价格路径记忆。
@@ -3649,7 +3793,7 @@ pub async fn run_altcoin_impulse(
                     };
                     let (max_favorable_excursion, max_adverse_excursion) =
                         position_excursions(&position);
-                    let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":reason,"price":exit,"raw_price":raw_exit,"qty":position.qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"hold_ms":scan_ms-position.entry_ms,"max_favorable_excursion":max_favorable_excursion,"max_adverse_excursion":max_adverse_excursion,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true,"intrabar_policy":"existing_stop_first","overextension_long_blocked":state.overextension_long_blocked});
+                    let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":reason,"price":exit,"raw_price":raw_exit,"qty":position.qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"hold_ms":scan_ms-position.entry_ms,"max_favorable_excursion":max_favorable_excursion,"max_adverse_excursion":max_adverse_excursion,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true,"intrabar_policy":"existing_stop_first","overextension_long_blocked":state.overextension_long_blocked});
                     append_event(&event_path, event.clone())?;
                     state.record_trade(event);
                     continue;
@@ -3677,7 +3821,7 @@ pub async fn run_altcoin_impulse(
                         );
                         let (max_favorable_excursion, max_adverse_excursion) =
                             position_excursions(&position);
-                        let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"scheduled_rebalance","price":exit,"raw_price":raw_exit,"qty":position.qty,"pnl":pnl,"trade_pnl":pnl,"fee":fee,"hold_ms":scan_ms-position.entry_ms,"max_favorable_excursion":max_favorable_excursion,"max_adverse_excursion":max_adverse_excursion,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true});
+                        let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":"scheduled_rebalance","price":exit,"raw_price":raw_exit,"qty":position.qty,"pnl":pnl,"trade_pnl":pnl,"fee":fee,"hold_ms":scan_ms-position.entry_ms,"max_favorable_excursion":max_favorable_excursion,"max_adverse_excursion":max_adverse_excursion,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true});
                         append_event(&event_path, event.clone())?;
                         state.record_trade(event);
                     } else {
@@ -3699,7 +3843,7 @@ pub async fn run_altcoin_impulse(
                         record_partial_exit(&mut state, &mut position, exit, qty, fee);
                     position.loss_trim_done = true;
                     position.last_partial_exit_ms = Some(scan_ms);
-                    let event = json!({"ts_ms":scan_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"loss_trim","trigger_return":-cfg.loss_trim_trigger_pct,"configured_fraction":cfg.loss_trim_fraction,"price":exit,"raw_price":raw_exit,"qty":qty,"remaining_qty":position.qty,"pnl":partial_pnl,"fee":fee,"stop_price":position.stop_price,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true});
+                    let event = json!({"ts_ms":scan_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":"loss_trim","trigger_return":-cfg.loss_trim_trigger_pct,"configured_fraction":cfg.loss_trim_fraction,"price":exit,"raw_price":raw_exit,"qty":qty,"remaining_qty":position.qty,"pnl":partial_pnl,"fee":fee,"stop_price":position.stop_price,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true});
                     append_event(&event_path, event.clone())?;
                     state.record_trade(event);
                 }
@@ -3716,7 +3860,7 @@ pub async fn run_altcoin_impulse(
                     position.last_partial_exit_ms = Some(scan_ms);
                     position.stop_price = position.entry_price;
                     position.protection_reason = "partial_take_profit_break_even".to_owned();
-                    let event = json!({"ts_ms":scan_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"partial_take_profit","price":exit,"raw_price":raw_exit,"qty":qty,"remaining_qty":position.qty,"pnl":partial_pnl,"fee":fee,"new_stop":position.stop_price,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true});
+                    let event = json!({"ts_ms":scan_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":"partial_take_profit","price":exit,"raw_price":raw_exit,"qty":qty,"remaining_qty":position.qty,"pnl":partial_pnl,"fee":fee,"new_stop":position.stop_price,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true});
                     append_event(&event_path, event.clone())?;
                     state.record_trade(event);
                 }
@@ -3794,7 +3938,7 @@ pub async fn run_altcoin_impulse(
                     };
                     let (max_favorable_excursion, max_adverse_excursion) =
                         position_excursions(&position);
-                    let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":reason,"price":exit,"raw_price":raw_exit,"qty":position.qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"hold_ms":scan_ms-position.entry_ms,"max_favorable_excursion":max_favorable_excursion,"max_adverse_excursion":max_adverse_excursion,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true,"overextension_long_blocked":state.overextension_long_blocked});
+                    let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":reason,"price":exit,"raw_price":raw_exit,"qty":position.qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"hold_ms":scan_ms-position.entry_ms,"max_favorable_excursion":max_favorable_excursion,"max_adverse_excursion":max_adverse_excursion,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true,"overextension_long_blocked":state.overextension_long_blocked});
                     append_event(&event_path, event.clone())?;
                     state.record_trade(event);
                 } else {
@@ -3919,6 +4063,60 @@ pub async fn run_altcoin_impulse(
                 state
                     .pulse_exhaustion_setups
                     .insert(candidate.symbol.clone(), setup.clone());
+                if let Some(client) = rest.as_ref() {
+                    let observation_notional = current_equity
+                        * cfg.risk_per_trade
+                        * cfg.pulse_risk_scale
+                        * cfg.short_risk_scale
+                        / (cfg.stop_pct + cfg.risk_execution_buffer_pct);
+                    match client
+                        .liquidity_snapshot(
+                            &candidate.symbol,
+                            -1,
+                            observation_notional.max(20.0),
+                            cfg.depth_band_pct,
+                            cfg.recent_trade_window_seconds as i64 * 1_000,
+                        )
+                        .await
+                    {
+                        Ok(snapshot) => {
+                            let setup_id = microstructure_trial_key(
+                                "pulse_exhaustion_short",
+                                &candidate.symbol,
+                                candidate.signal_ms,
+                            );
+                            let observation = json!({
+                                "ts_ms":scan_ms,
+                                "event":"entry_microstructure_observation",
+                                "strategy":"pulse_exhaustion_short",
+                                "setup_id":setup_id,
+                                "stage":"signal",
+                                "symbol":candidate.symbol,
+                                "side":-1,
+                                "origin_signal_ms":candidate.signal_ms,
+                                "target_notional":observation_notional,
+                                "source":"execution_endpoint_rest_agg_trades_and_depth",
+                                "snapshot":snapshot
+                            });
+                            state.latest_pulse_signal_microstructure = observation.clone();
+                            append_event(&event_path, observation)?;
+                        }
+                        Err(error) => append_event(
+                            &event_path,
+                            json!({
+                                "ts_ms":scan_ms,
+                                "event":"entry_microstructure_observation",
+                                "strategy":"pulse_exhaustion_short",
+                                "stage":"signal",
+                                "symbol":candidate.symbol,
+                                "side":-1,
+                                "origin_signal_ms":candidate.signal_ms,
+                                "available":false,
+                                "error":error.to_string()
+                            }),
+                        )?,
+                    }
+                }
                 append_event(
                     &event_path,
                     json!({
@@ -3966,6 +4164,72 @@ pub async fn run_altcoin_impulse(
                     ));
                 }
                 let eligible = candidate.eligible();
+                let pulse_observation_notional = current_equity
+                    * cfg.risk_per_trade
+                    * cfg.pulse_risk_scale
+                    * cfg.short_risk_scale
+                    / (cfg.stop_pct + cfg.risk_execution_buffer_pct);
+                observe_microstructure_trial(
+                    &mut state,
+                    "pulse_exhaustion_short",
+                    &candidate,
+                    candidate.signal_ms,
+                    candidate.price,
+                    cfg.max_hold_hours as i64 * 3_600_000,
+                );
+                if let Some(client) = rest.as_ref() {
+                    match client
+                        .liquidity_snapshot(
+                            &candidate.symbol,
+                            candidate.side,
+                            pulse_observation_notional.max(20.0),
+                            cfg.depth_band_pct,
+                            cfg.recent_trade_window_seconds as i64 * 1_000,
+                        )
+                        .await
+                    {
+                        Ok(snapshot) => {
+                            let setup_id = microstructure_trial_key(
+                                "pulse_exhaustion_short",
+                                &candidate.symbol,
+                                candidate_origin_ms(&candidate),
+                            );
+                            let observation = json!({
+                                "ts_ms":scan_ms,
+                                "event":"entry_microstructure_observation",
+                                "strategy":"pulse_exhaustion_short",
+                                "setup_id":setup_id,
+                                "stage":"confirmation",
+                                "symbol":candidate.symbol,
+                                "side":candidate.side,
+                                "origin_signal_ms":candidate_origin_ms(&candidate),
+                                "confirmation_ms":candidate.signal_ms,
+                                "target_notional":pulse_observation_notional,
+                                "eligible":eligible,
+                                "source":"execution_endpoint_rest_agg_trades_and_depth",
+                                "snapshot":snapshot
+                            });
+                            state.latest_pulse_confirmation_microstructure = observation.clone();
+                            append_event(&event_path, observation)?;
+                        }
+                        Err(error) => append_event(
+                            &event_path,
+                            json!({
+                                "ts_ms":scan_ms,
+                                "event":"entry_microstructure_observation",
+                                "strategy":"pulse_exhaustion_short",
+                                "stage":"confirmation",
+                                "symbol":candidate.symbol,
+                                "side":candidate.side,
+                                "origin_signal_ms":candidate_origin_ms(&candidate),
+                                "confirmation_ms":candidate.signal_ms,
+                                "eligible":eligible,
+                                "available":false,
+                                "error":error.to_string()
+                            }),
+                        )?,
+                    }
+                }
                 state.latest_pulse_exhaustion = json!({
                     "ts_ms":scan_ms,"stage":if eligible {"execution"} else {"rejected"},
                     "symbol":symbol,"origin_signal_ms":setup.origin_signal_ms,
@@ -4214,6 +4478,14 @@ pub async fn run_altcoin_impulse(
             {
                 continue;
             }
+            observe_microstructure_trial(
+                &mut state,
+                "confirmed_volume_breakout",
+                candidate,
+                candidate.signal_ms,
+                candidate.price,
+                cfg.max_hold_hours as i64 * 3_600_000,
+            );
             // Capture the tape and book when the setup first appears. This is
             // observation-only: historical tests show that same-direction
             // second-level Delta is often terminal crowding, not a universally
@@ -4245,14 +4517,17 @@ pub async fn run_altcoin_impulse(
                         let observation = json!({
                             "ts_ms":scan_ms,
                             "stage":"signal",
+                            "strategy":"confirmed_volume_breakout",
+                            "setup_id":microstructure_trial_key("confirmed_volume_breakout", &candidate.symbol, candidate_origin_ms(candidate)),
                             "symbol":candidate.symbol,
                             "side":candidate.side,
-                            "origin_signal_ms":candidate.signal_ms,
+                            "origin_signal_ms":candidate_origin_ms(candidate),
                             "target_notional":observation_notional,
                             "source":"execution_endpoint_rest_agg_trades_and_depth",
                             "snapshot":snapshot
                         });
                         state.latest_signal_microstructure = observation.clone();
+                        state.latest_main_signal_microstructure = observation.clone();
                         let mut event = observation;
                         event["event"] = json!("entry_microstructure_observation");
                         append_event(&event_path, event)?;
@@ -4263,9 +4538,10 @@ pub async fn run_altcoin_impulse(
                             "ts_ms":scan_ms,
                             "event":"entry_microstructure_observation",
                             "stage":"signal",
+                            "strategy":"confirmed_volume_breakout",
                             "symbol":candidate.symbol,
                             "side":candidate.side,
-                            "origin_signal_ms":candidate.signal_ms,
+                            "origin_signal_ms":candidate_origin_ms(candidate),
                             "available":false,
                             "error":error.to_string()
                         }),
@@ -4540,9 +4816,11 @@ pub async fn run_altcoin_impulse(
                 state.latest_confirmation_microstructure = json!({
                     "ts_ms":scan_ms,
                     "stage":"confirmation",
+                    "strategy":if pulse_candidate {"pulse_exhaustion_short"} else {"confirmed_volume_breakout"},
+                    "setup_id":microstructure_trial_key(if pulse_candidate {"pulse_exhaustion_short"} else {"confirmed_volume_breakout"}, &candidate.symbol, candidate_origin_ms(candidate)),
                     "symbol":candidate.symbol,
                     "side":candidate.side,
-                    "origin_signal_ms":candidate.signal_ms,
+                    "origin_signal_ms":candidate_origin_ms(candidate),
                     "target_notional":notional,
                     "source":"execution_endpoint_rest_agg_trades_and_depth",
                     "passed":blockers.is_empty(),
@@ -4550,9 +4828,16 @@ pub async fn run_altcoin_impulse(
                     "liquid_market_spread_relaxation":liquid_market_spread_relaxation,
                     "snapshot":liquidity
                 });
+                if pulse_candidate {
+                    state.latest_pulse_confirmation_microstructure =
+                        state.latest_confirmation_microstructure.clone();
+                } else {
+                    state.latest_main_confirmation_microstructure =
+                        state.latest_confirmation_microstructure.clone();
+                }
                 append_event(
                     &event_path,
-                    json!({"ts_ms":scan_ms,"event":"liquidity_check","microstructure_stage":"confirmation","microstructure_source":"execution_endpoint_rest_agg_trades_and_depth","origin_signal_ms":candidate.signal_ms,"symbol":candidate.symbol,"side":candidate.side,"target_notional":notional,"passed":blockers.is_empty(),"blockers":&blockers,"observations":if unique_trade_prices_warning {vec![format!("近 {} 秒仅 {} 个成交价，参考值 ≥{}；其他可成交性指标合格时不单独否决",cfg.recent_trade_window_seconds,liquidity.unique_trade_prices,cfg.min_unique_trade_prices)]} else {Vec::<String>::new()},"spread_policy":if liquid_market_spread_relaxation {"liquid_market_relaxed"} else {"default"},"effective_max_spread_bps":effective_spread_limit,"snapshot":liquidity,"limits":{"max_spread_bps":cfg.max_spread_bps,"liquid_market_max_spread_bps":cfg.liquid_market_max_spread_bps,"max_entry_impact_bps":cfg.max_entry_impact_bps,"max_exit_impact_bps":cfg.max_exit_impact_bps,"depth_band_pct":cfg.depth_band_pct,"min_depth_multiple":cfg.min_depth_multiple,"liquid_market_depth_multiple":cfg.min_depth_multiple*3.0,"recent_trade_window_seconds":cfg.recent_trade_window_seconds,"min_recent_trades":cfg.min_recent_trades,"liquid_market_min_recent_trades":cfg.min_recent_trades.saturating_mul(2),"min_unique_trade_prices":cfg.min_unique_trade_prices,"unique_trade_prices_hard":cfg.unique_trade_prices_hard,"max_last_trade_age_seconds":cfg.max_last_trade_age_seconds}}),
+                    json!({"ts_ms":scan_ms,"event":"liquidity_check","strategy":if pulse_candidate {"pulse_exhaustion_short"} else {"confirmed_volume_breakout"},"setup_id":microstructure_trial_key(if pulse_candidate {"pulse_exhaustion_short"} else {"confirmed_volume_breakout"}, &candidate.symbol, candidate_origin_ms(candidate)),"microstructure_stage":"confirmation","microstructure_source":"execution_endpoint_rest_agg_trades_and_depth","origin_signal_ms":candidate_origin_ms(candidate),"confirmation_ms":candidate.signal_ms,"symbol":candidate.symbol,"side":candidate.side,"target_notional":notional,"passed":blockers.is_empty(),"blockers":&blockers,"observations":if unique_trade_prices_warning {vec![format!("近 {} 秒仅 {} 个成交价，参考值 ≥{}；其他可成交性指标合格时不单独否决",cfg.recent_trade_window_seconds,liquidity.unique_trade_prices,cfg.min_unique_trade_prices)]} else {Vec::<String>::new()},"spread_policy":if liquid_market_spread_relaxation {"liquid_market_relaxed"} else {"default"},"effective_max_spread_bps":effective_spread_limit,"snapshot":liquidity,"limits":{"max_spread_bps":cfg.max_spread_bps,"liquid_market_max_spread_bps":cfg.liquid_market_max_spread_bps,"max_entry_impact_bps":cfg.max_entry_impact_bps,"max_exit_impact_bps":cfg.max_exit_impact_bps,"depth_band_pct":cfg.depth_band_pct,"min_depth_multiple":cfg.min_depth_multiple,"liquid_market_depth_multiple":cfg.min_depth_multiple*3.0,"recent_trade_window_seconds":cfg.recent_trade_window_seconds,"min_recent_trades":cfg.min_recent_trades,"liquid_market_min_recent_trades":cfg.min_recent_trades.saturating_mul(2),"min_unique_trade_prices":cfg.min_unique_trade_prices,"unique_trade_prices_hard":cfg.unique_trade_prices_hard,"max_last_trade_age_seconds":cfg.max_last_trade_age_seconds}}),
                 )?;
                 if !blockers.is_empty() {
                     let reason = blockers.join(" / ");
@@ -4830,11 +5115,23 @@ pub async fn run_altcoin_impulse(
             if pulse_candidate {
                 state.pulse_entries += 1;
             }
+            let micro_strategy = if pulse_candidate {
+                "pulse_exhaustion_short"
+            } else {
+                "confirmed_volume_breakout"
+            };
+            let setup_origin_ms = candidate_origin_ms(candidate);
+            let trial_key =
+                microstructure_trial_key(micro_strategy, &candidate.symbol, setup_origin_ms);
+            if let Some(trial) = state.microstructure_trials.get_mut(&trial_key) {
+                trial.executed = true;
+            }
             state.positions.insert(
                 candidate.symbol.clone(),
                 Position {
                     symbol: candidate.symbol.clone(),
                     side: candidate.side,
+                    setup_origin_ms,
                     qty,
                     entry_ms: scan_ms,
                     entry_price: entry,
@@ -4858,7 +5155,7 @@ pub async fn run_altcoin_impulse(
             if candidate.entry_phase == "overextended_long" {
                 overextension_slot_taken = true;
             }
-            let event = json!({"ts_ms":scan_ms,"event":"entry","symbol":candidate.symbol,"side":candidate.side,"entry_phase":candidate.entry_phase,"entry_trigger":candidate.entry_trigger,"risk_scale":candidate.risk_scale,"direction_risk_scale":direction_risk_scale,"effective_risk_scale":effective_risk_scale,"signal_age_ms":signal_age_ms(scan_ms,candidate.signal_ms),"max_signal_age_ms":max_signal_age_ms,"signal":candidate,"entry_price":entry,"qty":qty,"notional":qty*entry,"requested_leverage":cfg.exchange_leverage,"actual_leverage":actual_leverage,"margin_estimate":qty*entry/actual_leverage as f64,"risk_usd":qty*entry*risk_distance,"price_stop_risk_usd":qty*entry*cfg.stop_pct,"risk_execution_buffer_pct":cfg.risk_execution_buffer_pct,"fee":fee});
+            let event = json!({"ts_ms":scan_ms,"event":"entry","strategy":micro_strategy,"setup_id":trial_key,"origin_signal_ms":setup_origin_ms,"symbol":candidate.symbol,"side":candidate.side,"entry_phase":candidate.entry_phase,"entry_trigger":candidate.entry_trigger,"risk_scale":candidate.risk_scale,"direction_risk_scale":direction_risk_scale,"effective_risk_scale":effective_risk_scale,"signal_age_ms":signal_age_ms(scan_ms,candidate.signal_ms),"max_signal_age_ms":max_signal_age_ms,"signal":candidate,"entry_price":entry,"qty":qty,"notional":qty*entry,"requested_leverage":cfg.exchange_leverage,"actual_leverage":actual_leverage,"margin_estimate":qty*entry/actual_leverage as f64,"risk_usd":qty*entry*risk_distance,"price_stop_risk_usd":qty*entry*cfg.stop_pct,"risk_execution_buffer_pct":cfg.risk_execution_buffer_pct,"fee":fee});
             append_event(&event_path, event.clone())?;
             state.record_trade(event);
         }
@@ -4906,7 +5203,7 @@ pub async fn run_altcoin_impulse(
                         exit_qty.min(position.qty),
                         fee,
                     );
-                    let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"incomplete_basket_rollback","price":exit,"qty":exit_qty,"pnl":pnl,"trade_pnl":pnl,"fee":fee});
+                    let event = json!({"ts_ms":scan_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":"incomplete_basket_rollback","price":exit,"qty":exit_qty,"pnl":pnl,"trade_pnl":pnl,"fee":fee});
                     append_event(&event_path, event.clone())?;
                     state.record_trade(event);
                 }
@@ -5047,6 +5344,25 @@ pub async fn run_altcoin_impulse(
         scan_event["cross_section"] = state.cross_section_status.clone();
         scan_event["pulse_exhaustion"] = pulse_status.clone();
         append_event(&event_path, scan_event)?;
+        let microstructure_status = json!({
+            "observation_only":true,
+            "delta_flow_observation_only":true,
+            "execution_liquidity_gates_enabled":true,
+            "outcome_horizon_ms":cfg.max_hold_hours as i64*3_600_000,
+            "active_outcome_trials":state.microstructure_trials.len(),
+            "strategies":{
+                "main_breakout":{
+                    "signal":state.latest_main_signal_microstructure,
+                    "confirmation":state.latest_main_confirmation_microstructure
+                },
+                "pulse_exhaustion":{
+                    "signal":state.latest_pulse_signal_microstructure,
+                    "confirmation":state.latest_pulse_confirmation_microstructure
+                }
+            },
+            "signal":state.latest_signal_microstructure,
+            "confirmation":state.latest_confirmation_microstructure
+        });
         let mut status_payload = json!({
             "state":"running", "mode":mode.as_str(), "started_at_ms":started_ms,
             "uptime_s":(scan_ms-started_ms)/1000, "strategy_name":args.strategy,
@@ -5069,11 +5385,7 @@ pub async fn run_altcoin_impulse(
                 "total_entries":state.total_entries, "total_exits":state.total_exits, "wins":state.wins,
                 "rejected_entries":state.rejected_entries, "last_execution_issue":state.last_execution_issue,
                 "recent_trades":state.recent_trades,
-                "microstructure": {
-                    "observation_only": true,
-                    "signal": state.latest_signal_microstructure,
-                    "confirmation": state.latest_confirmation_microstructure
-                },
+                "microstructure":microstructure_status,
                 "realized_pnl":state.realized_pnl, "fees":state.fees,
                 "candidates":candidates.into_iter().take(10).collect::<Vec<_>>(),
                 "journal":event_path,
@@ -5397,11 +5709,12 @@ mod tests {
         clamp_entry_guard_price, confirmation_plan, default_entry_trigger, detected_exit_reason,
         directional_crowding_reason, effective_max_spread_bps, entry_phase, evaluate,
         evaluate_pulse_impulse, existing_stop_raw_fill, failed_breakout, first_week_progress,
-        intrabar_pending_decision, market_qty_chunks, pending_decision, position_excursions,
-        pulse_exhaustion_candidate, realtime_trailing_stop, recently_exited_symbol,
-        record_daily_equity, record_exit, record_partial_exit, recovery_profit_lock_stop,
-        signal_age_ms, update_adverse_extreme, Bar, Candidate, IntrabarPendingDecision,
-        PendingDecision, PersistedState, Position, PulseExhaustionSetup,
+        intrabar_pending_decision, market_qty_chunks, observe_microstructure_trial,
+        pending_decision, position_excursions, pulse_exhaustion_candidate, realtime_trailing_stop,
+        recently_exited_symbol, record_daily_equity, record_exit, record_partial_exit,
+        recovery_profit_lock_stop, signal_age_ms, update_adverse_extreme,
+        update_microstructure_trials, Bar, Candidate, IntrabarPendingDecision, PendingDecision,
+        PersistedState, Position, PulseExhaustionSetup,
     };
 
     #[test]
@@ -5574,6 +5887,7 @@ mod tests {
         let position = Position {
             symbol: "PATHUSDT".into(),
             side: 1,
+            setup_origin_ms: 1,
             qty: 1.0,
             entry_ms: 1,
             entry_price: 100.0,
@@ -5628,6 +5942,62 @@ mod tests {
     }
 
     #[test]
+    fn microstructure_trial_labels_untraded_candidate_path() {
+        let start = 1_800_000_000_000i64;
+        let candidate = Candidate {
+            symbol: "TESTUSDT".into(),
+            signal_ms: start,
+            setup_origin_ms: start,
+            side: 1,
+            price: 100.0,
+            return_1h: 0.05,
+            return_4h: 0.08,
+            volume_ratio: 5.0,
+            efficiency: 0.8,
+            close_location: 0.9,
+            volume_24h: 10_000_000.0,
+            score: 1.0,
+            entry_phase: "standard_impulse".into(),
+            breakout_level: 99.0,
+            entry_trigger: default_entry_trigger(),
+            risk_scale: 1.0,
+            blockers: Vec::new(),
+            spot_return_1h: None,
+            oi_change_1h: None,
+            funding_rate: None,
+            perp_premium: None,
+        };
+        let mut state = PersistedState::new(1_000.0, start);
+        observe_microstructure_trial(
+            &mut state,
+            "confirmed_volume_breakout",
+            &candidate,
+            start,
+            100.0,
+            7_200_000,
+        );
+        let bars = std::collections::HashMap::from([(
+            "TESTUSDT".to_owned(),
+            vec![Bar {
+                open_ms: start,
+                close_ms: start + 899_999,
+                open: 100.0,
+                high: 110.0,
+                low: 95.0,
+                close: 105.0,
+                quote_volume: 1.0,
+            }],
+        )]);
+        let outcomes = update_microstructure_trials(&mut state, &bars, start + 7_200_000);
+        assert_eq!(outcomes.len(), 1);
+        assert_eq!(outcomes[0]["executed"], false);
+        assert!((outcomes[0]["max_favorable_excursion"].as_f64().unwrap() - 0.10).abs() < 1e-10);
+        assert!((outcomes[0]["max_adverse_excursion"].as_f64().unwrap() - 0.05).abs() < 1e-10);
+        assert!((outcomes[0]["final_return"].as_f64().unwrap() - 0.05).abs() < 1e-10);
+        assert!(state.microstructure_trials.is_empty());
+    }
+
+    #[test]
     fn dry_existing_stop_wins_over_same_bar_profit_excursion() {
         let bar = Bar {
             open_ms: 1,
@@ -5650,6 +6020,7 @@ mod tests {
         let mut position = Position {
             symbol: "TESTUSDT".into(),
             side: 1,
+            setup_origin_ms: now_ms - 1_000,
             qty: 100.0,
             entry_ms: now_ms - 1_000,
             entry_price: 10.0,
@@ -5690,6 +6061,7 @@ mod tests {
         let mut position = Position {
             symbol: "TESTUSDT".into(),
             side: 1,
+            setup_origin_ms: now_ms,
             qty: 100.0,
             entry_ms: now_ms,
             entry_price: 100.0,
@@ -5771,6 +6143,7 @@ mod tests {
         let mut position = Position {
             symbol: "TESTUSDT".into(),
             side: 1,
+            setup_origin_ms: 1,
             qty: 100.0,
             entry_ms: 1,
             entry_price: 1.0,
@@ -5920,6 +6293,7 @@ mod tests {
         let position = Position {
             symbol: "PUMPUSDT".into(),
             side: 1,
+            setup_origin_ms: now_ms - 1_000,
             qty: 100.0,
             entry_ms: now_ms - 1_000,
             entry_price: 1.0,
@@ -6060,6 +6434,7 @@ mod tests {
         let vertical_candidate = Candidate {
             symbol: "GIGGLEUSDT".to_owned(),
             signal_ms: 1,
+            setup_origin_ms: 1,
             side: 1,
             price: 33.50,
             return_1h: 0.0859,
