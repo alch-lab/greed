@@ -376,6 +376,11 @@ struct Position {
     last_bar_ms: i64,
     #[serde(default)]
     protection_order_id: Option<i64>,
+    /// A position can exceed Binance's MARKET_LOT_SIZE maxQty even though its
+    /// LIMIT entry is valid under LOT_SIZE.  Keep every protective algo order
+    /// so the full logical position remains covered in market-sized chunks.
+    #[serde(default)]
+    protection_order_ids: Vec<i64>,
     #[serde(default = "default_protection_reason")]
     protection_reason: String,
     #[serde(default)]
@@ -2104,6 +2109,8 @@ async fn build_position_status(
             "initial_notional":position.initial_notional, "stop_price":position.stop_price,
             "extreme":position.extreme, "mark_price":mark_price,
             "protection_order_id":position.protection_order_id,
+            "protection_order_ids":protection_order_ids(position),
+            "protection_order_count":protection_order_ids(position).len(),
             "protection_reason":position.protection_reason,
             "entry_phase":position.entry_phase,
             "partial_take_profit_done":position.partial_take_profit_done,
@@ -2277,6 +2284,113 @@ async fn wait_fill(
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
     anyhow::bail!("{symbol} 订单 {order_id} 在 5 秒内没有成交回报")
+}
+
+fn protection_order_ids(position: &Position) -> Vec<i64> {
+    let mut ids = position.protection_order_ids.clone();
+    if let Some(id) = position.protection_order_id {
+        if !ids.contains(&id) {
+            ids.push(id);
+        }
+    }
+    ids
+}
+
+fn set_protection_order_ids(position: &mut Position, ids: Vec<i64>) {
+    position.protection_order_id = ids.first().copied();
+    position.protection_order_ids = ids;
+}
+
+fn market_qty_chunks(qty: f64, filters: &live::SymbolFilters) -> Vec<f64> {
+    if qty <= 0.0 {
+        return Vec::new();
+    }
+    let max_qty = filters.market_max_qty;
+    if !max_qty.is_finite() || max_qty <= 0.0 || qty <= max_qty {
+        return vec![qty];
+    }
+    let mut remaining = qty;
+    let mut chunks = Vec::new();
+    while remaining > 1e-12 {
+        let chunk = remaining.min(max_qty);
+        chunks.push(chunk);
+        remaining -= chunk;
+    }
+    chunks
+}
+
+async fn place_market_reduce_only(
+    rest: &live::RestClient,
+    symbol: &str,
+    side: &str,
+    qty: f64,
+    filters: &live::SymbolFilters,
+) -> Result<(f64, f64, f64)> {
+    let mut total_qty = 0.0;
+    let mut total_quote = 0.0;
+    let mut total_fee = 0.0;
+    for chunk in market_qty_chunks(qty, filters) {
+        let order = rest
+            .place_order(symbol, side, "MARKET", chunk, None, None, true, filters)
+            .await?;
+        let (price, filled_qty, fee) = wait_fill(rest, symbol, order).await?;
+        total_qty += filled_qty;
+        total_quote += price * filled_qty;
+        total_fee += fee;
+    }
+    if total_qty <= 0.0 {
+        anyhow::bail!("{symbol} 分片市价平仓没有成交")
+    }
+    Ok((total_quote / total_qty, total_qty, total_fee))
+}
+
+async fn place_protective_stops(
+    rest: &live::RestClient,
+    symbol: &str,
+    side: &str,
+    qty: f64,
+    stop_price: f64,
+    filters: &live::SymbolFilters,
+) -> Result<Vec<i64>> {
+    let mut ids = Vec::new();
+    for chunk in market_qty_chunks(qty, filters) {
+        match rest
+            .place_order(
+                symbol,
+                side,
+                "STOP_MARKET",
+                chunk,
+                None,
+                Some(stop_price),
+                true,
+                filters,
+            )
+            .await
+        {
+            Ok(id) => ids.push(id),
+            Err(error) => {
+                for id in &ids {
+                    let _ = rest.cancel_algo_order(symbol, *id).await;
+                }
+                return Err(error.into());
+            }
+        }
+    }
+    Ok(ids)
+}
+
+async fn cancel_protective_stops(
+    rest: &live::RestClient,
+    symbol: &str,
+    position: &Position,
+) -> Vec<(i64, String)> {
+    let mut failures = Vec::new();
+    for id in protection_order_ids(position) {
+        if let Err(error) = rest.cancel_algo_order(symbol, id).await {
+            failures.push((id, error.to_string()));
+        }
+    }
+    failures
 }
 
 async fn closing_fill(
@@ -2455,7 +2569,7 @@ async fn manage_live_positions(
             continue;
         };
         let snapshot = client.position_risk(&symbol).await?;
-        let mut managed_qty = snapshot.position_amt.abs();
+        let managed_qty = snapshot.position_amt.abs();
         if snapshot.position_amt.abs() <= 1e-12 {
             if let Err(error) = client.cancel_all_open_orders(&symbol).await {
                 warn!(symbol=%symbol, error=%error, "仓位已平，但清理残留保护单失败");
@@ -2493,10 +2607,8 @@ async fn manage_live_positions(
             let filters = client.symbol_filters(&symbol).await?;
             let side = if position.side > 0 { "SELL" } else { "BUY" };
             let qty = snapshot.position_amt.abs();
-            let order = client
-                .place_order(&symbol, side, "MARKET", qty, None, None, true, &filters)
-                .await?;
-            let (exit, exit_qty, fee) = wait_fill(client, &symbol, order).await?;
+            let (exit, exit_qty, fee) =
+                place_market_reduce_only(client, &symbol, side, qty, &filters).await?;
             let exit_qty = exit_qty.min(position.qty);
             let pnl = record_exit(
                 state,
@@ -2577,19 +2689,14 @@ async fn manage_live_positions(
             let filters = client.symbol_filters(&symbol).await?;
             let side = if position.side > 0 { "SELL" } else { "BUY" };
             // reduceOnly 市价退出先成交，再清理旧保护，避免撤单与平仓之间出现裸仓窗口。
-            let order = client
-                .place_order(
-                    &symbol,
-                    side,
-                    "MARKET",
-                    snapshot.position_amt.abs(),
-                    None,
-                    None,
-                    true,
-                    &filters,
-                )
-                .await?;
-            let (exit, exit_qty, fee) = wait_fill(client, &symbol, order).await?;
+            let (exit, exit_qty, fee) = place_market_reduce_only(
+                client,
+                &symbol,
+                side,
+                snapshot.position_amt.abs(),
+                &filters,
+            )
+            .await?;
             if let Err(error) = client.cancel_all_open_orders(&symbol).await {
                 warn!(symbol=%symbol, error=%error, "失败突破已平仓，但清理旧保护单失败");
             }
@@ -2620,12 +2727,9 @@ async fn manage_live_positions(
             let filters = client.symbol_filters(&symbol).await?;
             let side = if position.side > 0 { "SELL" } else { "BUY" };
             let target_qty = snapshot.position_amt.abs() * cfg.loss_trim_fraction;
-            let order = client
-                .place_order(
-                    &symbol, side, "MARKET", target_qty, None, None, true, &filters,
-                )
-                .await?;
-            let (exit, exit_qty, fee) = wait_fill(client, &symbol, order).await?;
+            let trigger_mark_price = snapshot.mark_price;
+            let (exit, exit_qty, fee) =
+                place_market_reduce_only(client, &symbol, side, target_qty, &filters).await?;
             let exit_qty = exit_qty.min(position.qty);
             let partial_pnl = record_partial_exit(state, &mut position, exit, exit_qty, fee);
             position.loss_trim_done = true;
@@ -2639,28 +2743,25 @@ async fn manage_live_positions(
                     position.qty
                 }
             };
-            managed_qty = remaining;
-            let replacement = client
-                .place_order(
-                    &symbol,
-                    side,
-                    "STOP_MARKET",
-                    remaining,
-                    None,
-                    Some(position.stop_price),
-                    true,
-                    &filters,
-                )
-                .await;
+            let replacement = place_protective_stops(
+                client,
+                &symbol,
+                side,
+                remaining,
+                position.stop_price,
+                &filters,
+            )
+            .await;
             match replacement {
-                Ok(new_order_id) => {
-                    if let Some(old_order_id) = position.protection_order_id {
-                        if let Err(error) = client.cancel_algo_order(&symbol, old_order_id).await {
-                            warn!(symbol=%symbol, old_order_id, error=%error, "亏损减仓后新保护已生效，但旧保护撤销失败");
-                        }
+                Ok(new_order_ids) => {
+                    let old_order_ids = protection_order_ids(&position);
+                    for (old_order_id, error) in
+                        cancel_protective_stops(client, &symbol, &position).await
+                    {
+                        warn!(symbol=%symbol, old_order_id, error=%error, "亏损减仓后新保护已生效，但旧保护撤销失败");
                     }
-                    position.protection_order_id = Some(new_order_id);
-                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"loss_trim","trigger_return":-cfg.loss_trim_trigger_pct,"configured_fraction":cfg.loss_trim_fraction,"price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"stop_price":position.stop_price,"new_order_id":new_order_id,"protection_replaced":true});
+                    set_protection_order_ids(&mut position, new_order_ids.clone());
+                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"loss_trim","trigger_return":-cfg.loss_trim_trigger_pct,"trigger_mark_price":trigger_mark_price,"execution_slippage_bps":position.side as f64*(exit/trigger_mark_price-1.0)*-10_000.0,"configured_fraction":cfg.loss_trim_fraction,"price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"stop_price":position.stop_price,"old_order_ids":old_order_ids,"new_order_ids":new_order_ids,"protection_replaced":true});
                     append_event(event_path, event.clone())?;
                     state.record_trade(event);
                 }
@@ -2672,18 +2773,20 @@ async fn manage_live_positions(
                 }
             }
             changed = true;
+            // 部分成交改变了真实仓位和保护单；下一轮用新 markPrice 重新计算，
+            // 避免同一轮继续使用成交前快照并挂出已被价格穿越的条件单。
+            state.positions.insert(symbol, position);
+            continue;
         }
         // 只按“当前仍有的浮盈”兑现，不能因历史上曾到过 +2%、现在已回落而补卖。
         if !position.partial_take_profit_done && current_return >= cfg.trail_activation_pct {
             let filters = client.symbol_filters(&symbol).await?;
             let side = if position.side > 0 { "SELL" } else { "BUY" };
             let target_qty = snapshot.position_amt.abs() * cfg.partial_take_profit_fraction;
-            let order = client
-                .place_order(
-                    &symbol, side, "MARKET", target_qty, None, None, true, &filters,
-                )
-                .await?;
-            let (exit, exit_qty, fee) = wait_fill(client, &symbol, order).await?;
+            let trigger_mark_price = snapshot.mark_price;
+            let trigger_extreme = position.extreme;
+            let (exit, exit_qty, fee) =
+                place_market_reduce_only(client, &symbol, side, target_qty, &filters).await?;
             let exit_qty = exit_qty.min(position.qty);
             let partial_pnl = record_partial_exit(state, &mut position, exit, exit_qty, fee);
             position.partial_take_profit_done = true;
@@ -2701,31 +2804,22 @@ async fn manage_live_positions(
                     position.qty
                 }
             };
-            managed_qty = remaining;
             let break_even_stop = position.entry_price;
-            let replacement = client
-                .place_order(
-                    &symbol,
-                    side,
-                    "STOP_MARKET",
-                    remaining,
-                    None,
-                    Some(break_even_stop),
-                    true,
-                    &filters,
-                )
-                .await;
+            let replacement =
+                place_protective_stops(client, &symbol, side, remaining, break_even_stop, &filters)
+                    .await;
             match replacement {
-                Ok(new_order_id) => {
-                    if let Some(old_order_id) = position.protection_order_id {
-                        if let Err(error) = client.cancel_algo_order(&symbol, old_order_id).await {
-                            warn!(symbol=%symbol, old_order_id, error=%error, "分段止盈后新保护已生效，但旧保护撤销失败");
-                        }
+                Ok(new_order_ids) => {
+                    let old_order_ids = protection_order_ids(&position);
+                    for (old_order_id, error) in
+                        cancel_protective_stops(client, &symbol, &position).await
+                    {
+                        warn!(symbol=%symbol, old_order_id, error=%error, "分段止盈后新保护已生效，但旧保护撤销失败");
                     }
-                    position.protection_order_id = Some(new_order_id);
+                    set_protection_order_ids(&mut position, new_order_ids.clone());
                     position.stop_price = break_even_stop;
                     position.protection_reason = "partial_take_profit_break_even".to_owned();
-                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"partial_take_profit","price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"new_stop":break_even_stop,"new_order_id":new_order_id,"protection_replaced":true});
+                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":"partial_take_profit","trigger_return":current_return,"trigger_mark_price":trigger_mark_price,"trigger_extreme":trigger_extreme,"execution_slippage_bps":position.side as f64*(exit/trigger_mark_price-1.0)*-10_000.0,"price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"new_stop":break_even_stop,"old_order_ids":old_order_ids,"new_order_ids":new_order_ids,"protection_replaced":true});
                     append_event(event_path, event.clone())?;
                     state.record_trade(event);
                 }
@@ -2737,6 +2831,8 @@ async fn manage_live_positions(
                 }
             }
             changed = true;
+            state.positions.insert(symbol, position);
+            continue;
         }
         let recovery_stop = cfg
             .recovery_lock_enabled
@@ -2780,36 +2876,62 @@ async fn manage_live_positions(
         if let Some(improved_stop) = improved_stop {
             let filters = client.symbol_filters(&symbol).await?;
             let side = if position.side > 0 { "SELL" } else { "BUY" };
-            // 先挂新保护，确认成功后才撤旧保护；任何下单失败都保留原止损。
-            let new_order_id = client
-                .place_order(
+            let stop_already_crossed = if position.side > 0 {
+                snapshot.mark_price <= improved_stop
+            } else {
+                snapshot.mark_price >= improved_stop
+            };
+            if stop_already_crossed {
+                // Binance 会以 -2021 拒绝已经被当前价格穿越的 STOP_MARKET。
+                // 此时策略语义本来就是“立即兑现”，直接 reduce-only 市价退出。
+                let (exit, exit_qty, fee) = place_market_reduce_only(
+                    client,
                     &symbol,
                     side,
-                    "STOP_MARKET",
-                    managed_qty,
-                    None,
-                    Some(improved_stop),
-                    true,
+                    snapshot.position_amt.abs(),
                     &filters,
                 )
                 .await?;
-            let old_order_id = position.protection_order_id;
-            if let Some(old_order_id) = old_order_id {
-                if let Err(error) = client.cancel_algo_order(&symbol, old_order_id).await {
-                    warn!(symbol=%symbol, old_order_id, error=%error, "新保护已生效，但旧保护撤销失败");
-                    append_event(
-                        event_path,
-                        json!({"ts_ms":now_ms,"event":"old_protection_cancel_failed","symbol":symbol,"old_order_id":old_order_id,"new_order_id":new_order_id,"reason":error.to_string()}),
-                    )?;
+                if let Err(error) = client.cancel_all_open_orders(&symbol).await {
+                    warn!(symbol=%symbol, error=%error, "跟踪止盈市价退出后清理旧保护失败");
                 }
+                let exit_qty = exit_qty.min(position.qty);
+                let pnl = record_exit(
+                    state,
+                    &position,
+                    now_ms,
+                    cfg.cooldown_hours,
+                    exit,
+                    exit_qty,
+                    fee,
+                );
+                let trade_pnl = position.realized_partial_pnl + pnl;
+                let (_, max_adverse_excursion) = position_excursions(&position);
+                let event = json!({"ts_ms":now_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"reason":protection_reason,"price":exit,"qty":exit_qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"hold_ms":now_ms-position.entry_ms,"mark_price":snapshot.mark_price,"crossed_stop":improved_stop,"max_favorable_excursion":excursion,"max_adverse_excursion":max_adverse_excursion,"direct_market_exit":true});
+                append_event(event_path, event.clone())?;
+                state.record_trade(event);
+                changed = true;
+                continue;
+            }
+            // 先挂新保护，确认成功后才撤旧保护；任何下单失败都保留原止损。
+            let new_order_ids =
+                place_protective_stops(client, &symbol, side, managed_qty, improved_stop, &filters)
+                    .await?;
+            let old_order_ids = protection_order_ids(&position);
+            for (old_order_id, error) in cancel_protective_stops(client, &symbol, &position).await {
+                warn!(symbol=%symbol, old_order_id, error=%error, "新保护已生效，但旧保护撤销失败");
+                append_event(
+                    event_path,
+                    json!({"ts_ms":now_ms,"event":"old_protection_cancel_failed","symbol":symbol,"old_order_id":old_order_id,"new_order_ids":new_order_ids,"reason":error}),
+                )?;
             }
             let old_stop = position.stop_price;
             position.stop_price = improved_stop;
-            position.protection_order_id = Some(new_order_id);
+            set_protection_order_ids(&mut position, new_order_ids.clone());
             position.protection_reason = protection_reason.to_owned();
             append_event(
                 event_path,
-                json!({"ts_ms":now_ms,"event":"protection_updated","symbol":symbol,"side":position.side,"mark_price":snapshot.mark_price,"extreme":position.extreme,"excursion":excursion,"adverse_extreme":adverse,"max_adverse_excursion":max_adverse,"current_return":position.side as f64*(snapshot.mark_price/position.entry_price-1.0),"old_stop":old_stop,"new_stop":improved_stop,"old_order_id":old_order_id,"new_order_id":new_order_id,"reason":protection_reason}),
+                json!({"ts_ms":now_ms,"event":"protection_updated","symbol":symbol,"side":position.side,"mark_price":snapshot.mark_price,"extreme":position.extreme,"excursion":excursion,"adverse_extreme":adverse,"max_adverse_excursion":max_adverse,"current_return":position.side as f64*(snapshot.mark_price/position.entry_price-1.0),"old_stop":old_stop,"new_stop":improved_stop,"old_order_ids":old_order_ids,"new_order_ids":new_order_ids,"reason":protection_reason}),
             )?;
             changed = true;
         }
@@ -2831,19 +2953,9 @@ async fn emergency_flatten(
         return Ok(None);
     }
     let side = if amount > 0.0 { "SELL" } else { "BUY" };
-    let order = rest
-        .place_order(
-            symbol,
-            side,
-            "MARKET",
-            amount.abs(),
-            None,
-            None,
-            true,
-            filters,
-        )
-        .await?;
-    Ok(Some(wait_fill(rest, symbol, order).await?))
+    Ok(Some(
+        place_market_reduce_only(rest, symbol, side, amount.abs(), filters).await?,
+    ))
 }
 
 /// 是否为山寨币专用配置。读取失败留给正式运行器报告。
@@ -4457,6 +4569,7 @@ pub async fn run_altcoin_impulse(
             let mut qty = notional / entry;
             let fee;
             let mut protection_order_id = None;
+            let mut protection_order_ids = Vec::new();
             let mut actual_leverage = cfg.exchange_leverage;
             if let Some(client) = rest.as_ref() {
                 actual_leverage = match client
@@ -4518,9 +4631,9 @@ pub async fn run_altcoin_impulse(
                     }
                 };
                 let requested_qty = qty;
-                // 入场使用 LIMIT IOC，但随后必须用一张 STOP_MARKET 覆盖全部仓位，
-                // 因此同时遵守 LOT_SIZE 与 MARKET_LOT_SIZE 的较小 maxQty。
-                let entry_max_qty = filters.max_qty.min(filters.market_max_qty);
+                // LIMIT IOC 服从 LOT_SIZE；若数量超过 MARKET_LOT_SIZE，保护单和
+                // 后续市价退出会分片执行，不能在这里把目标仓位静默砍小。
+                let entry_max_qty = filters.max_qty;
                 if entry_max_qty.is_finite() && qty > entry_max_qty {
                     qty = entry_max_qty;
                     append_event(
@@ -4669,20 +4782,20 @@ pub async fn run_altcoin_impulse(
                 }
                 let stop = entry * (1.0 - candidate.side as f64 * cfg.stop_pct);
                 let close_side = if candidate.side > 0 { "SELL" } else { "BUY" };
-                match client
-                    .place_order(
-                        &candidate.symbol,
-                        close_side,
-                        "STOP_MARKET",
-                        qty,
-                        None,
-                        Some(stop),
-                        true,
-                        &filters,
-                    )
-                    .await
+                match place_protective_stops(
+                    client,
+                    &candidate.symbol,
+                    close_side,
+                    qty,
+                    stop,
+                    &filters,
+                )
+                .await
                 {
-                    Ok(order_id) => protection_order_id = Some(order_id),
+                    Ok(order_ids) => {
+                        protection_order_id = order_ids.first().copied();
+                        protection_order_ids = order_ids;
+                    }
                     Err(error) => {
                         state.note_execution_issue(
                             scan_ms,
@@ -4732,6 +4845,7 @@ pub async fn run_altcoin_impulse(
                     stop_price: stop,
                     last_bar_ms: candidate.signal_ms,
                     protection_order_id,
+                    protection_order_ids,
                     protection_reason: default_protection_reason(),
                     exchange_leverage: Some(actual_leverage),
                     entry_phase: candidate.entry_phase.clone(),
@@ -5283,7 +5397,7 @@ mod tests {
         clamp_entry_guard_price, confirmation_plan, default_entry_trigger, detected_exit_reason,
         directional_crowding_reason, effective_max_spread_bps, entry_phase, evaluate,
         evaluate_pulse_impulse, existing_stop_raw_fill, failed_breakout, first_week_progress,
-        intrabar_pending_decision, pending_decision, position_excursions,
+        intrabar_pending_decision, market_qty_chunks, pending_decision, position_excursions,
         pulse_exhaustion_candidate, realtime_trailing_stop, recently_exited_symbol,
         record_daily_equity, record_exit, record_partial_exit, recovery_profit_lock_stop,
         signal_age_ms, update_adverse_extreme, Bar, Candidate, IntrabarPendingDecision,
@@ -5470,6 +5584,7 @@ mod tests {
             stop_price: 99.0,
             last_bar_ms: 1,
             protection_order_id: None,
+            protection_order_ids: Vec::new(),
             protection_reason: "initial_stop".into(),
             exchange_leverage: Some(10),
             entry_phase: "pulse_exhaustion_short".into(),
@@ -5489,6 +5604,27 @@ mod tests {
         assert_eq!(adverse_fill_price(100.0, 1, 5.0, false), 99.95);
         assert_eq!(adverse_fill_price(100.0, -1, 5.0, true), 99.95);
         assert_eq!(adverse_fill_price(100.0, -1, 5.0, false), 100.05);
+    }
+
+    #[test]
+    fn market_quantity_is_chunked_without_capping_limit_entry_size() {
+        let filters = live::SymbolFilters {
+            tick_size: 0.00001,
+            step_size: 0.1,
+            market_step_size: 0.1,
+            price_precision: 5,
+            quantity_precision: 1,
+            max_qty: 1_000_000.0,
+            market_max_qty: 30_000.0,
+            min_notional: 5.0,
+            multiplier_up: 1.05,
+            multiplier_down: 0.95,
+        };
+        let chunks = market_qty_chunks(61_988.7, &filters);
+        assert_eq!(chunks.len(), 3);
+        assert!(chunks.iter().all(|qty| *qty <= filters.market_max_qty));
+        assert!((chunks.iter().sum::<f64>() - 61_988.7).abs() < 1e-9);
+        assert_eq!(market_qty_chunks(20_000.0, &filters), vec![20_000.0]);
     }
 
     #[test]
@@ -5524,6 +5660,7 @@ mod tests {
             stop_price: 9.5,
             last_bar_ms: now_ms,
             protection_order_id: None,
+            protection_order_ids: Vec::new(),
             protection_reason: "initial_stop".into(),
             exchange_leverage: Some(10),
             entry_phase: "standard_impulse".into(),
@@ -5563,6 +5700,7 @@ mod tests {
             stop_price: 95.0,
             last_bar_ms: now_ms,
             protection_order_id: None,
+            protection_order_ids: Vec::new(),
             protection_reason: "initial_stop".into(),
             exchange_leverage: Some(10),
             entry_phase: "standard_impulse".into(),
@@ -5643,6 +5781,7 @@ mod tests {
             stop_price: 0.95,
             last_bar_ms: 1,
             protection_order_id: Some(42),
+            protection_order_ids: vec![42],
             protection_reason: "initial_stop".into(),
             exchange_leverage: Some(10),
             entry_phase: "standard_impulse".into(),
@@ -5791,6 +5930,7 @@ mod tests {
             stop_price: 0.95,
             last_bar_ms: now_ms,
             protection_order_id: None,
+            protection_order_ids: Vec::new(),
             protection_reason: "initial_stop".into(),
             exchange_leverage: Some(10),
             entry_phase: "overextended_long".into(),
