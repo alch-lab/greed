@@ -169,6 +169,10 @@ pub struct AltcoinImpulseConfig {
     pub min_contract_age_days: u32,
     #[serde(default = "default_max_spread_bps")]
     pub max_spread_bps: f64,
+    /// 深度、冲击和成交流全部显著优于硬门槛时允许的点差上限。
+    /// 普通盘口仍使用 `max_spread_bps`，避免为提高频率而全面放松流动性保护。
+    #[serde(default = "default_liquid_market_max_spread_bps")]
+    pub liquid_market_max_spread_bps: f64,
     #[serde(default = "default_max_entry_impact_bps")]
     pub max_entry_impact_bps: f64,
     #[serde(default = "default_max_exit_impact_bps")]
@@ -601,6 +605,9 @@ fn default_risk_execution_buffer_pct() -> f64 {
 fn default_max_spread_bps() -> f64 {
     10.0
 }
+fn default_liquid_market_max_spread_bps() -> f64 {
+    15.0
+}
 fn default_min_contract_age_days() -> u32 {
     7
 }
@@ -627,6 +634,33 @@ fn default_min_unique_trade_prices() -> usize {
 }
 fn default_max_last_trade_age_seconds() -> u64 {
     5
+}
+
+fn effective_max_spread_bps(
+    cfg: &AltcoinImpulseConfig,
+    liquidity: &live::rest::LiquiditySnapshot,
+    required_depth: f64,
+) -> (f64, bool) {
+    let liquid_market = liquidity.bid_depth_usd >= required_depth * 3.0
+        && liquidity.ask_depth_usd >= required_depth * 3.0
+        && liquidity
+            .entry_impact_bps
+            .is_some_and(|impact| impact <= cfg.max_entry_impact_bps * 0.5)
+        && liquidity
+            .exit_impact_bps
+            .is_some_and(|impact| impact <= cfg.max_exit_impact_bps * 0.5)
+        && liquidity.recent_trade_count >= cfg.min_recent_trades.saturating_mul(2)
+        && liquidity.unique_trade_prices >= cfg.min_unique_trade_prices
+        && liquidity.last_trade_age_ms <= cfg.max_last_trade_age_seconds as i64 * 1_000
+        && liquidity.trade_history_span_ms >= cfg.recent_trade_window_seconds as i64 * 1_000;
+    (
+        if liquid_market {
+            cfg.liquid_market_max_spread_bps
+        } else {
+            cfg.max_spread_bps
+        },
+        liquid_market,
+    )
 }
 
 fn default_loss_trim_trigger_pct() -> f64 {
@@ -2900,7 +2934,8 @@ pub async fn run_altcoin_impulse(
     );
     anyhow::ensure!(
         cfg.max_spread_bps > 0.0
-            && cfg.max_entry_impact_bps >= cfg.max_spread_bps
+            && cfg.liquid_market_max_spread_bps >= cfg.max_spread_bps
+            && cfg.max_entry_impact_bps >= cfg.liquid_market_max_spread_bps
             && cfg.max_exit_impact_bps >= cfg.max_entry_impact_bps
             && (0.001..=0.02).contains(&cfg.depth_band_pct)
             && cfg.min_depth_multiple >= 2.0
@@ -4319,11 +4354,13 @@ pub async fn run_altcoin_impulse(
                     }
                 };
                 let required_depth = notional * cfg.min_depth_multiple;
+                let (effective_spread_limit, liquid_market_spread_relaxation) =
+                    effective_max_spread_bps(&cfg, &liquidity, required_depth);
                 let mut blockers = Vec::new();
-                if liquidity.spread_bps > cfg.max_spread_bps {
+                if liquidity.spread_bps > effective_spread_limit {
                     blockers.push(format!(
                         "价差 {:.1}bps > {:.1}bps",
-                        liquidity.spread_bps, cfg.max_spread_bps
+                        liquidity.spread_bps, effective_spread_limit
                     ));
                 }
                 if liquidity
@@ -4397,11 +4434,13 @@ pub async fn run_altcoin_impulse(
                     "target_notional":notional,
                     "source":"execution_endpoint_rest_agg_trades_and_depth",
                     "passed":blockers.is_empty(),
+                    "effective_max_spread_bps":effective_spread_limit,
+                    "liquid_market_spread_relaxation":liquid_market_spread_relaxation,
                     "snapshot":liquidity
                 });
                 append_event(
                     &event_path,
-                    json!({"ts_ms":scan_ms,"event":"liquidity_check","microstructure_stage":"confirmation","microstructure_source":"execution_endpoint_rest_agg_trades_and_depth","origin_signal_ms":candidate.signal_ms,"symbol":candidate.symbol,"side":candidate.side,"target_notional":notional,"passed":blockers.is_empty(),"blockers":&blockers,"observations":if unique_trade_prices_warning {vec![format!("近 {} 秒仅 {} 个成交价，参考值 ≥{}；其他可成交性指标合格时不单独否决",cfg.recent_trade_window_seconds,liquidity.unique_trade_prices,cfg.min_unique_trade_prices)]} else {Vec::<String>::new()},"snapshot":liquidity,"limits":{"max_spread_bps":cfg.max_spread_bps,"max_entry_impact_bps":cfg.max_entry_impact_bps,"max_exit_impact_bps":cfg.max_exit_impact_bps,"depth_band_pct":cfg.depth_band_pct,"min_depth_multiple":cfg.min_depth_multiple,"recent_trade_window_seconds":cfg.recent_trade_window_seconds,"min_recent_trades":cfg.min_recent_trades,"min_unique_trade_prices":cfg.min_unique_trade_prices,"unique_trade_prices_hard":cfg.unique_trade_prices_hard,"max_last_trade_age_seconds":cfg.max_last_trade_age_seconds}}),
+                    json!({"ts_ms":scan_ms,"event":"liquidity_check","microstructure_stage":"confirmation","microstructure_source":"execution_endpoint_rest_agg_trades_and_depth","origin_signal_ms":candidate.signal_ms,"symbol":candidate.symbol,"side":candidate.side,"target_notional":notional,"passed":blockers.is_empty(),"blockers":&blockers,"observations":if unique_trade_prices_warning {vec![format!("近 {} 秒仅 {} 个成交价，参考值 ≥{}；其他可成交性指标合格时不单独否决",cfg.recent_trade_window_seconds,liquidity.unique_trade_prices,cfg.min_unique_trade_prices)]} else {Vec::<String>::new()},"spread_policy":if liquid_market_spread_relaxation {"liquid_market_relaxed"} else {"default"},"effective_max_spread_bps":effective_spread_limit,"snapshot":liquidity,"limits":{"max_spread_bps":cfg.max_spread_bps,"liquid_market_max_spread_bps":cfg.liquid_market_max_spread_bps,"max_entry_impact_bps":cfg.max_entry_impact_bps,"max_exit_impact_bps":cfg.max_exit_impact_bps,"depth_band_pct":cfg.depth_band_pct,"min_depth_multiple":cfg.min_depth_multiple,"liquid_market_depth_multiple":cfg.min_depth_multiple*3.0,"recent_trade_window_seconds":cfg.recent_trade_window_seconds,"min_recent_trades":cfg.min_recent_trades,"liquid_market_min_recent_trades":cfg.min_recent_trades.saturating_mul(2),"min_unique_trade_prices":cfg.min_unique_trade_prices,"unique_trade_prices_hard":cfg.unique_trade_prices_hard,"max_last_trade_age_seconds":cfg.max_last_trade_age_seconds}}),
                 )?;
                 if !blockers.is_empty() {
                     let reason = blockers.join(" / ");
@@ -5006,6 +5045,8 @@ pub async fn run_altcoin_impulse(
         status_payload["altcoin_impulse"]["extreme_direct_enabled"] =
             json!(cfg.extreme_direct_enabled);
         status_payload["altcoin_impulse"]["max_spread_bps"] = json!(cfg.max_spread_bps);
+        status_payload["altcoin_impulse"]["liquid_market_max_spread_bps"] =
+            json!(cfg.liquid_market_max_spread_bps);
         status_payload["altcoin_impulse"]["min_contract_age_days"] =
             json!(cfg.min_contract_age_days);
         status_payload["altcoin_impulse"]["max_entry_impact_bps"] = json!(cfg.max_entry_impact_bps);
@@ -5240,13 +5281,56 @@ mod tests {
     use super::{
         adverse_excursion, adverse_fill_price, apply_daily_entry_bonus, apply_daily_risk_reset,
         clamp_entry_guard_price, confirmation_plan, default_entry_trigger, detected_exit_reason,
-        directional_crowding_reason, entry_phase, evaluate, evaluate_pulse_impulse,
-        existing_stop_raw_fill, failed_breakout, first_week_progress, intrabar_pending_decision,
-        pending_decision, position_excursions, pulse_exhaustion_candidate, realtime_trailing_stop,
-        recently_exited_symbol, record_daily_equity, record_exit, record_partial_exit,
-        recovery_profit_lock_stop, signal_age_ms, update_adverse_extreme, Bar, Candidate,
-        IntrabarPendingDecision, PendingDecision, PersistedState, Position, PulseExhaustionSetup,
+        directional_crowding_reason, effective_max_spread_bps, entry_phase, evaluate,
+        evaluate_pulse_impulse, existing_stop_raw_fill, failed_breakout, first_week_progress,
+        intrabar_pending_decision, pending_decision, position_excursions,
+        pulse_exhaustion_candidate, realtime_trailing_stop, recently_exited_symbol,
+        record_daily_equity, record_exit, record_partial_exit, recovery_profit_lock_stop,
+        signal_age_ms, update_adverse_extreme, Bar, Candidate, IntrabarPendingDecision,
+        PendingDecision, PersistedState, Position, PulseExhaustionSetup,
     };
+
+    #[test]
+    fn spread_relaxes_only_for_an_exceptionally_liquid_book() {
+        let strategy: super::StrategyFile = toml::from_str(include_str!(
+            "../../../config/strategy-altcoin-impulse.toml"
+        ))
+        .unwrap();
+        let cfg = strategy.altcoin_impulse;
+        let mut snapshot = live::rest::LiquiditySnapshot {
+            measured_at_ms: 1_800_000_000_000,
+            bid: 0.01713,
+            ask: 0.01715,
+            spread_bps: 11.675,
+            bid_depth_usd: 1_218_238.0,
+            ask_depth_usd: 1_289_030.0,
+            entry_impact_bps: Some(0.0),
+            exit_impact_bps: Some(0.0),
+            recent_trade_count: 145,
+            unique_trade_prices: 15,
+            last_trade_age_ms: 1_030,
+            trade_history_span_ms: 384_686,
+            depth_imbalance: None,
+            trade_notional_60s: None,
+            delta_usd_60s: None,
+            delta_share_10s: None,
+            delta_share_30s: None,
+            delta_share_60s: None,
+            large_trade_delta_share_60s: None,
+            flow_persistence_60s: None,
+            volume_acceleration_60s: None,
+            trade_count_acceleration_60s: None,
+            price_return_60s: None,
+        };
+        let (limit, relaxed) = effective_max_spread_bps(&cfg, &snapshot, 11_369.0);
+        assert!(relaxed);
+        assert_eq!(limit, 15.0);
+
+        snapshot.recent_trade_count = cfg.min_recent_trades;
+        let (limit, relaxed) = effective_max_spread_bps(&cfg, &snapshot, 11_369.0);
+        assert!(!relaxed);
+        assert_eq!(limit, 10.0);
+    }
 
     #[test]
     fn directional_crowding_guard_is_mirrored_and_fails_closed() {
@@ -5972,6 +6056,7 @@ mod tests {
         assert_eq!(strategy.altcoin_impulse.loss_trim_fraction, 0.50);
         assert!(!strategy.altcoin_impulse.extreme_direct_enabled);
         assert_eq!(strategy.altcoin_impulse.max_spread_bps, 10.0);
+        assert_eq!(strategy.altcoin_impulse.liquid_market_max_spread_bps, 15.0);
         assert_eq!(strategy.altcoin_impulse.min_contract_age_days, 7);
         assert_eq!(strategy.altcoin_impulse.max_entry_impact_bps, 15.0);
         assert_eq!(strategy.altcoin_impulse.max_exit_impact_bps, 20.0);

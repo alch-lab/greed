@@ -108,6 +108,9 @@ min_24h_volume_usd = 5000000.0
 min_contract_age_days = 7
 # 下单前在实际执行端点硬检验可成交性；主网信号再强，也不能绕过这些门槛。
 max_spread_bps = 10.0
+# 普通盘口仍限制 10bps；只有双边深度达到基础要求 3 倍、进出冲击低于各自
+# 上限一半、60 秒成交笔数达到基础要求 2 倍且成交新鲜时，才允许到 15bps。
+liquid_market_max_spread_bps = 15.0
 max_entry_impact_bps = 15.0
 max_exit_impact_bps = 20.0
 depth_band_pct = 0.005
