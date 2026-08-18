@@ -255,6 +255,16 @@ fn aggregate_status(
     .filter_map(|(name, message)| message.map(|message| format!("{name}: {message}")))
     .collect::<Vec<_>>()
     .join("；");
+    let restart_count = [mr, altcoin]
+        .into_iter()
+        .filter(|component| component["state"] == "restarting")
+        .filter_map(|component| component["restart_count"].as_u64())
+        .max();
+    let retry_in_s = [mr, altcoin]
+        .into_iter()
+        .filter(|component| component["state"] == "restarting")
+        .filter_map(|component| component["retry_in_s"].as_u64())
+        .min();
     json!({
         "state":state,
         "mode":mode.as_str(),
@@ -267,6 +277,8 @@ fn aggregate_status(
         "n_intents":mr["n_intents"].as_u64().unwrap_or(0)+altcoin["n_intents"].as_u64().unwrap_or(0),
         "n_fills":mr["n_fills"].as_u64().unwrap_or(0)+altcoin["n_fills"].as_u64().unwrap_or(0),
         "execution_healthy":mr_healthy && altcoin_healthy,
+        "restart_count":restart_count,
+        "retry_in_s":retry_in_s,
         "error":if error.is_empty() {Value::Null} else {Value::String(error)},
         "portfolio":{
             "account_wallet_usdt":account_wallet,
@@ -482,5 +494,29 @@ mod tests {
         assert_eq!(status["portfolio"]["combined_pnl"], 5.0);
         assert_eq!(status["portfolio"]["mr"]["equity"], 1_025.0);
         assert_eq!(status["portfolio"]["altcoin"]["equity"], 980.0);
+    }
+
+    #[test]
+    fn aggregate_exposes_child_restart_timing() {
+        let cfg = deployed_config();
+        let mr = json!({"state":"running","equity":1_000.0});
+        let altcoin = json!({
+            "state":"restarting",
+            "restart_count":4,
+            "retry_in_s":16,
+            "error":"temporary upstream error"
+        });
+        let status = aggregate_status(
+            TradeMode::Paper,
+            "config/strategy-portfolio.toml",
+            1,
+            2_000.0,
+            &cfg,
+            &mr,
+            &altcoin,
+        );
+        assert_eq!(status["state"], "restarting");
+        assert_eq!(status["restart_count"], 4);
+        assert_eq!(status["retry_in_s"], 16);
     }
 }
