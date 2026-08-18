@@ -2194,6 +2194,22 @@ fn cross_section_analysis(
     (candidates, status)
 }
 
+fn cross_section_status_complete(status: &Value) -> bool {
+    status.get("gate").is_some_and(Value::is_object)
+        && status.get("execution").is_some_and(|execution| {
+            execution.is_object()
+                && execution
+                    .get("gross_multiple")
+                    .and_then(Value::as_f64)
+                    .is_some()
+                && execution.get("stop_pct").and_then(Value::as_f64).is_some()
+                && execution
+                    .get("fixed_exit_hours")
+                    .and_then(Value::as_u64)
+                    .is_some()
+        })
+}
+
 pub(crate) fn append_event(path: &str, event: Value) -> Result<()> {
     if let Some(parent) = std::path::Path::new(path).parent() {
         std::fs::create_dir_all(parent)?;
@@ -3782,10 +3798,15 @@ pub async fn run_altcoin_impulse(
         let cross_interval_ms = cross_cfg.hold_hours as i64 * 3_600_000;
         let cross_boundary_ms = scan_ms.div_euclid(cross_interval_ms) * cross_interval_ms;
         let cross_signal_ms = cross_boundary_ms - 1;
-        let cross_scan_due = cross_cfg.enabled
+        let cross_execution_due = cross_cfg.enabled
             && scan_ms.saturating_sub(cross_boundary_ms)
                 <= cfg.max_signal_age_seconds as i64 * 1_000
             && state.seen_signal.get("__cross_section__").copied() != Some(cross_signal_ms);
+        // 老版本的持久化状态可能已经带有 cross_section，但还没有 gate/execution。
+        // 此时立刻拉取完整横截面重建展示状态，但不执行当前 3h 边界的陈旧候选。
+        let cross_status_refresh_due =
+            cross_cfg.enabled && !cross_section_status_complete(&state.cross_section_status);
+        let cross_analysis_due = cross_execution_due || cross_status_refresh_due;
         let mut shortlist: Vec<(String, f64)> = tickers
             .as_array()
             .into_iter()
@@ -3800,7 +3821,7 @@ pub async fn run_altcoin_impulse(
                         .is_none_or(|symbols| symbols.contains(&symbol))
                     && spot_symbols.contains(&symbol)
                     && !excluded.contains(symbol.as_str());
-                let selected = if cross_cfg.enabled && cross_scan_due {
+                let selected = if cross_cfg.enabled && cross_analysis_due {
                     // 重建过去 30 个已完成信号时，不能只看“当前”成交额，否则会漏掉
                     // 历史截面曾满足 1000 万门槛、现在刚掉出门槛的币，造成幸存者偏差。
                     // 每个历史截面的真实 24h 成交额由 cross_ranks_at 再因果过滤。
@@ -3812,7 +3833,7 @@ pub async fn run_altcoin_impulse(
             })
             .collect();
         shortlist.sort_by(|a, b| b.1.total_cmp(&a.1));
-        if !cross_scan_due {
+        if !cross_analysis_due {
             shortlist.truncate(cfg.scan_limit);
         }
         // 已持仓标的即使跌出动量扫描池也必须继续取价、跟踪止损和时间退出。
@@ -3843,7 +3864,7 @@ pub async fn run_altcoin_impulse(
         let shortlist_count = shortlist.len();
         let mut set = tokio::task::JoinSet::new();
         let kline_limit = Arc::new(tokio::sync::Semaphore::new(20));
-        let history_bars = if cross_scan_due { 850 } else { 700 };
+        let history_bars = if cross_analysis_due { 850 } else { 700 };
         for (symbol, _) in shortlist {
             let client = http.clone();
             let permits = kline_limit.clone();
@@ -4197,17 +4218,21 @@ pub async fn run_altcoin_impulse(
         }
 
         let mut candidates: Vec<Candidate> = if cross_cfg.enabled {
-            if cross_scan_due {
-                let (candidates, mut status) =
+            if cross_analysis_due {
+                let (mut candidates, mut status) =
                     cross_section_analysis(&bars_by_symbol, cross_boundary_ms, &cross_cfg, &cfg);
                 status["performance"] = cross_performance(&state);
                 state.cross_section_status = status.clone();
-                state
-                    .seen_signal
-                    .insert("__cross_section__".to_owned(), cross_signal_ms);
+                if cross_execution_due {
+                    state
+                        .seen_signal
+                        .insert("__cross_section__".to_owned(), cross_signal_ms);
+                } else {
+                    candidates.clear();
+                }
                 append_event(
                     &event_path,
-                    json!({"ts_ms":scan_ms,"event":"cross_section_decision","status":status,"candidate_count":candidates.len()}),
+                    json!({"ts_ms":scan_ms,"event":if cross_execution_due {"cross_section_decision"} else {"cross_section_status_migrated"},"status":status,"candidate_count":candidates.len(),"execution_due":cross_execution_due}),
                 )?;
                 save_state(&state_path, &state)?;
                 candidates
@@ -6963,5 +6988,10 @@ mod tests {
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].entry_phase, "cross_section_momentum");
         assert_eq!(candidates[0].side, 1);
+        assert!(super::cross_section_status_complete(&status));
+        assert!(!super::cross_section_status_complete(&serde_json::json!({
+            "model":"12h_cross_section_momentum",
+            "universe_count":4
+        })));
     }
 }
