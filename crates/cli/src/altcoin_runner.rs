@@ -253,6 +253,10 @@ pub struct AltcoinCrossSectionConfig {
     pub base_gross_multiple: f64,
     #[serde(default = "default_cross_active_gross")]
     pub active_gross_multiple: f64,
+    #[serde(default = "default_cross_strong_excess_return")]
+    pub strong_excess_return: f64,
+    #[serde(default = "default_cross_strong_gross")]
+    pub strong_gross_multiple: f64,
     #[serde(default = "default_cross_stop_pct")]
     pub stop_pct: f64,
 }
@@ -271,6 +275,8 @@ impl Default for AltcoinCrossSectionConfig {
             assumed_cost_bps_per_side: default_cross_assumed_cost_bps(),
             base_gross_multiple: default_cross_base_gross(),
             active_gross_multiple: default_cross_active_gross(),
+            strong_excess_return: default_cross_strong_excess_return(),
+            strong_gross_multiple: default_cross_strong_gross(),
             stop_pct: default_cross_stop_pct(),
         }
     }
@@ -292,19 +298,25 @@ fn default_cross_market_threshold() -> f64 {
     0.01
 }
 fn default_cross_gate_window() -> usize {
-    80
+    30
 }
 fn default_cross_gate_pf() -> f64 {
-    1.2
+    1.3
 }
 fn default_cross_assumed_cost_bps() -> f64 {
     5.0
 }
 fn default_cross_base_gross() -> f64 {
-    0.15
+    0.05
 }
 fn default_cross_active_gross() -> f64 {
-    0.75
+    0.4
+}
+fn default_cross_strong_excess_return() -> f64 {
+    0.12
+}
+fn default_cross_strong_gross() -> f64 {
+    0.5
 }
 fn default_cross_stop_pct() -> f64 {
     0.08
@@ -2037,7 +2049,10 @@ fn cross_section_analysis(
     let min_universe_size = cross.names;
     let mut history = Vec::new();
     let mut shadow_baskets = Vec::new();
-    for offset in (1..=cross.gate_window).rev() {
+    // A scheduled boundary can occasionally have no directional extreme or
+    // insufficient point-in-time liquidity. Look back farther and retain the
+    // latest N *completed valid signals*, matching the causal portfolio gate.
+    for offset in (1..=cross.gate_window * 2).rev() {
         let entry_ms = boundary_ms - offset as i64 * cross.hold_hours as i64 * 3_600_000;
         let ranks = cross_ranks_at(bars_by_symbol, entry_ms, cross);
         if ranks.len() < min_universe_size {
@@ -2073,6 +2088,11 @@ fn cross_section_analysis(
             shadow_baskets.push(json!({"entry_ms":entry_ms,"exit_ms":entry_ms+cross.hold_hours as i64*3_600_000,"basket_return":basket_return,"legs":legs}));
         }
     }
+    if history.len() > cross.gate_window {
+        let excess = history.len() - cross.gate_window;
+        history.drain(..excess);
+        shadow_baskets.drain(..excess);
+    }
     let gains: f64 = history.iter().copied().filter(|value| *value > 0.0).sum();
     let losses: f64 = history
         .iter()
@@ -2092,7 +2112,17 @@ fn cross_section_analysis(
         .flatten()
         .unwrap_or_default();
     let market_return = ranks.get(ranks.len() / 2).map(|rank| rank.trailing_return);
-    let gross_multiple = if high_conviction {
+    let signal_excess_return = selected
+        .first()
+        .zip(market_return)
+        .map(|((rank, _), market)| (rank.trailing_return - market).abs());
+    let strong_signal = high_conviction
+        && signal_excess_return
+            .map(|value| value >= cross.strong_excess_return)
+            .unwrap_or(false);
+    let gross_multiple = if strong_signal {
+        cross.strong_gross_multiple
+    } else if high_conviction {
         cross.active_gross_multiple
     } else {
         cross.base_gross_multiple
@@ -2153,11 +2183,13 @@ fn cross_section_analysis(
         "market_return":market_return,
         "market_threshold":cross.market_momentum_threshold,
         "direction":market_return.map(|value| if value >= cross.market_momentum_threshold {"long_strongest"} else {"short_weakest"}),
+        "signal_excess_return":signal_excess_return,
+        "strong_signal":strong_signal,
         "universe_rule":"同名现货与 USDT 永续、24h 成交额达标；每 3 小时只执行截面最强或最弱的 1 币",
         "selected":selected_json,
         "ranked_extremes":ranked_extremes,
         "gate":{"ready":gate_ready,"open":high_conviction,"samples":history.len(),"required_samples":cross.gate_window,"sum_return":history.iter().sum::<f64>(),"profit_factor":profit_factor,"required_profit_factor":cross.gate_min_profit_factor,"returns":history,"baskets":shadow_baskets},
-        "execution":{"legs_required":cross.names,"gross_multiple":gross_multiple,"base_gross_multiple":cross.base_gross_multiple,"active_gross_multiple":cross.active_gross_multiple,"stop_pct":cross.stop_pct,"fixed_exit_hours":cross.hold_hours,"daily_loss_limit":impulse.daily_loss_limit}
+        "execution":{"legs_required":cross.names,"gross_multiple":gross_multiple,"base_gross_multiple":cross.base_gross_multiple,"active_gross_multiple":cross.active_gross_multiple,"strong_excess_return":cross.strong_excess_return,"strong_gross_multiple":cross.strong_gross_multiple,"stop_pct":cross.stop_pct,"fixed_exit_hours":cross.hold_hours,"daily_loss_limit":impulse.daily_loss_limit}
     });
     (candidates, status)
 }
@@ -3302,20 +3334,22 @@ pub async fn run_altcoin_impulse(
             || (cross_cfg.formation_hours == 12
                 && cross_cfg.hold_hours == 3
                 && cross_cfg.names == 1
-                && (72..=80).contains(&cross_cfg.gate_window)
+                && (26..=36).contains(&cross_cfg.gate_window)
                 && cross_cfg.min_24h_volume_usd >= 10_000_000.0
                 && (0.005..=0.02).contains(&cross_cfg.market_momentum_threshold)
                 && (1.0..=2.0).contains(&cross_cfg.gate_min_profit_factor)
                 && (5.0..=25.0).contains(&cross_cfg.assumed_cost_bps_per_side)),
-        "横截面动量参数必须保持在已验证口径：12h/3h、单币、72..=80 样本自适应仓位、日成交额至少 1000 万美元"
+        "横截面动量参数必须保持在已验证口径：12h/3h、单币、26..=36 个已完成信号自适应仓位、日成交额至少 1000 万美元"
     );
     anyhow::ensure!(
         !cross_cfg.enabled
             || ((0.05..=0.25).contains(&cross_cfg.base_gross_multiple)
                 && cross_cfg.active_gross_multiple >= cross_cfg.base_gross_multiple
-                && cross_cfg.active_gross_multiple <= 1.0
+                && cross_cfg.strong_gross_multiple >= cross_cfg.active_gross_multiple
+                && cross_cfg.strong_gross_multiple <= 0.5
+                && (0.08..=0.20).contains(&cross_cfg.strong_excess_return)
                 && (0.04..=0.10).contains(&cross_cfg.stop_pct)),
-        "横截面动量仓位要求基础 0.05x..=0.25x、增强不超过 1.0x、止损 4%..=10%"
+        "横截面动量仓位要求基础 0.05x..=0.25x、增强与强信号仓位递增且不超过 0.5x、超额动量 8%..=20%、止损 4%..=10%"
     );
     anyhow::ensure!(
         (0.0..=0.50).contains(&cfg.first_week_loss_limit)
@@ -3754,7 +3788,7 @@ pub async fn run_altcoin_impulse(
                     && spot_symbols.contains(&symbol)
                     && !excluded.contains(symbol.as_str());
                 let selected = if cross_cfg.enabled && cross_scan_due {
-                    // 重建过去 80 个影子信号时，不能只看“当前”成交额，否则会漏掉
+                    // 重建过去 30 个已完成信号时，不能只看“当前”成交额，否则会漏掉
                     // 历史截面曾满足 1000 万门槛、现在刚掉出门槛的币，造成幸存者偏差。
                     // 每个历史截面的真实 24h 成交额由 cross_ranks_at 再因果过滤。
                     common
@@ -3796,7 +3830,7 @@ pub async fn run_altcoin_impulse(
         let shortlist_count = shortlist.len();
         let mut set = tokio::task::JoinSet::new();
         let kline_limit = Arc::new(tokio::sync::Semaphore::new(20));
-        let history_bars = if cross_scan_due { 1_100 } else { 700 };
+        let history_bars = if cross_scan_due { 850 } else { 700 };
         for (symbol, _) in shortlist {
             let client = http.clone();
             let permits = kline_limit.clone();
@@ -4913,7 +4947,7 @@ pub async fn run_altcoin_impulse(
             let gross_limit = if pulse_candidate {
                 cfg.pulse_max_gross_multiple
             } else if cross_candidate {
-                cross_cfg.active_gross_multiple
+                cross_cfg.strong_gross_multiple
             } else {
                 cfg.max_gross_multiple
             };
@@ -6739,7 +6773,7 @@ mod tests {
         assert_eq!(strategy.altcoin_impulse.max_directional_funding_rate, 0.003);
         assert_eq!(strategy.altcoin_impulse.max_directional_premium, 0.01);
         assert_eq!(strategy.altcoin_impulse.stop_pct, 0.010);
-        assert_eq!(strategy.altcoin_impulse.max_gross_multiple, 0.75);
+        assert_eq!(strategy.altcoin_impulse.max_gross_multiple, 0.50);
         assert_eq!(strategy.altcoin_impulse.first_week_duration_days, 7);
         assert_eq!(strategy.altcoin_impulse.first_week_loss_limit, 0.12);
         assert_eq!(strategy.altcoin_impulse.dry_slippage_bps, 5.0);
@@ -6821,7 +6855,7 @@ mod tests {
         assert_eq!(strategy.altcoin_cross_section.formation_hours, 12);
         assert_eq!(strategy.altcoin_cross_section.hold_hours, 3);
         assert_eq!(strategy.altcoin_cross_section.names, 1);
-        assert_eq!(strategy.altcoin_cross_section.gate_window, 80);
+        assert_eq!(strategy.altcoin_cross_section.gate_window, 30);
         assert_eq!(
             strategy.altcoin_cross_section.min_24h_volume_usd,
             10_000_000.0
@@ -6830,8 +6864,10 @@ mod tests {
             strategy.altcoin_cross_section.market_momentum_threshold,
             0.01
         );
-        assert_eq!(strategy.altcoin_cross_section.base_gross_multiple, 0.15);
-        assert_eq!(strategy.altcoin_cross_section.active_gross_multiple, 0.75);
+        assert_eq!(strategy.altcoin_cross_section.base_gross_multiple, 0.05);
+        assert_eq!(strategy.altcoin_cross_section.active_gross_multiple, 0.40);
+        assert_eq!(strategy.altcoin_cross_section.strong_excess_return, 0.12);
+        assert_eq!(strategy.altcoin_cross_section.strong_gross_multiple, 0.50);
         assert_eq!(strategy.altcoin_cross_section.stop_pct, 0.08);
     }
 
@@ -6868,7 +6904,7 @@ mod tests {
     }
 
     #[test]
-    fn cross_section_gate_rebuilds_eighty_completed_shadow_signals() {
+    fn cross_section_gate_rebuilds_thirty_completed_shadow_signals() {
         let strategy: super::StrategyFile = toml::from_str(include_str!(
             "../../../config/strategy-altcoin-impulse.toml"
         ))
@@ -6904,7 +6940,7 @@ mod tests {
             &strategy.altcoin_cross_section,
             &strategy.altcoin_impulse,
         );
-        assert_eq!(status["gate"]["samples"], 80);
+        assert_eq!(status["gate"]["samples"], 30);
         assert_eq!(status["min_universe_size"], 1);
         assert_eq!(status["selected"].as_array().unwrap().len(), 1);
         assert_eq!(candidates.len(), 1);
