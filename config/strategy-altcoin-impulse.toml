@@ -1,6 +1,6 @@
-# 山寨币确认式放量突破（独立高风险 sleeve）
-# 以 109e769 的攻击型主线为基准：24h 突破后必须经历回踩/反抽，随后由独立
-# 15m K 线顺向收回才入场。保留后续版本的实时流动性、精度、杠杆回退和保护单修复。
+# 山寨币高周转截面动量（独立高风险 sleeve）
+# 每 3 小时根据已闭合 15m K 线重建全市场 12h 截面：市场中位涨幅达到 1%
+# 做多最强币，否则做空最弱币。信号直接进入模拟盘，不再等待形态观测层。
 
 [altcoin_impulse]
 enabled = true
@@ -17,12 +17,12 @@ short_risk_scale = 1.0
 # ACEUSDT 复盘中的 -0.997% 资金费率与 -1.26% 永续折价会被该门槛拦截。
 max_directional_funding_rate = 0.003
 max_directional_premium = 0.010
-max_positions = 2
+max_positions = 1
 max_daily_entries = 10
 # 模拟盘固定最多 10 笔/北京时间自然日，不允许临时加额。
 max_daily_entry_bonus = 0
 daily_loss_limit = 0.04
-max_gross_multiple = 2.5
+max_gross_multiple = 0.75
 # 模拟盘持续运行，不设盈利上限，也不因首个 7 天窗口结束而停止开仓。
 # 下面的 7 天窗口只用于首周亏损保护。
 first_week_duration_days = 7
@@ -54,7 +54,7 @@ cooldown_hours = 4
 # 信号价到实际可成交价最多允许 1.5% 不利偏移；超出则 IOC 限价单不追。
 max_entry_slippage_pct = 0.015
 # 只成交刚闭合的确认信号，避免仓位释放后追逐旧 K 线。
-max_signal_age_seconds = 120
+max_signal_age_seconds = 300
 # 突破后等待回踩/反抽守住，再由后续独立 K 线顺向收回。
 direct_entry_enabled = false
 fixed_time_exit_only = false
@@ -151,5 +151,17 @@ poll_seconds = 60
 allow_live = false
 
 [altcoin_cross_section]
-# 横截面反转不占真实仓位；当前真实执行恢复确认式放量突破。
-enabled = false
+# 12h/3h 截面动量直接执行。基础 0.15x 权益；最近 80 个完整影子信号
+# PF >= 1.20 且合计收益为正时升到 0.75x。无论门控状态都继续交易，门控只调仓位。
+enabled = true
+formation_hours = 12
+hold_hours = 3
+names = 1
+min_24h_volume_usd = 10000000.0
+market_momentum_threshold = 0.01
+gate_window = 80
+gate_min_profit_factor = 1.20
+assumed_cost_bps_per_side = 5.0
+base_gross_multiple = 0.15
+active_gross_multiple = 0.75
+stop_pct = 0.08
