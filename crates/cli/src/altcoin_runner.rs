@@ -164,6 +164,18 @@ pub struct AltcoinImpulseConfig {
     pub pulse_max_positions: usize,
     #[serde(default = "default_pulse_max_gross_multiple")]
     pub pulse_max_gross_multiple: f64,
+    /// The exhaustion sleeve has a different payoff path from the breakout
+    /// sleeve, so its stop and profit protection are configured independently.
+    /// This also keeps a pulse retune from silently changing open main-strategy
+    /// positions.
+    #[serde(default = "default_pulse_stop_pct")]
+    pub pulse_stop_pct: f64,
+    #[serde(default = "default_pulse_trail_activation_pct")]
+    pub pulse_trail_activation_pct: f64,
+    #[serde(default = "default_pulse_trail_pct")]
+    pub pulse_trail_pct: f64,
+    #[serde(default = "default_pulse_max_directional_premium")]
+    pub pulse_max_directional_premium: f64,
     pub min_24h_volume_usd: f64,
     #[serde(default = "default_min_contract_age_days")]
     pub min_contract_age_days: u32,
@@ -558,6 +570,18 @@ fn default_pulse_max_positions() -> usize {
 }
 fn default_pulse_max_gross_multiple() -> f64 {
     0.50
+}
+fn default_pulse_stop_pct() -> f64 {
+    0.01
+}
+fn default_pulse_trail_activation_pct() -> f64 {
+    0.015
+}
+fn default_pulse_trail_pct() -> f64 {
+    0.005
+}
+fn default_pulse_max_directional_premium() -> f64 {
+    0.01
 }
 
 fn default_entry_trigger() -> String {
@@ -1087,6 +1111,34 @@ fn is_extreme_direct(candidate: &Candidate, cfg: &AltcoinImpulseConfig) -> bool 
 
 fn is_pulse_position(position: &Position) -> bool {
     position.entry_phase == "pulse_exhaustion_short"
+}
+
+fn is_pulse_candidate(candidate: &Candidate) -> bool {
+    candidate.entry_phase == "pulse_exhaustion_short"
+}
+
+fn candidate_stop_pct(candidate: &Candidate, cfg: &AltcoinImpulseConfig) -> f64 {
+    if is_pulse_candidate(candidate) {
+        cfg.pulse_stop_pct
+    } else {
+        cfg.stop_pct
+    }
+}
+
+fn position_exit_parameters(position: &Position, cfg: &AltcoinImpulseConfig) -> (f64, f64) {
+    if is_pulse_position(position) {
+        (cfg.pulse_trail_activation_pct, cfg.pulse_trail_pct)
+    } else {
+        (cfg.trail_activation_pct, cfg.trail_pct)
+    }
+}
+
+fn candidate_max_directional_premium(candidate: &Candidate, cfg: &AltcoinImpulseConfig) -> f64 {
+    if is_pulse_candidate(candidate) {
+        cfg.pulse_max_directional_premium
+    } else {
+        cfg.max_directional_premium
+    }
 }
 
 /// Evaluate only the first independently closed 15m bar after the impulse.
@@ -2798,14 +2850,15 @@ async fn manage_live_positions(
         );
         position.adverse_extreme = Some(adverse);
         let max_adverse = adverse_excursion(position.side, position.entry_price, adverse);
+        let (trail_activation_pct, trail_pct) = position_exit_parameters(&position, cfg);
         let (new_extreme, improved_stop) = realtime_trailing_stop(
             position.side,
             position.entry_price,
             position.extreme,
             position.stop_price,
             snapshot.mark_price,
-            cfg.trail_activation_pct,
-            cfg.trail_pct,
+            trail_activation_pct,
+            trail_pct,
         );
         position.extreme = new_extreme;
         let excursion = position.side as f64 * (position.extreme / position.entry_price - 1.0);
@@ -2914,7 +2967,7 @@ async fn manage_live_positions(
             continue;
         }
         // 只按“当前仍有的浮盈”兑现，不能因历史上曾到过 +2%、现在已回落而补卖。
-        if !position.partial_take_profit_done && current_return >= cfg.trail_activation_pct {
+        if !position.partial_take_profit_done && current_return >= trail_activation_pct {
             let filters = client.symbol_filters(&symbol).await?;
             let side = if position.side > 0 { "SELL" } else { "BUY" };
             let target_qty = snapshot.position_amt.abs() * cfg.partial_take_profit_fraction;
@@ -2954,13 +3007,13 @@ async fn manage_live_positions(
                     set_protection_order_ids(&mut position, new_order_ids.clone());
                     position.stop_price = break_even_stop;
                     position.protection_reason = "partial_take_profit_break_even".to_owned();
-                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":"partial_take_profit","trigger_return":current_return,"trigger_mark_price":trigger_mark_price,"trigger_extreme":trigger_extreme,"execution_slippage_bps":position.side as f64*(exit/trigger_mark_price-1.0)*-10_000.0,"price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"new_stop":break_even_stop,"old_order_ids":old_order_ids,"new_order_ids":new_order_ids,"protection_replaced":true});
+                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":"partial_take_profit","trigger_return":current_return,"configured_trigger_return":trail_activation_pct,"configured_fraction":cfg.partial_take_profit_fraction,"configured_trail_pct":trail_pct,"trigger_mark_price":trigger_mark_price,"trigger_extreme":trigger_extreme,"execution_slippage_bps":position.side as f64*(exit/trigger_mark_price-1.0)*-10_000.0,"price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"new_stop":break_even_stop,"old_order_ids":old_order_ids,"new_order_ids":new_order_ids,"protection_replaced":true});
                     append_event(event_path, event.clone())?;
                     state.record_trade(event);
                 }
                 Err(error) => {
                     warn!(symbol=%symbol, error=%error, "第一段止盈已成交，保本保护替换失败；保留原交易所止损并等待下轮重试");
-                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":"partial_take_profit","price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"new_stop":position.stop_price,"protection_replaced":false,"protection_error":error.to_string()});
+                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":"partial_take_profit","configured_trigger_return":trail_activation_pct,"configured_fraction":cfg.partial_take_profit_fraction,"configured_trail_pct":trail_pct,"price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"new_stop":position.stop_price,"protection_replaced":false,"protection_error":error.to_string()});
                     append_event(event_path, event.clone())?;
                     state.record_trade(event);
                 }
@@ -3066,7 +3119,7 @@ async fn manage_live_positions(
             position.protection_reason = protection_reason.to_owned();
             append_event(
                 event_path,
-                json!({"ts_ms":now_ms,"event":"protection_updated","symbol":symbol,"side":position.side,"mark_price":snapshot.mark_price,"extreme":position.extreme,"excursion":excursion,"adverse_extreme":adverse,"max_adverse_excursion":max_adverse,"current_return":position.side as f64*(snapshot.mark_price/position.entry_price-1.0),"old_stop":old_stop,"new_stop":improved_stop,"old_order_ids":old_order_ids,"new_order_ids":new_order_ids,"reason":protection_reason}),
+                json!({"ts_ms":now_ms,"event":"protection_updated","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"mark_price":snapshot.mark_price,"extreme":position.extreme,"excursion":excursion,"adverse_extreme":adverse,"max_adverse_excursion":max_adverse,"current_return":position.side as f64*(snapshot.mark_price/position.entry_price-1.0),"trail_activation_pct":trail_activation_pct,"trail_pct":trail_pct,"old_stop":old_stop,"new_stop":improved_stop,"old_order_ids":old_order_ids,"new_order_ids":new_order_ids,"reason":protection_reason}),
             )?;
             changed = true;
         }
@@ -3295,9 +3348,13 @@ pub async fn run_altcoin_impulse(
             && (0.2..=1.5).contains(&cfg.pulse_max_spot_perp_ratio)
             && (0.01..=0.10).contains(&cfg.pulse_min_peak_retrace)
             && (0.2..=0.9).contains(&cfg.pulse_max_close_location)
-            && (0.05..=0.50).contains(&cfg.pulse_risk_scale)
+            && (0.05..=1.0).contains(&cfg.pulse_risk_scale)
             && (1..=2).contains(&cfg.pulse_max_positions)
-            && (0.1..=1.50).contains(&cfg.pulse_max_gross_multiple),
+            && (0.1..=1.50).contains(&cfg.pulse_max_gross_multiple)
+            && (0.01..=0.05).contains(&cfg.pulse_stop_pct)
+            && (0.01..=0.05).contains(&cfg.pulse_trail_activation_pct)
+            && (0.005..cfg.pulse_trail_activation_pct).contains(&cfg.pulse_trail_pct)
+            && (0.002..=0.05).contains(&cfg.pulse_max_directional_premium),
         "杠杆衰竭做空参数不合法"
     );
     let base_text = std::fs::read_to_string(&args.config)?;
@@ -3847,9 +3904,10 @@ pub async fn run_altcoin_impulse(
                     append_event(&event_path, event.clone())?;
                     state.record_trade(event);
                 }
-                if !position.partial_take_profit_done && excursion >= cfg.trail_activation_pct {
-                    let raw_exit = position.entry_price
-                        * (1.0 + position.side as f64 * cfg.trail_activation_pct);
+                let (trail_activation_pct, trail_pct) = position_exit_parameters(&position, &cfg);
+                if !position.partial_take_profit_done && excursion >= trail_activation_pct {
+                    let raw_exit =
+                        position.entry_price * (1.0 + position.side as f64 * trail_activation_pct);
                     let exit =
                         adverse_fill_price(raw_exit, position.side, cfg.dry_slippage_bps, false);
                     let qty = position.qty * cfg.partial_take_profit_fraction;
@@ -3860,7 +3918,7 @@ pub async fn run_altcoin_impulse(
                     position.last_partial_exit_ms = Some(scan_ms);
                     position.stop_price = position.entry_price;
                     position.protection_reason = "partial_take_profit_break_even".to_owned();
-                    let event = json!({"ts_ms":scan_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":"partial_take_profit","price":exit,"raw_price":raw_exit,"qty":qty,"remaining_qty":position.qty,"pnl":partial_pnl,"fee":fee,"new_stop":position.stop_price,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true});
+                    let event = json!({"ts_ms":scan_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":"partial_take_profit","configured_trigger_return":trail_activation_pct,"configured_fraction":cfg.partial_take_profit_fraction,"configured_trail_pct":trail_pct,"price":exit,"raw_price":raw_exit,"qty":qty,"remaining_qty":position.qty,"pnl":partial_pnl,"fee":fee,"new_stop":position.stop_price,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true});
                     append_event(&event_path, event.clone())?;
                     state.record_trade(event);
                 }
@@ -3879,8 +3937,8 @@ pub async fn run_altcoin_impulse(
                         position.protection_reason = "recovery_profit_lock".to_owned();
                     }
                 }
-                if excursion >= cfg.trail_activation_pct {
-                    let trail = position.extreme * (1.0 - position.side as f64 * cfg.trail_pct);
+                if excursion >= trail_activation_pct {
+                    let trail = position.extreme * (1.0 - position.side as f64 * trail_pct);
                     position.stop_price = if position.side > 0 {
                         position.stop_price.max(trail)
                     } else {
@@ -4064,11 +4122,12 @@ pub async fn run_altcoin_impulse(
                     .pulse_exhaustion_setups
                     .insert(candidate.symbol.clone(), setup.clone());
                 if let Some(client) = rest.as_ref() {
+                    let stop_pct = candidate_stop_pct(&candidate, &cfg);
                     let observation_notional = current_equity
                         * cfg.risk_per_trade
                         * cfg.pulse_risk_scale
                         * cfg.short_risk_scale
-                        / (cfg.stop_pct + cfg.risk_execution_buffer_pct);
+                        / (stop_pct + cfg.risk_execution_buffer_pct);
                     match client
                         .liquidity_snapshot(
                             &candidate.symbol,
@@ -4164,11 +4223,12 @@ pub async fn run_altcoin_impulse(
                     ));
                 }
                 let eligible = candidate.eligible();
+                let stop_pct = candidate_stop_pct(&candidate, &cfg);
                 let pulse_observation_notional = current_equity
                     * cfg.risk_per_trade
                     * cfg.pulse_risk_scale
                     * cfg.short_risk_scale
-                    / (cfg.stop_pct + cfg.risk_execution_buffer_pct);
+                    / (stop_pct + cfg.risk_execution_buffer_pct);
                 observe_microstructure_trial(
                     &mut state,
                     "pulse_exhaustion_short",
@@ -4502,7 +4562,7 @@ pub async fn run_altcoin_impulse(
                     * cfg.risk_per_trade
                     * candidate.risk_scale
                     * direction_risk_scale
-                    / (cfg.stop_pct + cfg.risk_execution_buffer_pct);
+                    / (candidate_stop_pct(candidate, &cfg) + cfg.risk_execution_buffer_pct);
                 match client
                     .liquidity_snapshot(
                         &candidate.symbol,
@@ -4611,16 +4671,17 @@ pub async fn run_altcoin_impulse(
             let mut crowding_checked = Vec::with_capacity(execution_candidates.len());
             for candidate in execution_candidates {
                 let candidate = enrich_candidate(http.clone(), candidate).await;
+                let max_directional_premium = candidate_max_directional_premium(&candidate, &cfg);
                 if let Some(reason) = directional_crowding_reason(
                     candidate.side,
                     candidate.funding_rate,
                     candidate.perp_premium,
                     cfg.max_directional_funding_rate,
-                    cfg.max_directional_premium,
+                    max_directional_premium,
                 ) {
                     append_event(
                         &event_path,
-                        json!({"ts_ms":scan_ms,"event":"entry_rejected","stage":"directional_crowding","symbol":candidate.symbol,"side":candidate.side,"reason":&reason,"funding_rate":candidate.funding_rate,"perp_premium":candidate.perp_premium,"limits":{"max_directional_funding_rate":cfg.max_directional_funding_rate,"max_directional_premium":cfg.max_directional_premium}}),
+                        json!({"ts_ms":scan_ms,"event":"entry_rejected","stage":"directional_crowding","symbol":candidate.symbol,"side":candidate.side,"entry_phase":candidate.entry_phase,"reason":&reason,"funding_rate":candidate.funding_rate,"perp_premium":candidate.perp_premium,"limits":{"max_directional_funding_rate":cfg.max_directional_funding_rate,"max_directional_premium":max_directional_premium}}),
                     )?;
                     state.note_execution_issue(
                         scan_ms,
@@ -4701,7 +4762,8 @@ pub async fn run_altcoin_impulse(
             } else {
                 cfg.max_gross_multiple
             };
-            let risk_distance = cfg.stop_pct + cfg.risk_execution_buffer_pct;
+            let stop_pct = candidate_stop_pct(&candidate, &cfg);
+            let risk_distance = stop_pct + cfg.risk_execution_buffer_pct;
             let direction_risk_scale = if candidate.side > 0 {
                 cfg.long_risk_scale
             } else {
@@ -5065,7 +5127,7 @@ pub async fn run_altcoin_impulse(
                         }
                     }
                 }
-                let stop = entry * (1.0 - candidate.side as f64 * cfg.stop_pct);
+                let stop = entry * (1.0 - candidate.side as f64 * stop_pct);
                 let close_side = if candidate.side > 0 { "SELL" } else { "BUY" };
                 match place_protective_stops(
                     client,
@@ -5106,7 +5168,7 @@ pub async fn run_altcoin_impulse(
                 qty = notional / entry;
                 fee = qty * entry * 0.0005;
             }
-            let stop = entry * (1.0 - candidate.side as f64 * cfg.stop_pct);
+            let stop = entry * (1.0 - candidate.side as f64 * stop_pct);
             state.last_execution_issue = None;
             state.cash -= fee;
             state.fees += fee;
@@ -5155,7 +5217,7 @@ pub async fn run_altcoin_impulse(
             if candidate.entry_phase == "overextended_long" {
                 overextension_slot_taken = true;
             }
-            let event = json!({"ts_ms":scan_ms,"event":"entry","strategy":micro_strategy,"setup_id":trial_key,"origin_signal_ms":setup_origin_ms,"symbol":candidate.symbol,"side":candidate.side,"entry_phase":candidate.entry_phase,"entry_trigger":candidate.entry_trigger,"risk_scale":candidate.risk_scale,"direction_risk_scale":direction_risk_scale,"effective_risk_scale":effective_risk_scale,"signal_age_ms":signal_age_ms(scan_ms,candidate.signal_ms),"max_signal_age_ms":max_signal_age_ms,"signal":candidate,"entry_price":entry,"qty":qty,"notional":qty*entry,"requested_leverage":cfg.exchange_leverage,"actual_leverage":actual_leverage,"margin_estimate":qty*entry/actual_leverage as f64,"risk_usd":qty*entry*risk_distance,"price_stop_risk_usd":qty*entry*cfg.stop_pct,"risk_execution_buffer_pct":cfg.risk_execution_buffer_pct,"fee":fee});
+            let event = json!({"ts_ms":scan_ms,"event":"entry","strategy":micro_strategy,"setup_id":trial_key,"origin_signal_ms":setup_origin_ms,"symbol":candidate.symbol,"side":candidate.side,"entry_phase":candidate.entry_phase,"entry_trigger":candidate.entry_trigger,"risk_scale":candidate.risk_scale,"direction_risk_scale":direction_risk_scale,"effective_risk_scale":effective_risk_scale,"signal_age_ms":signal_age_ms(scan_ms,candidate.signal_ms),"max_signal_age_ms":max_signal_age_ms,"signal":candidate,"entry_price":entry,"qty":qty,"notional":qty*entry,"requested_leverage":cfg.exchange_leverage,"actual_leverage":actual_leverage,"margin_estimate":qty*entry/actual_leverage as f64,"risk_usd":qty*entry*risk_distance,"price_stop_risk_usd":qty*entry*stop_pct,"stop_pct":stop_pct,"trail_activation_pct":if pulse_candidate {cfg.pulse_trail_activation_pct} else {cfg.trail_activation_pct},"trail_pct":if pulse_candidate {cfg.pulse_trail_pct} else {cfg.trail_pct},"partial_take_profit_fraction":cfg.partial_take_profit_fraction,"max_hold_hours":cfg.max_hold_hours,"risk_execution_buffer_pct":cfg.risk_execution_buffer_pct,"fee":fee});
             append_event(&event_path, event.clone())?;
             state.record_trade(event);
         }
@@ -5227,7 +5289,7 @@ pub async fn run_altcoin_impulse(
             .count();
         let pulse_notional_estimate =
             (current_equity * cfg.risk_per_trade * cfg.pulse_risk_scale * cfg.short_risk_scale
-                / (cfg.stop_pct + cfg.risk_execution_buffer_pct))
+                / (cfg.pulse_stop_pct + cfg.risk_execution_buffer_pct))
                 .min(current_equity * cfg.pulse_max_gross_multiple);
         let latest_pulse_fresh = state.latest_pulse_exhaustion["eligible"] == true
             && state.latest_pulse_exhaustion["confirmation_ms"]
@@ -5258,6 +5320,11 @@ pub async fn run_altcoin_impulse(
             "max_gross_multiple":cfg.pulse_max_gross_multiple,
             "risk_scale":cfg.pulse_risk_scale,
             "notional_estimate":pulse_notional_estimate,
+            "stop_pct":cfg.pulse_stop_pct,
+            "trail_activation_pct":cfg.pulse_trail_activation_pct,
+            "trail_pct":cfg.pulse_trail_pct,
+            "partial_take_profit_fraction":cfg.partial_take_profit_fraction,
+            "max_directional_premium":cfg.pulse_max_directional_premium,
             "entries":state.pulse_entries,"exits":state.pulse_exits,"wins":state.pulse_wins,
             "win_rate":if state.pulse_exits>0 {Some(state.pulse_wins as f64/state.pulse_exits as f64)} else {None},
             "realized_pnl":state.pulse_realized_pnl,
@@ -5268,7 +5335,9 @@ pub async fn run_altcoin_impulse(
                 "oi_change_1h":cfg.pulse_oi_change_1h,
                 "max_spot_perp_ratio":cfg.pulse_max_spot_perp_ratio,
                 "min_peak_retrace":cfg.pulse_min_peak_retrace,
-                "max_close_location":cfg.pulse_max_close_location
+                "max_close_location":cfg.pulse_max_close_location,
+                "max_directional_funding_rate":cfg.max_directional_funding_rate,
+                "max_directional_premium":cfg.pulse_max_directional_premium
             }
         });
         let mut scan_event = json!({
@@ -6605,11 +6674,18 @@ mod tests {
         assert!(!strategy.altcoin_impulse.pulse_exhaustion_allow_live);
         assert_eq!(strategy.altcoin_impulse.pulse_initial_return_1h, 0.06);
         assert_eq!(strategy.altcoin_impulse.pulse_initial_volume_ratio, 10.0);
-        assert_eq!(strategy.altcoin_impulse.pulse_oi_change_1h, 0.25);
-        assert_eq!(strategy.altcoin_impulse.pulse_min_peak_retrace, 0.045);
-        assert_eq!(strategy.altcoin_impulse.pulse_risk_scale, 0.375);
+        assert_eq!(strategy.altcoin_impulse.pulse_oi_change_1h, 0.20);
+        assert_eq!(strategy.altcoin_impulse.pulse_min_peak_retrace, 0.035);
+        assert_eq!(strategy.altcoin_impulse.pulse_risk_scale, 0.625);
         assert_eq!(strategy.altcoin_impulse.pulse_max_positions, 1);
         assert_eq!(strategy.altcoin_impulse.pulse_max_gross_multiple, 1.00);
+        assert_eq!(strategy.altcoin_impulse.pulse_stop_pct, 0.020);
+        assert_eq!(strategy.altcoin_impulse.pulse_trail_activation_pct, 0.020);
+        assert_eq!(strategy.altcoin_impulse.pulse_trail_pct, 0.0075);
+        assert_eq!(
+            strategy.altcoin_impulse.pulse_max_directional_premium,
+            0.015
+        );
         assert_eq!(strategy.altcoin_impulse.recovery_lock_adverse_pct, 0.03);
         assert_eq!(strategy.altcoin_impulse.recovery_lock_activation_pct, 0.01);
         assert_eq!(strategy.altcoin_impulse.recovery_lock_pct, 0.0025);

@@ -87,20 +87,29 @@ extreme_direct_risk_scale = 0.33
 # 独立小仓杠杆衰竭做空：极端上涨脉冲后，只观察紧随其后的第一根 15m K。
 # 第一阶段只使用自身的 1h 涨幅和量比，不继承主策略的24h突破、4h区间、
 # 路径效率、收盘位置或回踩确认；币种池、数据时效、流动性和账户风控仍共享。
-# 六日因果回放的有效组合为：永续仍强、OI 快速堆积、现货跟随不足且冲高回落。
+# 八日因果分钟回放显示，25% OI / 4.5% 回落确认过晚。这里恢复到相邻参数
+# 也保持为正的 20% OI / 3.5% 回落，同时保留现货滞后和真实可成交性硬门槛。
 # 仅 paper/dry 启用；它拥有独立的 1 个仓位槽和 1.0x 权益名义额度。
 pulse_exhaustion_enabled = true
 pulse_exhaustion_allow_live = false
 pulse_initial_return_1h = 0.06
 pulse_initial_volume_ratio = 10.0
 pulse_perp_return_1h = 0.06
-pulse_oi_change_1h = 0.25
+pulse_oi_change_1h = 0.20
 pulse_max_spot_perp_ratio = 1.10
-pulse_min_peak_retrace = 0.045
+pulse_min_peak_retrace = 0.035
 pulse_max_close_location = 0.80
-pulse_risk_scale = 0.375
+# 2% 止损 + 0.5% 执行缓冲下，0.625 风险倍率对应约 1.0x 权益名义仓位。
+pulse_risk_scale = 0.625
 pulse_max_positions = 1
 pulse_max_gross_multiple = 1.00
+# 杠杆衰竭需要容纳反抽噪声，独立使用 2% 硬止损；到 +2% 兑现 33%，
+# 余仓按峰值回撤 0.75% 跟踪。主突破通道仍保持 1% / 1.5% / 0.5%。
+pulse_stop_pct = 0.020
+pulse_trail_activation_pct = 0.020
+pulse_trail_pct = 0.0075
+# 只给衰竭空单略放宽永续折价：主通道仍保持 1.0%，资金费门槛不变。
+pulse_max_directional_premium = 0.015
 
 min_24h_volume_usd = 5000000.0
 # 只扫描同名现货 + USDT 永续的山寨币；排除 BTC/ETH/BNB/SOL/XRP 及另外六个主流币，
