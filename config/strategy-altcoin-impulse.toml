@@ -162,7 +162,8 @@ min_24h_volume_usd = 10000000.0
 market_momentum_threshold = 0.01
 gate_window = 30
 gate_min_profit_factor = 1.30
-assumed_cost_bps_per_side = 5.0
+# 影子门控按每边 5bp taker 手续费 + 5bp 不利滑点计成本。
+assumed_cost_bps_per_side = 10.0
 base_gross_multiple = 0.05
 active_gross_multiple = 0.40
 strong_excess_return = 0.12

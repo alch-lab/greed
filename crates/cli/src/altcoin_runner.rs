@@ -304,7 +304,7 @@ fn default_cross_gate_pf() -> f64 {
     1.3
 }
 fn default_cross_assumed_cost_bps() -> f64 {
-    5.0
+    10.0
 }
 fn default_cross_base_gross() -> f64 {
     0.05
@@ -6868,6 +6868,10 @@ mod tests {
         assert_eq!(strategy.altcoin_cross_section.active_gross_multiple, 0.40);
         assert_eq!(strategy.altcoin_cross_section.strong_excess_return, 0.12);
         assert_eq!(strategy.altcoin_cross_section.strong_gross_multiple, 0.50);
+        assert_eq!(
+            strategy.altcoin_cross_section.assumed_cost_bps_per_side,
+            10.0
+        );
         assert_eq!(strategy.altcoin_cross_section.stop_pct, 0.08);
     }
 
