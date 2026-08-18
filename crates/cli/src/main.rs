@@ -7,6 +7,7 @@
 //! - `serve`    → HTTP 控制面（前端监控/启停/回测任务）
 
 mod altcoin_runner;
+mod portfolio_runner;
 mod serve;
 mod trade_runner;
 
@@ -559,8 +560,11 @@ async fn main() -> Result<()> {
                 cb_daily_dd_pct,
                 leverage,
                 ws_base,
+                portfolio_mode: false,
             };
-            if altcoin_runner::is_altcoin_strategy(&strategy) {
+            if portfolio_runner::is_portfolio_strategy(&strategy) {
+                portfolio_runner::run_portfolio(args, rx, None, None, None).await
+            } else if altcoin_runner::is_altcoin_strategy(&strategy) {
                 altcoin_runner::run_altcoin_impulse(args, rx, None, None, None).await
             } else {
                 trade_runner::run_trade(args, rx, None).await

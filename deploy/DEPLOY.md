@@ -96,5 +96,23 @@ sudo systemctl restart greed-serve    # 重启（交易任务不会自动恢复�
 2 秒到 5 分钟的指数退避自动重启，前端会显示恢复状态与错误原因，无需人工重启。
 只有整个 systemd 服务被重启时，才需要重新点击“启动策略”。
 
+## 7. 单账户双策略模拟盘
+
+前端选择 `strategy-portfolio.toml` 后，会同时启动 BTC MR 和山寨币执行器。两者
+共用 Binance Futures 模拟账户，但分别使用 1000 USDT 虚拟本金、独立状态文件、
+回撤统计与收益曲线。首次启动要求账户钱包不少于 2000 USDT 且完全空仓；组合配置
+默认禁止实盘。
+
+组合状态文件位于：
+
+```text
+data/journal/portfolio-mr-paper.json
+data/journal/portfolio-altcoin-paper.jsonl
+data/journal/portfolio-altcoin-paper.state.json
+```
+
+需要重新从零统计时，先在 Binance 模拟盘平掉仓位并撤销挂单、停止策略，再删除上面
+三个组合文件。旧的单策略 Journal 不会被组合运行器读取，无需删除。
+
 注意：**重启 serve 会停掉正在运行的交易策略**。交易所保护性止损会保留；重新从
 前端启动后，引擎会校验 Journal 与交易所仓位并安全接管。

@@ -3550,8 +3550,18 @@ pub async fn run_altcoin_impulse(
         Some(client)
     };
     let now_ms = chrono::Utc::now().timestamp_millis();
-    let state_path = format!("data/journal/altcoin-{}.state.json", mode.as_str());
-    let event_path = format!("data/journal/altcoin-{}.jsonl", mode.as_str());
+    let (state_path, event_path) = if let Some(event_path) = args.journal.as_ref() {
+        let state_path = event_path
+            .strip_suffix(".jsonl")
+            .map(|prefix| format!("{prefix}.state.json"))
+            .unwrap_or_else(|| format!("{event_path}.state.json"));
+        (state_path, event_path.clone())
+    } else {
+        (
+            format!("data/journal/altcoin-{}.state.json", mode.as_str()),
+            format!("data/journal/altcoin-{}.jsonl", mode.as_str()),
+        )
+    };
     let initial_cash = if let Some(client) = rest.as_ref() {
         client.wallet_balance_usdt().await?.min(cfg.capital_usdt)
     } else {
@@ -3685,7 +3695,10 @@ pub async fn run_altcoin_impulse(
             .open_position_amounts()
             .await?
             .into_iter()
-            .filter(|(symbol, _)| !state.positions.contains_key(symbol))
+            .filter(|(symbol, _)| {
+                !state.positions.contains_key(symbol)
+                    && !(args.portfolio_mode && symbol == "BTCUSDT")
+            })
             .collect();
         anyhow::ensure!(
             external.is_empty(),

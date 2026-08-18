@@ -1,0 +1,14 @@
+# 单账户双策略组合：同一 Binance Futures 模拟账户，共享执行账户但使用两套
+# 独立虚拟账本、持仓归属、回撤统计、Journal 与收益曲线。
+
+[portfolio]
+enabled = true
+allow_live = false
+mr_strategy = "config/strategy-final.toml"
+altcoin_strategy = "config/strategy-altcoin-impulse.toml"
+mr_capital_usdt = 1000.0
+altcoin_capital_usdt = 1000.0
+mr_risk_pct = 0.0025
+mr_max_risk_pct = 0.005
+mr_leverage = 3
+

@@ -26,6 +26,7 @@ use tower_http::cors::CorsLayer;
 use tracing::{error, info, warn};
 
 use crate::altcoin_runner::{is_altcoin_strategy, run_altcoin_impulse};
+use crate::portfolio_runner::{is_portfolio_strategy, run_portfolio};
 use crate::trade_runner::{run_trade, TradeArgs, TradeMode};
 
 // ============================================================================
@@ -297,6 +298,17 @@ fn is_fatal_trade_error(msg: &str) -> bool {
         "读策略配置失败",
         "解析配置",
         "装配策略失败",
+        "读取组合配置失败",
+        "解析组合配置失败",
+        "组合配置未启用",
+        "组合首次启动要求",
+        "组合需要至少",
+        "MR 与山寨币虚拟本金",
+        "MR 风险参数要求",
+        "MR 杠杆必须",
+        "altcoin_strategy 必须",
+        "组合配置的 altcoin_capital_usdt",
+        "组合策略默认禁止实盘",
     ];
     FATAL_MARKERS.iter().any(|m| msg.contains(m))
 }
@@ -327,9 +339,12 @@ async fn trade_start(
         cb_daily_dd_pct: 0.0,
         leverage: req.leverage.unwrap_or(3),
         ws_base: None,
+        portfolio_mode: false,
     };
     let (sd_tx, sd_rx) = watch::channel(false);
+    let portfolio_strategy = is_portfolio_strategy(&args.strategy);
     let altcoin_strategy = is_altcoin_strategy(&args.strategy);
+    let supports_altcoin_controls = altcoin_strategy || portfolio_strategy;
     let (risk_reset_tx, risk_reset_rx) = watch::channel(0u64);
     let (entry_bonus_tx, entry_bonus_rx) = watch::channel(0u64);
     let (st_tx, st_rx) = watch::channel(serde_json::json!({
@@ -341,8 +356,8 @@ async fn trade_start(
     *guard = Some(TradeHandle {
         mode: req.mode,
         shutdown: sd_tx,
-        daily_risk_reset: altcoin_strategy.then_some(risk_reset_tx),
-        daily_entry_bonus: altcoin_strategy.then_some(entry_bonus_tx),
+        daily_risk_reset: supports_altcoin_controls.then_some(risk_reset_tx),
+        daily_entry_bonus: supports_altcoin_controls.then_some(entry_bonus_tx),
         status_rx: st_rx,
         running: running.clone(),
         error: error.clone(),
@@ -358,7 +373,16 @@ async fn trade_start(
                 break;
             }
             *error.lock().await = None;
-            let result = if altcoin_strategy {
+            let result = if portfolio_strategy {
+                run_portfolio(
+                    args.clone(),
+                    sd_rx.clone(),
+                    Some(st_tx.clone()),
+                    Some(risk_reset_rx.clone()),
+                    Some(entry_bonus_rx.clone()),
+                )
+                .await
+            } else if altcoin_strategy {
                 run_altcoin_impulse(
                     args.clone(),
                     sd_rx.clone(),
@@ -427,10 +451,15 @@ async fn trade_reset_daily_risk(
             .ok_or((StatusCode::CONFLICT, "当前没有运行中的交易".into()))?;
         let (task_state, first_week_protected) = {
             let status = handle.status_rx.borrow();
+            let altcoin = status
+                .get("portfolio")
+                .and_then(|portfolio| portfolio.get("altcoin"))
+                .and_then(|status| status.get("altcoin_impulse"))
+                .unwrap_or(&status["altcoin_impulse"]);
             (
                 status["state"].as_str().unwrap_or("unknown").to_owned(),
-                status["altcoin_impulse"]["first_week"]["window_complete"].as_bool() == Some(false)
-                    && status["altcoin_impulse"]["first_week"]["loss_limit_pct"]
+                altcoin["first_week"]["window_complete"].as_bool() == Some(false)
+                    && altcoin["first_week"]["loss_limit_pct"]
                         .as_f64()
                         .unwrap_or(0.0)
                         > 0.0,
@@ -564,6 +593,18 @@ async fn trade_journal(
     };
     let path = format!("data/journal/{}", name);
     read_json_file(&path).await.map(Json)
+}
+
+async fn portfolio_mr_journal(
+    Path(mode): Path<String>,
+) -> Result<Json<serde_json::Value>, (StatusCode, String)> {
+    match mode.as_str() {
+        "dry" | "paper" | "live" => {}
+        _ => return Err((StatusCode::BAD_REQUEST, "mode 应为 dry/paper/live".into())),
+    }
+    read_json_file(&format!("data/journal/portfolio-mr-{mode}.json"))
+        .await
+        .map(Json)
 }
 
 // ============================================================================
@@ -883,6 +924,10 @@ pub async fn run_serve(
             post(trade_add_daily_entries),
         )
         .route("/api/journal/{mode}", get(trade_journal))
+        .route(
+            "/api/portfolio/journal/{mode}/mr",
+            get(portfolio_mr_journal),
+        )
         .route("/api/backtest/run", post(backtest_run))
         .route("/api/backtest/jobs", get(backtest_jobs))
         .route("/api/backtest/jobs/{id}/journal", get(backtest_journal))

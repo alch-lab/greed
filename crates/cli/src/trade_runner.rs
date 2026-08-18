@@ -55,6 +55,9 @@ pub struct TradeArgs {
     pub cb_daily_dd_pct: f64,
     pub leverage: u32,
     pub ws_base: Option<String>,
+    /// 组合运行器下的虚拟 sleeve。允许账户中存在由另一个受管执行器维护的
+    /// 非本标的仓位，并将 `cash` 作为本策略可用本金上限。
+    pub portfolio_mode: bool,
 }
 
 /// 交易执行循环：行情 WS → LiveEngine → journal 落盘。
@@ -141,7 +144,7 @@ pub async fn run_trade(
             .filter(|(symbol, _)| symbol != &collector.symbol)
             .collect();
         anyhow::ensure!(
-            external.is_empty(),
+            args.portfolio_mode || external.is_empty(),
             "账户存在其他策略/手工持仓 {:?}；单账户模式拒绝同时启动 BTC 执行器",
             external
         );
@@ -162,8 +165,14 @@ pub async fn run_trade(
 
         let filters = rest.symbol_filters(&collector.symbol).await?;
         let wallet = rest.wallet_balance_usdt().await?;
+        let sleeve_cash = if args.cash.is_finite() && args.cash > 0.0 {
+            wallet.min(args.cash)
+        } else {
+            wallet
+        };
         info!(
             wallet,
+            sleeve_cash,
             leverage = args.leverage,
             tick = filters.tick_size,
             step = filters.step_size,
@@ -176,7 +185,7 @@ pub async fn run_trade(
         }
         (
             live::AnyBroker::testnet(rest, &collector.symbol, filters),
-            wallet,
+            sleeve_cash,
             filters.step_size,
             filters.min_notional,
             amt,
