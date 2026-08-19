@@ -282,6 +282,153 @@ impl Default for AltcoinCrossSectionConfig {
     }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct AltcoinShockReversalConfig {
+    #[serde(default)]
+    pub enabled: bool,
+    #[serde(default = "default_shock_min_return")]
+    pub min_shock_return: f64,
+    #[serde(default = "default_shock_max_return")]
+    pub max_shock_return: f64,
+    #[serde(default = "default_shock_min_reversal")]
+    pub min_reversal_return: f64,
+    #[serde(default = "default_shock_min_volume_ratio")]
+    pub min_volume_ratio: f64,
+    #[serde(default = "default_shock_min_close_location")]
+    pub min_close_location: f64,
+    #[serde(default = "default_shock_max_candle_range")]
+    pub max_candle_range: f64,
+    #[serde(default = "default_shock_strict_volume_ratio")]
+    pub strict_volume_ratio: f64,
+    #[serde(default = "default_shock_strict_close_location")]
+    pub strict_close_location: f64,
+    #[serde(default = "default_shock_strict_max_candle_range")]
+    pub strict_max_candle_range: f64,
+    #[serde(default = "default_shock_gate_window")]
+    pub gate_window: usize,
+    #[serde(default = "default_shock_gate_pf")]
+    pub gate_min_profit_factor: f64,
+    #[serde(default = "default_shock_assumed_fee_bps")]
+    pub assumed_fee_bps_per_side: f64,
+    #[serde(default = "default_shock_assumed_slippage_bps")]
+    pub assumed_slippage_bps_per_side: f64,
+    #[serde(default = "default_shock_stop_pct")]
+    pub stop_pct: f64,
+    #[serde(default = "default_shock_trail_activation_pct")]
+    pub trail_activation_pct: f64,
+    #[serde(default = "default_shock_trail_pct")]
+    pub trail_pct: f64,
+    #[serde(default = "default_shock_hold_hours")]
+    pub max_hold_hours: u32,
+    #[serde(default = "default_shock_broad_gross")]
+    pub broad_gross_multiple: f64,
+    #[serde(default = "default_shock_strict_gross")]
+    pub strict_gross_multiple: f64,
+    #[serde(default = "default_shock_max_gross")]
+    pub max_gross_multiple: f64,
+    #[serde(default = "default_shock_cooldown_hours")]
+    pub cooldown_hours: u32,
+    #[serde(default = "default_shock_gate_refresh_hours")]
+    pub gate_refresh_hours: u32,
+}
+
+impl Default for AltcoinShockReversalConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            min_shock_return: default_shock_min_return(),
+            max_shock_return: default_shock_max_return(),
+            min_reversal_return: default_shock_min_reversal(),
+            min_volume_ratio: default_shock_min_volume_ratio(),
+            min_close_location: default_shock_min_close_location(),
+            max_candle_range: default_shock_max_candle_range(),
+            strict_volume_ratio: default_shock_strict_volume_ratio(),
+            strict_close_location: default_shock_strict_close_location(),
+            strict_max_candle_range: default_shock_strict_max_candle_range(),
+            gate_window: default_shock_gate_window(),
+            gate_min_profit_factor: default_shock_gate_pf(),
+            assumed_fee_bps_per_side: default_shock_assumed_fee_bps(),
+            assumed_slippage_bps_per_side: default_shock_assumed_slippage_bps(),
+            stop_pct: default_shock_stop_pct(),
+            trail_activation_pct: default_shock_trail_activation_pct(),
+            trail_pct: default_shock_trail_pct(),
+            max_hold_hours: default_shock_hold_hours(),
+            broad_gross_multiple: default_shock_broad_gross(),
+            strict_gross_multiple: default_shock_strict_gross(),
+            max_gross_multiple: default_shock_max_gross(),
+            cooldown_hours: default_shock_cooldown_hours(),
+            gate_refresh_hours: default_shock_gate_refresh_hours(),
+        }
+    }
+}
+
+fn default_shock_min_return() -> f64 {
+    0.045
+}
+fn default_shock_max_return() -> f64 {
+    0.22
+}
+fn default_shock_min_reversal() -> f64 {
+    0.006
+}
+fn default_shock_min_volume_ratio() -> f64 {
+    2.5
+}
+fn default_shock_min_close_location() -> f64 {
+    0.68
+}
+fn default_shock_max_candle_range() -> f64 {
+    0.15
+}
+fn default_shock_strict_volume_ratio() -> f64 {
+    3.5
+}
+fn default_shock_strict_close_location() -> f64 {
+    0.75
+}
+fn default_shock_strict_max_candle_range() -> f64 {
+    0.12
+}
+fn default_shock_gate_window() -> usize {
+    30
+}
+fn default_shock_gate_pf() -> f64 {
+    1.0
+}
+fn default_shock_assumed_fee_bps() -> f64 {
+    5.0
+}
+fn default_shock_assumed_slippage_bps() -> f64 {
+    10.0
+}
+fn default_shock_stop_pct() -> f64 {
+    0.02
+}
+fn default_shock_trail_activation_pct() -> f64 {
+    0.03
+}
+fn default_shock_trail_pct() -> f64 {
+    0.01
+}
+fn default_shock_hold_hours() -> u32 {
+    3
+}
+fn default_shock_broad_gross() -> f64 {
+    0.5
+}
+fn default_shock_strict_gross() -> f64 {
+    1.0
+}
+fn default_shock_max_gross() -> f64 {
+    2.0
+}
+fn default_shock_cooldown_hours() -> u32 {
+    1
+}
+fn default_shock_gate_refresh_hours() -> u32 {
+    3
+}
+
 fn default_cross_formation_hours() -> usize {
     12
 }
@@ -327,6 +474,8 @@ struct StrategyFile {
     altcoin_impulse: AltcoinImpulseConfig,
     #[serde(default)]
     altcoin_cross_section: AltcoinCrossSectionConfig,
+    #[serde(default)]
+    altcoin_shock_reversal: AltcoinShockReversalConfig,
 }
 
 #[derive(Debug, Clone)]
@@ -915,6 +1064,8 @@ struct PersistedState {
     #[serde(default)]
     cross_section_pending: Option<Candidate>,
     #[serde(default)]
+    shock_reversal_status: Value,
+    #[serde(default)]
     latest_signal_microstructure: Value,
     #[serde(default)]
     latest_confirmation_microstructure: Value,
@@ -944,6 +1095,14 @@ struct PersistedState {
     cross_wins: u64,
     #[serde(default)]
     cross_realized_pnl: f64,
+    #[serde(default)]
+    shock_entries: u64,
+    #[serde(default)]
+    shock_exits: u64,
+    #[serde(default)]
+    shock_wins: u64,
+    #[serde(default)]
+    shock_realized_pnl: f64,
 }
 
 impl PersistedState {
@@ -983,6 +1142,7 @@ impl PersistedState {
             recent_trades: Vec::new(),
             cross_section_status: Value::Null,
             cross_section_pending: None,
+            shock_reversal_status: Value::Null,
             latest_signal_microstructure: Value::Null,
             latest_confirmation_microstructure: Value::Null,
             latest_main_signal_microstructure: Value::Null,
@@ -998,6 +1158,10 @@ impl PersistedState {
             cross_exits: 0,
             cross_wins: 0,
             cross_realized_pnl: 0.0,
+            shock_entries: 0,
+            shock_exits: 0,
+            shock_wins: 0,
+            shock_realized_pnl: 0.0,
         }
     }
 
@@ -1027,6 +1191,17 @@ fn cross_performance(state: &PersistedState) -> Value {
         "win_rate": (state.cross_exits > 0)
             .then_some(state.cross_wins as f64 / state.cross_exits as f64),
         "realized_pnl": state.cross_realized_pnl,
+    })
+}
+
+fn shock_performance(state: &PersistedState) -> Value {
+    json!({
+        "entries": state.shock_entries,
+        "exits": state.shock_exits,
+        "wins": state.shock_wins,
+        "win_rate": (state.shock_exits > 0)
+            .then_some(state.shock_wins as f64 / state.shock_exits as f64),
+        "realized_pnl": state.shock_realized_pnl,
     })
 }
 
@@ -1181,6 +1356,10 @@ fn is_cross_position(position: &Position) -> bool {
     position.entry_phase == "cross_section_momentum"
 }
 
+fn is_shock_position(position: &Position) -> bool {
+    position.entry_phase == "shock_reversal"
+}
+
 fn is_pulse_candidate(candidate: &Candidate) -> bool {
     candidate.entry_phase == "pulse_exhaustion_short"
 }
@@ -1189,25 +1368,65 @@ fn is_cross_candidate(candidate: &Candidate) -> bool {
     candidate.entry_phase == "cross_section_momentum"
 }
 
+fn is_shock_candidate(candidate: &Candidate) -> bool {
+    candidate.entry_phase == "shock_reversal"
+}
+
 fn candidate_stop_pct(
     candidate: &Candidate,
     cfg: &AltcoinImpulseConfig,
     cross: &AltcoinCrossSectionConfig,
+    shock: &AltcoinShockReversalConfig,
 ) -> f64 {
     if is_pulse_candidate(candidate) {
         cfg.pulse_stop_pct
     } else if is_cross_candidate(candidate) {
         cross.stop_pct
+    } else if is_shock_candidate(candidate) {
+        shock.stop_pct
     } else {
         cfg.stop_pct
     }
 }
 
-fn position_exit_parameters(position: &Position, cfg: &AltcoinImpulseConfig) -> (f64, f64) {
+fn position_exit_parameters(
+    position: &Position,
+    cfg: &AltcoinImpulseConfig,
+    shock: &AltcoinShockReversalConfig,
+) -> (f64, f64) {
     if is_pulse_position(position) {
         (cfg.pulse_trail_activation_pct, cfg.pulse_trail_pct)
+    } else if is_shock_position(position) {
+        (shock.trail_activation_pct, shock.trail_pct)
     } else {
         (cfg.trail_activation_pct, cfg.trail_pct)
+    }
+}
+
+fn position_max_hold_hours(
+    position: &Position,
+    cfg: &AltcoinImpulseConfig,
+    cross: &AltcoinCrossSectionConfig,
+    shock: &AltcoinShockReversalConfig,
+) -> i64 {
+    if is_cross_position(position) {
+        cross.hold_hours as i64
+    } else if is_shock_position(position) {
+        shock.max_hold_hours as i64
+    } else {
+        cfg.max_hold_hours as i64
+    }
+}
+
+fn position_cooldown_hours(
+    position: &Position,
+    cfg: &AltcoinImpulseConfig,
+    shock: &AltcoinShockReversalConfig,
+) -> u32 {
+    if is_shock_position(position) {
+        shock.cooldown_hours
+    } else {
+        cfg.cooldown_hours
     }
 }
 
@@ -2215,6 +2434,299 @@ fn cross_section_status_complete(status: &Value) -> bool {
         })
 }
 
+#[derive(Debug, Clone)]
+struct ShockShadowOutcome {
+    symbol: String,
+    side: i32,
+    signal_ms: i64,
+    exit_ms: i64,
+    net_return: f64,
+}
+
+fn shock_reversal_candidate_at(
+    symbol: &str,
+    bars: &[Bar],
+    index: usize,
+    shock: &AltcoinShockReversalConfig,
+    min_24h_volume_usd: f64,
+) -> Option<Candidate> {
+    const VOLUME_BASELINE_BARS: usize = 7 * 96;
+    if index < VOLUME_BASELINE_BARS.max(96).max(8) || index >= bars.len() {
+        return None;
+    }
+    if bars[index].open_ms - bars[index - VOLUME_BASELINE_BARS].open_ms
+        > (VOLUME_BASELINE_BARS as i64 + 1) * 15 * 60_000
+    {
+        return None;
+    }
+    let volume_24h: f64 = bars[index - 95..=index]
+        .iter()
+        .map(|bar| bar.quote_volume)
+        .sum();
+    if volume_24h < min_24h_volume_usd {
+        return None;
+    }
+    let baseline_volume: f64 = bars[index - VOLUME_BASELINE_BARS..index]
+        .iter()
+        .map(|bar| bar.quote_volume)
+        .sum::<f64>()
+        / VOLUME_BASELINE_BARS as f64;
+    let volume_ratio = bars[index].quote_volume / baseline_volume.max(1.0);
+    let prior_hour_return = bars[index - 1].close / bars[index - 5].close - 1.0;
+    let side = if prior_hour_return > 0.0 { -1 } else { 1 };
+    let reversal_return = bars[index].close / bars[index - 1].close - 1.0;
+    let prior_high = bars[index - 8..index]
+        .iter()
+        .map(|bar| bar.high)
+        .fold(f64::NEG_INFINITY, f64::max);
+    let prior_low = bars[index - 8..index]
+        .iter()
+        .map(|bar| bar.low)
+        .fold(f64::INFINITY, f64::min);
+    let swept = if side < 0 {
+        bars[index].high >= prior_high
+    } else {
+        bars[index].low <= prior_low
+    };
+    let range = bars[index].high - bars[index].low;
+    let close_location_long = if range > 0.0 {
+        (bars[index].close - bars[index].low) / range
+    } else {
+        0.5
+    };
+    let directional_close_location = if side > 0 {
+        close_location_long
+    } else {
+        1.0 - close_location_long
+    };
+    let candle_range = range / bars[index].close.max(f64::EPSILON);
+    if !(shock.min_shock_return..=shock.max_shock_return).contains(&prior_hour_return.abs())
+        || side as f64 * reversal_return < shock.min_reversal_return
+        || !swept
+        || volume_ratio < shock.min_volume_ratio
+        || directional_close_location < shock.min_close_location
+        || candle_range > shock.max_candle_range
+    {
+        return None;
+    }
+    let strict = volume_ratio >= shock.strict_volume_ratio
+        && directional_close_location >= shock.strict_close_location
+        && candle_range <= shock.strict_max_candle_range;
+    let return_4h = bars[index].close / bars[index - 16].close - 1.0;
+    Some(Candidate {
+        symbol: symbol.to_owned(),
+        signal_ms: bars[index].close_ms,
+        setup_origin_ms: bars[index].close_ms,
+        side,
+        price: bars[index].close,
+        return_1h: prior_hour_return,
+        return_4h,
+        volume_ratio,
+        efficiency: side as f64 * reversal_return,
+        close_location: directional_close_location,
+        volume_24h,
+        score: prior_hour_return.abs() * reversal_return.abs() * volume_ratio.ln_1p(),
+        entry_phase: "shock_reversal".to_owned(),
+        breakout_level: if side > 0 { prior_low } else { prior_high },
+        entry_trigger: if strict {
+            "strict_shock_reversal".to_owned()
+        } else {
+            "broad_shock_reversal".to_owned()
+        },
+        risk_scale: if strict {
+            shock.strict_gross_multiple
+        } else {
+            shock.broad_gross_multiple
+        },
+        blockers: Vec::new(),
+        spot_return_1h: None,
+        oi_change_1h: None,
+        funding_rate: None,
+        perp_premium: None,
+    })
+}
+
+fn shock_shadow_outcome(
+    candidate: &Candidate,
+    bars: &[Bar],
+    signal_index: usize,
+    shock: &AltcoinShockReversalConfig,
+) -> Option<ShockShadowOutcome> {
+    let entry_index = signal_index + 1;
+    let max_bars = shock.max_hold_hours as usize * 4;
+    let end = entry_index.checked_add(max_bars)?;
+    if end >= bars.len() {
+        return None;
+    }
+    let slip = shock.assumed_slippage_bps_per_side / 10_000.0;
+    let fee = shock.assumed_fee_bps_per_side / 10_000.0;
+    let entry = bars[entry_index].open * (1.0 + candidate.side as f64 * slip);
+    let mut stop = entry * (1.0 - candidate.side as f64 * shock.stop_pct);
+    let mut extreme = entry;
+    let mut raw_exit = bars[end].open;
+    let mut exit_ms = bars[end].open_ms;
+    for bar in &bars[entry_index..end] {
+        let gap = if candidate.side > 0 {
+            bar.open <= stop
+        } else {
+            bar.open >= stop
+        };
+        let stopped = if candidate.side > 0 {
+            bar.low <= stop
+        } else {
+            bar.high >= stop
+        };
+        if gap || stopped {
+            raw_exit = if gap { bar.open } else { stop };
+            exit_ms = bar.open_ms;
+            break;
+        }
+        extreme = if candidate.side > 0 {
+            extreme.max(bar.high)
+        } else {
+            extreme.min(bar.low)
+        };
+        let favorable = candidate.side as f64 * (extreme / entry - 1.0);
+        if favorable >= shock.trail_activation_pct {
+            let proposed = extreme * (1.0 - candidate.side as f64 * shock.trail_pct);
+            stop = if candidate.side > 0 {
+                stop.max(proposed)
+            } else {
+                stop.min(proposed)
+            };
+        }
+    }
+    let exit = raw_exit * (1.0 - candidate.side as f64 * slip);
+    let ratio = exit / entry;
+    Some(ShockShadowOutcome {
+        symbol: candidate.symbol.clone(),
+        side: candidate.side,
+        signal_ms: candidate.signal_ms,
+        exit_ms,
+        net_return: candidate.side as f64 * (ratio - 1.0) - fee - fee * ratio,
+    })
+}
+
+fn shock_gate_side(
+    outcomes: &[ShockShadowOutcome],
+    side: i32,
+    window: usize,
+    min_pf: f64,
+) -> Value {
+    let mut side_outcomes: Vec<_> = outcomes
+        .iter()
+        .filter(|outcome| outcome.side == side)
+        .collect();
+    side_outcomes.sort_by_key(|outcome| (outcome.exit_ms, outcome.signal_ms));
+    if side_outcomes.len() > window {
+        side_outcomes.drain(..side_outcomes.len() - window);
+    }
+    let returns: Vec<f64> = side_outcomes
+        .iter()
+        .map(|outcome| outcome.net_return)
+        .collect();
+    let gains: f64 = returns.iter().copied().filter(|value| *value > 0.0).sum();
+    let losses: f64 = returns
+        .iter()
+        .copied()
+        .filter(|value| *value < 0.0)
+        .map(f64::abs)
+        .sum();
+    let profit_factor = if losses > 0.0 { gains / losses } else { 99.0 };
+    let sum_return: f64 = returns.iter().sum();
+    let ready = returns.len() == window;
+    json!({
+        "side":side,
+        "ready":ready,
+        "open":ready && sum_return > 0.0 && profit_factor >= min_pf,
+        "samples":returns.len(),
+        "required_samples":window,
+        "sum_return":sum_return,
+        "profit_factor":profit_factor,
+        "required_profit_factor":min_pf,
+        "returns":returns,
+        "latest":side_outcomes.last().map(|outcome| json!({
+            "symbol":outcome.symbol,
+            "signal_ms":outcome.signal_ms,
+            "exit_ms":outcome.exit_ms,
+            "net_return":outcome.net_return
+        }))
+    })
+}
+
+fn shock_gate_analysis(
+    bars_by_symbol: &HashMap<String, Vec<Bar>>,
+    boundary_ms: i64,
+    shock: &AltcoinShockReversalConfig,
+    impulse: &AltcoinImpulseConfig,
+) -> Value {
+    let mut outcomes = Vec::new();
+    for (symbol, bars) in bars_by_symbol {
+        if bars.len() < 7 * 96 + shock.max_hold_hours as usize * 4 + 2 {
+            continue;
+        }
+        for index in 7 * 96..bars.len() - 1 {
+            let Some(candidate) =
+                shock_reversal_candidate_at(symbol, bars, index, shock, impulse.min_24h_volume_usd)
+            else {
+                continue;
+            };
+            let Some(outcome) = shock_shadow_outcome(&candidate, bars, index, shock) else {
+                continue;
+            };
+            if outcome.exit_ms < boundary_ms {
+                outcomes.push(outcome);
+            }
+        }
+    }
+    let long = shock_gate_side(
+        &outcomes,
+        1,
+        shock.gate_window,
+        shock.gate_min_profit_factor,
+    );
+    let short = shock_gate_side(
+        &outcomes,
+        -1,
+        shock.gate_window,
+        shock.gate_min_profit_factor,
+    );
+    json!({
+        "model":"15m_shock_reversal",
+        "stage":"scan",
+        "boundary_ms":boundary_ms,
+        "next_refresh_ms":boundary_ms + shock.gate_refresh_hours as i64 * 3_600_000,
+        "gate":{"long":long,"short":short},
+        "thresholds":{
+            "min_shock_return":shock.min_shock_return,
+            "max_shock_return":shock.max_shock_return,
+            "min_reversal_return":shock.min_reversal_return,
+            "min_volume_ratio":shock.min_volume_ratio,
+            "min_close_location":shock.min_close_location,
+            "max_candle_range":shock.max_candle_range,
+            "strict_volume_ratio":shock.strict_volume_ratio,
+            "strict_close_location":shock.strict_close_location,
+            "strict_max_candle_range":shock.strict_max_candle_range
+        },
+        "execution":{
+            "broad_gross_multiple":shock.broad_gross_multiple,
+            "strict_gross_multiple":shock.strict_gross_multiple,
+            "max_gross_multiple":shock.max_gross_multiple,
+            "stop_pct":shock.stop_pct,
+            "trail_activation_pct":shock.trail_activation_pct,
+            "trail_pct":shock.trail_pct,
+            "fixed_exit_hours":shock.max_hold_hours,
+            "partial_take_profit":false,
+            "daily_loss_limit":impulse.daily_loss_limit
+        }
+    })
+}
+
+fn shock_gate_open(status: &Value, side: i32) -> bool {
+    let key = if side > 0 { "long" } else { "short" };
+    status["gate"][key]["open"].as_bool().unwrap_or(false)
+}
+
 pub(crate) fn append_event(path: &str, event: Value) -> Result<()> {
     if let Some(parent) = std::path::Path::new(path).parent() {
         std::fs::create_dir_all(parent)?;
@@ -2803,6 +3315,12 @@ fn record_exit(
         if trade_pnl > 0.0 {
             state.cross_wins += 1;
         }
+    } else if is_shock_position(position) {
+        state.shock_exits += 1;
+        state.shock_realized_pnl += pnl;
+        if trade_pnl > 0.0 {
+            state.shock_wins += 1;
+        }
     }
     if position.entry_phase == "overextended_long" && trade_pnl < 0.0 {
         state.overextension_long_blocked = true;
@@ -2911,6 +3429,7 @@ async fn manage_live_positions(
     client: &live::RestClient,
     cfg: &AltcoinImpulseConfig,
     cross: &AltcoinCrossSectionConfig,
+    shock: &AltcoinShockReversalConfig,
     now_ms: i64,
     event_path: &str,
 ) -> Result<bool> {
@@ -2939,7 +3458,7 @@ async fn manage_live_positions(
                 state,
                 &position,
                 now_ms,
-                cfg.cooldown_hours,
+                position_cooldown_hours(&position, cfg, shock),
                 exit,
                 exit_qty,
                 exit_fee,
@@ -2954,11 +3473,7 @@ async fn manage_live_positions(
         }
 
         let cross_position = is_cross_position(&position);
-        let max_hold_hours = if cross_position {
-            cross.hold_hours as i64
-        } else {
-            cfg.max_hold_hours as i64
-        };
+        let max_hold_hours = position_max_hold_hours(&position, cfg, cross, shock);
         let timed = now_ms - position.entry_ms >= max_hold_hours * 3_600_000;
         if timed {
             client.cancel_all_open_orders(&symbol).await?;
@@ -2972,7 +3487,7 @@ async fn manage_live_positions(
                 state,
                 &position,
                 now_ms,
-                cfg.cooldown_hours,
+                position_cooldown_hours(&position, cfg, shock),
                 exit,
                 exit_qty,
                 fee,
@@ -3021,7 +3536,7 @@ async fn manage_live_positions(
         );
         position.adverse_extreme = Some(adverse);
         let max_adverse = adverse_excursion(position.side, position.entry_price, adverse);
-        let (trail_activation_pct, trail_pct) = position_exit_parameters(&position, cfg);
+        let (trail_activation_pct, trail_pct) = position_exit_parameters(&position, cfg, shock);
         let (new_extreme, improved_stop) = realtime_trailing_stop(
             position.side,
             position.entry_price,
@@ -3064,7 +3579,7 @@ async fn manage_live_positions(
                 state,
                 &position,
                 now_ms,
-                cfg.cooldown_hours,
+                position_cooldown_hours(&position, cfg, shock),
                 exit,
                 exit_qty,
                 fee,
@@ -3138,7 +3653,10 @@ async fn manage_live_positions(
             continue;
         }
         // 只按“当前仍有的浮盈”兑现，不能因历史上曾到过 +2%、现在已回落而补卖。
-        if !position.partial_take_profit_done && current_return >= trail_activation_pct {
+        if !is_shock_position(&position)
+            && !position.partial_take_profit_done
+            && current_return >= trail_activation_pct
+        {
             let filters = client.symbol_filters(&symbol).await?;
             let side = if position.side > 0 { "SELL" } else { "BUY" };
             let target_qty = snapshot.position_amt.abs() * cfg.partial_take_profit_fraction;
@@ -3259,7 +3777,7 @@ async fn manage_live_positions(
                     state,
                     &position,
                     now_ms,
-                    cfg.cooldown_hours,
+                    position_cooldown_hours(&position, cfg, shock),
                     exit,
                     exit_qty,
                     fee,
@@ -3338,6 +3856,7 @@ pub async fn run_altcoin_impulse(
     let strategy_file = toml::from_str::<StrategyFile>(&strategy_text)?;
     let cfg = strategy_file.altcoin_impulse;
     let cross_cfg = strategy_file.altcoin_cross_section;
+    let shock_cfg = strategy_file.altcoin_shock_reversal;
     let strategy_hash = format!("{:x}", Sha256::digest(strategy_text.as_bytes()));
     let git_commit = std::env::var("GREED_GIT_COMMIT").unwrap_or_else(|_| {
         std::process::Command::new("git")
@@ -3350,6 +3869,28 @@ pub async fn run_altcoin_impulse(
             .unwrap_or_else(|| "unknown".into())
     });
     anyhow::ensure!(cfg.enabled, "altcoin_impulse.enabled=false");
+    anyhow::ensure!(
+        !shock_cfg.enabled
+            || ((0.03..=0.10).contains(&shock_cfg.min_shock_return)
+                && shock_cfg.max_shock_return >= shock_cfg.min_shock_return
+                && shock_cfg.max_shock_return <= 0.30
+                && (0.003..=0.015).contains(&shock_cfg.min_reversal_return)
+                && (1.5..=5.0).contains(&shock_cfg.min_volume_ratio)
+                && (0.55..=0.85).contains(&shock_cfg.min_close_location)
+                && (20..=80).contains(&shock_cfg.gate_window)
+                && (0.8..=1.5).contains(&shock_cfg.gate_min_profit_factor)
+                && (0.0..=10.0).contains(&shock_cfg.assumed_fee_bps_per_side)
+                && (0.0..=25.0).contains(&shock_cfg.assumed_slippage_bps_per_side)
+                && (0.01..=0.04).contains(&shock_cfg.stop_pct)
+                && shock_cfg.trail_activation_pct > shock_cfg.stop_pct
+                && (0.003..shock_cfg.trail_activation_pct).contains(&shock_cfg.trail_pct)
+                && (1..=6).contains(&shock_cfg.max_hold_hours)
+                && shock_cfg.broad_gross_multiple > 0.0
+                && shock_cfg.strict_gross_multiple >= shock_cfg.broad_gross_multiple
+                && shock_cfg.max_gross_multiple >= shock_cfg.strict_gross_multiple
+                && shock_cfg.max_gross_multiple <= 3.0),
+        "冲击反转参数超出验证边界"
+    );
     anyhow::ensure!(
         !cross_cfg.enabled
             || (cross_cfg.formation_hours == 12
@@ -3688,6 +4229,10 @@ pub async fn run_altcoin_impulse(
     }
     let mut phase_migrations = Vec::new();
     for position in state.positions.values_mut() {
+        if is_cross_position(position) || is_pulse_position(position) || is_shock_position(position)
+        {
+            continue;
+        }
         let historical_returns = state.recent_trades.iter().rev().find_map(|event| {
             (event["event"] == "entry"
                 && event["symbol"] == position.symbol
@@ -3754,7 +4299,10 @@ pub async fn run_altcoin_impulse(
         leverage = cfg.exchange_leverage,
         capital = initial_cash,
         cross_section = cross_cfg.enabled,
-        strategy = if cross_cfg.enabled {
+        shock_reversal = shock_cfg.enabled,
+        strategy = if shock_cfg.enabled {
+            "multi_alpha"
+        } else if cross_cfg.enabled {
             "cross_section_momentum"
         } else {
             "confirmed_volume_breakout"
@@ -3763,7 +4311,7 @@ pub async fn run_altcoin_impulse(
     );
     append_event(
         &event_path,
-        json!({"ts_ms": now_ms, "event":"runner_start", "mode":mode.as_str(), "config":cfg, "cross_section_config":cross_cfg}),
+        json!({"ts_ms": now_ms, "event":"runner_start", "mode":mode.as_str(), "config":cfg, "cross_section_config":cross_cfg,"shock_reversal_config":shock_cfg}),
     )?;
 
     let spot_info = get_json(&http, &format!("{SPOT_BASE}/api/v3/exchangeInfo")).await?;
@@ -3825,6 +4373,12 @@ pub async fn run_altcoin_impulse(
         let cross_status_refresh_due =
             cross_cfg.enabled && !cross_section_status_complete(&state.cross_section_status);
         let cross_analysis_due = cross_execution_due || cross_status_refresh_due;
+        let shock_interval_ms = shock_cfg.gate_refresh_hours.max(1) as i64 * 3_600_000;
+        let shock_boundary_ms = scan_ms.div_euclid(shock_interval_ms) * shock_interval_ms;
+        let shock_gate_key = "__shock_gate__";
+        let shock_analysis_due = shock_cfg.enabled
+            && (state.shock_reversal_status.is_null()
+                || state.seen_signal.get(shock_gate_key).copied() != Some(shock_boundary_ms));
         let mut shortlist: Vec<(String, f64)> = tickers
             .as_array()
             .into_iter()
@@ -3839,11 +4393,16 @@ pub async fn run_altcoin_impulse(
                         .is_none_or(|symbols| symbols.contains(&symbol))
                     && spot_symbols.contains(&symbol)
                     && !excluded.contains(symbol.as_str());
-                let selected = if cross_cfg.enabled && cross_analysis_due {
+                let selected = if (cross_cfg.enabled && cross_analysis_due) || shock_analysis_due {
                     // 重建过去 30 个已完成信号时，不能只看“当前”成交额，否则会漏掉
                     // 历史截面曾满足 1000 万门槛、现在刚掉出门槛的币，造成幸存者偏差。
                     // 每个历史截面的真实 24h 成交额由 cross_ranks_at 再因果过滤。
                     common
+                } else if shock_cfg.enabled {
+                    // 快反转发生在冲击已经开始回吐之后，24h 净涨跌可能刚好落回
+                    // 旧的 4% 榜单外。放宽预筛到 2%，真正入场仍由 1h 冲击、
+                    // 扫高/扫低、反向强收和实时可成交性共同决定。
+                    common && volume >= cfg.min_24h_volume_usd && change >= 2.0
                 } else {
                     common && volume >= cfg.min_24h_volume_usd && change >= 4.0
                 };
@@ -3851,7 +4410,7 @@ pub async fn run_altcoin_impulse(
             })
             .collect();
         shortlist.sort_by(|a, b| b.1.total_cmp(&a.1));
-        if !cross_analysis_due {
+        if !cross_analysis_due && !shock_analysis_due {
             shortlist.truncate(cfg.scan_limit);
         }
         // 已持仓标的即使跌出动量扫描池也必须继续取价、跟踪止损和时间退出。
@@ -3882,7 +4441,13 @@ pub async fn run_altcoin_impulse(
         let shortlist_count = shortlist.len();
         let mut set = tokio::task::JoinSet::new();
         let kline_limit = Arc::new(tokio::sync::Semaphore::new(20));
-        let history_bars = if cross_analysis_due { 850 } else { 700 };
+        let history_bars = if shock_analysis_due {
+            1_500
+        } else if cross_analysis_due {
+            850
+        } else {
+            700
+        };
         for (symbol, _) in shortlist {
             let client = http.clone();
             let permits = kline_limit.clone();
@@ -3900,6 +4465,20 @@ pub async fn run_altcoin_impulse(
                 Ok(Err(e)) => warn!(error=%e, "候选 K 线拉取失败"),
                 Err(e) => warn!(error=%e, "候选任务失败"),
             }
+        }
+        if shock_analysis_due {
+            let mut status =
+                shock_gate_analysis(&bars_by_symbol, shock_boundary_ms, &shock_cfg, &cfg);
+            status["performance"] = shock_performance(&state);
+            state.shock_reversal_status = status.clone();
+            state
+                .seen_signal
+                .insert(shock_gate_key.to_owned(), shock_boundary_ms);
+            append_event(
+                &event_path,
+                json!({"ts_ms":scan_ms,"event":"shock_reversal_gate_refreshed","status":status,"history_symbols":bars_by_symbol.len()}),
+            )?;
+            save_state(&state_path, &state)?;
         }
         for outcome in update_microstructure_trials(&mut state, &bars_by_symbol, scan_ms) {
             append_event(&event_path, outcome)?;
@@ -4004,8 +4583,16 @@ pub async fn run_altcoin_impulse(
 
         // 先管理已有仓位。模拟盘/实盘走独立实时循环；dry 才使用闭合 K 线撮合。
         if let Some(client) = rest.as_ref() {
-            match manage_live_positions(&mut state, client, &cfg, &cross_cfg, scan_ms, &event_path)
-                .await
+            match manage_live_positions(
+                &mut state,
+                client,
+                &cfg,
+                &cross_cfg,
+                &shock_cfg,
+                scan_ms,
+                &event_path,
+            )
+            .await
             {
                 Ok(true) => save_state(&state_path, &state)?,
                 Ok(false) => {}
@@ -4062,7 +4649,7 @@ pub async fn run_altcoin_impulse(
                         &mut state,
                         &position,
                         scan_ms,
-                        cfg.cooldown_hours,
+                        position_cooldown_hours(&position, &cfg, &shock_cfg),
                         exit,
                         position.qty,
                         fee,
@@ -4101,7 +4688,7 @@ pub async fn run_altcoin_impulse(
                             &mut state,
                             &position,
                             scan_ms,
-                            cfg.cooldown_hours,
+                            position_cooldown_hours(&position, &cfg, &shock_cfg),
                             exit,
                             position.qty,
                             fee,
@@ -4134,8 +4721,12 @@ pub async fn run_altcoin_impulse(
                     append_event(&event_path, event.clone())?;
                     state.record_trade(event);
                 }
-                let (trail_activation_pct, trail_pct) = position_exit_parameters(&position, &cfg);
-                if !position.partial_take_profit_done && excursion >= trail_activation_pct {
+                let (trail_activation_pct, trail_pct) =
+                    position_exit_parameters(&position, &cfg, &shock_cfg);
+                if !is_shock_position(&position)
+                    && !position.partial_take_profit_done
+                    && excursion >= trail_activation_pct
+                {
                     let raw_exit =
                         position.entry_price * (1.0 + position.side as f64 * trail_activation_pct);
                     let exit =
@@ -4190,7 +4781,8 @@ pub async fn run_altcoin_impulse(
                         cfg.failed_breakout_adverse_pct,
                         cfg.failed_breakout_max_mfe_pct,
                     );
-                let timed = scan_ms - position.entry_ms >= cfg.max_hold_hours as i64 * 3_600_000;
+                let timed = scan_ms - position.entry_ms
+                    >= position_max_hold_hours(&position, &cfg, &cross_cfg, &shock_cfg) * 3_600_000;
                 if failed || stopped || timed {
                     let raw_exit = if failed {
                         bar.close
@@ -4206,7 +4798,7 @@ pub async fn run_altcoin_impulse(
                         &mut state,
                         &position,
                         scan_ms,
-                        cfg.cooldown_hours,
+                        position_cooldown_hours(&position, &cfg, &shock_cfg),
                         exit,
                         position.qty,
                         fee,
@@ -4298,6 +4890,80 @@ pub async fn run_altcoin_impulse(
                 .filter_map(|(s, bars)| evaluate(s.clone(), bars, &cfg))
                 .collect()
         };
+        let mut shock_candidates = if shock_cfg.enabled {
+            bars_by_symbol
+                .iter()
+                .filter_map(|(symbol, bars)| {
+                    shock_reversal_candidate_at(
+                        symbol,
+                        bars,
+                        bars.len().checked_sub(1)?,
+                        &shock_cfg,
+                        cfg.min_24h_volume_usd,
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        shock_candidates.sort_by(|left, right| right.score.total_cmp(&left.score));
+        for candidate in &mut shock_candidates {
+            let gate_open = shock_gate_open(&state.shock_reversal_status, candidate.side);
+            if !gate_open {
+                let side = if candidate.side > 0 { "long" } else { "short" };
+                let gate = &state.shock_reversal_status["gate"][side];
+                candidate.blockers.push(format!(
+                    "{} 侧滚动门控未开启：{}/{} 样本，PF {:.2}",
+                    side,
+                    gate["samples"].as_u64().unwrap_or(0),
+                    gate["required_samples"]
+                        .as_u64()
+                        .unwrap_or(shock_cfg.gate_window as u64),
+                    gate["profit_factor"].as_f64().unwrap_or(0.0)
+                ));
+            }
+            let seen_key = format!("__shock__{}", candidate.symbol);
+            if state.seen_signal.get(&seen_key).copied() == Some(candidate.signal_ms) {
+                candidate.blockers.push("本根冲击反转 K 已评估".into());
+            } else {
+                state.seen_signal.insert(seen_key, candidate.signal_ms);
+                observe_microstructure_trial(
+                    &mut state,
+                    "shock_reversal",
+                    candidate,
+                    candidate.signal_ms,
+                    candidate.price,
+                    shock_cfg.max_hold_hours as i64 * 3_600_000,
+                );
+                append_event(
+                    &event_path,
+                    json!({
+                        "ts_ms":scan_ms,"event":"shock_reversal_signal",
+                        "symbol":candidate.symbol,"side":candidate.side,
+                        "signal_ms":candidate.signal_ms,"gate_open":gate_open,
+                        "quality":if candidate.entry_trigger=="strict_shock_reversal" {"strict"} else {"broad"},
+                        "signal":candidate
+                    }),
+                )?;
+            }
+        }
+        if shock_cfg.enabled {
+            state.shock_reversal_status["stage"] =
+                json!(if state.positions.values().any(is_shock_position) {
+                    "position"
+                } else if shock_candidates.iter().any(Candidate::eligible) {
+                    "execution"
+                } else if shock_candidates.is_empty() {
+                    "scan"
+                } else {
+                    "gate_blocked"
+                });
+            state.shock_reversal_status["latest_candidates"] =
+                json!(shock_candidates.iter().take(10).collect::<Vec<_>>());
+            state.shock_reversal_status["last_scan_ms"] = json!(scan_ms);
+            state.shock_reversal_status["performance"] = shock_performance(&state);
+            candidates.extend(shock_candidates.iter().cloned());
+        }
         let mut pulse_initial_candidates: Vec<Candidate> = if pulse_exhaustion_active {
             bars_by_symbol
                 .iter()
@@ -4391,7 +5057,7 @@ pub async fn run_altcoin_impulse(
                     .pulse_exhaustion_setups
                     .insert(candidate.symbol.clone(), setup.clone());
                 if rest.is_some() {
-                    let stop_pct = candidate_stop_pct(&candidate, &cfg, &cross_cfg);
+                    let stop_pct = candidate_stop_pct(candidate, &cfg, &cross_cfg, &shock_cfg);
                     let observation_notional = current_equity
                         * cfg.risk_per_trade
                         * cfg.pulse_risk_scale
@@ -4492,7 +5158,7 @@ pub async fn run_altcoin_impulse(
                     ));
                 }
                 let eligible = candidate.eligible();
-                let stop_pct = candidate_stop_pct(&candidate, &cfg, &cross_cfg);
+                let stop_pct = candidate_stop_pct(&candidate, &cfg, &cross_cfg, &shock_cfg);
                 let pulse_observation_notional = current_equity
                     * cfg.risk_per_trade
                     * cfg.pulse_risk_scale
@@ -4666,11 +5332,17 @@ pub async fn run_altcoin_impulse(
             .saturating_add(state.daily_entry_bonus);
         let mut overextension_slot_taken = overextension_long_open;
         let mut execution_candidates = pulse_execution_candidates;
+        execution_candidates.extend(
+            shock_candidates
+                .iter()
+                .filter(|candidate| candidate.eligible())
+                .cloned(),
+        );
         if cross_cfg.enabled {
             execution_candidates.extend(
                 candidates
                     .iter()
-                    .filter(|candidate| candidate.eligible())
+                    .filter(|candidate| is_cross_candidate(candidate) && candidate.eligible())
                     .cloned(),
             );
         }
@@ -4808,10 +5480,9 @@ pub async fn run_altcoin_impulse(
 
         // 新突破先登记候选。只有真正极端且放量足够的延续段允许直接小仓探路；
         // 该分支对多空完全镜像，并通过 risk_scale 降低单次错误追价的代价。
-        for candidate in candidates
-            .iter()
-            .filter(|candidate| !cross_cfg.enabled && candidate.eligible())
-        {
+        for candidate in candidates.iter().filter(|candidate| {
+            !cross_cfg.enabled && !is_shock_candidate(candidate) && candidate.eligible()
+        }) {
             if state.positions.contains_key(&candidate.symbol)
                 || state.pending_entries.contains_key(&candidate.symbol)
                 || state.seen_signal.get(&candidate.symbol).copied() == Some(candidate.signal_ms)
@@ -4842,7 +5513,7 @@ pub async fn run_altcoin_impulse(
                     * cfg.risk_per_trade
                     * candidate.risk_scale
                     * direction_risk_scale
-                    / (candidate_stop_pct(candidate, &cfg, &cross_cfg)
+                    / (candidate_stop_pct(candidate, &cfg, &cross_cfg, &shock_cfg)
                         + cfg.risk_execution_buffer_pct);
                 match market_rest
                     .liquidity_snapshot(
@@ -4995,10 +5666,13 @@ pub async fn run_altcoin_impulse(
             }
             let pulse_candidate = candidate.entry_phase == "pulse_exhaustion_short";
             let cross_candidate = is_cross_candidate(candidate);
+            let shock_candidate = is_shock_candidate(candidate);
             let micro_strategy = if pulse_candidate {
                 "pulse_exhaustion_short"
             } else if cross_candidate {
                 "cross_section_momentum"
+            } else if shock_candidate {
+                "shock_reversal"
             } else {
                 "confirmed_volume_breakout"
             };
@@ -5039,18 +5713,22 @@ pub async fn run_altcoin_impulse(
                 cfg.pulse_max_gross_multiple
             } else if cross_candidate {
                 cross_cfg.strong_gross_multiple
+            } else if shock_candidate {
+                shock_cfg.max_gross_multiple
             } else {
                 cfg.max_gross_multiple
             };
-            let stop_pct = candidate_stop_pct(&candidate, &cfg, &cross_cfg);
+            let stop_pct = candidate_stop_pct(candidate, &cfg, &cross_cfg, &shock_cfg);
             let risk_distance = stop_pct + cfg.risk_execution_buffer_pct;
-            let direction_risk_scale = if candidate.side > 0 {
+            let direction_risk_scale = if shock_candidate {
+                1.0
+            } else if candidate.side > 0 {
                 cfg.long_risk_scale
             } else {
                 cfg.short_risk_scale
             };
             let effective_risk_scale = candidate.risk_scale * direction_risk_scale;
-            let requested_notional = if cross_candidate {
+            let requested_notional = if cross_candidate || shock_candidate {
                 managed_equity * candidate.risk_scale
             } else {
                 managed_equity * cfg.risk_per_trade * effective_risk_scale / risk_distance
@@ -5519,6 +6197,8 @@ pub async fn run_altcoin_impulse(
                     "executed_ms":scan_ms,
                     "next_boundary_ms":cross_boundary_ms + cross_interval_ms
                 });
+            } else if shock_candidate {
+                state.shock_entries += 1;
             }
             let setup_origin_ms = candidate_origin_ms(candidate);
             let trial_key =
@@ -5555,7 +6235,7 @@ pub async fn run_altcoin_impulse(
             if candidate.entry_phase == "overextended_long" {
                 overextension_slot_taken = true;
             }
-            let event = json!({"ts_ms":scan_ms,"event":"entry","strategy":micro_strategy,"setup_id":trial_key,"origin_signal_ms":setup_origin_ms,"symbol":candidate.symbol,"side":candidate.side,"entry_phase":candidate.entry_phase,"entry_trigger":candidate.entry_trigger,"risk_scale":candidate.risk_scale,"direction_risk_scale":direction_risk_scale,"effective_risk_scale":effective_risk_scale,"signal_age_ms":signal_age_ms(scan_ms,candidate.signal_ms),"max_signal_age_ms":max_signal_age_ms,"signal":candidate,"entry_price":entry,"qty":qty,"notional":qty*entry,"requested_leverage":cfg.exchange_leverage,"actual_leverage":actual_leverage,"margin_estimate":qty*entry/actual_leverage as f64,"risk_usd":qty*entry*risk_distance,"price_stop_risk_usd":qty*entry*stop_pct,"stop_pct":stop_pct,"trail_activation_pct":if pulse_candidate {Some(cfg.pulse_trail_activation_pct)} else if cross_candidate {None} else {Some(cfg.trail_activation_pct)},"trail_pct":if pulse_candidate {Some(cfg.pulse_trail_pct)} else if cross_candidate {None} else {Some(cfg.trail_pct)},"partial_take_profit_fraction":if cross_candidate {None} else {Some(cfg.partial_take_profit_fraction)},"max_hold_hours":if cross_candidate {cross_cfg.hold_hours as u32} else {cfg.max_hold_hours},"risk_execution_buffer_pct":cfg.risk_execution_buffer_pct,"fee":fee});
+            let event = json!({"ts_ms":scan_ms,"event":"entry","strategy":micro_strategy,"setup_id":trial_key,"origin_signal_ms":setup_origin_ms,"symbol":candidate.symbol,"side":candidate.side,"entry_phase":candidate.entry_phase,"entry_trigger":candidate.entry_trigger,"risk_scale":candidate.risk_scale,"direction_risk_scale":direction_risk_scale,"effective_risk_scale":effective_risk_scale,"signal_age_ms":signal_age_ms(scan_ms,candidate.signal_ms),"max_signal_age_ms":max_signal_age_ms,"signal":candidate,"entry_price":entry,"qty":qty,"notional":qty*entry,"requested_leverage":cfg.exchange_leverage,"actual_leverage":actual_leverage,"margin_estimate":qty*entry/actual_leverage as f64,"risk_usd":qty*entry*risk_distance,"price_stop_risk_usd":qty*entry*stop_pct,"stop_pct":stop_pct,"trail_activation_pct":if pulse_candidate {Some(cfg.pulse_trail_activation_pct)} else if cross_candidate {None} else if shock_candidate {Some(shock_cfg.trail_activation_pct)} else {Some(cfg.trail_activation_pct)},"trail_pct":if pulse_candidate {Some(cfg.pulse_trail_pct)} else if cross_candidate {None} else if shock_candidate {Some(shock_cfg.trail_pct)} else {Some(cfg.trail_pct)},"partial_take_profit_fraction":if cross_candidate || shock_candidate {None} else {Some(cfg.partial_take_profit_fraction)},"max_hold_hours":if cross_candidate {cross_cfg.hold_hours as u32} else if shock_candidate {shock_cfg.max_hold_hours} else {cfg.max_hold_hours},"risk_execution_buffer_pct":cfg.risk_execution_buffer_pct,"fee":fee});
             append_event(&event_path, event.clone())?;
             state.record_trade(event);
         }
@@ -5627,6 +6307,9 @@ pub async fn run_altcoin_impulse(
         if cross_cfg.enabled && state.cross_section_status.is_object() {
             state.cross_section_status["performance"] = cross_performance(&state);
         }
+        if shock_cfg.enabled && state.shock_reversal_status.is_object() {
+            state.shock_reversal_status["performance"] = shock_performance(&state);
+        }
         let mut scan_event = json!({
             "ts_ms":scan_ms, "event":"scan", "universe_count":spot_symbols.intersection(&active).filter(|symbol| !excluded.contains(symbol.as_str())).count(),
             "shortlist_count":shortlist_count, "eligible_count":regular_eligible_count,
@@ -5668,7 +6351,9 @@ pub async fn run_altcoin_impulse(
         });
         scan_event["max_positions"] = json!(cfg.max_positions);
         scan_event["max_gross_multiple"] = json!(cfg.max_gross_multiple);
-        scan_event["execution_model"] = json!(if cross_cfg.enabled {
+        scan_event["execution_model"] = json!(if shock_cfg.enabled {
+            "multi_alpha"
+        } else if cross_cfg.enabled {
             "cross_section_momentum"
         } else {
             "confirmed_volume_breakout"
@@ -5698,6 +6383,7 @@ pub async fn run_altcoin_impulse(
         scan_event["min_close_location"] = json!(cfg.min_close_location);
         scan_event["first_week"] = json!(&first_week);
         scan_event["cross_section"] = state.cross_section_status.clone();
+        scan_event["shock_reversal"] = state.shock_reversal_status.clone();
         scan_event["pulse_exhaustion"] = pulse_status.clone();
         append_event(&event_path, scan_event)?;
         let microstructure_status = json!({
@@ -5751,13 +6437,18 @@ pub async fn run_altcoin_impulse(
         status_payload["altcoin_impulse"]["entry_blocked"] =
             json!(daily_loss_blocked || first_week.entries_blocked);
         status_payload["altcoin_impulse"]["cross_section"] = state.cross_section_status.clone();
-        status_payload["altcoin_impulse"]["execution_model"] = json!(if cross_cfg.enabled {
+        status_payload["altcoin_impulse"]["shock_reversal"] = state.shock_reversal_status.clone();
+        status_payload["altcoin_impulse"]["execution_model"] = json!(if shock_cfg.enabled {
+            "multi_alpha"
+        } else if cross_cfg.enabled {
             "cross_section_momentum"
         } else {
             "confirmed_volume_breakout"
         });
         status_payload["altcoin_impulse"]["max_positions"] = json!(cfg.max_positions);
         status_payload["altcoin_impulse"]["max_gross_multiple"] = json!(cfg.max_gross_multiple);
+        status_payload["altcoin_impulse"]["shock_max_gross_multiple"] =
+            json!(shock_cfg.max_gross_multiple);
         status_payload["altcoin_impulse"]["long_risk_scale"] = json!(cfg.long_risk_scale);
         status_payload["altcoin_impulse"]["short_risk_scale"] = json!(cfg.short_risk_scale);
         status_payload["altcoin_impulse"]["max_directional_funding_rate"] =
@@ -5912,6 +6603,7 @@ pub async fn run_altcoin_impulse(
                     client,
                     &cfg,
                     &cross_cfg,
+                    &shock_cfg,
                     refresh_ms,
                     &event_path,
                 )
@@ -6235,6 +6927,67 @@ mod tests {
         assert!(pulse.return_1h >= cfg.pulse_initial_return_1h);
         assert!(pulse.volume_ratio >= cfg.pulse_initial_volume_ratio);
         assert_eq!(pulse.entry_trigger, "independent_leverage_pulse");
+    }
+
+    #[test]
+    fn shock_reversal_detects_a_swept_pump_and_strong_rejection() {
+        let strategy: super::StrategyFile = toml::from_str(include_str!(
+            "../../../config/strategy-altcoin-impulse.toml"
+        ))
+        .unwrap();
+        let shock = strategy.altcoin_shock_reversal;
+        let mut bars: Vec<Bar> = (0..(7 * 96 + 17))
+            .map(|i| Bar {
+                open_ms: i as i64 * 900_000,
+                close_ms: i as i64 * 900_000 + 899_999,
+                open: 100.0,
+                high: 100.2,
+                low: 99.8,
+                close: 100.0,
+                quote_volume: 100_000.0,
+            })
+            .collect();
+        let index = bars.len() - 1;
+        for bar in &mut bars[index - 4..index] {
+            bar.open = 104.0;
+            bar.high = 106.5;
+            bar.low = 103.5;
+            bar.close = 106.0;
+        }
+        bars[index].open = 106.0;
+        bars[index].high = 108.0;
+        bars[index].low = 104.0;
+        bars[index].close = 105.0;
+        bars[index].quote_volume = 400_000.0;
+
+        let candidate =
+            super::shock_reversal_candidate_at("SHOCKUSDT", &bars, index, &shock, 5_000_000.0)
+                .unwrap();
+        assert_eq!(candidate.side, -1);
+        assert_eq!(candidate.entry_phase, "shock_reversal");
+        assert_eq!(candidate.entry_trigger, "strict_shock_reversal");
+        assert_eq!(candidate.risk_scale, 1.0);
+        assert!(candidate.return_1h >= 0.045);
+        assert!(candidate.efficiency >= 0.006);
+    }
+
+    #[test]
+    fn shock_gate_is_side_specific_and_requires_only_completed_outcomes() {
+        let outcomes: Vec<_> = (0..30)
+            .map(|index| super::ShockShadowOutcome {
+                symbol: format!("S{index}USDT"),
+                side: -1,
+                signal_ms: index * 1_000,
+                exit_ms: index * 1_000 + 500,
+                net_return: if index % 3 == 0 { -0.01 } else { 0.012 },
+            })
+            .collect();
+        let short = super::shock_gate_side(&outcomes, -1, 30, 1.0);
+        let long = super::shock_gate_side(&outcomes, 1, 30, 1.0);
+        assert_eq!(short["ready"], true);
+        assert_eq!(short["open"], true);
+        assert_eq!(long["ready"], false);
+        assert_eq!(long["open"], false);
     }
 
     #[test]
@@ -6915,6 +7668,8 @@ mod tests {
         assert!(strategy.altcoin_impulse.enabled);
         assert!(strategy.altcoin_cross_section.enabled);
         assert_eq!(strategy.altcoin_impulse.max_daily_entries, 10);
+        assert_eq!(strategy.altcoin_impulse.max_positions, 2);
+        assert_eq!(strategy.altcoin_impulse.scan_limit, 120);
         assert_eq!(strategy.altcoin_impulse.max_daily_entry_bonus, 0);
         assert_eq!(strategy.altcoin_impulse.risk_per_trade, 0.04);
         assert_eq!(strategy.altcoin_impulse.long_risk_scale, 0.75);
@@ -7022,6 +7777,26 @@ mod tests {
             10.0
         );
         assert_eq!(strategy.altcoin_cross_section.stop_pct, 0.08);
+        assert!(strategy.altcoin_shock_reversal.enabled);
+        assert_eq!(strategy.altcoin_shock_reversal.min_shock_return, 0.045);
+        assert_eq!(strategy.altcoin_shock_reversal.min_reversal_return, 0.006);
+        assert_eq!(strategy.altcoin_shock_reversal.gate_window, 30);
+        assert_eq!(
+            strategy.altcoin_shock_reversal.assumed_fee_bps_per_side,
+            5.0
+        );
+        assert_eq!(
+            strategy
+                .altcoin_shock_reversal
+                .assumed_slippage_bps_per_side,
+            10.0
+        );
+        assert_eq!(strategy.altcoin_shock_reversal.broad_gross_multiple, 0.5);
+        assert_eq!(strategy.altcoin_shock_reversal.strict_gross_multiple, 1.0);
+        assert_eq!(strategy.altcoin_shock_reversal.stop_pct, 0.02);
+        assert_eq!(strategy.altcoin_shock_reversal.trail_activation_pct, 0.03);
+        assert_eq!(strategy.altcoin_shock_reversal.trail_pct, 0.01);
+        assert_eq!(strategy.altcoin_shock_reversal.max_hold_hours, 3);
     }
 
     #[test]

@@ -17,7 +17,7 @@ short_risk_scale = 1.0
 # ACEUSDT 复盘中的 -0.997% 资金费率与 -1.26% 永续折价会被该门槛拦截。
 max_directional_funding_rate = 0.003
 max_directional_premium = 0.010
-max_positions = 1
+max_positions = 2
 max_daily_entries = 10
 # 模拟盘固定最多 10 笔/北京时间自然日，不允许临时加额。
 max_daily_entry_bonus = 0
@@ -144,7 +144,7 @@ min_efficiency = 0.45
 min_close_location = 0.70
 
 # 先按当前活跃度筛选，再进行因果信号判断。
-scan_limit = 60
+scan_limit = 120
 poll_seconds = 60
 
 # 高风险模块默认禁止主网实盘；paper/dry 不受影响。
@@ -169,3 +169,39 @@ active_gross_multiple = 0.40
 strong_excess_return = 0.12
 strong_gross_multiple = 0.50
 stop_pct = 0.08
+
+[altcoin_shock_reversal]
+# 15m 快反转：前一小时先出现 4.5%–22% 的单向冲击，当前 K 扫过近两小时
+# 极值后反向收盘至少 0.6%，且成交量达到七日同时间尺度均值的 2.5 倍。
+# 信号直接进入 paper，不等待回踩；实时点差、双边深度、冲击和成交新鲜度仍是硬门槛。
+enabled = true
+min_shock_return = 0.045
+max_shock_return = 0.22
+min_reversal_return = 0.006
+min_volume_ratio = 2.5
+min_close_location = 0.68
+max_candle_range = 0.15
+
+# 更干净的反转 K 使用 1.0x 权益；其余通过基础质量的信号只用 0.5x。
+strict_volume_ratio = 3.5
+strict_close_location = 0.75
+strict_max_candle_range = 0.12
+broad_gross_multiple = 0.50
+strict_gross_multiple = 1.00
+max_gross_multiple = 2.00
+
+# 每 3 小时用历史已完成的模拟结果重建多/空独立门控。门控只读取信号发生前
+# 已退出的 30 笔，不使用未来数据；门控使用更保守的每边 5bp 手续费 + 10bp 不利滑点。
+gate_window = 30
+gate_min_profit_factor = 1.0
+gate_refresh_hours = 3
+assumed_fee_bps_per_side = 5.0
+assumed_slippage_bps_per_side = 10.0
+
+# 不做分段止盈：2% 交易所硬止损；盈利达到 3% 后，余仓按峰值回撤 1% 跟踪；
+# 最长 3 小时退出。同币只冷却 1 小时，组合仍受每日 10 笔和 4% 回撤保护。
+stop_pct = 0.020
+trail_activation_pct = 0.030
+trail_pct = 0.010
+max_hold_hours = 3
+cooldown_hours = 1
