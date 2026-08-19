@@ -910,6 +910,10 @@ struct PersistedState {
     recent_trades: Vec<Value>,
     #[serde(default)]
     cross_section_status: Value,
+    /// Scheduled cross-section candidate retained while transient public-market
+    /// liquidity is rechecked inside the signal execution window.
+    #[serde(default)]
+    cross_section_pending: Option<Candidate>,
     #[serde(default)]
     latest_signal_microstructure: Value,
     #[serde(default)]
@@ -978,6 +982,7 @@ impl PersistedState {
             last_execution_issue: None,
             recent_trades: Vec::new(),
             cross_section_status: Value::Null,
+            cross_section_pending: None,
             latest_signal_microstructure: Value::Null,
             latest_confirmation_microstructure: Value::Null,
             latest_main_signal_microstructure: Value::Null,
@@ -3554,6 +3559,18 @@ pub async fn run_altcoin_impulse(
     let pulse_exhaustion_active = cfg.pulse_exhaustion_enabled
         && (mode != TradeMode::Live || cfg.pulse_exhaustion_allow_live);
     let http = data::live::build_http_client(collector.effective_proxy().as_deref());
+    // Signal discovery and pre-trade liquidity must describe the same real
+    // market. Paper orders still go to Futures Demo below, but Demo/Testnet's
+    // sparse synthetic order book must never decide whether a mainnet signal
+    // is tradable.
+    let mut market_rest =
+        live::RestClient::new(http.clone(), FUTURES_BASE, String::new(), String::new());
+    // Public market-data time sync improves trade-age measurements, but a
+    // transient mainnet 5xx must not prevent the paper engine from starting.
+    // Liquidity calls are retried later inside the bounded execution window.
+    if let Err(error) = market_rest.sync_time().await {
+        tracing::warn!(%error, "主网公开行情对时失败，暂用本机时钟");
+    }
     let rest = if mode == TradeMode::Dry {
         None
     } else {
@@ -3637,6 +3654,7 @@ pub async fn run_altcoin_impulse(
     }
     if !cross_cfg.enabled && !state.cross_section_status.is_null() {
         state.cross_section_status = Value::Null;
+        state.cross_section_pending = None;
         state.seen_signal.remove("__cross_section__");
         append_event(
             &event_path,
@@ -4222,20 +4240,55 @@ pub async fn run_altcoin_impulse(
                 let (mut candidates, mut status) =
                     cross_section_analysis(&bars_by_symbol, cross_boundary_ms, &cross_cfg, &cfg);
                 status["performance"] = cross_performance(&state);
-                state.cross_section_status = status.clone();
                 if cross_execution_due {
                     state
                         .seen_signal
                         .insert("__cross_section__".to_owned(), cross_signal_ms);
+                    state.cross_section_pending = candidates.first().cloned();
+                    status["execution_state"] = if let Some(candidate) = candidates.first() {
+                        json!({
+                            "status":"awaiting_liquidity",
+                            "symbol":candidate.symbol,
+                            "side":candidate.side,
+                            "retry_count":0,
+                            "created_ms":scan_ms,
+                            "expires_ms":cross_signal_ms + cfg.max_signal_age_seconds as i64 * 1_000,
+                            "next_retry_ms":scan_ms
+                        })
+                    } else {
+                        json!({"status":"no_candidate","created_ms":scan_ms})
+                    };
                 } else {
                     candidates.clear();
                 }
+                state.cross_section_status = status.clone();
                 append_event(
                     &event_path,
                     json!({"ts_ms":scan_ms,"event":if cross_execution_due {"cross_section_decision"} else {"cross_section_status_migrated"},"status":status,"candidate_count":candidates.len(),"execution_due":cross_execution_due}),
                 )?;
                 save_state(&state_path, &state)?;
                 candidates
+            } else if let Some(candidate) = state.cross_section_pending.clone() {
+                let expires_ms = candidate.signal_ms + cfg.max_signal_age_seconds as i64 * 1_000;
+                if scan_ms <= expires_ms {
+                    vec![candidate]
+                } else {
+                    state.cross_section_pending = None;
+                    state.cross_section_status["execution_state"] = json!({
+                        "status":"expired",
+                        "symbol":candidate.symbol,
+                        "side":candidate.side,
+                        "expired_ms":scan_ms,
+                        "expires_ms":expires_ms,
+                        "next_boundary_ms":cross_boundary_ms + cross_interval_ms
+                    });
+                    append_event(
+                        &event_path,
+                        json!({"ts_ms":scan_ms,"event":"cross_section_execution_expired","symbol":candidate.symbol,"side":candidate.side,"signal_ms":candidate.signal_ms,"expires_ms":expires_ms,"next_boundary_ms":cross_boundary_ms+cross_interval_ms}),
+                    )?;
+                    save_state(&state_path, &state)?;
+                    Vec::new()
+                }
             } else {
                 Vec::new()
             }
@@ -4337,14 +4390,14 @@ pub async fn run_altcoin_impulse(
                 state
                     .pulse_exhaustion_setups
                     .insert(candidate.symbol.clone(), setup.clone());
-                if let Some(client) = rest.as_ref() {
+                if rest.is_some() {
                     let stop_pct = candidate_stop_pct(&candidate, &cfg, &cross_cfg);
                     let observation_notional = current_equity
                         * cfg.risk_per_trade
                         * cfg.pulse_risk_scale
                         * cfg.short_risk_scale
                         / (stop_pct + cfg.risk_execution_buffer_pct);
-                    match client
+                    match market_rest
                         .liquidity_snapshot(
                             &candidate.symbol,
                             -1,
@@ -4370,7 +4423,7 @@ pub async fn run_altcoin_impulse(
                                 "side":-1,
                                 "origin_signal_ms":candidate.signal_ms,
                                 "target_notional":observation_notional,
-                                "source":"execution_endpoint_rest_agg_trades_and_depth",
+                                "source":"binance_mainnet_public_rest_agg_trades_and_depth",
                                 "snapshot":snapshot
                             });
                             state.latest_pulse_signal_microstructure = observation.clone();
@@ -4453,8 +4506,8 @@ pub async fn run_altcoin_impulse(
                     candidate.price,
                     cfg.max_hold_hours as i64 * 3_600_000,
                 );
-                if let Some(client) = rest.as_ref() {
-                    match client
+                if rest.is_some() {
+                    match market_rest
                         .liquidity_snapshot(
                             &candidate.symbol,
                             candidate.side,
@@ -4482,7 +4535,7 @@ pub async fn run_altcoin_impulse(
                                 "confirmation_ms":candidate.signal_ms,
                                 "target_notional":pulse_observation_notional,
                                 "eligible":eligible,
-                                "source":"execution_endpoint_rest_agg_trades_and_depth",
+                                "source":"binance_mainnet_public_rest_agg_trades_and_depth",
                                 "snapshot":snapshot
                             });
                             state.latest_pulse_confirmation_microstructure = observation.clone();
@@ -4779,7 +4832,7 @@ pub async fn run_altcoin_impulse(
             // valid entry gate. The paired execution-time snapshot below lets
             // us learn whether flow strengthening, fading or flipping improves
             // this exact confirmed-retest strategy without suppressing trades.
-            if let Some(client) = rest.as_ref() {
+            if rest.is_some() {
                 let direction_risk_scale = if candidate.side > 0 {
                     cfg.long_risk_scale
                 } else {
@@ -4791,7 +4844,7 @@ pub async fn run_altcoin_impulse(
                     * direction_risk_scale
                     / (candidate_stop_pct(candidate, &cfg, &cross_cfg)
                         + cfg.risk_execution_buffer_pct);
-                match client
+                match market_rest
                     .liquidity_snapshot(
                         &candidate.symbol,
                         candidate.side,
@@ -4811,7 +4864,7 @@ pub async fn run_altcoin_impulse(
                             "side":candidate.side,
                             "origin_signal_ms":candidate_origin_ms(candidate),
                             "target_notional":observation_notional,
-                            "source":"execution_endpoint_rest_agg_trades_and_depth",
+                            "source":"binance_mainnet_public_rest_agg_trades_and_depth",
                             "snapshot":snapshot
                         });
                         state.latest_signal_microstructure = observation.clone();
@@ -5006,8 +5059,8 @@ pub async fn run_altcoin_impulse(
             if notional < 20.0 {
                 continue;
             }
-            if let Some(client) = rest.as_ref() {
-                let liquidity = match client
+            if rest.is_some() {
+                let liquidity = match market_rest
                     .liquidity_snapshot(
                         &candidate.symbol,
                         candidate.side,
@@ -5019,7 +5072,7 @@ pub async fn run_altcoin_impulse(
                 {
                     Ok(snapshot) => snapshot,
                     Err(error) => {
-                        let reason = format!("无法取得执行端实时盘口/成交: {error}");
+                        let reason = format!("无法取得主网公开实时盘口/成交: {error}");
                         state.note_execution_issue(
                             scan_ms,
                             &candidate.symbol,
@@ -5030,6 +5083,25 @@ pub async fn run_altcoin_impulse(
                             &event_path,
                             json!({"ts_ms":scan_ms,"event":"entry_rejected","stage":"liquidity_check","symbol":candidate.symbol,"reason":reason,"target_notional":notional}),
                         )?;
+                        if cross_candidate {
+                            let retry_count = state.cross_section_status["execution_state"]
+                                ["retry_count"]
+                                .as_u64()
+                                .unwrap_or(0)
+                                + 1;
+                            state.cross_section_status["execution_state"] = json!({
+                                "status":"retrying_liquidity",
+                                "symbol":candidate.symbol,
+                                "side":candidate.side,
+                                "retry_count":retry_count,
+                                "last_check_ms":scan_ms,
+                                "next_retry_ms":scan_ms + cfg.poll_seconds.max(15) as i64 * 1_000,
+                                "expires_ms":candidate.signal_ms + max_signal_age_ms,
+                                "reason":reason,
+                                "market_data_source":"binance_mainnet_public"
+                            });
+                            save_state(&state_path, &state)?;
+                        }
                         continue;
                     }
                 };
@@ -5114,7 +5186,7 @@ pub async fn run_altcoin_impulse(
                     "side":candidate.side,
                     "origin_signal_ms":candidate_origin_ms(candidate),
                     "target_notional":notional,
-                    "source":"execution_endpoint_rest_agg_trades_and_depth",
+                    "source":"binance_mainnet_public_rest_agg_trades_and_depth",
                     "passed":blockers.is_empty(),
                     "effective_max_spread_bps":effective_spread_limit,
                     "liquid_market_spread_relaxation":liquid_market_spread_relaxation,
@@ -5129,7 +5201,7 @@ pub async fn run_altcoin_impulse(
                 }
                 append_event(
                     &event_path,
-                    json!({"ts_ms":scan_ms,"event":"liquidity_check","strategy":micro_strategy,"setup_id":microstructure_trial_key(micro_strategy, &candidate.symbol, candidate_origin_ms(candidate)),"microstructure_stage":"confirmation","microstructure_source":"execution_endpoint_rest_agg_trades_and_depth","origin_signal_ms":candidate_origin_ms(candidate),"confirmation_ms":candidate.signal_ms,"symbol":candidate.symbol,"side":candidate.side,"target_notional":notional,"passed":blockers.is_empty(),"blockers":&blockers,"observations":if unique_trade_prices_warning {vec![format!("近 {} 秒仅 {} 个成交价，参考值 ≥{}；其他可成交性指标合格时不单独否决",cfg.recent_trade_window_seconds,liquidity.unique_trade_prices,cfg.min_unique_trade_prices)]} else {Vec::<String>::new()},"spread_policy":if liquid_market_spread_relaxation {"liquid_market_relaxed"} else {"default"},"effective_max_spread_bps":effective_spread_limit,"snapshot":liquidity,"limits":{"max_spread_bps":cfg.max_spread_bps,"liquid_market_max_spread_bps":cfg.liquid_market_max_spread_bps,"max_entry_impact_bps":cfg.max_entry_impact_bps,"max_exit_impact_bps":cfg.max_exit_impact_bps,"depth_band_pct":cfg.depth_band_pct,"min_depth_multiple":cfg.min_depth_multiple,"liquid_market_depth_multiple":cfg.min_depth_multiple*3.0,"recent_trade_window_seconds":cfg.recent_trade_window_seconds,"min_recent_trades":cfg.min_recent_trades,"liquid_market_min_recent_trades":cfg.min_recent_trades.saturating_mul(2),"min_unique_trade_prices":cfg.min_unique_trade_prices,"unique_trade_prices_hard":cfg.unique_trade_prices_hard,"max_last_trade_age_seconds":cfg.max_last_trade_age_seconds}}),
+                    json!({"ts_ms":scan_ms,"event":"liquidity_check","strategy":micro_strategy,"setup_id":microstructure_trial_key(micro_strategy, &candidate.symbol, candidate_origin_ms(candidate)),"microstructure_stage":"confirmation","microstructure_source":"binance_mainnet_public_rest_agg_trades_and_depth","origin_signal_ms":candidate_origin_ms(candidate),"confirmation_ms":candidate.signal_ms,"symbol":candidate.symbol,"side":candidate.side,"target_notional":notional,"passed":blockers.is_empty(),"blockers":&blockers,"observations":if unique_trade_prices_warning {vec![format!("近 {} 秒仅 {} 个成交价，参考值 ≥{}；其他可成交性指标合格时不单独否决",cfg.recent_trade_window_seconds,liquidity.unique_trade_prices,cfg.min_unique_trade_prices)]} else {Vec::<String>::new()},"spread_policy":if liquid_market_spread_relaxation {"liquid_market_relaxed"} else {"default"},"effective_max_spread_bps":effective_spread_limit,"snapshot":liquidity,"limits":{"max_spread_bps":cfg.max_spread_bps,"liquid_market_max_spread_bps":cfg.liquid_market_max_spread_bps,"max_entry_impact_bps":cfg.max_entry_impact_bps,"max_exit_impact_bps":cfg.max_exit_impact_bps,"depth_band_pct":cfg.depth_band_pct,"min_depth_multiple":cfg.min_depth_multiple,"liquid_market_depth_multiple":cfg.min_depth_multiple*3.0,"recent_trade_window_seconds":cfg.recent_trade_window_seconds,"min_recent_trades":cfg.min_recent_trades,"liquid_market_min_recent_trades":cfg.min_recent_trades.saturating_mul(2),"min_unique_trade_prices":cfg.min_unique_trade_prices,"unique_trade_prices_hard":cfg.unique_trade_prices_hard,"max_last_trade_age_seconds":cfg.max_last_trade_age_seconds}}),
                 )?;
                 if !blockers.is_empty() {
                     let reason = blockers.join(" / ");
@@ -5139,8 +5211,40 @@ pub async fn run_altcoin_impulse(
                         "liquidity_check",
                         reason,
                     );
+                    if cross_candidate {
+                        let retry_count = state.cross_section_status["execution_state"]
+                            ["retry_count"]
+                            .as_u64()
+                            .unwrap_or(0)
+                            + 1;
+                        state.cross_section_status["execution_state"] = json!({
+                            "status":"retrying_liquidity",
+                            "symbol":candidate.symbol,
+                            "side":candidate.side,
+                            "retry_count":retry_count,
+                            "last_check_ms":scan_ms,
+                            "next_retry_ms":scan_ms + cfg.poll_seconds.max(15) as i64 * 1_000,
+                            "expires_ms":candidate.signal_ms + max_signal_age_ms,
+                            "reason":blockers.join(" / "),
+                            "market_data_source":"binance_mainnet_public"
+                        });
+                        save_state(&state_path, &state)?;
+                    }
                     continue;
                 }
+            }
+            if cross_candidate {
+                // Liquidity passed. Consume the retry ticket before touching the
+                // exchange so an order-side rejection cannot duplicate entries.
+                state.cross_section_pending = None;
+                state.cross_section_status["execution_state"] = json!({
+                    "status":"liquidity_passed",
+                    "symbol":candidate.symbol,
+                    "side":candidate.side,
+                    "passed_ms":scan_ms,
+                    "market_data_source":"binance_mainnet_public"
+                });
+                save_state(&state_path, &state)?;
             }
             let mut entry = candidate.price;
             let mut qty = notional / entry;
@@ -5408,6 +5512,13 @@ pub async fn run_altcoin_impulse(
                 state.pulse_entries += 1;
             } else if cross_candidate {
                 state.cross_entries += 1;
+                state.cross_section_status["execution_state"] = json!({
+                    "status":"executed",
+                    "symbol":candidate.symbol,
+                    "side":candidate.side,
+                    "executed_ms":scan_ms,
+                    "next_boundary_ms":cross_boundary_ms + cross_interval_ms
+                });
             }
             let setup_origin_ms = candidate_origin_ms(candidate);
             let trial_key =
