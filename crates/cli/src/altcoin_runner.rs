@@ -4639,6 +4639,18 @@ pub async fn run_altcoin_impulse(
         None
     };
 
+    // 首轮全市场历史窗口会持续数分钟。先把组件标记为 running，并持续上报
+    // warm-up 进度；控制面不应因为研究基线尚未完成而一直停在 starting。
+    if let Some(tx) = &status_tx {
+        let _ = tx.send(json!({
+            "state":"running", "component":"altcoin", "mode":mode.as_str(),
+            "started_at_ms":started_ms, "equity":state.cash, "cash":state.cash,
+            "n_intents":state.total_entries, "n_fills":state.total_entries+state.total_exits,
+            "execution_healthy":true,
+            "warmup":{"active":true,"stage":"loading_market_history","completed":0,"total":0,"failures":0}
+        }));
+    }
+
     loop {
         if *shutdown.borrow() {
             break;
@@ -4768,10 +4780,10 @@ pub async fn run_altcoin_impulse(
         let shortlist_count = shortlist.len();
         let mut set = tokio::task::JoinSet::new();
         let kline_limit = Arc::new(tokio::sync::Semaphore::new(20));
-        let history_bars = if shock_analysis_due {
-            1_500
-        } else if cross_analysis_due {
-            850
+        let history_bars = if shock_analysis_due || cross_analysis_due {
+            // 1000 根 15m K 已覆盖约 10.4 天，足够重建 30 个 3h 截面和
+            // 冲击反转门控；保持单请求可避免首次启动超过 Binance 权重上限。
+            1_000
         } else {
             700
         };
@@ -4784,13 +4796,39 @@ pub async fn run_altcoin_impulse(
             });
         }
         let mut bars_by_symbol = HashMap::new();
+        let mut warmup_completed = 0usize;
+        let mut warmup_failures = 0usize;
         while let Some(result) = set.join_next().await {
             match result {
                 Ok(Ok((symbol, bars))) => {
                     bars_by_symbol.insert(symbol, bars);
                 }
-                Ok(Err(e)) => warn!(error=%e, "候选 K 线拉取失败"),
-                Err(e) => warn!(error=%e, "候选任务失败"),
+                Ok(Err(e)) => {
+                    warmup_failures += 1;
+                    warn!(error=%format!("{e:#}"), "候选 K 线拉取失败");
+                }
+                Err(e) => {
+                    warmup_failures += 1;
+                    warn!(error=%e, "候选任务失败");
+                }
+            }
+            warmup_completed += 1;
+            if (cross_analysis_due || shock_analysis_due)
+                && (warmup_completed.is_multiple_of(10) || warmup_completed == shortlist_count)
+            {
+                if let Some(tx) = &status_tx {
+                    let _ = tx.send(json!({
+                        "state":"running", "component":"altcoin", "mode":mode.as_str(),
+                        "started_at_ms":started_ms, "equity":state.cash, "cash":state.cash,
+                        "n_intents":state.total_entries, "n_fills":state.total_entries+state.total_exits,
+                        "execution_healthy":true,
+                        "warmup":{
+                            "active":true,"stage":"loading_market_history",
+                            "completed":warmup_completed,"total":shortlist_count,
+                            "failures":warmup_failures
+                        }
+                    }));
+                }
             }
         }
         if shock_analysis_due {
