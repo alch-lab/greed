@@ -151,7 +151,9 @@ poll_seconds = 60
 allow_live = false
 
 [altcoin_cross_section]
-# 12h/3h 截面动量直接执行。最近 30 个已完成信号 PF >= 1.30 且累计
+# 12h/3h 截面动量直接执行。全池 12h 中位涨幅达到 1% 时做多最强币，
+# 其余市场状态做空最弱币；这是一条经过样本验证的偏空规则，并非只做空。
+# 最近 30 个已完成信号 PF >= 1.30 且累计
 # 收益为正时用 0.40x 权益；若候选相对全市场中位数还有至少 12% 超额动量，
 # 再升到 0.50x。其余状态仍用 0.05x 小仓执行，不会停止交易。
 enabled = true
@@ -168,7 +170,15 @@ base_gross_multiple = 0.05
 active_gross_multiple = 0.40
 strong_excess_return = 0.12
 strong_gross_multiple = 0.50
-stop_pct = 0.08
+# 同币同向连续入选时保留原仓和已收紧的保护，不再每 3 小时平掉重开。
+# 4% 初始止损将 0.5x 强信号仓的价格风险压到约 2% 权益；盈利达到 5%
+# 兑现 33%，余仓按峰值回撤 2% 跟踪。3 小时只是重新排名边界。
+# 完整止盈/止损后，从下一根闭合 15m K 开始提前重排；当前 3h 窗口内
+# 已退出币不再重进，替代候选相对全池中位数须达到 strong_excess_return。
+stop_pct = 0.04
+trail_activation_pct = 0.05
+trail_pct = 0.02
+partial_take_profit_fraction = 0.33
 
 [altcoin_shock_reversal]
 # 15m 快反转：前一小时先出现 4.5%–22% 的单向冲击，当前 K 扫过近两小时

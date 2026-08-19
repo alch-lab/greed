@@ -575,6 +575,10 @@ impl BacktestEngine {
             .position()
             .map(|position| position.strategy_tag)
         {
+            Some(3) => self
+                .ctx
+                .flags
+                .insert("position_strategy".into(), "trend".into()),
             Some(2) => self
                 .ctx
                 .flags

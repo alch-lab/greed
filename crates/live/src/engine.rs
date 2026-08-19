@@ -78,6 +78,24 @@ struct PendingEntry {
     reason: String,
 }
 
+/// 最近一笔入场订单的执行状态，供控制面区分“有信号”和“已成交”。
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct EntryOrderStatusSnap {
+    pub status: String,
+    pub ts_ms: i64,
+    pub intent_id: String,
+    pub order_id: Option<i64>,
+    pub order_kind: String,
+    pub side: String,
+    pub qty: f64,
+    pub planned_price: f64,
+    pub expires_ts_ms: Option<i64>,
+    pub reason: String,
+    #[serde(default)]
+    pub alpha: String,
+    pub error: Option<String>,
+}
+
 /// 已提交、等待交易所成交回报的减仓单。
 ///
 /// testnet 的 REST 下单只返回“已受理”，真实成交由 userTrades 异步回传。
@@ -137,6 +155,8 @@ pub struct EngineSnapshot {
     pub estimated_risk_usd: f64,
     pub estimated_notional_usd: f64,
     pub position: Option<PositionSnap>,
+    /// 入场订单生命周期：submitting/pending/filled/expired/rejected。
+    pub entry_order: Option<EntryOrderStatusSnap>,
     pub n_intents: usize,
     pub n_fills: usize,
     /// 最近一次策略评估说明（信号插件 eval_note）
@@ -163,6 +183,7 @@ pub struct EngineSnapshot {
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PositionSnap {
     pub side: String,
+    /// 具体入场 alpha，而不是只标记 BTC/Altcoin sleeve。
     pub strategy: String,
     pub qty: f64,
     pub entry_price: f64,
@@ -222,6 +243,8 @@ struct EngineState {
     observation_signals_run: usize,
     #[serde(default)]
     shadow_outcomes_run: usize,
+    #[serde(default)]
+    last_entry_order: Option<EntryOrderStatusSnap>,
 }
 
 const ENGINE_STATE_VERSION: u32 = 2;
@@ -253,6 +276,7 @@ pub struct LiveEngine {
     shadow_outcomes_run: usize,
     // ---- 入场挂起 ----
     pending_entry: Option<PendingEntry>,
+    last_entry_order: Option<EntryOrderStatusSnap>,
     // ---- 减仓挂起（等待 userTrades 确认后重挂剩余仓位止损）----
     pending_exit: Option<PendingExit>,
     // ---- 熔断状态（同回测）----
@@ -271,6 +295,18 @@ pub struct LiveEngine {
 }
 
 impl LiveEngine {
+    fn entry_alpha(reason: &str) -> &'static str {
+        if reason.starts_with("orderflow_verified_context") {
+            "btc_orderflow_mr"
+        } else if reason.starts_with("trend_continuation") {
+            "btc_trend_continuation"
+        } else if reason.starts_with("trend_pullback") {
+            "btc_tactical_pullback"
+        } else {
+            "unknown"
+        }
+    }
+
     pub fn new(
         strategy: Strategy,
         broker: AnyBroker,
@@ -302,6 +338,7 @@ impl LiveEngine {
             observation_signals_run: 0,
             shadow_outcomes_run: 0,
             pending_entry: None,
+            last_entry_order: None,
             pending_exit: None,
             cb_day: i64::MIN,
             cb_day_start_equity: 0.0,
@@ -457,6 +494,16 @@ impl LiveEngine {
         self.confirmed_signals_run = state.confirmed_signals_run;
         self.observation_signals_run = state.observation_signals_run;
         self.shadow_outcomes_run = state.shadow_outcomes_run;
+        self.last_entry_order = state.last_entry_order.map(|mut order| {
+            // 空仓启动检查已经撤掉遗留订单；不能继续把旧挂单显示为 pending。
+            if matches!(order.status.as_str(), "pending" | "submitting") && position.is_none() {
+                order.status = "canceled".into();
+                order.ts_ms = chrono::Utc::now().timestamp_millis();
+                order.expires_ts_ms = None;
+                order.error = Some("engine restarted before fill confirmation".into());
+            }
+            order
+        });
         self.needs_stop_rearm = needs_rearm;
         self.sync_position_flag();
 
@@ -852,6 +899,7 @@ impl LiveEngine {
             position: self.account.position().map(|p| PositionSnap {
                 side: format!("{:?}", p.side),
                 strategy: match p.strategy_tag {
+                    3 => "tactical_pullback",
                     2 => "trend",
                     1 => "mr",
                     _ => "unknown",
@@ -862,6 +910,7 @@ impl LiveEngine {
                 stop_price: p.stop_price.map(|s| s.to_f64()),
                 unrealized_pnl: px.map(|x| p.unrealized(x)).unwrap_or(0.0),
             }),
+            entry_order: self.last_entry_order.clone(),
             n_intents: self.intents.len(),
             n_fills: self.account.fills().len(),
             last_eval: plugin_note("OrderFlowExhaustion").or_else(|| self.latest_eval.clone()),
@@ -1077,7 +1126,15 @@ impl LiveEngine {
                         "order_id": pe.order_id, "cause": "entry_ttl_expired",
                     }),
                 );
+                if let Some(status) = self.last_entry_order.as_mut() {
+                    if status.intent_id == pe.intent_id {
+                        status.status = "expired".into();
+                        status.ts_ms = now_ms;
+                        status.expires_ts_ms = None;
+                    }
+                }
                 self.pending_entry = None;
+                self.persist_journal();
             }
         }
 
@@ -1417,6 +1474,21 @@ impl LiveEngine {
             120_000
         };
         let expire_ts = Timestamp::from_millis(trade.ts.as_millis() + ttl);
+        let order_kind = if is_limit { "limit" } else { "market" }.to_string();
+        self.last_entry_order = Some(EntryOrderStatusSnap {
+            status: "submitting".into(),
+            ts_ms: trade.ts.as_millis(),
+            intent_id: intent_id.clone(),
+            order_id: None,
+            order_kind: order_kind.clone(),
+            side: format!("{:?}", intent.side),
+            qty: qty.to_f64(),
+            planned_price: intent.limit_price.unwrap_or(trade.price).to_f64(),
+            expires_ts_ms: Some(expire_ts.as_millis()),
+            reason: intent.reason.clone(),
+            alpha: Self::entry_alpha(&intent.reason).into(),
+            error: None,
+        });
 
         let order = backtest::Order {
             side: intent.side,
@@ -1431,6 +1503,11 @@ impl LiveEngine {
         match self.broker.submit(trade.ts, trade.price, order).await {
             Ok(Some(ex)) => {
                 // dry 市价单立即成交
+                if let Some(status) = self.last_entry_order.as_mut() {
+                    status.status = "filled".into();
+                    status.ts_ms = ex.ts.as_millis();
+                    status.expires_ts_ms = None;
+                }
                 self.log_execution(
                     &ex,
                     Some(&intent_id),
@@ -1455,6 +1532,10 @@ impl LiveEngine {
             }
             Ok(None) => {
                 let order_id = self.broker.last_submitted_order_id();
+                if let Some(status) = self.last_entry_order.as_mut() {
+                    status.status = "pending".into();
+                    status.order_id = order_id;
+                }
                 self.append_research(
                     "order_accepted",
                     trade.ts.as_millis(),
@@ -1480,6 +1561,12 @@ impl LiveEngine {
             }
             Err(e) => {
                 error!(error = %e, reason = %intent.reason, "下单失败");
+                if let Some(status) = self.last_entry_order.as_mut() {
+                    status.status = "rejected".into();
+                    status.ts_ms = trade.ts.as_millis();
+                    status.expires_ts_ms = None;
+                    status.error = Some(e.to_string());
+                }
                 self.append_research(
                     "order_rejected",
                     trade.ts.as_millis(),
@@ -1490,6 +1577,8 @@ impl LiveEngine {
                 );
             }
         }
+        // Intent 之后的交易所受理/拒绝状态也必须立即落盘，避免子引擎重启后消失。
+        self.persist_journal();
     }
 
     /// 持仓建立后挂保护性止损（先清旧单，按总仓重挂）。
@@ -1550,6 +1639,13 @@ impl LiveEngine {
             return;
         };
         if self.account.position().is_some() {
+            if let Some(status) = self.last_entry_order.as_mut() {
+                if status.intent_id == pe.intent_id {
+                    status.status = "filled".into();
+                    status.ts_ms = now.as_millis();
+                    status.expires_ts_ms = None;
+                }
+            }
             self.append_research(
                 "entry_settled",
                 now.as_millis(),
@@ -1760,6 +1856,10 @@ impl LiveEngine {
             .position()
             .map(|position| position.strategy_tag)
         {
+            Some(3) => self
+                .ctx
+                .flags
+                .insert("position_strategy".into(), "trend".into()),
             Some(2) => self
                 .ctx
                 .flags
@@ -1858,6 +1958,7 @@ impl LiveEngine {
             confirmed_signals_run: self.confirmed_signals_run,
             observation_signals_run: self.observation_signals_run,
             shadow_outcomes_run: self.shadow_outcomes_run,
+            last_entry_order: self.last_entry_order.clone(),
         };
         let journal = Journal {
             meta: JournalMeta {

@@ -224,7 +224,7 @@ pub struct AltcoinImpulseConfig {
     pub poll_seconds: u64,
     #[serde(default)]
     pub allow_live: bool,
-    /// 横截面策略只使用交易所硬止损和固定持有期，不启用旧突破模型的分段/跟踪退出。
+    /// 横截面策略使用独立的硬止损、分段止盈和跟踪退出参数。
     #[serde(default)]
     pub fixed_time_exit_only: bool,
 }
@@ -259,6 +259,16 @@ pub struct AltcoinCrossSectionConfig {
     pub strong_gross_multiple: f64,
     #[serde(default = "default_cross_stop_pct")]
     pub stop_pct: f64,
+    /// Cross-section positions are re-ranked every `hold_hours`, but a
+    /// same-symbol/same-side winner is carried instead of churned. Profit
+    /// protection therefore belongs to the position, not to one ranking
+    /// window.
+    #[serde(default = "default_cross_trail_activation_pct")]
+    pub trail_activation_pct: f64,
+    #[serde(default = "default_cross_trail_pct")]
+    pub trail_pct: f64,
+    #[serde(default = "default_cross_partial_take_profit_fraction")]
+    pub partial_take_profit_fraction: f64,
 }
 
 impl Default for AltcoinCrossSectionConfig {
@@ -278,6 +288,9 @@ impl Default for AltcoinCrossSectionConfig {
             strong_excess_return: default_cross_strong_excess_return(),
             strong_gross_multiple: default_cross_strong_gross(),
             stop_pct: default_cross_stop_pct(),
+            trail_activation_pct: default_cross_trail_activation_pct(),
+            trail_pct: default_cross_trail_pct(),
+            partial_take_profit_fraction: default_cross_partial_take_profit_fraction(),
         }
     }
 }
@@ -466,7 +479,16 @@ fn default_cross_strong_gross() -> f64 {
     0.5
 }
 fn default_cross_stop_pct() -> f64 {
-    0.08
+    0.04
+}
+fn default_cross_trail_activation_pct() -> f64 {
+    0.05
+}
+fn default_cross_trail_pct() -> f64 {
+    0.02
+}
+fn default_cross_partial_take_profit_fraction() -> f64 {
+    0.33
 }
 
 #[derive(Debug, Deserialize)]
@@ -1372,6 +1394,20 @@ fn is_shock_candidate(candidate: &Candidate) -> bool {
     candidate.entry_phase == "shock_reversal"
 }
 
+fn execution_priority(candidate: &Candidate) -> u8 {
+    if is_pulse_candidate(candidate) {
+        3
+    } else if is_shock_candidate(candidate) {
+        // Event-driven reversals expire after one closed bar and therefore get
+        // the shared regular slot before the scheduled rotation fallback.
+        2
+    } else if is_cross_candidate(candidate) {
+        1
+    } else {
+        0
+    }
+}
+
 fn candidate_stop_pct(
     candidate: &Candidate,
     cfg: &AltcoinImpulseConfig,
@@ -1392,14 +1428,29 @@ fn candidate_stop_pct(
 fn position_exit_parameters(
     position: &Position,
     cfg: &AltcoinImpulseConfig,
+    cross: &AltcoinCrossSectionConfig,
     shock: &AltcoinShockReversalConfig,
 ) -> (f64, f64) {
     if is_pulse_position(position) {
         (cfg.pulse_trail_activation_pct, cfg.pulse_trail_pct)
+    } else if is_cross_position(position) {
+        (cross.trail_activation_pct, cross.trail_pct)
     } else if is_shock_position(position) {
         (shock.trail_activation_pct, shock.trail_pct)
     } else {
         (cfg.trail_activation_pct, cfg.trail_pct)
+    }
+}
+
+fn position_partial_take_profit_fraction(
+    position: &Position,
+    cfg: &AltcoinImpulseConfig,
+    cross: &AltcoinCrossSectionConfig,
+) -> f64 {
+    if is_cross_position(position) {
+        cross.partial_take_profit_fraction
+    } else {
+        cfg.partial_take_profit_fraction
     }
 }
 
@@ -2204,26 +2255,20 @@ fn cross_selected(
         return None;
     }
     let market_return = ranks[ranks.len() / 2].trailing_return;
-    let selected = if market_return >= market_threshold {
-        ranks
-            .iter()
-            .rev()
-            .take(names)
-            .cloned()
-            .map(|item| (item, 1))
-            .collect::<Vec<_>>()
+    let (selected, side) = if market_return >= market_threshold {
+        (
+            ranks.iter().rev().take(names).cloned().collect::<Vec<_>>(),
+            1,
+        )
     } else {
-        ranks
-            .iter()
-            .take(names)
-            .cloned()
-            .map(|item| (item, -1))
-            .collect::<Vec<_>>()
+        (ranks.iter().take(names).cloned().collect::<Vec<_>>(), -1)
     };
-    selected
-        .iter()
-        .all(|(item, side)| *side as f64 * item.trailing_return > 0.0)
-        .then_some(selected)
+    if selected.iter().any(|item| {
+        (side > 0 && item.trailing_return <= 0.0) || (side < 0 && item.trailing_return >= 0.0)
+    }) {
+        return None;
+    }
+    Some(selected.into_iter().map(|item| (item, side)).collect())
 }
 
 fn cross_leg_return(
@@ -2269,6 +2314,7 @@ fn cross_section_analysis(
     boundary_ms: i64,
     cross: &AltcoinCrossSectionConfig,
     impulse: &AltcoinImpulseConfig,
+    current_exclusions: &HashSet<String>,
 ) -> (Vec<Candidate>, Value) {
     let min_universe_size = cross.names;
     let mut history = Vec::new();
@@ -2329,7 +2375,8 @@ fn cross_section_analysis(
     let high_conviction = gate_ready
         && history.iter().sum::<f64>() > 0.0
         && profit_factor >= cross.gate_min_profit_factor;
-    let ranks = cross_ranks_at(bars_by_symbol, boundary_ms, cross);
+    let mut ranks = cross_ranks_at(bars_by_symbol, boundary_ms, cross);
+    ranks.retain(|rank| !current_exclusions.contains(&rank.symbol));
     let universe_ready = ranks.len() >= min_universe_size;
     let selected = universe_ready
         .then(|| cross_selected(&ranks, cross.names, cross.market_momentum_threshold))
@@ -2388,12 +2435,30 @@ fn cross_section_analysis(
             json!({"symbol":rank.symbol,"side":side,"return_12h":rank.trailing_return,"volume_24h":rank.volume_24h})
         })
         .collect();
+    let selected_direction = selected.first().map(|(_, side)| {
+        if *side > 0 {
+            "long_strongest"
+        } else {
+            "short_weakest"
+        }
+    });
+    let market_regime = market_return.map(|value| {
+        if value >= cross.market_momentum_threshold {
+            "broad_up"
+        } else if value <= -cross.market_momentum_threshold {
+            "broad_down_short"
+        } else {
+            "neutral_short_bias"
+        }
+    });
     let ranked_extremes: Vec<Value> = ranks
         .iter()
         .take(10)
         .chain(ranks.iter().rev().take(10))
         .map(|rank| json!({"symbol":rank.symbol,"return_12h":rank.trailing_return,"volume_24h":rank.volume_24h}))
         .collect();
+    let mut reentry_exclusions = current_exclusions.iter().cloned().collect::<Vec<_>>();
+    reentry_exclusions.sort();
     let next_boundary_ms = boundary_ms + cross.hold_hours as i64 * 3_600_000;
     let status = json!({
         "model":"12h_cross_section_momentum",
@@ -2406,14 +2471,16 @@ fn cross_section_analysis(
         "min_universe_size":min_universe_size,
         "market_return":market_return,
         "market_threshold":cross.market_momentum_threshold,
-        "direction":market_return.map(|value| if value >= cross.market_momentum_threshold {"long_strongest"} else {"short_weakest"}),
+        "direction":selected_direction,
+        "market_regime":market_regime,
         "signal_excess_return":signal_excess_return,
         "strong_signal":strong_signal,
         "universe_rule":"同名现货与 USDT 永续、24h 成交额达标；每 3 小时只执行截面最强或最弱的 1 币",
         "selected":selected_json,
+        "reentry_exclusions":reentry_exclusions,
         "ranked_extremes":ranked_extremes,
         "gate":{"ready":gate_ready,"open":high_conviction,"samples":history.len(),"required_samples":cross.gate_window,"sum_return":history.iter().sum::<f64>(),"profit_factor":profit_factor,"required_profit_factor":cross.gate_min_profit_factor,"returns":history,"baskets":shadow_baskets},
-        "execution":{"legs_required":cross.names,"gross_multiple":gross_multiple,"base_gross_multiple":cross.base_gross_multiple,"active_gross_multiple":cross.active_gross_multiple,"strong_excess_return":cross.strong_excess_return,"strong_gross_multiple":cross.strong_gross_multiple,"stop_pct":cross.stop_pct,"fixed_exit_hours":cross.hold_hours,"daily_loss_limit":impulse.daily_loss_limit}
+        "execution":{"legs_required":cross.names,"gross_multiple":gross_multiple,"base_gross_multiple":cross.base_gross_multiple,"active_gross_multiple":cross.active_gross_multiple,"strong_excess_return":cross.strong_excess_return,"strong_gross_multiple":cross.strong_gross_multiple,"stop_pct":cross.stop_pct,"trail_activation_pct":cross.trail_activation_pct,"trail_pct":cross.trail_pct,"partial_take_profit_fraction":cross.partial_take_profit_fraction,"rebalance_hours":cross.hold_hours,"same_signal_carry":true,"daily_loss_limit":impulse.daily_loss_limit}
     });
     (candidates, status)
 }
@@ -2428,10 +2495,41 @@ fn cross_section_status_complete(status: &Value) -> bool {
                     .is_some()
                 && execution.get("stop_pct").and_then(Value::as_f64).is_some()
                 && execution
-                    .get("fixed_exit_hours")
+                    .get("rebalance_hours")
                     .and_then(Value::as_u64)
                     .is_some()
+                && execution
+                    .get("trail_activation_pct")
+                    .and_then(Value::as_f64)
+                    .is_some()
+                && execution.get("trail_pct").and_then(Value::as_f64).is_some()
         })
+}
+
+fn cross_protective_exits_since(
+    state: &PersistedState,
+    since_ms: i64,
+) -> (HashSet<String>, Option<i64>) {
+    let exits = state.recent_trades.iter().filter(|trade| {
+        trade["entry_phase"] == "cross_section_momentum"
+            && matches!(trade["event"].as_str(), Some("exit" | "exit_detected"))
+            && trade["ts_ms"].as_i64().is_some_and(|ts| ts >= since_ms)
+            && !matches!(
+                trade["reason"].as_str(),
+                Some("cross_section_rotation" | "cross_section_no_candidate")
+            )
+    });
+    let mut symbols = HashSet::new();
+    let mut latest = None;
+    for trade in exits {
+        if let Some(symbol) = trade["symbol"].as_str() {
+            symbols.insert(symbol.to_owned());
+        }
+        if let Some(ts_ms) = trade["ts_ms"].as_i64() {
+            latest = Some(latest.map_or(ts_ms, |current: i64| current.max(ts_ms)));
+        }
+    }
+    (symbols, latest)
 }
 
 #[derive(Debug, Clone)]
@@ -2959,6 +3057,19 @@ async fn build_position_status(
             ),
         };
         let entry_notional = qty * entry_price;
+        let price_return_pct = if entry_notional > 0.0 {
+            unrealized_pnl / entry_notional
+        } else {
+            0.0
+        };
+        // Binance paper UI reports ROI against mark-value margin, not entry
+        // notional.  For a profitable short this is intentionally larger than
+        // price_return * leverage because the current mark notional is lower.
+        let mark_notional = qty * mark_price;
+        let margin_roe_pct = position.exchange_leverage.and_then(|leverage| {
+            let mark_margin = mark_notional / leverage as f64;
+            (mark_margin > 0.0).then_some(unrealized_pnl / mark_margin)
+        });
         let adverse = position.adverse_extreme.unwrap_or(position.entry_price);
         result.push(json!({
             "symbol":position.symbol, "side":position.side, "qty":qty,
@@ -2977,7 +3088,13 @@ async fn build_position_status(
             "max_adverse_excursion_pct": adverse_excursion(position.side, position.entry_price, adverse),
             "exchange_leverage":position.exchange_leverage,
             "unrealized_pnl":unrealized_pnl,
-            "return_pct": if entry_notional > 0.0 { unrealized_pnl / entry_notional } else { 0.0 },
+            // Keep return_pct for backwards compatibility, but make both
+            // denominators explicit so the UI cannot confuse price P&L with
+            // Binance's leverage/margin ROE.
+            "return_pct":price_return_pct,
+            "price_return_pct":price_return_pct,
+            "margin_roe_pct":margin_roe_pct,
+            "margin_roe_approximate":true,
             "valuation_source":valuation_source,
             "valuation_ms":valuation_ms
         }));
@@ -3420,6 +3537,164 @@ fn apply_daily_entry_bonus(
     Ok(true)
 }
 
+async fn resolve_live_cross_rebalance(
+    state: &mut PersistedState,
+    candidates: &mut Vec<Candidate>,
+    client: &live::RestClient,
+    now_ms: i64,
+    event_path: &str,
+) -> Result<bool> {
+    let selected = candidates
+        .iter()
+        .find(|candidate| is_cross_candidate(candidate))
+        .cloned();
+    let current = state
+        .positions
+        .values()
+        .find(|position| is_cross_position(position))
+        .cloned();
+    let Some(position) = current else {
+        return Ok(false);
+    };
+
+    if selected.as_ref().is_some_and(|candidate| {
+        candidate.symbol == position.symbol && candidate.side == position.side
+    }) {
+        let candidate = selected.expect("checked above");
+        candidates.retain(|item| !is_cross_candidate(item));
+        state.cross_section_pending = None;
+        state.cross_section_status["execution_state"] = json!({
+            "status":"carried",
+            "symbol":position.symbol,
+            "side":position.side,
+            "carried_ms":now_ms,
+            "origin_signal_ms":candidate_origin_ms(&candidate),
+            "reason":"same_symbol_same_side",
+            "position_entry_ms":position.entry_ms,
+            "position_entry_price":position.entry_price,
+            "protection_reason":position.protection_reason
+        });
+        append_event(
+            event_path,
+            json!({
+                "ts_ms":now_ms,"event":"cross_section_position_carried",
+                "symbol":position.symbol,"side":position.side,
+                "position_entry_ms":position.entry_ms,"position_entry_price":position.entry_price,
+                "new_signal_ms":candidate.signal_ms,"new_signal_return_12h":candidate.return_1h,
+                "qty":position.qty,"initial_notional":position.initial_notional,
+                "stop_price":position.stop_price,"protection_reason":position.protection_reason,
+                "reason":"同币同向继续排名第一，保留仓位和收紧后的保护，不重复平开"
+            }),
+        )?;
+        return Ok(true);
+    }
+
+    let filters = client.symbol_filters(&position.symbol).await?;
+    let snapshot = client.position_risk(&position.symbol).await?;
+    let close_side = if position.side > 0 { "SELL" } else { "BUY" };
+    let (exit, exit_qty, fee) = place_market_reduce_only(
+        client,
+        &position.symbol,
+        close_side,
+        snapshot.position_amt.abs(),
+        &filters,
+    )
+    .await?;
+    if let Err(error) = client.cancel_all_open_orders(&position.symbol).await {
+        warn!(symbol=%position.symbol, error=%error, "横截面轮换已平仓，但清理旧保护单失败");
+    }
+    let exit_qty = exit_qty.min(position.qty);
+    let pnl = record_exit(state, &position, now_ms, 0, exit, exit_qty, fee);
+    let trade_pnl = position.realized_partial_pnl + pnl;
+    let replacement = selected.as_ref().map(|candidate| candidate.symbol.clone());
+    let reason = if replacement.is_some() {
+        "cross_section_rotation"
+    } else {
+        "cross_section_no_candidate"
+    };
+    let (max_favorable_excursion, max_adverse_excursion) = position_excursions(&position);
+    let event = json!({
+        "ts_ms":now_ms,"event":"exit","symbol":position.symbol,"side":position.side,
+        "entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,
+        "reason":reason,"replacement_symbol":replacement,"price":exit,"qty":exit_qty,
+        "pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"hold_ms":now_ms-position.entry_ms,
+        "max_favorable_excursion":max_favorable_excursion,
+        "max_adverse_excursion":max_adverse_excursion
+    });
+    append_event(event_path, event.clone())?;
+    state.record_trade(event);
+    state.cross_section_status["execution_state"] = json!({
+        "status":if selected.is_some() {"rotating"} else {"closed_no_candidate"},
+        "previous_symbol":position.symbol,
+        "replacement_symbol":selected.as_ref().map(|candidate| candidate.symbol.clone()),
+        "rotated_ms":now_ms
+    });
+    Ok(true)
+}
+
+fn resolve_dry_cross_rebalance(
+    state: &mut PersistedState,
+    candidates: &mut Vec<Candidate>,
+    bars_by_symbol: &HashMap<String, Vec<Bar>>,
+    cfg: &AltcoinImpulseConfig,
+    now_ms: i64,
+    event_path: &str,
+) -> Result<bool> {
+    let selected = candidates
+        .iter()
+        .find(|candidate| is_cross_candidate(candidate))
+        .cloned();
+    let current = state
+        .positions
+        .values()
+        .find(|position| is_cross_position(position))
+        .cloned();
+    let Some(position) = current else {
+        return Ok(false);
+    };
+    if selected.as_ref().is_some_and(|candidate| {
+        candidate.symbol == position.symbol && candidate.side == position.side
+    }) {
+        let candidate = selected.expect("checked above");
+        candidates.retain(|item| !is_cross_candidate(item));
+        state.cross_section_pending = None;
+        state.cross_section_status["execution_state"] = json!({
+            "status":"carried","symbol":position.symbol,"side":position.side,
+            "carried_ms":now_ms,"origin_signal_ms":candidate_origin_ms(&candidate),
+            "reason":"same_symbol_same_side","position_entry_ms":position.entry_ms,
+            "position_entry_price":position.entry_price,"protection_reason":position.protection_reason
+        });
+        append_event(
+            event_path,
+            json!({"ts_ms":now_ms,"event":"cross_section_position_carried","symbol":position.symbol,"side":position.side,"position_entry_ms":position.entry_ms,"position_entry_price":position.entry_price,"new_signal_ms":candidate.signal_ms,"new_signal_return_12h":candidate.return_1h,"qty":position.qty,"initial_notional":position.initial_notional,"stop_price":position.stop_price,"protection_reason":position.protection_reason,"dry_fill":true,"reason":"同币同向继续排名第一，保留仓位和收紧后的保护，不重复平开"}),
+        )?;
+        return Ok(true);
+    }
+    let Some(raw_exit) = bars_by_symbol
+        .get(&position.symbol)
+        .and_then(|bars| bars.last())
+        .map(|bar| bar.close)
+    else {
+        return Ok(false);
+    };
+    let exit = adverse_fill_price(raw_exit, position.side, cfg.dry_slippage_bps, false);
+    let fee = position.qty * exit * 0.0005;
+    let pnl = record_exit(state, &position, now_ms, 0, exit, position.qty, fee);
+    let trade_pnl = position.realized_partial_pnl + pnl;
+    let replacement = selected.as_ref().map(|candidate| candidate.symbol.clone());
+    let reason = if replacement.is_some() {
+        "cross_section_rotation"
+    } else {
+        "cross_section_no_candidate"
+    };
+    let (max_favorable_excursion, max_adverse_excursion) = position_excursions(&position);
+    let event = json!({"ts_ms":now_ms,"event":"exit","symbol":position.symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":reason,"replacement_symbol":replacement,"price":exit,"raw_price":raw_exit,"qty":position.qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"hold_ms":now_ms-position.entry_ms,"max_favorable_excursion":max_favorable_excursion,"max_adverse_excursion":max_adverse_excursion,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true});
+    append_event(event_path, event.clone())?;
+    state.record_trade(event);
+    state.cross_section_status["execution_state"] = json!({"status":if selected.is_some() {"rotating"} else {"closed_no_candidate"},"previous_symbol":position.symbol,"replacement_symbol":selected.as_ref().map(|candidate| candidate.symbol.clone()),"rotated_ms":now_ms});
+    Ok(true)
+}
+
 /// 模拟盘/实盘的独立持仓管理循环。信号扫描可以维持低频，但交易所仓位必须高频：
 /// - 识别交易所止损成交；
 /// - 用实时 markPrice 推进极值与跟踪止盈；
@@ -3474,7 +3749,10 @@ async fn manage_live_positions(
 
         let cross_position = is_cross_position(&position);
         let max_hold_hours = position_max_hold_hours(&position, cfg, cross, shock);
-        let timed = now_ms - position.entry_ms >= max_hold_hours * 3_600_000;
+        // Cross-section windows are ranking boundaries, not mandatory round
+        // trips. The boundary resolver below rotates only when the selected
+        // symbol or side changes; an unchanged winner keeps its live position.
+        let timed = !cross_position && now_ms - position.entry_ms >= max_hold_hours * 3_600_000;
         if timed {
             client.cancel_all_open_orders(&symbol).await?;
             let filters = client.symbol_filters(&symbol).await?;
@@ -3506,7 +3784,7 @@ async fn manage_live_positions(
             continue;
         }
 
-        if cross_position || cfg.fixed_time_exit_only {
+        if cfg.fixed_time_exit_only {
             let previous_extreme = position.extreme;
             let previous_adverse = position.adverse_extreme;
             position.extreme = if position.side > 0 {
@@ -3536,7 +3814,8 @@ async fn manage_live_positions(
         );
         position.adverse_extreme = Some(adverse);
         let max_adverse = adverse_excursion(position.side, position.entry_price, adverse);
-        let (trail_activation_pct, trail_pct) = position_exit_parameters(&position, cfg, shock);
+        let (trail_activation_pct, trail_pct) =
+            position_exit_parameters(&position, cfg, cross, shock);
         let (new_extreme, improved_stop) = realtime_trailing_stop(
             position.side,
             position.entry_price,
@@ -3659,7 +3938,9 @@ async fn manage_live_positions(
         {
             let filters = client.symbol_filters(&symbol).await?;
             let side = if position.side > 0 { "SELL" } else { "BUY" };
-            let target_qty = snapshot.position_amt.abs() * cfg.partial_take_profit_fraction;
+            let partial_take_profit_fraction =
+                position_partial_take_profit_fraction(&position, cfg, cross);
+            let target_qty = snapshot.position_amt.abs() * partial_take_profit_fraction;
             let trigger_mark_price = snapshot.mark_price;
             let trigger_extreme = position.extreme;
             let (exit, exit_qty, fee) =
@@ -3696,13 +3977,13 @@ async fn manage_live_positions(
                     set_protection_order_ids(&mut position, new_order_ids.clone());
                     position.stop_price = break_even_stop;
                     position.protection_reason = "partial_take_profit_break_even".to_owned();
-                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":"partial_take_profit","trigger_return":current_return,"configured_trigger_return":trail_activation_pct,"configured_fraction":cfg.partial_take_profit_fraction,"configured_trail_pct":trail_pct,"trigger_mark_price":trigger_mark_price,"trigger_extreme":trigger_extreme,"execution_slippage_bps":position.side as f64*(exit/trigger_mark_price-1.0)*-10_000.0,"price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"new_stop":break_even_stop,"old_order_ids":old_order_ids,"new_order_ids":new_order_ids,"protection_replaced":true});
+                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":"partial_take_profit","trigger_return":current_return,"configured_trigger_return":trail_activation_pct,"configured_fraction":partial_take_profit_fraction,"configured_trail_pct":trail_pct,"trigger_mark_price":trigger_mark_price,"trigger_extreme":trigger_extreme,"execution_slippage_bps":position.side as f64*(exit/trigger_mark_price-1.0)*-10_000.0,"price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"new_stop":break_even_stop,"old_order_ids":old_order_ids,"new_order_ids":new_order_ids,"protection_replaced":true});
                     append_event(event_path, event.clone())?;
                     state.record_trade(event);
                 }
                 Err(error) => {
                     warn!(symbol=%symbol, error=%error, "第一段止盈已成交，保本保护替换失败；保留原交易所止损并等待下轮重试");
-                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":"partial_take_profit","configured_trigger_return":trail_activation_pct,"configured_fraction":cfg.partial_take_profit_fraction,"configured_trail_pct":trail_pct,"price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"new_stop":position.stop_price,"protection_replaced":false,"protection_error":error.to_string()});
+                    let event = json!({"ts_ms":now_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":"partial_take_profit","configured_trigger_return":trail_activation_pct,"configured_fraction":partial_take_profit_fraction,"configured_trail_pct":trail_pct,"price":exit,"qty":exit_qty,"remaining_qty":remaining,"pnl":partial_pnl,"fee":fee,"new_stop":position.stop_price,"protection_replaced":false,"protection_error":error.to_string()});
                     append_event(event_path, event.clone())?;
                     state.record_trade(event);
                 }
@@ -3726,7 +4007,7 @@ async fn manage_live_positions(
                 )
             })
             .flatten();
-        let (improved_stop, protection_reason) = match (improved_stop, recovery_stop) {
+        let (mut improved_stop, mut protection_reason) = match (improved_stop, recovery_stop) {
             (Some(trailing), Some(recovery)) => {
                 let trailing_is_tighter = if position.side > 0 {
                     trailing >= recovery
@@ -3743,6 +4024,23 @@ async fn manage_live_positions(
             (None, Some(recovery)) => (Some(recovery), "recovery_profit_lock"),
             (None, None) => (None, "initial_stop"),
         };
+        // A persisted cross-section position can have been opened under the
+        // former 8% stop.  Tighten it to the current configured initial stop
+        // after deployment; never loosen a break-even or trailing stop.
+        if cross_position {
+            let configured_stop =
+                position.entry_price * (1.0 - position.side as f64 * cross.stop_pct);
+            let reference = improved_stop.unwrap_or(position.stop_price);
+            let tighter = if position.side > 0 {
+                configured_stop > reference
+            } else {
+                configured_stop < reference
+            };
+            if tighter {
+                improved_stop = Some(configured_stop);
+                protection_reason = "configured_stop_migration";
+            }
+        }
         let improved_stop = improved_stop.map(|stop| {
             if position.side > 0 {
                 stop.max(position.stop_price)
@@ -3910,8 +4208,11 @@ pub async fn run_altcoin_impulse(
                 && cross_cfg.strong_gross_multiple >= cross_cfg.active_gross_multiple
                 && cross_cfg.strong_gross_multiple <= 0.5
                 && (0.08..=0.20).contains(&cross_cfg.strong_excess_return)
-                && (0.04..=0.10).contains(&cross_cfg.stop_pct)),
-        "横截面动量仓位要求基础 0.05x..=0.25x、增强与强信号仓位递增且不超过 0.5x、超额动量 8%..=20%、止损 4%..=10%"
+                && (0.02..=0.08).contains(&cross_cfg.stop_pct)
+                && (0.01..=0.10).contains(&cross_cfg.trail_activation_pct)
+                && (0.003..cross_cfg.trail_activation_pct).contains(&cross_cfg.trail_pct)
+                && (0.25..=0.75).contains(&cross_cfg.partial_take_profit_fraction)),
+        "横截面动量仓位要求基础 0.05x..=0.25x、增强与强信号仓位递增且不超过 0.5x、超额动量 8%..=20%、止损 2%..=8%，且止盈/跟踪参数有效"
     );
     anyhow::ensure!(
         (0.0..=0.50).contains(&cfg.first_week_loss_limit)
@@ -4363,11 +4664,37 @@ pub async fn run_altcoin_impulse(
             .collect();
         let cross_interval_ms = cross_cfg.hold_hours as i64 * 3_600_000;
         let cross_boundary_ms = scan_ms.div_euclid(cross_interval_ms) * cross_interval_ms;
-        let cross_signal_ms = cross_boundary_ms - 1;
-        let cross_execution_due = cross_cfg.enabled
+        let scheduled_cross_signal_ms = cross_boundary_ms - 1;
+        let scheduled_cross_due = cross_cfg.enabled
             && scan_ms.saturating_sub(cross_boundary_ms)
                 <= cfg.max_signal_age_seconds as i64 * 1_000
-            && state.seen_signal.get("__cross_section__").copied() != Some(cross_signal_ms);
+            && state.seen_signal.get("__cross_section__").copied()
+                != Some(scheduled_cross_signal_ms);
+        // A full protective exit frees the slot immediately.  On the next
+        // closed 15m bar rerank the remaining universe instead of idling until
+        // the next 3h wall-clock boundary.  Symbols already stopped/realized
+        // during this 3h window are excluded to prevent same-signal churn.
+        let (cross_reentry_exclusions, latest_cross_exit_ms) =
+            cross_protective_exits_since(&state, cross_boundary_ms);
+        let cross_position_open = state.positions.values().any(is_cross_position);
+        let cross_15m_boundary_ms = scan_ms.div_euclid(15 * 60_000) * (15 * 60_000);
+        let cross_early_signal_ms = cross_15m_boundary_ms - 1;
+        let early_cross_due = cross_cfg.enabled
+            && !scheduled_cross_due
+            && !cross_position_open
+            && !cross_reentry_exclusions.is_empty()
+            && latest_cross_exit_ms.is_some_and(|exit_ms| cross_15m_boundary_ms > exit_ms)
+            && scan_ms.saturating_sub(cross_15m_boundary_ms)
+                <= cfg.max_signal_age_seconds as i64 * 1_000
+            && state.seen_signal.get("__cross_section_early__").copied()
+                != Some(cross_early_signal_ms);
+        let cross_execution_due = scheduled_cross_due || early_cross_due;
+        let cross_evaluation_boundary_ms = if early_cross_due {
+            cross_15m_boundary_ms
+        } else {
+            cross_boundary_ms
+        };
+        let cross_signal_ms = cross_evaluation_boundary_ms - 1;
         // 老版本的持久化状态可能已经带有 cross_section，但还没有 gate/execution。
         // 此时立刻拉取完整横截面重建展示状态，但不执行当前 3h 边界的陈旧候选。
         let cross_status_refresh_due =
@@ -4668,13 +4995,9 @@ pub async fn run_altcoin_impulse(
                     state.record_trade(event);
                     continue;
                 }
-                if is_cross_position(&position) || cfg.fixed_time_exit_only {
-                    let hold_hours = if is_cross_position(&position) {
-                        cross_cfg.hold_hours as i64
-                    } else {
-                        cfg.max_hold_hours as i64
-                    };
-                    let timed = scan_ms - position.entry_ms >= hold_hours * 3_600_000;
+                if cfg.fixed_time_exit_only {
+                    let timed =
+                        scan_ms - position.entry_ms >= cfg.max_hold_hours as i64 * 3_600_000;
                     if timed {
                         let raw_exit = bar.close;
                         let exit = adverse_fill_price(
@@ -4722,7 +5045,7 @@ pub async fn run_altcoin_impulse(
                     state.record_trade(event);
                 }
                 let (trail_activation_pct, trail_pct) =
-                    position_exit_parameters(&position, &cfg, &shock_cfg);
+                    position_exit_parameters(&position, &cfg, &cross_cfg, &shock_cfg);
                 if !is_shock_position(&position)
                     && !position.partial_take_profit_done
                     && excursion >= trail_activation_pct
@@ -4731,7 +5054,9 @@ pub async fn run_altcoin_impulse(
                         position.entry_price * (1.0 + position.side as f64 * trail_activation_pct);
                     let exit =
                         adverse_fill_price(raw_exit, position.side, cfg.dry_slippage_bps, false);
-                    let qty = position.qty * cfg.partial_take_profit_fraction;
+                    let partial_take_profit_fraction =
+                        position_partial_take_profit_fraction(&position, &cfg, &cross_cfg);
+                    let qty = position.qty * partial_take_profit_fraction;
                     let fee = qty * exit * 0.0005;
                     let partial_pnl =
                         record_partial_exit(&mut state, &mut position, exit, qty, fee);
@@ -4739,7 +5064,7 @@ pub async fn run_altcoin_impulse(
                     position.last_partial_exit_ms = Some(scan_ms);
                     position.stop_price = position.entry_price;
                     position.protection_reason = "partial_take_profit_break_even".to_owned();
-                    let event = json!({"ts_ms":scan_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":"partial_take_profit","configured_trigger_return":trail_activation_pct,"configured_fraction":cfg.partial_take_profit_fraction,"configured_trail_pct":trail_pct,"price":exit,"raw_price":raw_exit,"qty":qty,"remaining_qty":position.qty,"pnl":partial_pnl,"fee":fee,"new_stop":position.stop_price,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true});
+                    let event = json!({"ts_ms":scan_ms,"event":"partial_exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":"partial_take_profit","configured_trigger_return":trail_activation_pct,"configured_fraction":partial_take_profit_fraction,"configured_trail_pct":trail_pct,"price":exit,"raw_price":raw_exit,"qty":qty,"remaining_qty":position.qty,"pnl":partial_pnl,"fee":fee,"new_stop":position.stop_price,"dry_slippage_bps":cfg.dry_slippage_bps,"dry_fill":true});
                     append_event(&event_path, event.clone())?;
                     state.record_trade(event);
                 }
@@ -4781,8 +5106,10 @@ pub async fn run_altcoin_impulse(
                         cfg.failed_breakout_adverse_pct,
                         cfg.failed_breakout_max_mfe_pct,
                     );
-                let timed = scan_ms - position.entry_ms
-                    >= position_max_hold_hours(&position, &cfg, &cross_cfg, &shock_cfg) * 3_600_000;
+                let timed = !is_cross_position(&position)
+                    && scan_ms - position.entry_ms
+                        >= position_max_hold_hours(&position, &cfg, &cross_cfg, &shock_cfg)
+                            * 3_600_000;
                 if failed || stopped || timed {
                     let raw_exit = if failed {
                         bar.close
@@ -4829,13 +5156,45 @@ pub async fn run_altcoin_impulse(
 
         let mut candidates: Vec<Candidate> = if cross_cfg.enabled {
             if cross_analysis_due {
-                let (mut candidates, mut status) =
-                    cross_section_analysis(&bars_by_symbol, cross_boundary_ms, &cross_cfg, &cfg);
+                // Position management runs after the initial scheduling check.
+                // Re-read exits here so a stop filled exactly on a 3h boundary
+                // cannot be immediately reopened from the same signal.
+                let (current_reentry_exclusions, _) =
+                    cross_protective_exits_since(&state, cross_boundary_ms);
+                let (mut candidates, mut status) = cross_section_analysis(
+                    &bars_by_symbol,
+                    cross_evaluation_boundary_ms,
+                    &cross_cfg,
+                    &cfg,
+                    &current_reentry_exclusions,
+                );
+                let post_exit_excess = status["signal_excess_return"].as_f64();
+                let post_exit_quality_passed = !early_cross_due
+                    || post_exit_excess.is_some_and(|excess| {
+                        excess + f64::EPSILON >= cross_cfg.strong_excess_return
+                    });
+                if !post_exit_quality_passed {
+                    candidates.clear();
+                    status["stage"] = json!("post_exit_quality_missing");
+                }
                 status["performance"] = cross_performance(&state);
+                status["evaluation_kind"] = json!(if early_cross_due {
+                    "post_exit_15m_rerank"
+                } else {
+                    "scheduled_3h_rerank"
+                });
+                status["next_boundary_ms"] = json!(cross_boundary_ms + cross_interval_ms);
+                status["post_exit_min_excess_return"] = json!(cross_cfg.strong_excess_return);
+                status["post_exit_quality_passed"] = json!(post_exit_quality_passed);
                 if cross_execution_due {
+                    let signal_key = if early_cross_due {
+                        "__cross_section_early__"
+                    } else {
+                        "__cross_section__"
+                    };
                     state
                         .seen_signal
-                        .insert("__cross_section__".to_owned(), cross_signal_ms);
+                        .insert(signal_key.to_owned(), cross_signal_ms);
                     state.cross_section_pending = candidates.first().cloned();
                     status["execution_state"] = if let Some(candidate) = candidates.first() {
                         json!({
@@ -4856,7 +5215,7 @@ pub async fn run_altcoin_impulse(
                 state.cross_section_status = status.clone();
                 append_event(
                     &event_path,
-                    json!({"ts_ms":scan_ms,"event":if cross_execution_due {"cross_section_decision"} else {"cross_section_status_migrated"},"status":status,"candidate_count":candidates.len(),"execution_due":cross_execution_due}),
+                    json!({"ts_ms":scan_ms,"event":if early_cross_due {"cross_section_post_exit_rerank"} else if cross_execution_due {"cross_section_decision"} else {"cross_section_status_migrated"},"status":status,"candidate_count":candidates.len(),"execution_due":cross_execution_due,"evaluation_kind":if early_cross_due {"post_exit_15m_rerank"} else {"scheduled_3h_rerank"}}),
                 )?;
                 save_state(&state_path, &state)?;
                 candidates
@@ -4890,6 +5249,30 @@ pub async fn run_altcoin_impulse(
                 .filter_map(|(s, bars)| evaluate(s.clone(), bars, &cfg))
                 .collect()
         };
+        if cross_execution_due {
+            let changed = if let Some(client) = rest.as_ref() {
+                resolve_live_cross_rebalance(
+                    &mut state,
+                    &mut candidates,
+                    client,
+                    scan_ms,
+                    &event_path,
+                )
+                .await?
+            } else {
+                resolve_dry_cross_rebalance(
+                    &mut state,
+                    &mut candidates,
+                    &bars_by_symbol,
+                    &cfg,
+                    scan_ms,
+                    &event_path,
+                )?
+            };
+            if changed {
+                save_state(&state_path, &state)?;
+            }
+        }
         let mut shock_candidates = if shock_cfg.enabled {
             bars_by_symbol
                 .iter()
@@ -5651,7 +6034,11 @@ pub async fn run_altcoin_impulse(
             }
             execution_candidates = crowding_checked;
         }
-        execution_candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+        execution_candidates.sort_by(|a, b| {
+            execution_priority(b)
+                .cmp(&execution_priority(a))
+                .then_with(|| b.score.total_cmp(&a.score))
+        });
         let pulse_eligible_count = execution_candidates
             .iter()
             .filter(|candidate| candidate.entry_phase == "pulse_exhaustion_short")
@@ -5685,10 +6072,45 @@ pub async fn run_altcoin_impulse(
             if (pulse_candidate && pulse_position_count >= cfg.pulse_max_positions)
                 || (!pulse_candidate && regular_position_count >= cfg.max_positions)
             {
+                if !pulse_candidate {
+                    let owner = state
+                        .positions
+                        .values()
+                        .find(|position| !is_pulse_position(position))
+                        .map(|position| {
+                            json!({
+                                "symbol":position.symbol,
+                                "side":position.side,
+                                "strategy":position.entry_phase
+                            })
+                        });
+                    append_event(
+                        &event_path,
+                        json!({
+                            "ts_ms":scan_ms,"event":"strategy_slot_conflict",
+                            "candidate_symbol":candidate.symbol,"candidate_side":candidate.side,
+                            "candidate_strategy":micro_strategy,"slot_owner":owner,
+                            "resolution":"existing_position_kept",
+                            "shared_regular_slots":cfg.max_positions
+                        }),
+                    )?;
+                }
                 continue;
             }
-            if state.positions.contains_key(&candidate.symbol)
-                || (candidate.entry_phase == "overextended_long" && !cfg.overextension_long_enabled)
+            if let Some(owner) = state.positions.get(&candidate.symbol) {
+                append_event(
+                    &event_path,
+                    json!({
+                        "ts_ms":scan_ms,"event":"strategy_symbol_conflict",
+                        "symbol":candidate.symbol,
+                        "candidate_side":candidate.side,"candidate_strategy":micro_strategy,
+                        "existing_side":owner.side,"existing_strategy":owner.entry_phase,
+                        "resolution":"existing_position_kept"
+                    }),
+                )?;
+                continue;
+            }
+            if (candidate.entry_phase == "overextended_long" && !cfg.overextension_long_enabled)
                 || (candidate.entry_phase == "overextended_long" && overextension_slot_taken)
                 || (candidate.entry_phase == "overextended_long"
                     && state.overextension_long_blocked)
@@ -5711,9 +6133,11 @@ pub async fn run_altcoin_impulse(
                 .sum();
             let gross_limit = if pulse_candidate {
                 cfg.pulse_max_gross_multiple
-            } else if cross_candidate {
-                cross_cfg.strong_gross_multiple
-            } else if shock_candidate {
+            } else if shock_cfg.enabled {
+                // Cross-section and shock reversal share the regular sleeve.
+                // Their own risk_scale sets each order size; the combined cap
+                // must be common, otherwise entry order alone changes whether
+                // the second strategy is allowed to participate.
                 shock_cfg.max_gross_multiple
             } else {
                 cfg.max_gross_multiple
@@ -6235,7 +6659,7 @@ pub async fn run_altcoin_impulse(
             if candidate.entry_phase == "overextended_long" {
                 overextension_slot_taken = true;
             }
-            let event = json!({"ts_ms":scan_ms,"event":"entry","strategy":micro_strategy,"setup_id":trial_key,"origin_signal_ms":setup_origin_ms,"symbol":candidate.symbol,"side":candidate.side,"entry_phase":candidate.entry_phase,"entry_trigger":candidate.entry_trigger,"risk_scale":candidate.risk_scale,"direction_risk_scale":direction_risk_scale,"effective_risk_scale":effective_risk_scale,"signal_age_ms":signal_age_ms(scan_ms,candidate.signal_ms),"max_signal_age_ms":max_signal_age_ms,"signal":candidate,"entry_price":entry,"qty":qty,"notional":qty*entry,"requested_leverage":cfg.exchange_leverage,"actual_leverage":actual_leverage,"margin_estimate":qty*entry/actual_leverage as f64,"risk_usd":qty*entry*risk_distance,"price_stop_risk_usd":qty*entry*stop_pct,"stop_pct":stop_pct,"trail_activation_pct":if pulse_candidate {Some(cfg.pulse_trail_activation_pct)} else if cross_candidate {None} else if shock_candidate {Some(shock_cfg.trail_activation_pct)} else {Some(cfg.trail_activation_pct)},"trail_pct":if pulse_candidate {Some(cfg.pulse_trail_pct)} else if cross_candidate {None} else if shock_candidate {Some(shock_cfg.trail_pct)} else {Some(cfg.trail_pct)},"partial_take_profit_fraction":if cross_candidate || shock_candidate {None} else {Some(cfg.partial_take_profit_fraction)},"max_hold_hours":if cross_candidate {cross_cfg.hold_hours as u32} else if shock_candidate {shock_cfg.max_hold_hours} else {cfg.max_hold_hours},"risk_execution_buffer_pct":cfg.risk_execution_buffer_pct,"fee":fee});
+            let event = json!({"ts_ms":scan_ms,"event":"entry","strategy":micro_strategy,"setup_id":trial_key,"origin_signal_ms":setup_origin_ms,"symbol":candidate.symbol,"side":candidate.side,"entry_phase":candidate.entry_phase,"entry_trigger":candidate.entry_trigger,"risk_scale":candidate.risk_scale,"direction_risk_scale":direction_risk_scale,"effective_risk_scale":effective_risk_scale,"signal_age_ms":signal_age_ms(scan_ms,candidate.signal_ms),"max_signal_age_ms":max_signal_age_ms,"signal":candidate,"entry_price":entry,"qty":qty,"notional":qty*entry,"requested_leverage":cfg.exchange_leverage,"actual_leverage":actual_leverage,"margin_estimate":qty*entry/actual_leverage as f64,"risk_usd":qty*entry*risk_distance,"price_stop_risk_usd":qty*entry*stop_pct,"stop_pct":stop_pct,"trail_activation_pct":if pulse_candidate {Some(cfg.pulse_trail_activation_pct)} else if cross_candidate {Some(cross_cfg.trail_activation_pct)} else if shock_candidate {Some(shock_cfg.trail_activation_pct)} else {Some(cfg.trail_activation_pct)},"trail_pct":if pulse_candidate {Some(cfg.pulse_trail_pct)} else if cross_candidate {Some(cross_cfg.trail_pct)} else if shock_candidate {Some(shock_cfg.trail_pct)} else {Some(cfg.trail_pct)},"partial_take_profit_fraction":if cross_candidate {Some(cross_cfg.partial_take_profit_fraction)} else if shock_candidate {None} else {Some(cfg.partial_take_profit_fraction)},"max_hold_hours":if cross_candidate {Value::Null} else if shock_candidate {json!(shock_cfg.max_hold_hours)} else {json!(cfg.max_hold_hours)},"rebalance_hours":if cross_candidate {Some(cross_cfg.hold_hours as u32)} else {None},"risk_execution_buffer_pct":cfg.risk_execution_buffer_pct,"fee":fee});
             append_event(&event_path, event.clone())?;
             state.record_trade(event);
         }
@@ -6444,6 +6868,28 @@ pub async fn run_altcoin_impulse(
             "cross_section_momentum"
         } else {
             "confirmed_volume_breakout"
+        });
+        let regular_slot_owners = state
+            .positions
+            .values()
+            .filter(|position| !is_pulse_position(position))
+            .map(|position| {
+                json!({
+                    "symbol":position.symbol,
+                    "side":position.side,
+                    "strategy":position.entry_phase
+                })
+            })
+            .collect::<Vec<_>>();
+        status_payload["altcoin_impulse"]["strategy_coordination"] = json!({
+            "capital_pool":"shared_altcoin_sleeve",
+            "regular_slots":cfg.max_positions,
+            "regular_slot_owners":regular_slot_owners,
+            "regular_priority":["shock_reversal","cross_section_momentum"],
+            "existing_position_wins":true,
+            "same_symbol_opposite_orders_allowed":false,
+            "pulse_slot_independent":true,
+            "pulse_same_symbol_conflict_blocked":true
         });
         status_payload["altcoin_impulse"]["max_positions"] = json!(cfg.max_positions);
         status_payload["altcoin_impulse"]["max_gross_multiple"] = json!(cfg.max_gross_multiple);
@@ -7776,7 +8222,13 @@ mod tests {
             strategy.altcoin_cross_section.assumed_cost_bps_per_side,
             10.0
         );
-        assert_eq!(strategy.altcoin_cross_section.stop_pct, 0.08);
+        assert_eq!(strategy.altcoin_cross_section.stop_pct, 0.04);
+        assert_eq!(strategy.altcoin_cross_section.trail_activation_pct, 0.05);
+        assert_eq!(strategy.altcoin_cross_section.trail_pct, 0.02);
+        assert_eq!(
+            strategy.altcoin_cross_section.partial_take_profit_fraction,
+            0.33
+        );
         assert!(strategy.altcoin_shock_reversal.enabled);
         assert_eq!(strategy.altcoin_shock_reversal.min_shock_return, 0.045);
         assert_eq!(strategy.altcoin_shock_reversal.min_reversal_return, 0.006);
@@ -7832,6 +8284,57 @@ mod tests {
     }
 
     #[test]
+    fn cross_section_neutral_band_keeps_the_validated_short_bias() {
+        let ranks = [-0.03, -0.01, 0.004, 0.008, 0.04, 0.25]
+            .into_iter()
+            .enumerate()
+            .map(|(index, trailing_return)| super::CrossRank {
+                symbol: format!("N{index}USDT"),
+                trailing_return,
+                volume_24h: 100_000_000.0,
+                signal_index: 100,
+            })
+            .collect::<Vec<_>>();
+        let selected = super::cross_selected(&ranks, 1, 0.01).unwrap();
+        assert_eq!(selected[0].0.symbol, "N0USDT");
+        assert_eq!(selected[0].1, -1);
+
+        let ranks = [-0.30, -0.02, -0.005, 0.002, 0.02, 0.05]
+            .into_iter()
+            .enumerate()
+            .map(|(index, trailing_return)| super::CrossRank {
+                symbol: format!("W{index}USDT"),
+                trailing_return,
+                volume_24h: 100_000_000.0,
+                signal_index: 100,
+            })
+            .collect::<Vec<_>>();
+        let selected = super::cross_selected(&ranks, 1, 0.01).unwrap();
+        assert_eq!(selected[0].0.symbol, "W0USDT");
+        assert_eq!(selected[0].1, -1);
+    }
+
+    #[test]
+    fn cross_section_post_exit_rerank_excludes_only_protective_exits_in_window() {
+        let boundary = 1_800_000_000_000i64;
+        let mut state = super::PersistedState::new(1_000.0, boundary);
+        for event in [
+            serde_json::json!({"ts_ms":boundary+1,"event":"exit","entry_phase":"cross_section_momentum","symbol":"STOPUSDT","reason":"initial_stop"}),
+            serde_json::json!({"ts_ms":boundary+2,"event":"exit_detected","entry_phase":"cross_section_momentum","symbol":"TPUSDT","reason":"trailing_take_profit"}),
+            serde_json::json!({"ts_ms":boundary+3,"event":"exit","entry_phase":"cross_section_momentum","symbol":"ROTATEUSDT","reason":"cross_section_rotation"}),
+            serde_json::json!({"ts_ms":boundary-1,"event":"exit","entry_phase":"cross_section_momentum","symbol":"OLDUSDT","reason":"initial_stop"}),
+            serde_json::json!({"ts_ms":boundary+4,"event":"exit","entry_phase":"shock_reversal","symbol":"SHOCKUSDT","reason":"initial_stop"}),
+        ] {
+            state.record_trade(event);
+        }
+        let (symbols, latest) = super::cross_protective_exits_since(&state, boundary);
+        assert_eq!(symbols.len(), 2);
+        assert!(symbols.contains("STOPUSDT"));
+        assert!(symbols.contains("TPUSDT"));
+        assert_eq!(latest, Some(boundary + 2));
+    }
+
+    #[test]
     fn cross_section_gate_rebuilds_thirty_completed_shadow_signals() {
         let strategy: super::StrategyFile = toml::from_str(include_str!(
             "../../../config/strategy-altcoin-impulse.toml"
@@ -7867,6 +8370,7 @@ mod tests {
             boundary_ms,
             &strategy.altcoin_cross_section,
             &strategy.altcoin_impulse,
+            &std::collections::HashSet::new(),
         );
         assert_eq!(status["gate"]["samples"], 30);
         assert_eq!(status["min_universe_size"], 1);
@@ -7875,6 +8379,20 @@ mod tests {
         assert_eq!(candidates[0].entry_phase, "cross_section_momentum");
         assert_eq!(candidates[0].side, 1);
         assert!(super::cross_section_status_complete(&status));
+        let excluded = std::collections::HashSet::from([candidates[0].symbol.clone()]);
+        let (replacement, replacement_status) = super::cross_section_analysis(
+            &bars_by_symbol,
+            boundary_ms,
+            &strategy.altcoin_cross_section,
+            &strategy.altcoin_impulse,
+            &excluded,
+        );
+        assert_eq!(replacement.len(), 1);
+        assert_ne!(replacement[0].symbol, candidates[0].symbol);
+        assert_eq!(
+            replacement_status["reentry_exclusions"][0],
+            excluded.iter().next().unwrap().as_str()
+        );
         assert!(!super::cross_section_status_complete(&serde_json::json!({
             "model":"12h_cross_section_momentum",
             "universe_count":4
