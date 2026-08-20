@@ -18,7 +18,6 @@ backtest = { workspace = true }
 live = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
-thiserror = { workspace = true }
 anyhow = { workspace = true }
 config = { workspace = true }
 tracing = { workspace = true }

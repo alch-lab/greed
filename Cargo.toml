@@ -68,5 +68,8 @@ proptest = "1"
 
 [profile.release]
 opt-level = 3
-lto = "thin"
-codegen-units = 1
+# The service is dominated by exchange/network I/O. Cross-crate LTO and a
+# single codegen unit add substantial deployment build time for negligible
+# operational benefit, so keep release optimization while compiling in parallel.
+lto = false
+codegen-units = 16

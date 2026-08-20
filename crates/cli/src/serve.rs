@@ -64,9 +64,29 @@ struct AppState {
 /// 登录接口按 IP 限流（5 分钟 10 次失败），防公网爆破。
 struct AuthState {
     password: Option<String>,
-    /// token → 签发时间
-    tokens: Mutex<HashMap<String, std::time::Instant>>,
+    guest_token: String,
+    /// token → (签发时间, 权限角色)
+    tokens: Mutex<HashMap<String, (std::time::Instant, AuthRole)>>,
     rate: Mutex<LoginRateLimit>,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AuthRole {
+    Operator,
+    Guest,
+}
+
+impl AuthRole {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::Guest => "guest",
+        }
+    }
+}
+
+fn role_allows(role: AuthRole, method: &axum::http::Method) -> bool {
+    role == AuthRole::Operator || method == axum::http::Method::GET
 }
 
 /// 登录限流：同一 IP 窗口内失败次数封顶。
@@ -170,9 +190,9 @@ async fn auth_login(
             .tokens
             .lock()
             .await
-            .insert(t.clone(), std::time::Instant::now());
+            .insert(t.clone(), (std::time::Instant::now(), AuthRole::Operator));
         Ok(Json(
-            serde_json::json!({ "auth_required": true, "token": t }),
+            serde_json::json!({ "auth_required": true, "token": t, "role": "operator" }),
         ))
     } else {
         st.auth.rate.lock().await.note_fail(&ip);
@@ -181,10 +201,37 @@ async fn auth_login(
     }
 }
 
-async fn auth_check(State(st): State<Arc<AppState>>) -> StatusCode {
-    // 能走到这里说明已通过中间件（或未启用鉴权）
-    let _ = st;
-    StatusCode::OK
+async fn auth_guest(State(st): State<Arc<AppState>>) -> Json<serde_json::Value> {
+    if st.auth.password.is_none() {
+        return Json(serde_json::json!({ "auth_required": false, "role": "operator" }));
+    }
+    st.auth.tokens.lock().await.insert(
+        st.auth.guest_token.clone(),
+        (std::time::Instant::now(), AuthRole::Guest),
+    );
+    Json(serde_json::json!({
+        "auth_required": true,
+        "token": st.auth.guest_token.clone(),
+        "role": "guest"
+    }))
+}
+
+async fn auth_check(
+    State(st): State<Arc<AppState>>,
+    headers: axum::http::HeaderMap,
+) -> Json<serde_json::Value> {
+    if st.auth.password.is_none() {
+        return Json(serde_json::json!({ "role": "operator" }));
+    }
+    let token = headers
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|s| s.strip_prefix("Bearer "));
+    let tokens = st.auth.tokens.lock().await;
+    let role = token
+        .and_then(|token| tokens.get(token).map(|(_, role)| *role))
+        .unwrap_or(AuthRole::Guest);
+    Json(serde_json::json!({ "role": role.as_str() }))
 }
 
 /// 鉴权中间件：未启用（无 GREED_WEB_PASSWORD）直接放行；
@@ -198,7 +245,7 @@ async fn auth_mw(
         return Ok(next.run(req).await);
     }
     let path = req.uri().path().to_string();
-    if path == "/api/auth/login" || path == "/api/health" {
+    if path == "/api/auth/login" || path == "/api/auth/guest" || path == "/api/health" {
         return Ok(next.run(req).await);
     }
     let token = req
@@ -209,8 +256,12 @@ async fn auth_mw(
         .map(|s| s.to_string());
     if let Some(t) = token {
         let mut tokens = st.auth.tokens.lock().await;
-        match tokens.get(&t) {
-            Some(issued) if issued.elapsed() < TOKEN_TTL => {
+        match tokens.get(&t).copied() {
+            Some((issued, role)) if issued.elapsed() < TOKEN_TTL => {
+                if !role_allows(role, req.method()) {
+                    return Err(StatusCode::FORBIDDEN);
+                }
+                drop(tokens);
                 return Ok(next.run(req).await);
             }
             Some(_) => {
@@ -238,6 +289,14 @@ mod tests {
         assert!(rl.allow("5.6.7.8"));
         rl.note_ok("1.2.3.4");
         assert!(rl.allow("1.2.3.4"));
+    }
+
+    #[test]
+    fn guest_is_strictly_read_only() {
+        assert!(role_allows(AuthRole::Guest, &axum::http::Method::GET));
+        assert!(!role_allows(AuthRole::Guest, &axum::http::Method::POST));
+        assert!(!role_allows(AuthRole::Guest, &axum::http::Method::DELETE));
+        assert!(role_allows(AuthRole::Operator, &axum::http::Method::POST));
     }
 }
 
@@ -894,6 +953,12 @@ pub async fn run_serve(
     } else {
         warn!("未设置 GREED_WEB_PASSWORD，控制面无鉴权（仅建议本机使用）");
     }
+    let guest_token = gen_token();
+    let mut initial_tokens = HashMap::new();
+    initial_tokens.insert(
+        guest_token.clone(),
+        (std::time::Instant::now(), AuthRole::Guest),
+    );
     let state = Arc::new(AppState {
         config,
         default_strategy: strategy,
@@ -902,7 +967,8 @@ pub async fn run_serve(
         jobs: Arc::new(Mutex::new(HashMap::new())),
         auth: AuthState {
             password,
-            tokens: Mutex::new(HashMap::new()),
+            guest_token,
+            tokens: Mutex::new(initial_tokens),
             rate: Mutex::new(LoginRateLimit::new()),
         },
     });
@@ -913,6 +979,7 @@ pub async fn run_serve(
             get(|| async { Json(serde_json::json!({"ok": true})) }),
         )
         .route("/api/auth/login", post(auth_login))
+        .route("/api/auth/guest", post(auth_guest))
         .route("/api/auth/check", get(auth_check))
         .route("/api/strategies", get(list_strategies))
         .route("/api/trade/status", get(trade_status))
