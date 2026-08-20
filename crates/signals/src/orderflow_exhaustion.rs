@@ -421,6 +421,10 @@ fn trdr_context(ctx: &Ctx, side: Side, cfg: &Config, now_ms: i64) -> TrdrContext
     let blocked_side = ctx
         .latest_of(SignalKind::TrendRegime)
         .and_then(|s| s.payload.get("blocked_side").and_then(Json::as_str));
+    let trend_regime = ctx.latest_of(SignalKind::TrendRegime);
+    let mr_allowed = trend_regime
+        .and_then(|s| s.payload.get("mr_allowed").and_then(Json::as_bool))
+        .unwrap_or_else(|| trend_regime.is_none() || regime == "range");
 
     TrdrContext {
         zone_matches,
@@ -456,7 +460,8 @@ fn trdr_context(ctx: &Ctx, side: Side, cfg: &Config, now_ms: i64) -> TrdrContext
             .unwrap_or("neutral")
             .to_string(),
         regime,
-        trend_blocked: cfg.block_countertrend && blocked_side == Some(side_name(side)),
+        trend_blocked: cfg.block_countertrend
+            && (!mr_allowed || blocked_side == Some(side_name(side))),
         production_ready,
         zone_persistence_ms,
         source_coverage_complete,

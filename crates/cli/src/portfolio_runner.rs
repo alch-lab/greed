@@ -38,15 +38,15 @@ struct PortfolioFile {
 }
 
 fn default_mr_risk_pct() -> f64 {
-    0.0025
+    0.0125
 }
 
 fn default_mr_max_risk_pct() -> f64 {
-    0.005
+    0.0125
 }
 
 fn default_mr_leverage() -> u32 {
-    3
+    5
 }
 
 pub fn is_portfolio_strategy(path: &str) -> bool {
@@ -469,9 +469,22 @@ mod tests {
         let cfg = deployed_config();
         assert_eq!(cfg.mr_capital_usdt, 1_000.0);
         assert_eq!(cfg.altcoin_capital_usdt, 1_000.0);
+        assert_eq!(cfg.mr_risk_pct, 0.0125);
+        assert_eq!(cfg.mr_max_risk_pct, 0.0125);
+        assert_eq!(cfg.mr_leverage, 5);
         assert_eq!(cfg.mr_strategy, "config/strategy-final.toml");
         assert_eq!(cfg.altcoin_strategy, "config/strategy-altcoin-impulse.toml");
         assert!(!cfg.allow_live);
+    }
+
+    #[test]
+    fn deployed_btc_sleeve_keeps_negative_mr_observation_only() {
+        let doc: toml::Value =
+            toml::from_str(include_str!("../../../config/strategy-final.toml")).unwrap();
+        let hybrid = &doc["strategy"]["plugins"]["HybridEntry"];
+        assert_eq!(hybrid["mr_enabled"].as_bool(), Some(false));
+        assert_eq!(hybrid["trend_enabled"].as_bool(), Some(true));
+        assert_eq!(hybrid["tactical_enabled"].as_bool(), Some(true));
     }
 
     #[test]

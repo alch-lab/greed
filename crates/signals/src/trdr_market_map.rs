@@ -16,6 +16,7 @@ pub struct Config {
     pub delta_window_ms: i64,
     pub trend_window_ms: i64,
     pub trend_slow_window_ms: i64,
+    pub trend_anchor_window_ms: i64,
     pub book_fresh_ms: i64,
     pub book_bands: Vec<f64>,
     pub min_zone_depth_usd: f64,
@@ -36,6 +37,8 @@ pub struct Config {
     pub trend_efficiency: f64,
     pub trend_slow_return_pct: f64,
     pub trend_slow_efficiency: f64,
+    pub trend_anchor_return_pct: f64,
+    pub trend_anchor_efficiency: f64,
     pub oi_change_threshold: f64,
 }
 
@@ -80,6 +83,7 @@ impl Config {
             delta_window_ms: i("delta_window_ms", 30 * 60_000).max(60_000),
             trend_window_ms: i("trend_window_ms", 30 * 60_000).max(60_000),
             trend_slow_window_ms: i("trend_slow_window_ms", 2 * 60 * 60_000).max(5 * 60_000),
+            trend_anchor_window_ms: i("trend_anchor_window_ms", 6 * 60 * 60_000).max(30 * 60_000),
             book_fresh_ms: i("book_fresh_ms", 20_000).max(1_000),
             book_bands: bands,
             min_zone_depth_usd: f("min_zone_depth_usd", 1_000_000.0).max(0.0),
@@ -99,6 +103,8 @@ impl Config {
             trend_efficiency: f("trend_efficiency", 0.45).clamp(0.05, 1.0),
             trend_slow_return_pct: f("trend_slow_return_pct", 0.005).clamp(0.001, 0.10),
             trend_slow_efficiency: f("trend_slow_efficiency", 0.10).clamp(0.01, 1.0),
+            trend_anchor_return_pct: f("trend_anchor_return_pct", 0.010).clamp(0.002, 0.20),
+            trend_anchor_efficiency: f("trend_anchor_efficiency", 0.08).clamp(0.01, 1.0),
             oi_change_threshold: f("oi_change_threshold", 0.001).clamp(0.00001, 0.10),
         }
     }
@@ -114,6 +120,8 @@ struct BookState {
 struct FlowBucket {
     open: f64,
     close: f64,
+    reference_open: f64,
+    reference_close: f64,
     volume: f64,
     delta: f64,
     spot_volume: f64,
@@ -143,6 +151,12 @@ impl FlowBucket {
             self.open = price;
         }
         self.close = price;
+        if exchange == Exchange::BinanceFutures {
+            if self.reference_open <= 0.0 {
+                self.reference_open = price;
+            }
+            self.reference_close = price;
+        }
         self.volume += notional;
         self.delta += signed;
         *self.source_volume.entry(exchange).or_default() += notional;
@@ -267,6 +281,10 @@ struct FlowState {
     trend_slow_return_pct: f64,
     trend_slow_efficiency: f64,
     trend_slow_window_ms: i64,
+    trend_anchor_return_pct: f64,
+    trend_anchor_efficiency: f64,
+    trend_anchor_window_ms: i64,
+    mr_allowed: bool,
 }
 
 pub struct TrdrMarketMap {
@@ -738,29 +756,37 @@ impl TrdrMarketMap {
             .delta_window_ms
             .max(self.cfg.trend_window_ms)
             .max(self.cfg.trend_slow_window_ms)
+            .max(self.cfg.trend_anchor_window_ms)
             + self.cfg.bucket_ms;
         self.flows.retain(|start, _| now_ms - *start <= keep_ms);
     }
 
-    fn trend_stats<'a>(buckets: impl Iterator<Item = &'a FlowBucket>) -> (f64, f64) {
-        let mut first = None;
-        let mut last = None;
-        let mut previous = None;
-        let mut path = 0.0;
-        for bucket in buckets.filter(|bucket| bucket.open > 0.0) {
-            if first.is_none() {
-                first = Some(bucket.open);
-                previous = Some(bucket.open);
-            }
-            if let Some(prev) = previous {
-                path += (bucket.close - prev).abs();
-            }
-            previous = Some(bucket.close);
-            last = Some(bucket.close);
+    /// Price regime uses a single executable reference market, sampled to one-minute
+    /// closes.  Mixing the last arriving trade from six venues makes the path length
+    /// mostly measure venue basis/arrival jitter and incorrectly labels trends as range.
+    fn reference_trend_stats<'a>(
+        buckets: impl Iterator<Item = (&'a i64, &'a FlowBucket)>,
+    ) -> (f64, f64) {
+        let mut minutes = BTreeMap::<i64, (f64, f64)>::new();
+        for (ts, bucket) in buckets.filter(|(_, bucket)| bucket.reference_open > 0.0) {
+            let minute = ts.div_euclid(60_000) * 60_000;
+            let entry = minutes
+                .entry(minute)
+                .or_insert((bucket.reference_open, bucket.reference_close));
+            entry.1 = bucket.reference_close;
         }
-        let (Some(first), Some(last)) = (first, last) else {
+        let mut values = minutes.into_values();
+        let Some((first, first_close)) = values.next() else {
             return (0.0, 0.0);
         };
+        let mut last = first_close;
+        let mut previous = first_close;
+        let mut path = (first_close - first).abs();
+        for (_, close) in values {
+            path += (close - previous).abs();
+            previous = close;
+            last = close;
+        }
         let trend_return = if first > 0.0 { last / first - 1.0 } else { 0.0 };
         let efficiency = if path > 0.0 {
             (last - first).abs() / path
@@ -807,6 +833,7 @@ impl TrdrMarketMap {
         let delta_from = now_ms - self.cfg.delta_window_ms;
         let trend_from = now_ms - self.cfg.trend_window_ms;
         let trend_slow_from = now_ms - self.cfg.trend_slow_window_ms;
+        let trend_anchor_from = now_ms - self.cfg.trend_anchor_window_ms;
         let mut volume = 0.0;
         let mut delta = 0.0;
         let mut spot_volume = 0.0;
@@ -943,12 +970,11 @@ impl TrdrMarketMap {
             })
             .collect::<Vec<_>>();
         let (trend_return, efficiency) =
-            Self::trend_stats(self.flows.range(trend_from..).map(|(_, bucket)| bucket));
-        let (slow_return, slow_efficiency) = Self::trend_stats(
-            self.flows
-                .range(trend_slow_from..)
-                .map(|(_, bucket)| bucket),
-        );
+            Self::reference_trend_stats(self.flows.range(trend_from..));
+        let (slow_return, slow_efficiency) =
+            Self::reference_trend_stats(self.flows.range(trend_slow_from..));
+        let (anchor_return, anchor_efficiency) =
+            Self::reference_trend_stats(self.flows.range(trend_anchor_from..));
         let aligned = trend_return.signum() == delta.signum();
         let fast_up = aligned
             && trend_return >= self.cfg.trend_return_pct
@@ -962,9 +988,16 @@ impl TrdrMarketMap {
             && slow_efficiency >= self.cfg.trend_slow_efficiency;
         let slow_down = slow_return <= -self.cfg.trend_slow_return_pct
             && slow_efficiency >= self.cfg.trend_slow_efficiency;
-        let regime = if slow_up {
+        let anchor_up = anchor_return >= self.cfg.trend_anchor_return_pct
+            && anchor_efficiency >= self.cfg.trend_anchor_efficiency;
+        let anchor_down = anchor_return <= -self.cfg.trend_anchor_return_pct
+            && anchor_efficiency >= self.cfg.trend_anchor_efficiency;
+        let directional_conflict = slow_up && anchor_down || slow_down && anchor_up;
+        let regime = if directional_conflict {
+            "transition"
+        } else if slow_up || anchor_up {
             "trend_up"
-        } else if slow_down {
+        } else if slow_down || anchor_down {
             "trend_down"
         } else if fast_up {
             "trend_up"
@@ -973,6 +1006,9 @@ impl TrdrMarketMap {
         } else {
             "range"
         };
+        // MR is a range sleeve.  A trend on either horizon, or disagreement between
+        // horizons, delegates the account to continuation/pullback instead of fading it.
+        let mr_allowed = !(slow_up || slow_down || anchor_up || anchor_down);
         let oi_change = match (self.oi_history.front(), self.oi_history.back()) {
             (Some((_, first)), Some((_, last))) if *first > 0.0 => Some(last / first - 1.0),
             _ => None,
@@ -1032,6 +1068,10 @@ impl TrdrMarketMap {
             trend_slow_return_pct: slow_return,
             trend_slow_efficiency: slow_efficiency,
             trend_slow_window_ms: self.cfg.trend_slow_window_ms,
+            trend_anchor_return_pct: anchor_return,
+            trend_anchor_efficiency: anchor_efficiency,
+            trend_anchor_window_ms: self.cfg.trend_anchor_window_ms,
+            mr_allowed,
         }
     }
 
@@ -1080,7 +1120,11 @@ impl TrdrMarketMap {
                 "trend_efficiency":f.trend_efficiency,
                 "trend_slow_return_pct":f.trend_slow_return_pct,
                 "trend_slow_efficiency":f.trend_slow_efficiency,
-                "trend_slow_window_ms":f.trend_slow_window_ms
+                "trend_slow_window_ms":f.trend_slow_window_ms,
+                "trend_anchor_return_pct":f.trend_anchor_return_pct,
+                "trend_anchor_efficiency":f.trend_anchor_efficiency,
+                "trend_anchor_window_ms":f.trend_anchor_window_ms,
+                "mr_allowed":f.mr_allowed
             }),
             None => json!({"tier":0,"tier_name":"none","direction":"neutral","regime":"warming"}),
         }
@@ -1099,6 +1143,10 @@ impl TrdrMarketMap {
             obj.insert(
                 "trend_slow_window_ms".into(),
                 json!(self.cfg.trend_slow_window_ms),
+            );
+            obj.insert(
+                "trend_anchor_window_ms".into(),
+                json!(self.cfg.trend_anchor_window_ms),
             );
         }
         let regime = self
@@ -1168,7 +1216,11 @@ impl TrdrMarketMap {
                     "return_pct":f.trend_return_pct,"efficiency":f.trend_efficiency,
                     "slow_return_pct":f.trend_slow_return_pct,
                     "slow_efficiency":f.trend_slow_efficiency,
-                    "slow_window_ms":self.cfg.trend_slow_window_ms
+                    "slow_window_ms":self.cfg.trend_slow_window_ms,
+                    "anchor_return_pct":f.trend_anchor_return_pct,
+                    "anchor_efficiency":f.trend_anchor_efficiency,
+                    "anchor_window_ms":self.cfg.trend_anchor_window_ms,
+                    "mr_allowed":f.mr_allowed
                 }),
             ),
         ]
@@ -1457,7 +1509,7 @@ mod tests {
         let mut map = TrdrMarketMap::new(cfg);
         let ctx = Ctx::default();
         let mut last = vec![];
-        for (ts, px) in [(1_000, 100.0), (11_000, 101.0), (21_000, 102.0)] {
+        for (ts, px) in [(1_000, 100.0), (61_000, 101.0), (121_000, 102.0)] {
             let trade = Trade {
                 ts: Timestamp::from_millis(ts),
                 exchange: Exchange::BinanceFutures,
@@ -1494,7 +1546,7 @@ mod tests {
         cfg.trend_slow_efficiency = 0.10;
         let mut map = TrdrMarketMap::new(cfg);
         let ctx = Ctx::default();
-        for (ts, px) in [(1_000, 100.0), (11_000, 100.4), (21_000, 100.8)] {
+        for (ts, px) in [(1_000, 100.0), (61_000, 100.4), (121_000, 100.8)] {
             let trade = Trade {
                 ts: Timestamp::from_millis(ts),
                 exchange: Exchange::BinanceFutures,
@@ -1509,6 +1561,43 @@ mod tests {
         assert!(flow.delta_usd < 0.0);
         assert_eq!(flow.regime, "trend_up");
         assert!(flow.trend_slow_return_pct >= 0.005);
+        assert!(!flow.mr_allowed);
+    }
+
+    #[test]
+    fn venue_basis_noise_does_not_erase_reference_trend() {
+        let mut cfg = Config::from_params(&json!({}));
+        cfg.trend_return_pct = 0.10;
+        cfg.trend_slow_return_pct = 0.005;
+        cfg.trend_slow_efficiency = 0.10;
+        let mut map = TrdrMarketMap::new(cfg);
+        let ctx = Ctx::default();
+        for minute in 0..4 {
+            let base_ts = minute * 60_000 + 1_000;
+            let reference = 100.0 + minute as f64 * 0.4;
+            for (offset, exchange, price) in [
+                (0, Exchange::BinanceFutures, reference),
+                (10_000, Exchange::BybitFutures, reference * 1.003),
+                (20_000, Exchange::OkxFutures, reference * 0.997),
+                (30_000, Exchange::BinanceSpot, reference * 1.002),
+            ] {
+                map.on_event(
+                    &Event::Trade(Trade {
+                        ts: Timestamp::from_millis(base_ts + offset),
+                        exchange,
+                        symbol: Symbol::new("BTCUSDT"),
+                        price: Price::from_f64(price),
+                        qty: Qty::from_f64(1.0),
+                        is_buyer_maker: false,
+                    }),
+                    &ctx,
+                );
+            }
+        }
+        let flow = map.latest_flow.as_ref().unwrap();
+        assert_eq!(flow.regime, "trend_up");
+        assert!(flow.trend_slow_efficiency > 0.9);
+        assert!(!flow.mr_allowed);
     }
 
     #[test]

@@ -810,20 +810,40 @@ impl RestClient {
 
     /// 撤销本交易对全部挂单。
     pub async fn cancel_all_open_orders(&self, symbol: &str) -> Result<(), RestError> {
-        self.signed(
-            reqwest::Method::DELETE,
-            "/fapi/v1/allOpenOrders",
-            &[("symbol", symbol.to_string())],
-        )
-        .await?;
-        // 条件单已迁移到独立 Algo API，普通 allOpenOrders 不会清理这些止损单。
-        self.signed(
-            reqwest::Method::DELETE,
-            "/fapi/v1/algoOpenOrders",
-            &[("symbol", symbol.to_string())],
-        )
-        .await?;
-        Ok(())
+        // 普通订单和 Algo 条件单是两个独立端点。即使其中一个端点返回“没有订单”，
+        // 也必须继续清理另一个端点；旧实现的 `?` 会让普通单撤单失败时直接跳过
+        // Algo 止损，最终留下已经没有仓位的孤儿保护单。
+        let regular = self
+            .signed(
+                reqwest::Method::DELETE,
+                "/fapi/v1/allOpenOrders",
+                &[("symbol", symbol.to_string())],
+            )
+            .await;
+        let algo = self
+            .signed(
+                reqwest::Method::DELETE,
+                "/fapi/v1/algoOpenOrders",
+                &[("symbol", symbol.to_string())],
+            )
+            .await;
+
+        let benign = |result: &Result<serde_json::Value, RestError>| {
+            result.is_ok()
+                || matches!(
+                    result,
+                    Err(RestError::Binance {
+                        code: -2011 | -2013,
+                        ..
+                    })
+                )
+        };
+        if benign(&regular) && benign(&algo) {
+            return Ok(());
+        }
+        Err(RestError::Data(format!(
+            "撤单未完全成功: regular={regular:?}; algo={algo:?}"
+        )))
     }
 
     /// 撤销单个条件 Algo 订单。跟踪止损换挡时先挂新保护，再按 ID 撤旧保护，

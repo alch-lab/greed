@@ -40,6 +40,11 @@ trend_efficiency = 0.40
 trend_slow_window_ms = 7200000
 trend_slow_return_pct = 0.005
 trend_slow_efficiency = 0.10
+# 6h 方向锚用于识别“大趋势中的 2h 回调”。趋势价格只取 Binance 永续参考价，
+# 每分钟降采样；任一周期有方向或两周期冲突时，MR 都让位给趋势模块。
+trend_anchor_window_ms = 21600000
+trend_anchor_return_pct = 0.010
+trend_anchor_efficiency = 0.08
 oi_change_threshold = 0.001
 
 [strategy.plugins.OrderFlowExhaustion]
@@ -97,9 +102,12 @@ bucket_ms = 10000
 warmup_ms = 7200000
 # 只覆盖真正的强趋势；普通 0.5% 慢趋势仍只用于 MR 方向过滤。
 min_return_pct = 0.008
+# 超过 3%/2h 已属于过度延伸，等待 TacticalPullback 回踩而不是市价追入。
+max_return_pct = 0.030
 min_efficiency = 0.15
 min_delta_tier = 1
 reset_neutral_ms = 900000
+reentry_cooldown_ms = 21600000
 require_source_coverage = true
 require_spot_perp_delta = true
 require_oi_support = true
@@ -124,6 +132,11 @@ require_spot_perp_delta = true
 # 只交易实时全市场口径：完整来源 + footprint 成交簇 + 吸收；
 # 区间要求 context >= 5 且必须在有效位置，顺势回调要求 context >= 4。
 # Binance-only 历史数据无法重建该门槛，因此不会被误当作同一信号下单。
+# 最近事件级回放中 MR 为明确负贡献；保留完整信号与研究日志，但不再送单，
+# 也不参与统一仲裁，避免反向 MR 抢占或否决已经确认的趋势回踩。
+mr_enabled = false
+trend_enabled = true
+tactical_enabled = true
 mr_risk_scale = 1.0
 # MR 固定 0.25% 保护距离，TP1=0.8R=0.20%；结构止损超过 0.25% 的信号放弃。
 mr_tp1_r = 0.80
@@ -144,8 +157,13 @@ tp2_original_close = 0.30
 # MR: TP1 0.20% 平 50%并推保本；TP2 0.35% 再平原仓 30%；余下 20% 跟踪。
 tp2_r = 1.40
 runner_trail_pct = 0.0015
+mr_breakeven_buffer_pct = 0.0008
 max_hold_hours = 0.5
-# 趋势覆盖层不套用 MR 目标，使用 0.25% 单向跟踪止损，最多持有 2 小时。
+# 趋势覆盖层先在 +0.60% 兑现 25%，并把余仓保护到扣费后正收益；达到 +1.0%
+# 后才启用 0.25% 跟踪。避免旧配置在 +0.25% 时把止损放回成本附近。
+trend_partial_activation_pct = 0.006
+trend_partial_close = 0.25
+trend_lock_profit_pct = 0.001
 trend_trail_pct = 0.0025
-trend_trail_activation_pct = 0.0025
-trend_max_hold_hours = 2.0
+trend_trail_activation_pct = 0.010
+trend_max_hold_hours = 4.0

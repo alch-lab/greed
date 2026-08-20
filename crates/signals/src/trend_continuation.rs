@@ -12,9 +12,11 @@ pub struct Config {
     bucket_ms: i64,
     warmup_ms: i64,
     min_return_pct: f64,
+    max_return_pct: f64,
     min_efficiency: f64,
     min_delta_tier: u8,
     reset_neutral_ms: i64,
+    reentry_cooldown_ms: i64,
     require_source_coverage: bool,
     require_spot_perp_delta: bool,
     require_oi_support: bool,
@@ -37,9 +39,11 @@ impl Config {
             bucket_ms: i("bucket_ms", 10_000).max(1_000),
             warmup_ms: i("warmup_ms", 2 * 60 * 60_000).max(30 * 60_000),
             min_return_pct: f("min_return_pct", 0.008).clamp(0.002, 0.05),
+            max_return_pct: f("max_return_pct", 0.030).clamp(0.005, 0.20),
             min_efficiency: f("min_efficiency", 0.15).clamp(0.02, 1.0),
             min_delta_tier: u("min_delta_tier", 1).min(4),
             reset_neutral_ms: i("reset_neutral_ms", 15 * 60_000).max(60_000),
+            reentry_cooldown_ms: i("reentry_cooldown_ms", 30 * 60_000).max(60_000),
             require_source_coverage: b("require_source_coverage", true),
             require_spot_perp_delta: b("require_spot_perp_delta", true),
             require_oi_support: b("require_oi_support", true),
@@ -52,6 +56,7 @@ pub struct TrendContinuation {
     started_at_ms: Option<i64>,
     last_bucket: Option<i64>,
     fired_side: Option<Side>,
+    last_fired_ms: Option<i64>,
     neutral_since_ms: Option<i64>,
     eval: Option<Json>,
 }
@@ -63,6 +68,7 @@ impl TrendContinuation {
             started_at_ms: None,
             last_bucket: None,
             fired_side: None,
+            last_fired_ms: None,
             neutral_since_ms: None,
             eval: None,
         }
@@ -86,12 +92,20 @@ impl TrendContinuation {
             .and_then(|value| value.get("slow_efficiency"))
             .and_then(Json::as_f64)
             .unwrap_or(0.0);
+        let regime = trend
+            .and_then(|value| value.get("regime"))
+            .and_then(Json::as_str)
+            .unwrap_or("warming");
         let side = if slow_return >= self.cfg.min_return_pct
+            && slow_return <= self.cfg.max_return_pct
             && slow_efficiency >= self.cfg.min_efficiency
+            && regime == "trend_up"
         {
             Some(Side::Buy)
         } else if slow_return <= -self.cfg.min_return_pct
+            && slow_return >= -self.cfg.max_return_pct
             && slow_efficiency >= self.cfg.min_efficiency
+            && regime == "trend_down"
         {
             Some(Side::Sell)
         } else {
@@ -143,12 +157,20 @@ impl TrendContinuation {
         let oi_ready = !self.cfg.require_oi_support
             || matches!(
                 (side, oi_quadrant),
-                (Some(Side::Buy), "new_longs" | "short_covering")
-                    | (Some(Side::Sell), "new_shorts" | "long_liquidation")
+                (
+                    Some(Side::Buy),
+                    "new_longs" | "short_cover" | "short_covering"
+                ) | (Some(Side::Sell), "new_shorts" | "long_liquidation")
             );
         let warmed = observed_ms >= self.cfg.warmup_ms;
-        let already_fired = side.is_some() && self.fired_side == side;
+        let flat = ctx.position.is_none();
+        let reentry_ready = self
+            .last_fired_ms
+            .is_none_or(|last| now_ms - last >= self.cfg.reentry_cooldown_ms);
+        let already_fired = side.is_some() && self.fired_side == side && !reentry_ready;
         let ready = warmed
+            && flat
+            && reentry_ready
             && price_ready
             && delta_ready
             && coverage_ready
@@ -158,6 +180,8 @@ impl TrendContinuation {
 
         let blockers = [
             (!warmed).then_some("warmup"),
+            (!flat).then_some("position_open"),
+            (!reentry_ready).then_some("reentry_cooldown"),
             (!price_ready).then_some("strong_price_trend"),
             (!delta_ready).then_some("delta_alignment"),
             (!coverage_ready).then_some("source_coverage"),
@@ -176,6 +200,8 @@ impl TrendContinuation {
             "side":side.map(side_name),
             "slow_return_pct":slow_return,
             "slow_efficiency":slow_efficiency,
+            "regime":regime,
+            "max_return_pct":self.cfg.max_return_pct,
             "delta_tier":delta_tier,
             "delta_direction":delta_direction,
             "source_coverage_complete":source_coverage,
@@ -184,6 +210,9 @@ impl TrendContinuation {
             "oi_quadrant":oi_quadrant,
             "warmed":warmed,
             "already_fired":already_fired,
+            "flat":flat,
+            "reentry_ready":reentry_ready,
+            "reentry_cooldown_ms":self.cfg.reentry_cooldown_ms,
             "trade_eligible":ready,
             "blockers":blockers,
             "funnel":{
@@ -199,6 +228,7 @@ impl TrendContinuation {
         }
         let side = side.expect("ready trend side");
         self.fired_side = Some(side);
+        self.last_fired_ms = Some(now_ms);
         vec![Signal::new(
             SignalKind::Other,
             ts,
@@ -284,7 +314,7 @@ mod tests {
             SignalKind::TrendRegime,
             Timestamp::from_millis(2_000_000),
             "test",
-            json!({"slow_return_pct":0.009,"slow_efficiency":0.20}),
+            json!({"regime":"trend_up","slow_return_pct":0.009,"slow_efficiency":0.20}),
         ));
         ctx.set_latest(Signal::new(
             SignalKind::DeltaTier,
@@ -298,5 +328,7 @@ mod tests {
         assert_eq!(emitted.len(), 1);
         assert_eq!(emitted[0].payload["side"], "buy");
         assert!(plugin.on_event(&trade(2_010_000, 101.1), &ctx).is_empty());
+        let reentry = plugin.on_event(&trade(4_000_000, 102.0), &ctx);
+        assert_eq!(reentry.len(), 1);
     }
 }

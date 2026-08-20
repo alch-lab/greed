@@ -127,12 +127,18 @@ impl TacticalPullback {
             .and_then(|v| v.get("slow_efficiency"))
             .and_then(Json::as_f64)
             .unwrap_or(0.0);
+        let regime = trend
+            .and_then(|value| value.get("regime"))
+            .and_then(Json::as_str)
+            .unwrap_or("warming");
         let side = if slow_return >= self.cfg.min_return_pct
             && slow_efficiency >= self.cfg.min_efficiency
+            && regime == "trend_up"
         {
             Some(Side::Buy)
         } else if slow_return <= -self.cfg.min_return_pct
             && slow_efficiency >= self.cfg.min_efficiency
+            && regime == "trend_down"
         {
             Some(Side::Sell)
         } else {
@@ -192,7 +198,9 @@ impl TacticalPullback {
                 .front()
                 .is_some_and(|(stamp, _)| now_ms - *stamp >= self.cfg.price_window_ms);
         let cooling_down = now_ms < self.cooldown_until_ms;
+        let flat = ctx.position.is_none();
         let ready = warmed
+            && flat
             && side.is_some()
             && pulled_back
             && reclaimed
@@ -217,6 +225,7 @@ impl TacticalPullback {
 
         let blockers = [
             (!warmed).then_some("warmup"),
+            (!flat).then_some("position_open"),
             (side.is_none()).then_some("trend_regime"),
             (!pulled_back).then_some("pullback_depth"),
             (!reclaimed).then_some("price_reclaim"),
@@ -236,6 +245,7 @@ impl TacticalPullback {
             "side":side.map(side_name),
             "slow_return_pct":slow_return,
             "slow_efficiency":slow_efficiency,
+            "regime":regime,
             "recent_high":recent_high,
             "recent_low":recent_low,
             "pullback_extreme":self.pullback_extreme,
@@ -248,6 +258,7 @@ impl TacticalPullback {
             "spot_delta_usd":spot_delta,
             "perp_delta_usd":perp_delta,
             "cooldown_until_ms":self.cooldown_until_ms,
+            "flat":flat,
             "warmed":warmed,
             "trade_eligible":ready,
             "blockers":blockers,
@@ -345,7 +356,7 @@ mod tests {
             SignalKind::TrendRegime,
             Timestamp::from_millis(0),
             "test",
-            json!({"slow_return_pct":0.006,"slow_efficiency":0.20}),
+            json!({"regime":"trend_up","slow_return_pct":0.006,"slow_efficiency":0.20}),
         ));
         ctx.set_latest(Signal::new(SignalKind::DeltaTier, Timestamp::from_millis(0), "test", json!({"tier":2,"direction":"buy","source_coverage_complete":true,"spot_delta_usd":1.0,"perp_delta_usd":2.0})));
         assert!(plugin.on_event(&trade(0, 100.0), &ctx).is_empty());

@@ -9,9 +9,13 @@ pub struct OrderFlowTradeManagement {
     tp2_original_close: f64,
     tp2_r: f64,
     runner_trail_pct: f64,
+    mr_breakeven_buffer_pct: f64,
     max_hold_ms: i64,
     trend_trail_pct: f64,
     trend_trail_activation_pct: f64,
+    trend_partial_activation_pct: f64,
+    trend_partial_close: f64,
+    trend_lock_profit_pct: f64,
     trend_max_hold_ms: i64,
 }
 
@@ -43,6 +47,18 @@ impl ExitPlugin for OrderFlowTradeManagement {
                 Side::Buy => last / pos.entry_price.to_f64() - 1.0,
                 Side::Sell => 1.0 - last / pos.entry_price.to_f64(),
             };
+            if pos.closed_frac + 1e-6 < self.trend_partial_close
+                && favorable_pct >= self.trend_partial_activation_pct
+            {
+                let protected = match pos.side {
+                    Side::Buy => entry_with_buffer(pos.entry_price, self.trend_lock_profit_pct),
+                    Side::Sell => entry_with_buffer(pos.entry_price, -self.trend_lock_profit_pct),
+                };
+                return vec![
+                    ExitAction::ClosePartial(self.trend_partial_close),
+                    ExitAction::MoveStop(protected),
+                ];
+            }
             if favorable_pct < self.trend_trail_activation_pct {
                 return vec![];
             }
@@ -70,9 +86,17 @@ impl ExitPlugin for OrderFlowTradeManagement {
         if pos.closed_frac < 0.49 {
             if let Some(tp1) = pos.tp1_price.map(Price::to_f64) {
                 if favorable(tp1) {
+                    let protected = match pos.side {
+                        Side::Buy => {
+                            entry_with_buffer(pos.entry_price, self.mr_breakeven_buffer_pct)
+                        }
+                        Side::Sell => {
+                            entry_with_buffer(pos.entry_price, -self.mr_breakeven_buffer_pct)
+                        }
+                    };
                     return vec![
                         ExitAction::ClosePartial(self.tp1_close),
-                        ExitAction::MoveStop(pos.entry_price),
+                        ExitAction::MoveStop(protected),
                     ];
                 }
             }
@@ -113,11 +137,19 @@ pub fn build_orderflow_management(p: &Json) -> Result<Box<dyn ExitPlugin>, Plugi
         tp2_original_close: f("tp2_original_close", 0.25).clamp(0.05, 0.45),
         tp2_r: f("tp2_r", 4.0).max(0.2),
         runner_trail_pct: f("runner_trail_pct", 0.006).clamp(0.001, 0.05),
+        mr_breakeven_buffer_pct: f("mr_breakeven_buffer_pct", 0.0008).clamp(0.0, 0.005),
         max_hold_ms: (f("max_hold_hours", 4.0).max(0.1) * 3_600_000.0) as i64,
         trend_trail_pct: f("trend_trail_pct", 0.0025).clamp(0.001, 0.05),
         trend_trail_activation_pct: f("trend_trail_activation_pct", 0.0025).clamp(0.001, 0.05),
+        trend_partial_activation_pct: f("trend_partial_activation_pct", 0.006).clamp(0.002, 0.05),
+        trend_partial_close: f("trend_partial_close", 0.25).clamp(0.05, 0.75),
+        trend_lock_profit_pct: f("trend_lock_profit_pct", 0.001).clamp(0.0, 0.02),
         trend_max_hold_ms: (f("trend_max_hold_hours", 2.0).max(0.1) * 3_600_000.0) as i64,
     }))
+}
+
+fn entry_with_buffer(entry: Price, signed_pct: f64) -> Price {
+    Price::from_f64(entry.to_f64() * (1.0 + signed_pct))
 }
 
 #[cfg(test)]
@@ -158,13 +190,35 @@ mod tests {
 
     #[test]
     fn mr_uses_partial_tp_and_breakeven() {
-        let exit = build_orderflow_management(&json!({"max_hold_hours":0.5})).unwrap();
+        let exit = build_orderflow_management(
+            &json!({"max_hold_hours":0.5,"mr_breakeven_buffer_pct":0.0008}),
+        )
+        .unwrap();
         let mut ctx = Ctx::default();
         ctx.now = Some(Timestamp::from_millis(60_000));
         ctx.flags.insert("position_strategy".into(), "mr".into());
         ctx.flags.insert("last_price".into(), "100.20".into());
         let actions = exit.manage(&position(), &ctx);
         assert!(matches!(actions[0], ExitAction::ClosePartial(_)));
-        assert!(matches!(actions[1], ExitAction::MoveStop(_)));
+        assert!(matches!(actions[1], ExitAction::MoveStop(price) if price.to_f64() > 100.0));
+    }
+
+    #[test]
+    fn trend_takes_partial_before_wider_trailing_stage() {
+        let exit = build_orderflow_management(&json!({
+            "trend_partial_activation_pct":0.006,
+            "trend_partial_close":0.25,
+            "trend_lock_profit_pct":0.001,
+            "trend_trail_activation_pct":0.010,
+            "trend_trail_pct":0.0025
+        }))
+        .unwrap();
+        let mut ctx = Ctx::default();
+        ctx.now = Some(Timestamp::from_millis(60_000));
+        ctx.flags.insert("position_strategy".into(), "trend".into());
+        ctx.flags.insert("last_price".into(), "100.70".into());
+        let actions = exit.manage(&position(), &ctx);
+        assert!(matches!(actions[0], ExitAction::ClosePartial(frac) if (frac - 0.25).abs() < 1e-9));
+        assert!(matches!(actions[1], ExitAction::MoveStop(price) if price.to_f64() > 100.0));
     }
 }

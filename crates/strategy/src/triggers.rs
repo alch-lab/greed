@@ -102,6 +102,9 @@ pub fn build_orderflow(p: &Json) -> Result<Box<dyn TriggerPlugin>, PluginBuildEr
 /// 不会在已有订单或持仓时建立第二个方向。
 pub struct HybridEntry {
     mr: OrderFlowEntry,
+    mr_enabled: bool,
+    trend_enabled: bool,
+    tactical_enabled: bool,
     trend_risk_scale: f64,
     trend_stop_pct: f64,
     tactical_risk_scale: f64,
@@ -110,7 +113,8 @@ pub struct HybridEntry {
 
 impl HybridEntry {
     fn trend_intent(&self, signal: &Signal, symbol: &Symbol) -> Option<OrderIntent> {
-        if signal.source != "TrendContinuation"
+        if !self.trend_enabled
+            || signal.source != "TrendContinuation"
             || signal.payload.get("stage")?.as_str()? != "confirmed"
             || signal.payload.get("trade_eligible").and_then(Json::as_bool) != Some(true)
         {
@@ -140,7 +144,8 @@ impl HybridEntry {
     }
 
     fn tactical_intent(&self, signal: &Signal, symbol: &Symbol) -> Option<OrderIntent> {
-        if signal.source != "TacticalPullback"
+        if !self.tactical_enabled
+            || signal.source != "TacticalPullback"
             || signal.payload.get("stage")?.as_str()? != "confirmed"
             || signal.payload.get("trade_eligible").and_then(Json::as_bool) != Some(true)
         {
@@ -188,9 +193,14 @@ impl TriggerPlugin for HybridEntry {
         let trend = signals
             .iter()
             .find_map(|signal| self.trend_intent(signal, symbol));
-        let mr = signals
-            .iter()
-            .find_map(|signal| self.mr.intent(signal, symbol));
+        let mr = self
+            .mr_enabled
+            .then(|| {
+                signals
+                    .iter()
+                    .find_map(|signal| self.mr.intent(signal, symbol))
+            })
+            .flatten();
         let tactical = signals
             .iter()
             .find_map(|signal| self.tactical_intent(signal, symbol));
@@ -224,6 +234,9 @@ pub fn build_hybrid(p: &Json) -> Result<Box<dyn TriggerPlugin>, PluginBuildError
             max_stop_pct: f("mr_max_structural_stop_pct", 0.0025).clamp(0.001, 0.05),
             market_entry: b("mr_market_entry", false),
         },
+        mr_enabled: b("mr_enabled", true),
+        trend_enabled: b("trend_enabled", true),
+        tactical_enabled: b("tactical_enabled", true),
         trend_risk_scale: f("trend_risk_scale", 1.0).clamp(0.0, 1.0),
         trend_stop_pct: f("trend_stop_pct", 0.0025).clamp(0.001, 0.02),
         tactical_risk_scale: f("tactical_risk_scale", 1.0).clamp(0.0, 1.0),
@@ -301,6 +314,28 @@ mod tests {
             .on_signals(&[tactical], &Ctx::default(), &symbol)
             .unwrap();
         assert_eq!(intent.side, Side::Buy);
+        assert_eq!(intent.reason, "trend_pullback_tactical");
+    }
+
+    #[test]
+    fn disabled_mr_is_observation_only_and_does_not_block_tactical() {
+        let mut trigger = build_hybrid(&json!({
+            "mr_enabled": false,
+            "mr_max_structural_stop_pct": 0.02
+        }))
+        .unwrap();
+        let symbol = Symbol::new("BTCUSDT");
+        let tactical = Signal::new(
+            SignalKind::Other,
+            Timestamp::from_millis(3),
+            "TacticalPullback",
+            json!({"stage":"confirmed","trade_eligible":true,"side":"buy","price":100.0}),
+        );
+        let mut mr = signal(true);
+        mr.payload["side"] = json!("sell");
+        let intent = trigger
+            .on_signals(&[mr, tactical], &Ctx::default(), &symbol)
+            .unwrap();
         assert_eq!(intent.reason, "trend_pullback_tactical");
     }
 }

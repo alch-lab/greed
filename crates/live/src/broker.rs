@@ -18,7 +18,7 @@ use backtest::{Broker, Execution, FeeModel, Order, OrderKind};
 use tcore::types::{Price, Qty, Side, Timestamp};
 use tracing::{info, warn};
 
-use crate::rest::{RestClient, RestError, SymbolFilters};
+use crate::rest::{PositionRisk, RestClient, RestError, SymbolFilters};
 
 /// 登记表：orderId → 下单上下文（成交回报映射原因用）。
 #[derive(Debug, Clone)]
@@ -331,6 +331,70 @@ impl AnyBroker {
             AnyBroker::Dry(_) => true,
             AnyBroker::Testnet(b) => b.execution_healthy,
         }
+    }
+
+    /// 交易所实时仓位。Dry 模式没有外部仓位，返回 None。
+    pub async fn exchange_position_risk(&self) -> Result<Option<PositionRisk>, RestError> {
+        match self {
+            AnyBroker::Dry(_) => Ok(None),
+            AnyBroker::Testnet(b) => b.rest.position_risk(&b.symbol).await.map(Some),
+        }
+    }
+
+    /// 当 positionRisk 已经为空、但本地仍有仓位时，从最近真实 userTrades 中恢复
+    /// 最后发生的反向成交。Algo 止损触发后的 child orderId 可能无法与本地 algoId
+    /// 映射，这条恢复路径保证真实成交不会被永久丢弃。
+    pub async fn recover_recent_close_fills(
+        &self,
+        position_side: Side,
+        remaining_qty: f64,
+        since_ms: i64,
+    ) -> Result<Vec<Execution>, RestError> {
+        let AnyBroker::Testnet(b) = self else {
+            return Ok(Vec::new());
+        };
+        let expected_side = position_side.opposite();
+        let mut trades = b.rest.user_trades(&b.symbol, 0).await?;
+        trades.retain(|trade| {
+            trade.time >= since_ms
+                && matches!(
+                    (expected_side, trade.side.as_str()),
+                    (Side::Buy, "BUY") | (Side::Sell, "SELL")
+                )
+        });
+        // 从最新成交向前覆盖当前本地剩余数量，可避开已经记账的早期部分止盈。
+        trades.sort_by_key(|trade| std::cmp::Reverse(trade.time));
+        let mut needed = remaining_qty.max(0.0);
+        let mut recovered = Vec::new();
+        for trade in trades {
+            if needed <= 1e-9 {
+                break;
+            }
+            let (price, raw_qty, raw_fee) = match (
+                trade.price.parse::<f64>(),
+                trade.qty.parse::<f64>(),
+                trade.commission.parse::<f64>(),
+            ) {
+                (Ok(price), Ok(qty), Ok(fee)) if price > 0.0 && qty > 0.0 => (price, qty, fee),
+                _ => continue,
+            };
+            let qty = raw_qty.min(needed);
+            let fee = raw_fee * (qty / raw_qty);
+            needed -= qty;
+            recovered.push(Execution {
+                order_id: Some(trade.order_id),
+                trade_id: Some(trade.trade_id),
+                ts: Timestamp::from_millis(trade.time),
+                side: expected_side,
+                price: Price::from_f64(price),
+                qty: Qty::from_f64(qty),
+                fee,
+                is_maker: trade.maker,
+                reason: "exchange_flat_reconcile".into(),
+            });
+        }
+        recovered.sort_by_key(|execution| execution.ts);
+        Ok(recovered)
     }
 
     /// 撤销全部挂单。

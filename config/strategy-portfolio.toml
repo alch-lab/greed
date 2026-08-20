@@ -8,7 +8,9 @@ mr_strategy = "config/strategy-final.toml"
 altcoin_strategy = "config/strategy-altcoin-impulse.toml"
 mr_capital_usdt = 1000.0
 altcoin_capital_usdt = 1000.0
-mr_risk_pct = 0.0025
-mr_max_risk_pct = 0.005
-mr_leverage = 3
-
+# BTC 使用 0.25% 初始保护距离：1.25% 风险预算对应约 5x 权益名义仓位。
+# 在约 1% 的顺势行情里，$1,000 sleeve 的毛利润目标约为 $50；
+# 完整初始止损约 $12.50，另加成交费用与滑点。
+mr_risk_pct = 0.0125
+mr_max_risk_pct = 0.0125
+mr_leverage = 5
