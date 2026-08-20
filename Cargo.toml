@@ -69,7 +69,8 @@ proptest = "1"
 [profile.release]
 opt-level = 3
 # The service is dominated by exchange/network I/O. Cross-crate LTO and a
-# single codegen unit add substantial deployment build time for negligible
-# operational benefit, so keep release optimization while compiling in parallel.
+# LTO adds substantial deployment build time for negligible operational benefit.
+# Keep one codegen unit because production hosts are memory constrained; higher
+# values can make rustc's LLVM workers exceed the server memory limit.
 lto = false
-codegen-units = 16
+codegen-units = 1
