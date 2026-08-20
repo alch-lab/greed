@@ -111,7 +111,8 @@ def build_series(data: dict, names: int, slip_bps: float) -> list[tuple[int, flo
     return output
 
 
-def evaluate(series, start: int, end: int, gross: float, dynamic=False):
+def evaluate(series, start: int, end: int, gross: float, dynamic=False,
+             dynamic_tiers=(0.05, 0.40, 0.50)):
     equity = peak = 1000.0
     drawdown = 0.0
     baskets = legs = wins = 0
@@ -126,7 +127,8 @@ def evaluate(series, start: int, end: int, gross: float, dynamic=False):
         losses = sum(max(-value, 0) for value in past)
         profit_factor = gains / losses if losses else 99.0
         gate = len(past) == 30 and sum(past) > 0 and profit_factor >= 1.30
-        active_gross = (0.5 if excess >= 0.12 else 0.4) if gate else 0.05
+        base_gross, active_gross, strong_gross = dynamic_tiers
+        active_gross = (strong_gross if excess >= 0.12 else active_gross) if gate else base_gross
         history.append(basket_return)
         if not start <= signal_ts < end:
             continue
@@ -182,6 +184,27 @@ def main():
             "fixed_per_name_gross_0.5x": {period: evaluate(series, *bounds, 0.5 * names) for period, bounds in periods.items()},
             "production_dynamic_gross": {period: evaluate(series, *bounds, 0.5, dynamic=True) for period, bounds in periods.items()},
         }
+        if names == 5:
+            report["five_name_sizing_grid"] = {
+                label: {period: evaluate(series, *bounds, 0.5, dynamic=True, dynamic_tiers=tiers)
+                        for period, bounds in periods.items()}
+                for label, tiers in {
+                    "production_0.05_0.40_0.50": (0.05, 0.40, 0.50),
+                    "conservative_0.25_0.50_0.75": (0.25, 0.50, 0.75),
+                    "base_0.15_active_0.75_strong_1.00": (0.15, 0.75, 1.00),
+                    "base_0.15_active_1.00_strong_1.50": (0.15, 1.00, 1.50),
+                    "base_0.20_active_0.75_strong_1.00": (0.20, 0.75, 1.00),
+                    "base_0.20_active_1.00_strong_1.50": (0.20, 1.00, 1.50),
+                    "base_0.25_active_0.75_strong_1.00": (0.25, 0.75, 1.00),
+                    "base_0.25_active_1.00_strong_1.50": (0.25, 1.00, 1.50),
+                    "base_0.30_active_0.75_strong_1.00": (0.30, 0.75, 1.00),
+                    "balanced_0.50_1.00_1.50": (0.50, 1.00, 1.50),
+                    "aggressive_0.75_1.25_2.00": (0.75, 1.25, 2.00),
+                    "always_0.50": (0.50, 0.50, 0.50),
+                    "always_1.00": (1.00, 1.00, 1.00),
+                    "always_1.50": (1.50, 1.50, 1.50),
+                }.items()
+            }
     with open(args.output, "w") as handle:
         json.dump(report, handle, ensure_ascii=False, indent=2)
     print(json.dumps(report, ensure_ascii=False))

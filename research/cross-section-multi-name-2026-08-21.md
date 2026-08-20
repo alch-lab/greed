@@ -65,3 +65,21 @@ allocate `basket_gross / names`, keep per-leg carry/replacement state, and log
 both basket and leg attribution.
 
 Reproducer: `scripts/exp_cross_section_multi_name.py`.
+
+## Position-sizing follow-up
+
+The five-name signal was replayed again with the ranking, fills, fees, stops and
+daily loss guard held constant while only the three gross-notional tiers were
+changed. On the full 2026-05-15 through 2026-08-20 sample, the selected
+`0.15x / 1.00x / 1.50x` tiers returned +66.70% with 32.93% maximum drawdown,
+versus +18.37% and 13.17% for production's former
+`0.05x / 0.40x / 0.50x` tiers. On the separately cached 2026-08-10 through
+2026-08-21 window it returned +42.96% with 6.53% maximum drawdown, versus
++12.92% and 2.43%.
+
+The experiment rejected an always-large base position: fixed 1.00x and 1.50x
+gross lost 27.03% and 39.52% over the full sample, with 65.21% and 78.24%
+maximum drawdown. The weak-signal base therefore remains deliberately smaller;
+the larger 1.00x and 1.50x tiers are unlocked only by the causal rolling
+30-basket profit-factor gate. At $1,000 sleeve equity and five equal legs, the
+three tiers target approximately $30, $200 and $300 per leg.

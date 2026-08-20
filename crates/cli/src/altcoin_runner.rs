@@ -467,16 +467,16 @@ fn default_cross_assumed_cost_bps() -> f64 {
     10.0
 }
 fn default_cross_base_gross() -> f64 {
-    0.05
+    0.15
 }
 fn default_cross_active_gross() -> f64 {
-    0.4
+    1.0
 }
 fn default_cross_strong_excess_return() -> f64 {
     0.12
 }
 fn default_cross_strong_gross() -> f64 {
-    0.5
+    1.5
 }
 fn default_cross_stop_pct() -> f64 {
     0.04
@@ -4252,13 +4252,14 @@ pub async fn run_altcoin_impulse(
             || ((0.05..=0.25).contains(&cross_cfg.base_gross_multiple)
                 && cross_cfg.active_gross_multiple >= cross_cfg.base_gross_multiple
                 && cross_cfg.strong_gross_multiple >= cross_cfg.active_gross_multiple
-                && cross_cfg.strong_gross_multiple <= 0.5
+                && cross_cfg.active_gross_multiple <= 1.0
+                && cross_cfg.strong_gross_multiple <= 1.5
                 && (0.08..=0.20).contains(&cross_cfg.strong_excess_return)
                 && (0.02..=0.08).contains(&cross_cfg.stop_pct)
                 && (0.01..=0.10).contains(&cross_cfg.trail_activation_pct)
                 && (0.003..cross_cfg.trail_activation_pct).contains(&cross_cfg.trail_pct)
                 && (0.25..=0.75).contains(&cross_cfg.partial_take_profit_fraction)),
-        "横截面动量仓位要求基础 0.05x..=0.25x、增强与强信号仓位递增且不超过 0.5x、超额动量 8%..=20%、止损 2%..=8%，且止盈/跟踪参数有效"
+        "横截面动量仓位要求基础 0.05x..=0.25x、增强仓位不超过 1.0x、强信号仓位不超过 1.5x、超额动量 8%..=20%、止损 2%..=8%，且止盈/跟踪参数有效"
     );
     anyhow::ensure!(
         (0.0..=0.50).contains(&cfg.first_week_loss_limit)
@@ -8387,10 +8388,10 @@ mod tests {
             strategy.altcoin_cross_section.market_momentum_threshold,
             0.01
         );
-        assert_eq!(strategy.altcoin_cross_section.base_gross_multiple, 0.05);
-        assert_eq!(strategy.altcoin_cross_section.active_gross_multiple, 0.40);
+        assert_eq!(strategy.altcoin_cross_section.base_gross_multiple, 0.15);
+        assert_eq!(strategy.altcoin_cross_section.active_gross_multiple, 1.00);
         assert_eq!(strategy.altcoin_cross_section.strong_excess_return, 0.12);
-        assert_eq!(strategy.altcoin_cross_section.strong_gross_multiple, 0.50);
+        assert_eq!(strategy.altcoin_cross_section.strong_gross_multiple, 1.50);
         assert_eq!(
             strategy.altcoin_cross_section.assumed_cost_bps_per_side,
             10.0
