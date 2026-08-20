@@ -4211,16 +4211,7 @@ pub async fn run_altcoin_impulse(
     let cross_cfg = strategy_file.altcoin_cross_section;
     let shock_cfg = strategy_file.altcoin_shock_reversal;
     let strategy_hash = format!("{:x}", Sha256::digest(strategy_text.as_bytes()));
-    let git_commit = std::env::var("GREED_GIT_COMMIT").unwrap_or_else(|_| {
-        std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .ok()
-            .filter(|output| output.status.success())
-            .map(|output| String::from_utf8_lossy(&output.stdout).trim().to_owned())
-            .filter(|value| !value.is_empty())
-            .unwrap_or_else(|| "unknown".into())
-    });
+    let git_commit = crate::BUILD_GIT_COMMIT.to_owned();
     anyhow::ensure!(cfg.enabled, "altcoin_impulse.enabled=false");
     anyhow::ensure!(
         !shock_cfg.enabled

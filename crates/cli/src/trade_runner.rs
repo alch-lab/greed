@@ -223,16 +223,7 @@ pub async fn run_trade(
         .and_then(toml::Value::as_float)
         .unwrap_or(0.005)
         .max(1e-6);
-    let git_commit = std::env::var("GREED_GIT_COMMIT").unwrap_or_else(|_| {
-        std::process::Command::new("git")
-            .args(["rev-parse", "HEAD"])
-            .output()
-            .ok()
-            .filter(|x| x.status.success())
-            .map(|x| String::from_utf8_lossy(&x.stdout).trim().to_string())
-            .filter(|x| !x.is_empty())
-            .unwrap_or_else(|| "unknown".into())
-    });
+    let git_commit = crate::BUILD_GIT_COMMIT.to_owned();
     let eval_dir = format!("data/evals/{}", mode.as_str());
     let research_dir = format!("data/research/{}", mode.as_str());
     let cfg = live::LiveConfig {

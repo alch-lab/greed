@@ -11,6 +11,8 @@ mod portfolio_runner;
 mod serve;
 mod trade_runner;
 
+pub(crate) const BUILD_GIT_COMMIT: &str = env!("GREED_BUILD_GIT_COMMIT");
+
 use anyhow::{Context, Result};
 use backtest::{
     build_report, pair_round_trips, to_json, to_markdown, BacktestConfig, BacktestEngine, Journal,
