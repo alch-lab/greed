@@ -4,7 +4,10 @@
 # 把 greed.example.com 换成你的域名。
 
 greed.example.com {
-	encode zstd gzip
+	# gzip is deliberately preferred over zstd here. Some embedded browsers and
+	# older WebViews advertise zstd but fail to decode ES modules, leaving the UI
+	# completely blank. gzip keeps the dashboard compatible with those clients.
+	encode gzip
 
 	# API → 控制面（只监听本机 127.0.0.1:8088，不直接暴露）
 	handle /api/* {
@@ -13,7 +16,7 @@ greed.example.com {
 
 	# 前端静态文件（greed-web 构建产物）+ SPA 路由回退
 	handle {
-		root * /opt/greed/web/dist
+		root * /opt/greed-web/dist
 		try_files {path} /index.html
 		file_server
 	}
