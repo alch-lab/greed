@@ -11,6 +11,7 @@ use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
 use std::collections::HashSet;
+use std::sync::atomic::{AtomicI64, Ordering};
 use thiserror::Error;
 
 type HmacSha256 = Hmac<Sha256>;
@@ -359,7 +360,7 @@ pub struct RestClient {
     api_key: String,
     api_secret: String,
     /// server_time - local_time（毫秒），签名时间戳用
-    time_offset_ms: i64,
+    time_offset_ms: AtomicI64,
 }
 
 impl RestClient {
@@ -369,7 +370,7 @@ impl RestClient {
             base: base.trim_end_matches('/').to_string(),
             api_key,
             api_secret,
-            time_offset_ms: 0,
+            time_offset_ms: AtomicI64::new(0),
         }
     }
 
@@ -378,7 +379,7 @@ impl RestClient {
     }
 
     fn ts(&self) -> i64 {
-        Self::now_ms() + self.time_offset_ms
+        Self::now_ms() + self.time_offset_ms.load(Ordering::Relaxed)
     }
 
     /// HMAC-SHA256 签名（hex）。
@@ -397,20 +398,36 @@ impl RestClient {
     }
 
     /// 与服务器对时（漂移 >1s 时签名会被拒）。
-    pub async fn sync_time(&mut self) -> Result<(), RestError> {
+    pub async fn sync_time(&self) -> Result<(), RestError> {
         let v = self
             .get_json(&format!("{}/fapi/v1/time", self.base))
             .await?;
         let server = v["serverTime"]
             .as_i64()
             .ok_or_else(|| RestError::Data("serverTime 缺失".into()))?;
-        self.time_offset_ms = server - Self::now_ms();
-        tracing::info!(offset_ms = self.time_offset_ms, "币安服务器对时完成");
+        let offset = server - Self::now_ms();
+        self.time_offset_ms.store(offset, Ordering::Relaxed);
+        tracing::info!(offset_ms = offset, "币安服务器对时完成");
         Ok(())
     }
 
     /// 签名请求统一入口。params 不含 timestamp/signature。
     async fn signed(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        params: &[(&str, String)],
+    ) -> Result<serde_json::Value, RestError> {
+        let first = self.signed_once(method.clone(), path, params).await;
+        if matches!(first, Err(RestError::Binance { code: -1021, .. })) {
+            tracing::warn!(path, "签名时间戳失效，重新对时后重试一次");
+            self.sync_time().await?;
+            return self.signed_once(method, path, params).await;
+        }
+        first
+    }
+
+    async fn signed_once(
         &self,
         method: reqwest::Method,
         path: &str,

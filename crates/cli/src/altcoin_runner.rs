@@ -2189,21 +2189,50 @@ async fn enrich_candidate(http: reqwest::Client, mut candidate: Candidate) -> Ca
 
 pub(crate) async fn get_json(http: &reqwest::Client, url: &str) -> Result<Value> {
     let mut last_error = None;
-    for attempt in 0..3 {
+    let candidates = public_url_candidates(url);
+    for (attempt, candidate_url) in candidates.iter().enumerate() {
         let request = async {
-            let response = http.get(url).send().await?.error_for_status()?;
+            let response = http.get(candidate_url).send().await?.error_for_status()?;
             let text = response.text().await?;
             Ok::<Value, anyhow::Error>(serde_json::from_str(&text)?)
         };
-        match tokio::time::timeout(Duration::from_secs(12), request).await {
+        match tokio::time::timeout(Duration::from_secs(4), request).await {
             Ok(Ok(value)) => return Ok(value),
             Ok(Err(error)) => last_error = Some(error),
-            Err(_) => last_error = Some(anyhow::anyhow!("公共行情请求 12 秒超时")),
+            Err(_) => last_error = Some(anyhow::anyhow!("公共行情端点 4 秒超时")),
         }
-        tokio::time::sleep(Duration::from_millis(500 * (attempt + 1))).await;
+        if attempt + 1 < candidates.len() {
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        }
     }
     Err(last_error.unwrap_or_else(|| anyhow::anyhow!("公共行情请求失败")))
         .with_context(|| url.to_owned())
+}
+
+fn public_url_candidates(url: &str) -> Vec<String> {
+    if url.starts_with(FUTURES_BASE) {
+        // 部分云厂商到 fapi.binance.com 会间歇性黑洞。优先切换 Binance
+        // 官方同源入口；组合目前只开放模拟盘，最后以执行测试网公共行情兜底。
+        return [
+            FUTURES_BASE,
+            "https://fapi1.binance.com",
+            "https://testnet.binancefuture.com",
+        ]
+        .into_iter()
+        .map(|base| url.replacen(FUTURES_BASE, base, 1))
+        .collect();
+    }
+    if url.starts_with(SPOT_BASE) {
+        return [
+            SPOT_BASE,
+            "https://api1.binance.com",
+            "https://api2.binance.com",
+        ]
+        .into_iter()
+        .map(|base| url.replacen(SPOT_BASE, base, 1))
+        .collect();
+    }
+    vec![url.to_owned()]
 }
 
 async fn fetch_bars(
@@ -4577,7 +4606,7 @@ pub async fn run_altcoin_impulse(
     // market. Paper orders still go to Futures Demo below, but Demo/Testnet's
     // sparse synthetic order book must never decide whether a mainnet signal
     // is tradable.
-    let mut market_rest =
+    let market_rest =
         live::RestClient::new(http.clone(), FUTURES_BASE, String::new(), String::new());
     // Public market-data time sync improves trade-age measurements, but a
     // transient mainnet 5xx must not prevent the paper engine from starting.
@@ -4592,7 +4621,7 @@ pub async fn run_altcoin_impulse(
             (Some(key), Some(secret)) => (key, secret),
             _ => anyhow::bail!("缺少 Binance Futures API 凭证"),
         };
-        let mut client = live::RestClient::new(http.clone(), account.rest_base(), key, secret);
+        let client = live::RestClient::new(http.clone(), account.rest_base(), key, secret);
         client.sync_time().await?;
         Some(client)
     };
@@ -4985,9 +5014,7 @@ pub async fn run_altcoin_impulse(
                 }
             }
             warmup_completed += 1;
-            if (cross_analysis_due || shock_analysis_due)
-                && (warmup_completed.is_multiple_of(10) || warmup_completed == shortlist_count)
-            {
+            if cross_analysis_due || shock_analysis_due {
                 if let Some(tx) = &status_tx {
                     let _ = tx.send(json!({
                         "state":"running", "component":"altcoin", "mode":mode.as_str(),
@@ -7503,6 +7530,18 @@ mod tests {
         update_microstructure_trials, Bar, Candidate, IntrabarPendingDecision, PendingDecision,
         PersistedState, Position, PulseExhaustionSetup,
     };
+
+    #[test]
+    fn public_market_requests_rotate_away_from_a_stalled_primary_domain() {
+        let futures =
+            super::public_url_candidates("https://fapi.binance.com/fapi/v1/klines?symbol=BTCUSDT");
+        assert_eq!(futures.len(), 3);
+        assert!(futures[1].starts_with("https://fapi1.binance.com/"));
+        assert!(futures[2].starts_with("https://testnet.binancefuture.com/"));
+
+        let unrelated = super::public_url_candidates("https://example.com/data");
+        assert_eq!(unrelated, ["https://example.com/data"]);
+    }
 
     #[test]
     fn spread_relaxes_only_for_an_exceptionally_liquid_book() {

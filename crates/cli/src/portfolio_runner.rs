@@ -343,7 +343,7 @@ async fn preflight_account(
         _ => anyhow::bail!("缺少 Binance Futures API 凭证"),
     };
     let http = data::live::build_http_client(collector.effective_proxy().as_deref());
-    let mut client = live::RestClient::new(http, account.rest_base(), key, secret);
+    let client = live::RestClient::new(http, account.rest_base(), key, secret);
     client.sync_time().await?;
     let wallet = client.wallet_balance_usdt().await?;
     let required = cfg.mr_capital_usdt + cfg.altcoin_capital_usdt;

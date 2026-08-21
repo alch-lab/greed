@@ -134,7 +134,7 @@ pub async fn run_trade(
                 account.api_secret_env
             ),
         };
-            let mut rest = live::RestClient::new(http.clone(), account.rest_base(), key, secret);
+            let rest = live::RestClient::new(http.clone(), account.rest_base(), key, secret);
             rest.sync_time().await?;
 
             let external: Vec<_> = rest
