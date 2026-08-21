@@ -265,6 +265,14 @@ fn aggregate_status(
         .filter(|component| component["state"] == "restarting")
         .filter_map(|component| component["retry_in_s"].as_u64())
         .min();
+    let btc_completed = mr["performance"]["completed_trades"].as_u64().unwrap_or(0);
+    let btc_wins = mr["performance"]["wins"].as_u64().unwrap_or(0);
+    let alt_completed = altcoin["altcoin_impulse"]["total_exits"]
+        .as_u64()
+        .unwrap_or(0);
+    let alt_wins = altcoin["altcoin_impulse"]["wins"].as_u64().unwrap_or(0);
+    let completed_trades = btc_completed + alt_completed;
+    let wins = btc_wins + alt_wins;
     json!({
         "state":state,
         "mode":mode.as_str(),
@@ -287,6 +295,19 @@ fn aggregate_status(
             "combined_pnl":mr_equity+altcoin_equity-cfg.mr_capital_usdt-cfg.altcoin_capital_usdt,
             "mr_capital_usdt":cfg.mr_capital_usdt,
             "altcoin_capital_usdt":cfg.altcoin_capital_usdt,
+            "performance":{
+                "completed_trades":completed_trades,
+                "wins":wins,
+                "win_rate":if completed_trades > 0 {
+                    Value::from(wins as f64 / completed_trades as f64)
+                } else {
+                    Value::Null
+                },
+                "btc_completed_trades":btc_completed,
+                "btc_wins":btc_wins,
+                "altcoin_completed_trades":alt_completed,
+                "altcoin_wins":alt_wins
+            },
             "mr":mr,
             "altcoin":altcoin,
             "component_states":{"mr":mr_state,"altcoin":altcoin_state},
@@ -490,10 +511,14 @@ mod tests {
     #[test]
     fn aggregate_keeps_sleeve_equity_separate() {
         let cfg = deployed_config();
-        let mr =
-            json!({"state":"running","equity":1_025.0,"cash":1_020.0,"execution_healthy":true});
-        let altcoin =
-            json!({"state":"running","equity":980.0,"cash":975.0,"execution_healthy":true});
+        let mr = json!({
+            "state":"running","equity":1_025.0,"cash":1_020.0,"execution_healthy":true,
+            "performance":{"completed_trades":3,"wins":2}
+        });
+        let altcoin = json!({
+            "state":"running","equity":980.0,"cash":975.0,"execution_healthy":true,
+            "altcoin_impulse":{"total_exits":7,"wins":4}
+        });
         let status = aggregate_status(
             TradeMode::Paper,
             "config/strategy-portfolio.toml",
@@ -507,6 +532,9 @@ mod tests {
         assert_eq!(status["portfolio"]["combined_pnl"], 5.0);
         assert_eq!(status["portfolio"]["mr"]["equity"], 1_025.0);
         assert_eq!(status["portfolio"]["altcoin"]["equity"], 980.0);
+        assert_eq!(status["portfolio"]["performance"]["completed_trades"], 10);
+        assert_eq!(status["portfolio"]["performance"]["wins"], 6);
+        assert_eq!(status["portfolio"]["performance"]["win_rate"], 0.6);
     }
 
     #[test]

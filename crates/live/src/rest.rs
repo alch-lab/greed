@@ -865,6 +865,9 @@ impl RestClient {
     ///
     /// - `kind`："MARKET" / "LIMIT" / "STOP_MARKET"
     /// - LIMIT 需 `price`；STOP_MARKET 需 `stop_price`；止损平仓用 `reduce_only`。
+    // 参数与 Binance new-order 协议逐项对应；保留显式字段可避免调用处
+    // 在 MARKET/LIMIT/STOP 三类订单之间构造不完整的通用 map。
+    #[allow(clippy::too_many_arguments)]
     pub async fn place_order(
         &self,
         symbol: &str,

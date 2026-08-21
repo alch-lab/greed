@@ -94,7 +94,9 @@ fn execution_channel_healthy(since_success: Duration) -> bool {
 /// 经纪层统一入口（枚举分发，避免 async trait 对象安全问题）。
 pub enum AnyBroker {
     Dry(DryBroker),
-    Testnet(TestnetBroker),
+    // REST 客户端及交易所状态明显大于本地撮合器，使用间接存储避免每个
+    // AnyBroker 都按最大 variant 分配栈空间。
+    Testnet(Box<TestnetBroker>),
 }
 
 impl AnyBroker {
@@ -105,7 +107,7 @@ impl AnyBroker {
     }
 
     pub fn testnet(rest: RestClient, symbol: &str, filters: SymbolFilters) -> Self {
-        AnyBroker::Testnet(TestnetBroker {
+        AnyBroker::Testnet(Box::new(TestnetBroker {
             rest,
             symbol: symbol.to_string(),
             filters,
@@ -115,7 +117,7 @@ impl AnyBroker {
             execution_healthy: true,
             consecutive_poll_failures: 0,
             last_poll_success: Instant::now(),
-        })
+        }))
     }
 
     /// 把成交游标定位到启动时账户的最新成交。
@@ -161,7 +163,7 @@ impl AnyBroker {
                 let reduce_only = reduce_only
                     || matches!(
                         order.reason.as_str(),
-                        "close_all" | "tp_partial" | "reverse_out"
+                        "close_all" | "tp_partial" | "trend_tight_tranche" | "reverse_out"
                     );
                 let order_id = b
                     .rest

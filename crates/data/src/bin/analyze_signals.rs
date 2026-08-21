@@ -64,10 +64,12 @@ fn main() {
 
     for i in window..sec_data.len().saturating_sub(60) {
         let (_, _, px_last_i, _, _) = sec_data[i];
-        let mut delta = 0.0_f64;
-        for j in (i - window)..i {
-            delta += sec_data[j].3 - sec_data[j].4;
-        }
+        let delta = sec_data
+            .iter()
+            .take(i)
+            .skip(i - window)
+            .map(|row| row.3 - row.4)
+            .sum::<f64>();
         let future_px = sec_data[i + 60].2;
         let ret = future_px / px_last_i - 1.0;
         let threshold = 1_000_000.0;
@@ -182,9 +184,9 @@ fn main() {
         hour_ret[hour].0 += ret;
         hour_ret[hour].1 += 1;
     }
-    for h in 0..24 {
-        if hour_ret[h].1 > 0 {
-            let avg = hour_ret[h].0 / hour_ret[h].1 as f64;
+    for (h, (sum, count)) in hour_ret.iter().copied().enumerate() {
+        if count > 0 {
+            let avg = sum / count as f64;
             let session = if h < 7 {
                 "asia"
             } else if h < 13 {
@@ -197,7 +199,7 @@ fn main() {
                 h,
                 session,
                 pct(avg),
-                hour_ret[h].1
+                count
             );
         }
     }
@@ -212,9 +214,9 @@ fn main() {
     for i in 60..sec_data.len().saturating_sub(60) {
         let mut px_min = f64::MAX;
         let mut px_max = 0.0_f64;
-        for j in (i - 60)..i {
-            px_min = px_min.min(sec_data[j].1);
-            px_max = px_max.max(sec_data[j].2);
+        for row in sec_data.iter().take(i).skip(i - 60) {
+            px_min = px_min.min(row.1);
+            px_max = px_max.max(row.2);
         }
         let range = (px_max - px_min) / sec_data[i].2;
         let ret = (sec_data[i + 60].2 - sec_data[i].2).abs() / sec_data[i].2;

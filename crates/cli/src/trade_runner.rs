@@ -110,23 +110,23 @@ pub async fn run_trade(
     let http = data::live::build_http_client(collector.effective_proxy().as_deref());
 
     // 经纪层：dry（模拟撮合）或 testnet/主网（真实下单）
-    let (mut broker, initial_cash, qty_step, min_notional, exchange_position_amt) = if mode
-        == TradeMode::Dry
-    {
-        info!(
-            cash = args.cash,
-            ws = %ws_base,
-            "dry-run：模拟撮合，不下真实订单"
-        );
-        (
-            live::AnyBroker::dry(FeeModel::default()),
-            args.cash,
-            1e-8,
-            0.0,
-            0.0,
-        )
-    } else {
-        let (key, secret) = match (account.api_key(), account.api_secret()) {
+    let (mut broker, initial_cash, qty_step, market_qty_step, min_notional, exchange_position_amt) =
+        if mode == TradeMode::Dry {
+            info!(
+                cash = args.cash,
+                ws = %ws_base,
+                "dry-run：模拟撮合，不下真实订单"
+            );
+            (
+                live::AnyBroker::dry(FeeModel::default()),
+                args.cash,
+                1e-8,
+                1e-8,
+                0.0,
+                0.0,
+            )
+        } else {
+            let (key, secret) = match (account.api_key(), account.api_secret()) {
             (Some(k), Some(s)) => (k, s),
             _ => anyhow::bail!(
                 "缺少 API 凭证：请 export {} 与 {}（Demo Trading 创建：https://demo.binance.com → API 管理）",
@@ -134,76 +134,77 @@ pub async fn run_trade(
                 account.api_secret_env
             ),
         };
-        let mut rest = live::RestClient::new(http.clone(), account.rest_base(), key, secret);
-        rest.sync_time().await?;
+            let mut rest = live::RestClient::new(http.clone(), account.rest_base(), key, secret);
+            rest.sync_time().await?;
 
-        let external: Vec<_> = rest
-            .open_position_amounts()
-            .await?
-            .into_iter()
-            .filter(|(symbol, _)| symbol != &collector.symbol)
-            .collect();
-        anyhow::ensure!(
-            args.portfolio_mode || external.is_empty(),
-            "账户存在其他策略/手工持仓 {:?}；单账户模式拒绝同时启动 BTC 执行器",
-            external
-        );
-
-        let amt = rest.position_amt(&collector.symbol).await?;
-        // 空仓才可在恢复检查前清遗留单。有仓时先保留交易所保护性止损；若后续确认
-        // journal 与仓位一致，首个行情节拍会安全撤旧并重挂。若不一致则原止损不受影响。
-        let resuming_position = amt.abs() > 1e-12;
-        if !resuming_position {
-            rest.cancel_all_open_orders(&collector.symbol).await?;
-        } else {
-            info!(
-                position_amt = amt,
-                "检测到交易所持仓，恢复校验前保留现有保护单"
+            let external: Vec<_> = rest
+                .open_position_amounts()
+                .await?
+                .into_iter()
+                .filter(|(symbol, _)| symbol != &collector.symbol)
+                .collect();
+            anyhow::ensure!(
+                args.portfolio_mode || external.is_empty(),
+                "账户存在其他策略/手工持仓 {:?}；单账户模式拒绝同时启动 BTC 执行器",
+                external
             );
-        }
-        rest.set_leverage(&collector.symbol, args.leverage).await?;
-        // Binance rejects margin/position-mode changes while a protective
-        // order exists (-4067/-4047). A resumed position was opened by this
-        // runner after isolated mode had already been configured, so preserve
-        // both its mode and live stop. Empty accounts are still normalized
-        // before the next entry.
-        if !resuming_position {
-            rest.set_margin_isolated(&collector.symbol).await?;
-        } else {
-            info!(
-                position_amt = amt,
-                "恢复持仓：跳过逐仓模式切换，避免保护单触发 Binance -4067"
-            );
-        }
 
-        let filters = rest.symbol_filters(&collector.symbol).await?;
-        let wallet = rest.wallet_balance_usdt().await?;
-        let sleeve_cash = if args.cash.is_finite() && args.cash > 0.0 {
-            wallet.min(args.cash)
-        } else {
-            wallet
+            let amt = rest.position_amt(&collector.symbol).await?;
+            // 空仓才可在恢复检查前清遗留单。有仓时先保留交易所保护性止损；若后续确认
+            // journal 与仓位一致，首个行情节拍会安全撤旧并重挂。若不一致则原止损不受影响。
+            let resuming_position = amt.abs() > 1e-12;
+            if !resuming_position {
+                rest.cancel_all_open_orders(&collector.symbol).await?;
+            } else {
+                info!(
+                    position_amt = amt,
+                    "检测到交易所持仓，恢复校验前保留现有保护单"
+                );
+            }
+            rest.set_leverage(&collector.symbol, args.leverage).await?;
+            // Binance rejects margin/position-mode changes while a protective
+            // order exists (-4067/-4047). A resumed position was opened by this
+            // runner after isolated mode had already been configured, so preserve
+            // both its mode and live stop. Empty accounts are still normalized
+            // before the next entry.
+            if !resuming_position {
+                rest.set_margin_isolated(&collector.symbol).await?;
+            } else {
+                info!(
+                    position_amt = amt,
+                    "恢复持仓：跳过逐仓模式切换，避免保护单触发 Binance -4067"
+                );
+            }
+
+            let filters = rest.symbol_filters(&collector.symbol).await?;
+            let wallet = rest.wallet_balance_usdt().await?;
+            let sleeve_cash = if args.cash.is_finite() && args.cash > 0.0 {
+                wallet.min(args.cash)
+            } else {
+                wallet
+            };
+            info!(
+                wallet,
+                sleeve_cash,
+                leverage = args.leverage,
+                tick = filters.tick_size,
+                step = filters.step_size,
+                min_notional = filters.min_notional,
+                mode = mode.as_str(),
+                "账户就绪"
+            );
+            if mode == TradeMode::Paper {
+                info!(ws = %ws_base, "行情=主网公共 WS，执行=testnet（信号价格与回测同环境）");
+            }
+            (
+                live::AnyBroker::testnet(rest, &collector.symbol, filters),
+                sleeve_cash,
+                filters.step_size,
+                filters.market_step_size,
+                filters.min_notional,
+                amt,
+            )
         };
-        info!(
-            wallet,
-            sleeve_cash,
-            leverage = args.leverage,
-            tick = filters.tick_size,
-            step = filters.step_size,
-            min_notional = filters.min_notional,
-            mode = mode.as_str(),
-            "账户就绪"
-        );
-        if mode == TradeMode::Paper {
-            info!(ws = %ws_base, "行情=主网公共 WS，执行=testnet（信号价格与回测同环境）");
-        }
-        (
-            live::AnyBroker::testnet(rest, &collector.symbol, filters),
-            sleeve_cash,
-            filters.step_size,
-            filters.min_notional,
-            amt,
-        )
-    };
     // 必须在引擎提交任何订单之前定位 userTrades 游标；否则进程重启会把账户历史成交
     // 重新当成新 fill 导入，污染本地持仓、盈亏与 Journal。
     broker.prime_fill_cursor().await?;
@@ -250,6 +251,7 @@ pub async fn run_trade(
         cb_max_daily_losses: args.cb_max_daily_losses,
         cb_daily_dd_pct: args.cb_daily_dd_pct,
         qty_step,
+        market_qty_step,
         min_notional,
         journal_path: std::path::PathBuf::from(&journal_path),
         eval_log_path: std::path::PathBuf::from(format!("{eval_dir}/{run_id}.jsonl")),

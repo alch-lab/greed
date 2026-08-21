@@ -11,7 +11,7 @@ fn main() {
     let trades = read_trade_log(Path::new(&args[1])).expect("读取失败");
 
     let mut w = csv::Writer::from_path(&args[2]).expect("创建CSV失败");
-    w.write_record(&["ts_ms", "price", "qty", "is_buyer_maker", "taker_side"])
+    w.write_record(["ts_ms", "price", "qty", "is_buyer_maker", "taker_side"])
         .unwrap();
 
     let mut count = 0;

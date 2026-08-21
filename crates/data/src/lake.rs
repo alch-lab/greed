@@ -579,6 +579,7 @@ pub fn read_book_shard(path: &Path) -> Result<Vec<BookRow>, LakeError> {
 }
 
 #[cfg(test)]
+#[allow(clippy::items_after_test_module)] // 宏观 CSV 读取器与分片 round-trip 测试同属本文件。
 mod tests {
     use super::*;
     use tcore::types::{Price, Qty};

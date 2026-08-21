@@ -3068,6 +3068,9 @@ async fn build_position_status(
     prices: &HashMap<String, f64>,
     rest: Option<&live::RestClient>,
     valuation_ms: i64,
+    cfg: &AltcoinImpulseConfig,
+    cross: &AltcoinCrossSectionConfig,
+    shock: &AltcoinShockReversalConfig,
 ) -> Vec<Value> {
     let mut open_positions: Vec<_> = state.positions.values().collect();
     open_positions.sort_by_key(|position| position.entry_ms);
@@ -3122,6 +3125,47 @@ async fn build_position_status(
             (mark_margin > 0.0).then_some(unrealized_pnl / mark_margin)
         });
         let adverse = position.adverse_extreme.unwrap_or(position.entry_price);
+        let (trail_activation_pct, trail_pct) =
+            position_exit_parameters(position, cfg, cross, shock);
+        let partial_fraction = position_partial_take_profit_fraction(position, cfg, cross);
+        let activation_price =
+            position.entry_price * (1.0 + position.side as f64 * trail_activation_pct);
+        let trailing_stop = position.extreme * (1.0 - position.side as f64 * trail_pct);
+        let (management_stage, next_trigger_price, next_action) =
+            match position.protection_reason.as_str() {
+                "trailing_take_profit" => (
+                    "trailing_take_profit",
+                    position.stop_price,
+                    "Current trailing stop closes the remaining position".to_owned(),
+                ),
+                "recovery_profit_lock" => (
+                    "recovery_profit_lock",
+                    position.stop_price,
+                    "Recovery lock is active; the current stop protects the recovered profit"
+                        .to_owned(),
+                ),
+                "partial_take_profit_break_even" => (
+                    "partial_profit_protected",
+                    position.stop_price,
+                    format!(
+                        "Partial profit is realized; the remainder trails {:.2}% behind its peak",
+                        trail_pct * 100.0
+                    ),
+                ),
+                _ if partial_fraction > 0.0 && !position.partial_take_profit_done => (
+                    "initial_protection",
+                    activation_price,
+                    format!(
+                        "At the next profit trigger, close {:.0}% and protect the remainder",
+                        partial_fraction * 100.0
+                    ),
+                ),
+                _ => (
+                    "initial_protection",
+                    activation_price,
+                    "Waiting for trailing activation; the exchange stop remains active".to_owned(),
+                ),
+            };
         result.push(json!({
             "symbol":position.symbol, "side":position.side, "qty":qty,
             "entry_ms":position.entry_ms, "entry_price":entry_price,
@@ -3147,7 +3191,20 @@ async fn build_position_status(
             "margin_roe_pct":margin_roe_pct,
             "margin_roe_approximate":true,
             "valuation_source":valuation_source,
-            "valuation_ms":valuation_ms
+            "valuation_ms":valuation_ms,
+            "management":{
+                "stage":management_stage,
+                "current_stop":position.stop_price,
+                "next_trigger_price":next_trigger_price,
+                "next_action":next_action,
+                "trail_activation_price":activation_price,
+                "trail_activation_pct":trail_activation_pct,
+                "trail_distance_pct":trail_pct,
+                "calculated_trailing_stop":trailing_stop,
+                "partial_close_fraction":partial_fraction,
+                "partial_done":position.partial_take_profit_done,
+                "protection_order_count":protection_order_ids(position).len()
+            }
         }));
     }
     result
@@ -3232,6 +3289,8 @@ fn position_excursions(position: &Position) -> (f64, f64) {
     (favorable, adverse)
 }
 
+// 将恢复锁盈的全部风控阈值保留为显式输入，便于回测与线上共用同一计算函数。
+#[allow(clippy::too_many_arguments)]
 fn recovery_profit_lock_stop(
     side: i32,
     entry_price: f64,
@@ -3355,9 +3414,35 @@ async fn place_market_reduce_only(
     let mut total_quote = 0.0;
     let mut total_fee = 0.0;
     for chunk in market_qty_chunks(qty, filters) {
-        let order = rest
+        let order = match rest
             .place_order(symbol, side, "MARKET", chunk, None, None, true, filters)
-            .await?;
+            .await
+        {
+            Ok(order) => order,
+            // Demo Futures 偶尔用 PERCENT_PRICE 拒绝 reduce-only MARKET（-4131）。
+            // 改用交易所当前 mark 附近、且被过滤器限制住的可成交 IOC，避免已触发
+            // 的止盈止损因为测试网价格保护而留仓。
+            Err(live::rest::RestError::Binance { code: -4131, .. }) => {
+                let mark = rest.mark_price(symbol).await?;
+                let guard = if side == "SELL" {
+                    mark * filters.multiplier_down * 1.001
+                } else {
+                    mark * filters.multiplier_up * 0.999
+                };
+                rest.place_order(
+                    symbol,
+                    side,
+                    "LIMIT_IOC",
+                    chunk,
+                    Some(guard),
+                    None,
+                    true,
+                    filters,
+                )
+                .await?
+            }
+            Err(error) => return Err(error.into()),
+        };
         let (price, filled_qty, fee) = wait_fill(rest, symbol, order).await?;
         total_qty += filled_qty;
         total_quote += price * filled_qty;
@@ -4144,9 +4229,48 @@ async fn manage_live_positions(
                 continue;
             }
             // 先挂新保护，确认成功后才撤旧保护；任何下单失败都保留原止损。
-            let new_order_ids =
-                place_protective_stops(client, &symbol, side, managed_qty, improved_stop, &filters)
-                    .await?;
+            let new_order_ids = match place_protective_stops(
+                client,
+                &symbol,
+                side,
+                managed_qty,
+                improved_stop,
+                &filters,
+            )
+            .await
+            {
+                Ok(order_ids) => order_ids,
+                Err(error) if error.to_string().contains("错误 -2021:") => {
+                    // CONTRACT_PRICE can cross the trigger between positionRisk and
+                    // conditional-order submission. A rejected tighter stop means the
+                    // exit condition is already true, so settle immediately instead of
+                    // retrying the same invalid stop every five seconds.
+                    let (exit, exit_qty, fee) =
+                        place_market_reduce_only(client, &symbol, side, managed_qty, &filters)
+                            .await?;
+                    if let Err(cancel_error) = client.cancel_all_open_orders(&symbol).await {
+                        warn!(symbol=%symbol, error=%cancel_error, "保护单竞态退出后清理旧保护失败");
+                    }
+                    let exit_qty = exit_qty.min(position.qty);
+                    let pnl = record_exit(
+                        state,
+                        &position,
+                        now_ms,
+                        position_cooldown_hours(&position, cfg, shock),
+                        exit,
+                        exit_qty,
+                        fee,
+                    );
+                    let trade_pnl = position.realized_partial_pnl + pnl;
+                    let (_, max_adverse_excursion) = position_excursions(&position);
+                    let event = json!({"ts_ms":now_ms,"event":"exit","symbol":symbol,"side":position.side,"entry_phase":position.entry_phase,"origin_signal_ms":position.setup_origin_ms,"reason":protection_reason,"price":exit,"qty":exit_qty,"pnl":pnl,"trade_pnl":trade_pnl,"fee":fee,"hold_ms":now_ms-position.entry_ms,"mark_price":snapshot.mark_price,"crossed_stop":improved_stop,"max_favorable_excursion":excursion,"max_adverse_excursion":max_adverse_excursion,"direct_market_exit":true,"trigger_order_race":true,"rejected_trigger_error":error.to_string()});
+                    append_event(event_path, event.clone())?;
+                    state.record_trade(event);
+                    changed = true;
+                    continue;
+                }
+                Err(error) => return Err(error),
+            };
             let old_order_ids = protection_order_ids(&position);
             for (old_order_id, error) in cancel_protective_stops(client, &symbol, &position).await {
                 warn!(symbol=%symbol, old_order_id, error=%error, "新保护已生效，但旧保护撤销失败");
@@ -4624,8 +4748,8 @@ pub async fn run_altcoin_impulse(
             .await?
             .into_iter()
             .filter(|(symbol, _)| {
-                !state.positions.contains_key(symbol)
-                    && !(args.portfolio_mode && symbol == "BTCUSDT")
+                !(state.positions.contains_key(symbol)
+                    || args.portfolio_mode && symbol == "BTCUSDT")
             })
             .collect();
         anyhow::ensure!(
@@ -6225,10 +6349,10 @@ pub async fn run_altcoin_impulse(
                 )?;
                 continue;
             }
-            if (candidate.entry_phase == "overextended_long" && !cfg.overextension_long_enabled)
-                || (candidate.entry_phase == "overextended_long" && overextension_slot_taken)
-                || (candidate.entry_phase == "overextended_long"
-                    && state.overextension_long_blocked)
+            if (candidate.entry_phase == "overextended_long"
+                && (!cfg.overextension_long_enabled
+                    || overextension_slot_taken
+                    || state.overextension_long_blocked))
                 || (!pulse_candidate
                     && !cross_candidate
                     && state
@@ -6805,8 +6929,16 @@ pub async fn run_altcoin_impulse(
         }
         save_state(&state_path, &state)?;
         let valuation_ms = chrono::Utc::now().timestamp_millis();
-        let position_status =
-            build_position_status(&state, &prices, rest.as_ref(), valuation_ms).await;
+        let position_status = build_position_status(
+            &state,
+            &prices,
+            rest.as_ref(),
+            valuation_ms,
+            &cfg,
+            &cross_cfg,
+            &shock_cfg,
+        )
+        .await;
         let current_equity = state.cash + positions_unrealized(&position_status);
         record_daily_equity(&mut state.equity_curve, valuation_ms, current_equity);
         save_state(&state_path, &state)?;
@@ -7230,8 +7362,16 @@ pub async fn run_altcoin_impulse(
                         )?;
                     }
                 }
-                let refreshed =
-                    build_position_status(&state, &prices, Some(client), refresh_ms).await;
+                let refreshed = build_position_status(
+                    &state,
+                    &prices,
+                    Some(client),
+                    refresh_ms,
+                    &cfg,
+                    &cross_cfg,
+                    &shock_cfg,
+                )
+                .await;
                 let refreshed_equity = state.cash + positions_unrealized(&refreshed);
                 record_daily_equity(&mut state.equity_curve, refresh_ms, refreshed_equity);
                 if take_control_commands(&mut daily_risk_reset, &mut handled_risk_reset) > 0 {

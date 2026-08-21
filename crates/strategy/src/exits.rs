@@ -16,6 +16,8 @@ pub struct OrderFlowTradeManagement {
     trend_partial_activation_pct: f64,
     trend_partial_close: f64,
     trend_lock_profit_pct: f64,
+    trend_runner_fraction: f64,
+    trend_runner_trail_pct: f64,
     trend_max_hold_ms: i64,
 }
 
@@ -63,19 +65,52 @@ impl ExitPlugin for OrderFlowTradeManagement {
             if favorable_pct < self.trend_trail_activation_pct {
                 return vec![];
             }
+            if pos.closed_frac >= 1.0 - self.trend_runner_fraction - 0.01 {
+                let candidate = match pos.side {
+                    Side::Buy => last * (1.0 - self.trend_runner_trail_pct),
+                    Side::Sell => last * (1.0 + self.trend_runner_trail_pct),
+                };
+                let improves = match pos.side {
+                    Side::Buy => candidate > pos.stop_price.to_f64(),
+                    Side::Sell => candidate < pos.stop_price.to_f64(),
+                };
+                return if improves {
+                    vec![ExitAction::MoveStop(Price::from_f64(candidate))]
+                } else {
+                    vec![]
+                };
+            }
             let candidate = match pos.side {
                 Side::Buy => last * (1.0 - self.trend_trail_pct),
                 Side::Sell => last * (1.0 + self.trend_trail_pct),
             };
-            let improves = match pos.side {
-                Side::Buy => candidate > pos.stop_price.to_f64(),
-                Side::Sell => candidate < pos.stop_price.to_f64(),
+            // Defensive compatibility for configurations whose trail activates
+            // before the first partial target: do not create a runner before any
+            // profit has actually been realized.
+            if pos.closed_frac <= 1e-9 {
+                let improves = match pos.side {
+                    Side::Buy => candidate > pos.stop_price.to_f64(),
+                    Side::Sell => candidate < pos.stop_price.to_f64(),
+                };
+                return if improves {
+                    vec![ExitAction::MoveStop(Price::from_f64(candidate))]
+                } else {
+                    vec![]
+                };
+            }
+            let runner_stop = match pos.side {
+                Side::Buy => last * (1.0 - self.trend_runner_trail_pct),
+                Side::Sell => last * (1.0 + self.trend_runner_trail_pct),
             };
-            return if improves {
-                vec![ExitAction::MoveStop(Price::from_f64(candidate))]
-            } else {
-                vec![]
-            };
+            let remaining_fraction = (1.0 - pos.closed_frac).max(1e-9);
+            let tight_original_fraction =
+                (remaining_fraction - self.trend_runner_fraction).max(0.0);
+            return vec![ExitAction::ArmTieredTrail {
+                tight_stop: Price::from_f64(candidate),
+                runner_stop: Price::from_f64(runner_stop),
+                tight_close_fraction: (tight_original_fraction / remaining_fraction)
+                    .clamp(0.0, 1.0),
+            }];
         }
         let entry = pos.entry_price.to_f64();
         let initial_stop = pos.initial_stop_price.to_f64();
@@ -145,6 +180,8 @@ pub fn build_orderflow_management(p: &Json) -> Result<Box<dyn ExitPlugin>, Plugi
         trend_partial_activation_pct: f("trend_partial_activation_pct", 0.006).clamp(0.002, 0.05),
         trend_partial_close: f("trend_partial_close", 0.25).clamp(0.05, 0.75),
         trend_lock_profit_pct: f("trend_lock_profit_pct", 0.001).clamp(0.0, 0.02),
+        trend_runner_fraction: f("trend_runner_fraction", 0.10).clamp(0.05, 0.25),
+        trend_runner_trail_pct: f("trend_runner_trail_pct", 0.0075).clamp(0.0025, 0.03),
         trend_max_hold_ms: (f("trend_max_hold_hours", 2.0).max(0.1) * 3_600_000.0) as i64,
     }))
 }
@@ -177,8 +214,10 @@ mod tests {
     #[test]
     fn trend_trail_waits_for_activation_profit() {
         let exit = build_orderflow_management(&json!({})).unwrap();
-        let mut ctx = Ctx::default();
-        ctx.now = Some(Timestamp::from_millis(60_000));
+        let mut ctx = Ctx {
+            now: Some(Timestamp::from_millis(60_000)),
+            ..Default::default()
+        };
         ctx.flags.insert("position_strategy".into(), "trend".into());
         ctx.flags.insert("last_price".into(), "100.10".into());
         assert!(exit.manage(&position(), &ctx).is_empty());
@@ -195,8 +234,10 @@ mod tests {
             &json!({"max_hold_hours":0.5,"mr_breakeven_buffer_pct":0.0008}),
         )
         .unwrap();
-        let mut ctx = Ctx::default();
-        ctx.now = Some(Timestamp::from_millis(60_000));
+        let mut ctx = Ctx {
+            now: Some(Timestamp::from_millis(60_000)),
+            ..Default::default()
+        };
         ctx.flags.insert("position_strategy".into(), "mr".into());
         ctx.flags.insert("last_price".into(), "100.20".into());
         let actions = exit.manage(&position(), &ctx);
@@ -214,8 +255,10 @@ mod tests {
             "trend_trail_pct":0.0025
         }))
         .unwrap();
-        let mut ctx = Ctx::default();
-        ctx.now = Some(Timestamp::from_millis(60_000));
+        let mut ctx = Ctx {
+            now: Some(Timestamp::from_millis(60_000)),
+            ..Default::default()
+        };
         ctx.flags.insert("position_strategy".into(), "trend".into());
         ctx.flags.insert("last_price".into(), "100.70".into());
         let actions = exit.manage(&position(), &ctx);
@@ -232,16 +275,25 @@ mod tests {
             "trend_trail_pct":0.0025
         }))
         .unwrap();
-        let mut ctx = Ctx::default();
-        ctx.now = Some(Timestamp::from_millis(60_000));
+        let mut ctx = Ctx {
+            now: Some(Timestamp::from_millis(60_000)),
+            ..Default::default()
+        };
         ctx.flags.insert("position_strategy".into(), "trend".into());
         ctx.flags.insert("last_price".into(), "105.0".into());
         let mut pos = position();
         pos.closed_frac = 0.2496;
         let actions = exit.manage(&pos, &ctx);
         assert_eq!(actions.len(), 1);
-        assert!(
-            matches!(actions[0], ExitAction::MoveStop(price) if (price.to_f64() - 104.7375).abs() < 1e-9)
-        );
+        assert!(matches!(
+            actions[0],
+            ExitAction::ArmTieredTrail {
+                tight_stop,
+                runner_stop,
+                tight_close_fraction,
+            } if (tight_stop.to_f64() - 104.7375).abs() < 1e-9
+                && runner_stop.to_f64() < tight_stop.to_f64()
+                && (tight_close_fraction - (0.6504 / 0.7504)).abs() < 1e-6
+        ));
     }
 }

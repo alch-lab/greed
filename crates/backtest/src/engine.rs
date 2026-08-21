@@ -18,7 +18,7 @@ use crate::report::EquityPoint;
 use strategy::Strategy;
 use tcore::plugin::{Ctx, ExitAction, OrderIntent, Signal, Verdict};
 use tcore::types::{Price, Qty, Symbol, Timestamp};
-use tcore::{Event, EventClock, Trade};
+use tcore::{Event, EventClock, Side, Trade};
 
 /// 回测配置。
 #[derive(Debug, Clone, Copy)]
@@ -80,6 +80,7 @@ pub struct BacktestEngine {
     last_equity_day: i64,
     /// 未成交的限价入场意图（延迟成交后补挂止损/止盈）
     pending_entry: Option<PendingEntry>,
+    tiered_exit: Option<TieredExitPlan>,
     // ---- 熔断状态（日连亏/日回撤）----
     cb_day: i64,
     cb_day_start_equity: f64,
@@ -89,6 +90,13 @@ pub struct BacktestEngine {
     cb_noted_fills: usize,
     /// 决策流水：下单意图
     intents: Vec<JournalIntent>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TieredExitPlan {
+    tight_stop: Price,
+    runner_stop: Price,
+    tight_close_fraction: f64,
 }
 
 /// 挂起中的限价入场：成交后需要补挂的止损/止盈参数。
@@ -115,6 +123,7 @@ impl BacktestEngine {
             equity_curve: Vec::new(),
             last_equity_day: i64::MIN,
             pending_entry: None,
+            tiered_exit: None,
             cb_day: i64::MIN,
             cb_day_start_equity: 0.0,
             cb_consec_losses: 0,
@@ -290,6 +299,37 @@ impl BacktestEngine {
 
     /// 出场插件管理持仓。
     fn manage_position(&mut self, trade: &Trade) {
+        if let Some(plan) = self.tiered_exit {
+            let crossed = match self.account.position().map(|position| position.side) {
+                Some(Side::Buy) => trade.price <= plan.tight_stop,
+                Some(Side::Sell) => trade.price >= plan.tight_stop,
+                None => false,
+            };
+            if crossed {
+                self.tiered_exit = None;
+                if let Some(position) = self.account.position().copied() {
+                    let qty = Qty::from_f64(position.qty.to_f64() * plan.tight_close_fraction);
+                    self.market_close(trade, qty, "trend_tight_tranche");
+                    if let Some(remaining) = self.account.position().copied() {
+                        self.broker.submit(
+                            trade.ts,
+                            trade.price,
+                            Order {
+                                side: remaining.side.opposite(),
+                                qty: remaining.qty,
+                                kind: OrderKind::StopMarket(plan.runner_stop),
+                                reason: "stop".into(),
+                                expire_ts: None,
+                            },
+                        );
+                        if let Some(position) = self.account.position_mut() {
+                            position.stop_price = Some(plan.runner_stop);
+                        }
+                    }
+                }
+                return;
+            }
+        }
         let pos_view = match self.account.position_view(&self.symbol) {
             Some(p) => p,
             None => return,
@@ -328,6 +368,34 @@ impl BacktestEngine {
                         let close_qty = Qty::from_f64(p.qty.to_f64() * frac);
                         self.market_close(trade, close_qty, "tp_partial");
                         // closed_frac 由 Account::apply_fill 按原始仓位口径维护。
+                    }
+                }
+                ExitAction::ArmTieredTrail {
+                    tight_stop,
+                    runner_stop,
+                    tight_close_fraction,
+                } => {
+                    self.tiered_exit = Some(TieredExitPlan {
+                        tight_stop,
+                        runner_stop,
+                        tight_close_fraction,
+                    });
+                    if let Some(position) = self.account.position_mut() {
+                        position.stop_price = Some(runner_stop);
+                        let side = position.side;
+                        let qty = position.qty;
+                        self.broker.cancel_all();
+                        self.broker.submit(
+                            trade.ts,
+                            trade.price,
+                            Order {
+                                side: side.opposite(),
+                                qty,
+                                kind: OrderKind::StopMarket(runner_stop),
+                                reason: "stop".into(),
+                                expire_ts: None,
+                            },
+                        );
                     }
                 }
                 ExitAction::CloseAll => {
@@ -689,7 +757,7 @@ trigger = "OrderFlowEntry"
         eng.enter(&t0, intent);
         assert!(eng.account().position().is_some());
         // 价格跌到 66750 触发止损
-        let trades = vec![trade(1000, 66900.0, 0.01), trade(2000, 66750.0, 0.01)];
+        let trades = [trade(1000, 66900.0, 0.01), trade(2000, 66750.0, 0.01)];
         let events: Vec<Event> = trades.iter().cloned().map(Event::Trade).collect();
         let res = eng.run(&events);
         // 应有开仓 + 止损平仓两笔成交

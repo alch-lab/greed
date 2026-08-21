@@ -129,6 +129,15 @@ pub enum ExitAction {
     MoveStop(Price),
     /// 平掉部分仓位（比例为当前剩余的比例）
     ClosePartial(f64),
+    /// 将趋势余仓拆成紧跟踪主体与宽跟踪 runner。
+    ///
+    /// 执行层在交易所保留 `runner_stop` 作为全仓灾难保护；行情触及
+    /// `tight_stop` 时只减掉 `tight_close_fraction`，随后继续保护 runner。
+    ArmTieredTrail {
+        tight_stop: Price,
+        runner_stop: Price,
+        tight_close_fraction: f64,
+    },
     /// 全部平仓
     CloseAll,
     /// 反手（先平仓再按新意图开仓）

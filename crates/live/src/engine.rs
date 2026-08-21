@@ -16,7 +16,8 @@
 use std::path::PathBuf;
 
 use backtest::{
-    Account, EquityPoint, FillRequest, Journal, JournalEval, JournalIntent, JournalMeta,
+    Account, EquityPoint, Fill, FillRequest, Journal, JournalEval, JournalIntent, JournalMeta,
+    OpenPosition,
 };
 use strategy::Strategy;
 use tcore::plugin::{Ctx, ExitAction, OrderIntent, Signal, Verdict};
@@ -43,6 +44,8 @@ pub struct LiveConfig {
     pub cb_daily_dd_pct: f64,
     /// testnet 数量步长（dry 模式无约束，用 1e-8）
     pub qty_step: f64,
+    /// 市价/止损订单使用 MARKET_LOT_SIZE；可能比普通 LOT_SIZE 更粗。
+    pub market_qty_step: f64,
     /// 最小名义价值（USDT；dry 模式 0）
     pub min_notional: f64,
     /// journal 输出路径（原子重写）
@@ -117,6 +120,16 @@ struct PendingExit {
     timeout_noted: bool,
 }
 
+/// 趋势仓双层退出计划。交易所始终用较宽的 runner stop 保护全部余仓；
+/// 进程在线时，价格触及 tight stop 只减掉主体仓位。状态写入 journal，重启后
+/// 可以继续管理，不依赖内存中的定时任务或锁。
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize)]
+struct TieredExitPlan {
+    tight_stop: Price,
+    runner_stop: Price,
+    tight_close_fraction: f64,
+}
+
 /// 每一个已确认信号都跟踪到 4 小时，不论其是否获准交易。
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 struct ShadowSignal {
@@ -158,6 +171,8 @@ pub struct EngineSnapshot {
     pub estimated_risk_usd: f64,
     pub estimated_notional_usd: f64,
     pub position: Option<PositionSnap>,
+    /// 以完整开仓到完全平仓为一笔，部分止盈不会重复计数。
+    pub performance: PerformanceSnap,
     /// 入场订单生命周期：submitting/pending/filled/expired/rejected。
     pub entry_order: Option<EntryOrderStatusSnap>,
     pub n_intents: usize,
@@ -194,6 +209,26 @@ pub struct PositionSnap {
     pub entry_ts_ms: i64,
     pub stop_price: Option<f64>,
     pub unrealized_pnl: f64,
+    pub closed_fraction: f64,
+    pub management: PositionManagementSnap,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PerformanceSnap {
+    pub completed_trades: usize,
+    pub wins: usize,
+    pub win_rate: Option<f64>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PositionManagementSnap {
+    pub stage: String,
+    pub current_stop: Option<f64>,
+    pub next_trigger_price: Option<f64>,
+    pub next_action: String,
+    pub tight_stop: Option<f64>,
+    pub runner_stop: Option<f64>,
+    pub tight_close_fraction: Option<f64>,
 }
 
 /// 一笔持仓的绩效追踪：开仓建立、平仓结算成 trip 记录。
@@ -250,6 +285,8 @@ struct EngineState {
     shadow_outcomes_run: usize,
     #[serde(default)]
     last_entry_order: Option<EntryOrderStatusSnap>,
+    #[serde(default)]
+    tiered_exit: Option<TieredExitPlan>,
 }
 
 const ENGINE_STATE_VERSION: u32 = 2;
@@ -307,6 +344,8 @@ pub struct LiveEngine {
     last_entry_order: Option<EntryOrderStatusSnap>,
     // ---- 减仓挂起（等待 userTrades 确认后重挂剩余仓位止损）----
     pending_exit: Option<PendingExit>,
+    // ---- 趋势主体仓 + runner 双层保护 ----
+    tiered_exit: Option<TieredExitPlan>,
     // ---- 熔断状态（同回测）----
     cb_day: i64,
     cb_day_start_equity: f64,
@@ -372,6 +411,7 @@ impl LiveEngine {
             pending_entry: None,
             last_entry_order: None,
             pending_exit: None,
+            tiered_exit: None,
             cb_day: i64::MIN,
             cb_day_start_equity: 0.0,
             cb_consec_losses: 0,
@@ -540,6 +580,11 @@ impl LiveEngine {
             }
             order
         });
+        self.tiered_exit = if position.is_some() {
+            state.tiered_exit
+        } else {
+            None
+        };
         self.needs_stop_rearm = needs_rearm;
         self.sync_position_flag();
 
@@ -917,6 +962,7 @@ impl LiveEngine {
                 .find(|sp| sp.name() == name)
                 .and_then(|sp| sp.eval_note())
         };
+        let performance = completed_trade_performance(self.account.fills());
         EngineSnapshot {
             last_price: px.map(|p| p.to_f64()),
             equity,
@@ -932,22 +978,28 @@ impl LiveEngine {
             } else {
                 0.0
             },
-            position: self.account.position().map(|p| PositionSnap {
-                side: format!("{:?}", p.side),
-                strategy: match p.strategy_tag {
+            position: self.account.position().map(|p| {
+                let strategy = match p.strategy_tag {
                     3 => "tactical_pullback",
                     2 => "trend",
                     1 => "mr",
                     _ => "unknown",
+                };
+                let management = position_management_snapshot(p, strategy, self.tiered_exit);
+                PositionSnap {
+                    side: format!("{:?}", p.side),
+                    strategy: strategy.into(),
+                    qty: p.qty.to_f64(),
+                    entry_price: p.entry_price.to_f64(),
+                    mark_price: px.map(|value| value.to_f64()),
+                    entry_ts_ms: p.entry_ts.as_millis(),
+                    stop_price: p.stop_price.map(|s| s.to_f64()),
+                    unrealized_pnl: px.map(|x| p.unrealized(x)).unwrap_or(0.0),
+                    closed_fraction: p.closed_frac,
+                    management,
                 }
-                .into(),
-                qty: p.qty.to_f64(),
-                entry_price: p.entry_price.to_f64(),
-                mark_price: px.map(|value| value.to_f64()),
-                entry_ts_ms: p.entry_ts.as_millis(),
-                stop_price: p.stop_price.map(|s| s.to_f64()),
-                unrealized_pnl: px.map(|x| p.unrealized(x)).unwrap_or(0.0),
             }),
+            performance,
             entry_order: self.last_entry_order.clone(),
             n_intents: self.intents.len(),
             n_fills: self.account.fills().len(),
@@ -981,6 +1033,7 @@ impl LiveEngine {
         self.cb_update(trade.ts, trade.price);
 
         // 1) 撮合/成交回报（dry：本地模拟撮合；testnet：本地挂单不消费价格）
+        let had_position = self.account.position().is_some();
         let execs = self.broker.on_trade_price(trade.ts, trade.price).await;
         for ex in execs {
             let benchmark = self.pending_entry.as_ref().map(|pending| {
@@ -1000,6 +1053,12 @@ impl LiveEngine {
                 is_maker: ex.is_maker,
                 reason: ex.reason,
             });
+        }
+        // 交易所/模拟 broker 的保护单可能直接把仓位平完。此时必须清掉本地的
+        // 分层退出状态，否则下一笔新仓会继承上一笔的 tight tranche。
+        if had_position && self.account.position().is_none() {
+            self.tiered_exit = None;
+            self.pending_exit = None;
         }
         self.settle_pending_entry(trade.ts).await;
 
@@ -1116,6 +1175,7 @@ impl LiveEngine {
                     self.last_protective_stop_price = None;
                     self.last_protective_stop_submit_ms = 0;
                     self.exit_retry_after_ms = 0;
+                    self.tiered_exit = None;
                 }
                 self.cb_note_fills();
                 if let Some(px) = self.latest_price {
@@ -1315,6 +1375,40 @@ impl LiveEngine {
         if trade.ts.as_millis() < self.exit_retry_after_ms {
             return;
         }
+        if let Some(plan) = self.tiered_exit {
+            let crossed = match self.account.position().map(|position| position.side) {
+                Some(Side::Buy) => trade.price <= plan.tight_stop,
+                Some(Side::Sell) => trade.price >= plan.tight_stop,
+                None => false,
+            };
+            if crossed {
+                // 清除计划后再提交，避免网络重试期间同一行情重复发送主体减仓。
+                self.tiered_exit = None;
+                if let Some(position) = self.account.position().copied() {
+                    let qty = Qty::from_f64(position.qty.to_f64() * plan.tight_close_fraction);
+                    self.append_research(
+                        "tiered_tight_triggered",
+                        trade.ts.as_millis(),
+                        serde_json::json!({
+                            "price": trade.price.to_f64(),
+                            "tight_stop": plan.tight_stop.to_f64(),
+                            "runner_stop": plan.runner_stop.to_f64(),
+                            "close_fraction": plan.tight_close_fraction,
+                            "qty": qty.to_f64(),
+                        }),
+                    );
+                    let accepted = self
+                        .market_close(trade, qty, "trend_tight_tranche", Some(plan.runner_stop))
+                        .await;
+                    if !accepted {
+                        // 短暂 REST/网络失败时保留计划；交易所 runner 硬止损仍在，
+                        // 退避结束后若价格仍越过 tight stop 会继续重试主体减仓。
+                        self.tiered_exit = Some(plan);
+                    }
+                }
+                return;
+            }
+        }
         let pos_view = match self.account.position_view(&self.symbol) {
             Some(p) => p,
             None => return,
@@ -1348,13 +1442,39 @@ impl LiveEngine {
                     }
                     return;
                 }
+                ExitAction::ArmTieredTrail {
+                    tight_stop,
+                    runner_stop,
+                    tight_close_fraction,
+                } => {
+                    self.tiered_exit = Some(TieredExitPlan {
+                        tight_stop,
+                        runner_stop,
+                        tight_close_fraction,
+                    });
+                    self.append_research(
+                        "tiered_trail_armed",
+                        trade.ts.as_millis(),
+                        serde_json::json!({
+                            "tight_stop": tight_stop.to_f64(),
+                            "runner_stop": runner_stop.to_f64(),
+                            "tight_close_fraction": tight_close_fraction,
+                        }),
+                    );
+                    // runner stop 是断网/进程退出时的交易所侧灾难保护；主体仓的
+                    // tight stop 由在线行情触发部分市价减仓。
+                    self.place_protective_stop(trade.ts, trade.price, runner_stop)
+                        .await;
+                }
                 ExitAction::CloseAll => {
+                    self.tiered_exit = None;
                     if let Some(p) = self.account.position().copied() {
                         self.market_close(trade, p.qty, "close_all", None).await;
                     }
                     return;
                 }
                 ExitAction::Reverse(intent) => {
+                    self.tiered_exit = None;
                     if let Some(p) = self.account.position().copied() {
                         self.market_close(trade, p.qty, "reverse_out", None).await;
                     }
@@ -1481,6 +1601,9 @@ impl LiveEngine {
 
     /// 开仓：仓位计算（与回测同式）→ 精度约束 → 记录意图 → 下单。
     async fn enter(&mut self, trade: &Trade, intent: OrderIntent, event_id: Option<i64>) {
+        // 新仓绝不能继承前一笔仓位的分层退出进度；正常路径这里本就为空，
+        // 这一行同时保护重连/外部平仓后立即再入场的边界场景。
+        self.tiered_exit = None;
         let entry_ref = intent.limit_price.unwrap_or(trade.price);
         let stop_dist = (intent.stop_price.to_f64() - entry_ref.to_f64()).abs();
         let qty = if stop_dist > 1e-9 {
@@ -1863,10 +1986,15 @@ impl LiveEngine {
         qty: Qty,
         reason: &str,
         rearm_stop: Option<Price>,
-    ) {
+    ) -> bool {
         let Some(p) = self.account.position() else {
-            return;
+            return false;
         };
+        let normalized_qty = floor_to_step(qty.to_f64(), self.config.market_qty_step);
+        if normalized_qty <= 0.0 {
+            return false;
+        }
+        let qty = Qty::from_f64(normalized_qty.min(p.qty.to_f64()));
         let side = p.side.opposite();
         let expected_remaining_qty = (p.qty.to_f64() - qty.to_f64()).max(0.0);
         // 不在提交市价减仓前撤保护止损。交易所成交回报可能延迟；先撤会制造一个
@@ -1910,6 +2038,7 @@ impl LiveEngine {
                     self.last_protective_stop_submit_ms = 0;
                     self.exit_retry_after_ms = 0;
                 }
+                true
             }
             Ok(None) => {
                 let order_id = self.broker.last_submitted_order_id();
@@ -1935,6 +2064,7 @@ impl LiveEngine {
                     rearm_stop,
                     timeout_noted: false,
                 });
+                true
             }
             Err(e) => {
                 // 不允许逐笔行情无间隔重发同一平仓请求。-2022 常见于保护单已经
@@ -1949,6 +2079,7 @@ impl LiveEngine {
                         "reason": reason, "error": e.to_string(), "qty": qty.to_f64(),
                     }),
                 );
+                false
             }
         }
     }
@@ -1963,9 +2094,10 @@ impl LiveEngine {
             .position()
             .map(|position| position.qty.to_f64())
             .unwrap_or(0.0);
+        let qty_tolerance = self.config.market_qty_step.max(1e-9);
         let complete = self.account.position().is_none()
-            || pending.filled_qty + 1e-9 >= pending.requested_qty
-            || observed_remaining_qty <= pending.expected_remaining_qty + 1e-9;
+            || pending.filled_qty + qty_tolerance >= pending.requested_qty
+            || observed_remaining_qty <= pending.expected_remaining_qty + qty_tolerance;
         if !complete {
             return;
         }
@@ -2147,6 +2279,7 @@ impl LiveEngine {
             self.broker.cancel_all().await;
             self.last_protective_stop_price = None;
             self.last_protective_stop_submit_ms = 0;
+            self.tiered_exit = None;
         } else if let Some(position) = self.account.position().copied() {
             // 部分减仓漏记后，旧保护数量已经过大，按交易所剩余仓位立即重挂。
             if let Some(stop) = position.stop_price {
@@ -2324,6 +2457,7 @@ impl LiveEngine {
             observation_signals_run: self.observation_signals_run,
             shadow_outcomes_run: self.shadow_outcomes_run,
             last_entry_order: self.last_entry_order.clone(),
+            tiered_exit: self.tiered_exit,
         };
         let journal = Journal {
             meta: JournalMeta {
@@ -2357,6 +2491,94 @@ impl LiveEngine {
     }
 }
 
+fn completed_trade_performance(fills: &[Fill]) -> PerformanceSnap {
+    let mut completed = 0usize;
+    let mut wins = 0usize;
+    let mut trip_open = false;
+    let mut trip_net = 0.0;
+    for fill in fills {
+        trip_net += fill.realized_pnl - fill.fee;
+        if fill.position_side_after.is_some() {
+            trip_open = true;
+        } else if trip_open {
+            completed += 1;
+            wins += usize::from(trip_net > 0.0);
+            trip_open = false;
+            trip_net = 0.0;
+        }
+    }
+    PerformanceSnap {
+        completed_trades: completed,
+        wins,
+        win_rate: (completed > 0).then_some(wins as f64 / completed as f64),
+    }
+}
+
+fn position_management_snapshot(
+    position: &OpenPosition,
+    strategy: &str,
+    tiered: Option<TieredExitPlan>,
+) -> PositionManagementSnap {
+    let current_stop = position.stop_price.map(|value| value.to_f64());
+    if let Some(plan) = tiered {
+        return PositionManagementSnap {
+            stage: "tiered_trailing".into(),
+            current_stop,
+            next_trigger_price: Some(plan.tight_stop.to_f64()),
+            next_action: format!(
+                "Tight trail hit: close {:.0}% of the remaining position; keep the runner protected",
+                plan.tight_close_fraction * 100.0
+            ),
+            tight_stop: Some(plan.tight_stop.to_f64()),
+            runner_stop: Some(plan.runner_stop.to_f64()),
+            tight_close_fraction: Some(plan.tight_close_fraction),
+        };
+    }
+    if strategy == "trend" && position.closed_frac >= 0.89 {
+        return PositionManagementSnap {
+            stage: "runner".into(),
+            current_stop,
+            next_trigger_price: current_stop,
+            next_action: "Runner is following the peak; its current stop closes the remainder"
+                .into(),
+            tight_stop: None,
+            runner_stop: current_stop,
+            tight_close_fraction: None,
+        };
+    }
+    if position.closed_frac > 0.0 {
+        return PositionManagementSnap {
+            stage: "profit_locked".into(),
+            current_stop,
+            next_trigger_price: current_stop,
+            next_action: if strategy == "trend" {
+                "First profit taken; waiting for the two-layer trailing threshold".into()
+            } else {
+                "Partial profit taken; the remaining position is protected by the current stop"
+                    .into()
+            },
+            tight_stop: None,
+            runner_stop: None,
+            tight_close_fraction: None,
+        };
+    }
+    PositionManagementSnap {
+        stage: "initial_protection".into(),
+        current_stop,
+        next_trigger_price: position.tp1_price.map(|value| value.to_f64()),
+        next_action: match strategy {
+            "trend" => "Waiting for the first profit target; then close 25% and lock profit",
+            "mr" => "Waiting for mean-reversion TP1 or the initial stop",
+            "tactical_pullback" => "Waiting for tactical TP1 or the initial stop",
+            _ => "Waiting for the first profit target or the initial stop",
+        }
+        .into(),
+        tight_stop: None,
+        runner_stop: None,
+        tight_close_fraction: None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2374,6 +2596,32 @@ mod tests {
             qty: Qty::from_f64(0.01),
             is_buyer_maker: false,
         }
+    }
+
+    #[test]
+    fn performance_counts_round_trips_not_partial_fills() {
+        let fill = |ts_ms, realized_pnl, fee, position_side_after| Fill {
+            ts: Timestamp::from_millis(ts_ms),
+            side: Side::Buy,
+            price: Price::from_f64(100.0),
+            qty: Qty::from_f64(1.0),
+            fee,
+            is_maker: false,
+            realized_pnl,
+            position_side_after,
+            reason: "test".into(),
+        };
+        let fills = vec![
+            fill(1, 0.0, 1.0, Some(Side::Buy)),
+            fill(2, 4.0, 0.5, Some(Side::Buy)),
+            fill(3, 3.0, 0.5, None),
+            fill(4, 0.0, 1.0, Some(Side::Sell)),
+            fill(5, -2.0, 0.5, None),
+        ];
+        let performance = completed_trade_performance(&fills);
+        assert_eq!(performance.completed_trades, 2);
+        assert_eq!(performance.wins, 1);
+        assert_eq!(performance.win_rate, Some(0.5));
     }
 
     fn noop_strategy() -> Strategy {
@@ -2396,6 +2644,7 @@ trigger = "OrderFlowEntry"
             cb_max_daily_losses: 0,
             cb_daily_dd_pct: 0.0,
             qty_step: 1e-8,
+            market_qty_step: 1e-8,
             min_notional: 0.0,
             journal_path: std::env::temp_dir().join(format!("greed-live-test-{}.json", tag)),
             eval_log_path: std::env::temp_dir().join(format!("greed-live-test-{}.jsonl", tag)),
@@ -2546,7 +2795,8 @@ trigger = "OrderFlowEntry"
 
     #[tokio::test]
     async fn partial_exit_settles_from_remaining_qty_without_fill_id_mapping() {
-        let cfg = test_config("partial-exit-unmapped");
+        let mut cfg = test_config("partial-exit-unmapped");
+        cfg.market_qty_step = 0.0001;
         let _ = std::fs::remove_file(&cfg.journal_path);
         let mut eng = LiveEngine::new(
             noop_strategy(),
@@ -2560,7 +2810,7 @@ trigger = "OrderFlowEntry"
             ts: Timestamp::from_millis(1_000),
             side: Side::Buy,
             price: Price::from_f64(100.0),
-            qty: Qty::from_f64(1.0),
+            qty: Qty::from_f64(0.0661),
             fee: 0.0,
             is_maker: false,
             reason: "open".into(),
@@ -2568,8 +2818,10 @@ trigger = "OrderFlowEntry"
         eng.pending_exit = Some(PendingExit {
             order_id: Some(42),
             reason: "tp_partial".into(),
-            requested_qty: 0.25,
-            expected_remaining_qty: 0.75,
+            // 交易所会把策略请求的 0.016525 BTC 按 MARKET stepSize
+            // 向下规范为 0.0165 BTC；状态机必须按实际可下单精度结算。
+            requested_qty: 0.0165,
+            expected_remaining_qty: 0.0496,
             filled_qty: 0.0,
             submitted_ts_ms: 1_500,
             reference_price: 101.0,
@@ -2582,7 +2834,7 @@ trigger = "OrderFlowEntry"
             ts: Timestamp::from_millis(2_000),
             side: Side::Sell,
             price: Price::from_f64(101.0),
-            qty: Qty::from_f64(0.25),
+            qty: Qty::from_f64(0.0165),
             fee: 0.0,
             is_maker: false,
             reason: "external".into(),
@@ -2593,6 +2845,54 @@ trigger = "OrderFlowEntry"
             eng.account.position().unwrap().stop_price,
             Some(Price::from_f64(100.1))
         );
+        let _ = std::fs::remove_file(&cfg.journal_path);
+    }
+
+    #[tokio::test]
+    async fn tiered_trail_closes_tight_tranche_and_keeps_runner_protected() {
+        let cfg = test_config("tiered-trail");
+        let _ = std::fs::remove_file(&cfg.journal_path);
+        let mut eng = LiveEngine::new(
+            noop_strategy(),
+            AnyBroker::dry(FeeModel::default()),
+            cfg.clone(),
+            100_000.0,
+            "2026-08-21".into(),
+        );
+        eng.latest_price = Some(Price::from_f64(101.0));
+        eng.account.apply_fill(FillRequest {
+            ts: Timestamp::from_millis(1_000),
+            side: Side::Buy,
+            price: Price::from_f64(100.0),
+            qty: Qty::from_f64(1.0),
+            fee: 0.0,
+            is_maker: false,
+            reason: "trend_pullback_tactical".into(),
+        });
+        eng.account.apply_fill(FillRequest {
+            ts: Timestamp::from_millis(2_000),
+            side: Side::Sell,
+            price: Price::from_f64(100.6),
+            qty: Qty::from_f64(0.25),
+            fee: 0.0,
+            is_maker: false,
+            reason: "tp_partial".into(),
+        });
+        eng.tiered_exit = Some(TieredExitPlan {
+            tight_stop: Price::from_f64(100.75),
+            runner_stop: Price::from_f64(100.25),
+            tight_close_fraction: 0.65 / 0.75,
+        });
+
+        eng.on_trade(&trade(3_000, 100.70)).await;
+        let runner = eng.account.position().expect("10% runner must remain");
+        assert!((runner.qty.to_f64() - 0.10).abs() < 1e-8);
+        assert_eq!(runner.stop_price, Some(Price::from_f64(100.25)));
+        assert!(eng.tiered_exit.is_none());
+
+        eng.on_trade(&trade(4_000, 100.20)).await;
+        assert!(eng.account.position().is_none());
+        assert_eq!(eng.account.fills().last().unwrap().reason, "stop");
         let _ = std::fs::remove_file(&cfg.journal_path);
     }
 
@@ -2770,6 +3070,11 @@ location_buckets = 10
         });
         eng.cb_day = 42;
         eng.cb_consec_losses = 2;
+        eng.tiered_exit = Some(TieredExitPlan {
+            tight_stop: Price::from_f64(59_500.0),
+            runner_stop: Price::from_f64(59_000.0),
+            tight_close_fraction: 0.8,
+        });
         eng.persist_journal();
 
         // 第二段进程：新引擎从 journal 恢复（组合模式，allow_position=true）
@@ -2792,6 +3097,7 @@ location_buckets = 10
         assert!(eng2.needs_stop_rearm);
         assert_eq!(eng2.cb_day, 42);
         assert_eq!(eng2.cb_consec_losses, 2);
+        assert_eq!(eng2.tiered_exit.unwrap().tight_close_fraction, 0.8);
 
         // 恢复后首个行情节拍：重挂保护性止损且不丢失止损价
         eng2.on_trade(&trade(3000, 60_500.0)).await;
@@ -2811,6 +3117,7 @@ location_buckets = 10
         );
         assert!(eng3.try_restore(false));
         assert!(eng3.account().position().is_none());
+        assert!(eng3.tiered_exit.is_none());
         assert_eq!(eng3.account().fills().len(), 2);
         assert!((eng3.account().cash() - 10_098.0).abs() < 1e-6);
 

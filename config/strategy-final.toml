@@ -166,4 +166,8 @@ trend_partial_close = 0.25
 trend_lock_profit_pct = 0.001
 trend_trail_pct = 0.0025
 trend_trail_activation_pct = 0.010
+# 双层趋势退出：达到跟踪门槛后，65% 原仓继续用 0.25% 紧跟踪，
+# 最后 10% 保留为 0.75% 宽跟踪 runner；runner 始终受交易所硬止损保护。
+trend_runner_fraction = 0.10
+trend_runner_trail_pct = 0.0075
 trend_max_hold_hours = 4.0
