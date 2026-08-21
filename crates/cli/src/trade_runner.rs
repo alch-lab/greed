@@ -152,7 +152,8 @@ pub async fn run_trade(
         let amt = rest.position_amt(&collector.symbol).await?;
         // 空仓才可在恢复检查前清遗留单。有仓时先保留交易所保护性止损；若后续确认
         // journal 与仓位一致，首个行情节拍会安全撤旧并重挂。若不一致则原止损不受影响。
-        if amt.abs() <= 1e-12 {
+        let resuming_position = amt.abs() > 1e-12;
+        if !resuming_position {
             rest.cancel_all_open_orders(&collector.symbol).await?;
         } else {
             info!(
@@ -161,7 +162,19 @@ pub async fn run_trade(
             );
         }
         rest.set_leverage(&collector.symbol, args.leverage).await?;
-        rest.set_margin_isolated(&collector.symbol).await?;
+        // Binance rejects margin/position-mode changes while a protective
+        // order exists (-4067/-4047). A resumed position was opened by this
+        // runner after isolated mode had already been configured, so preserve
+        // both its mode and live stop. Empty accounts are still normalized
+        // before the next entry.
+        if !resuming_position {
+            rest.set_margin_isolated(&collector.symbol).await?;
+        } else {
+            info!(
+                position_amt = amt,
+                "恢复持仓：跳过逐仓模式切换，避免保护单触发 Binance -4067"
+            );
+        }
 
         let filters = rest.symbol_filters(&collector.symbol).await?;
         let wallet = rest.wallet_balance_usdt().await?;
