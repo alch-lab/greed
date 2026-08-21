@@ -106,6 +106,9 @@ struct PendingExit {
     order_id: Option<i64>,
     reason: String,
     requested_qty: f64,
+    /// Expected quantity after this reduce-only order fills. This closes the
+    /// state machine even when userTrades cannot map a child fill order id.
+    expected_remaining_qty: f64,
     filled_qty: f64,
     submitted_ts_ms: i64,
     reference_price: f64,
@@ -187,6 +190,8 @@ pub struct PositionSnap {
     pub strategy: String,
     pub qty: f64,
     pub entry_price: f64,
+    pub mark_price: Option<f64>,
+    pub entry_ts_ms: i64,
     pub stop_price: Option<f64>,
     pub unrealized_pnl: f64,
 }
@@ -938,6 +943,8 @@ impl LiveEngine {
                 .into(),
                 qty: p.qty.to_f64(),
                 entry_price: p.entry_price.to_f64(),
+                mark_price: px.map(|value| value.to_f64()),
+                entry_ts_ms: p.entry_ts.as_millis(),
                 stop_price: p.stop_price.map(|s| s.to_f64()),
                 unrealized_pnl: px.map(|x| p.unrealized(x)).unwrap_or(0.0),
             }),
@@ -1861,6 +1868,7 @@ impl LiveEngine {
             return;
         };
         let side = p.side.opposite();
+        let expected_remaining_qty = (p.qty.to_f64() - qty.to_f64()).max(0.0);
         // 不在提交市价减仓前撤保护止损。交易所成交回报可能延迟；先撤会制造一个
         // 无保护窗口。成交确认后 settle_pending_exit 会撤旧止损并按剩余数量重挂。
         let order = backtest::Order {
@@ -1919,6 +1927,7 @@ impl LiveEngine {
                     order_id,
                     reason: reason.to_string(),
                     requested_qty: qty.to_f64(),
+                    expected_remaining_qty,
                     filled_qty: 0.0,
                     submitted_ts_ms: trade.ts.as_millis(),
                     reference_price: trade.price.to_f64(),
@@ -1949,8 +1958,14 @@ impl LiveEngine {
         let Some(pending) = self.pending_exit.as_ref() else {
             return;
         };
-        let complete =
-            self.account.position().is_none() || pending.filled_qty + 1e-9 >= pending.requested_qty;
+        let observed_remaining_qty = self
+            .account
+            .position()
+            .map(|position| position.qty.to_f64())
+            .unwrap_or(0.0);
+        let complete = self.account.position().is_none()
+            || pending.filled_qty + 1e-9 >= pending.requested_qty
+            || observed_remaining_qty <= pending.expected_remaining_qty + 1e-9;
         if !complete {
             return;
         }
@@ -1969,6 +1984,7 @@ impl LiveEngine {
             serde_json::json!({
                 "order_id": pending.order_id, "reason": pending.reason,
                 "requested_qty": pending.requested_qty, "filled_qty": pending.filled_qty,
+                "expected_remaining_qty": pending.expected_remaining_qty,
                 "remaining_qty": remaining_qty,
                 "latency_ms": now.as_millis() - pending.submitted_ts_ms,
                 "rearm_stop": pending.rearm_stop.map(|x| x.to_f64()),
@@ -2498,6 +2514,7 @@ trigger = "OrderFlowEntry"
             order_id: Some(42),
             reason: "tp_partial".into(),
             requested_qty: 0.5,
+            expected_remaining_qty: 0.5,
             filled_qty: 0.5,
             submitted_ts_ms: 1_500,
             reference_price: 101.0,
@@ -2524,6 +2541,58 @@ trigger = "OrderFlowEntry"
         eng.on_trade(&trade(3_000, 99.9)).await;
         assert!(eng.account.position().is_none());
         assert!((eng.account.fills().last().unwrap().qty.to_f64() - 0.5).abs() < 1e-9);
+        let _ = std::fs::remove_file(&cfg.journal_path);
+    }
+
+    #[tokio::test]
+    async fn partial_exit_settles_from_remaining_qty_without_fill_id_mapping() {
+        let cfg = test_config("partial-exit-unmapped");
+        let _ = std::fs::remove_file(&cfg.journal_path);
+        let mut eng = LiveEngine::new(
+            noop_strategy(),
+            AnyBroker::dry(FeeModel::default()),
+            cfg.clone(),
+            100_000.0,
+            "2026-08-04".into(),
+        );
+        eng.latest_price = Some(Price::from_f64(101.0));
+        eng.account.apply_fill(FillRequest {
+            ts: Timestamp::from_millis(1_000),
+            side: Side::Buy,
+            price: Price::from_f64(100.0),
+            qty: Qty::from_f64(1.0),
+            fee: 0.0,
+            is_maker: false,
+            reason: "open".into(),
+        });
+        eng.pending_exit = Some(PendingExit {
+            order_id: Some(42),
+            reason: "tp_partial".into(),
+            requested_qty: 0.25,
+            expected_remaining_qty: 0.75,
+            filled_qty: 0.0,
+            submitted_ts_ms: 1_500,
+            reference_price: 101.0,
+            planned_price: 101.0,
+            rearm_stop: Some(Price::from_f64(100.1)),
+            timeout_noted: false,
+        });
+        // The fill reached Account but was not attributed to PendingExit.
+        eng.account.apply_fill(FillRequest {
+            ts: Timestamp::from_millis(2_000),
+            side: Side::Sell,
+            price: Price::from_f64(101.0),
+            qty: Qty::from_f64(0.25),
+            fee: 0.0,
+            is_maker: false,
+            reason: "external".into(),
+        });
+        eng.settle_pending_exit(Timestamp::from_millis(2_000)).await;
+        assert!(eng.pending_exit.is_none());
+        assert_eq!(
+            eng.account.position().unwrap().stop_price,
+            Some(Price::from_f64(100.1))
+        );
         let _ = std::fs::remove_file(&cfg.journal_path);
     }
 

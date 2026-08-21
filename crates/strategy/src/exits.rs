@@ -47,9 +47,10 @@ impl ExitPlugin for OrderFlowTradeManagement {
                 Side::Buy => last / pos.entry_price.to_f64() - 1.0,
                 Side::Sell => 1.0 - last / pos.entry_price.to_f64(),
             };
-            if pos.closed_frac + 1e-6 < self.trend_partial_close
-                && favorable_pct >= self.trend_partial_activation_pct
-            {
+            // The exchange quantity step can make a requested 25% reduction
+            // settle as 24.96%. Any prior reduction is the one configured
+            // trend partial; do not repeatedly shave the remainder forever.
+            if pos.closed_frac <= 1e-9 && favorable_pct >= self.trend_partial_activation_pct {
                 let protected = match pos.side {
                     Side::Buy => entry_with_buffer(pos.entry_price, self.trend_lock_profit_pct),
                     Side::Sell => entry_with_buffer(pos.entry_price, -self.trend_lock_profit_pct),
@@ -220,5 +221,27 @@ mod tests {
         let actions = exit.manage(&position(), &ctx);
         assert!(matches!(actions[0], ExitAction::ClosePartial(frac) if (frac - 0.25).abs() < 1e-9));
         assert!(matches!(actions[1], ExitAction::MoveStop(price) if price.to_f64() > 100.0));
+    }
+
+    #[test]
+    fn rounded_trend_partial_advances_to_trailing_stage() {
+        let exit = build_orderflow_management(&json!({
+            "trend_partial_activation_pct":0.006,
+            "trend_partial_close":0.25,
+            "trend_trail_activation_pct":0.010,
+            "trend_trail_pct":0.0025
+        }))
+        .unwrap();
+        let mut ctx = Ctx::default();
+        ctx.now = Some(Timestamp::from_millis(60_000));
+        ctx.flags.insert("position_strategy".into(), "trend".into());
+        ctx.flags.insert("last_price".into(), "105.0".into());
+        let mut pos = position();
+        pos.closed_frac = 0.2496;
+        let actions = exit.manage(&pos, &ctx);
+        assert_eq!(actions.len(), 1);
+        assert!(
+            matches!(actions[0], ExitAction::MoveStop(price) if (price.to_f64() - 104.7375).abs() < 1e-9)
+        );
     }
 }
