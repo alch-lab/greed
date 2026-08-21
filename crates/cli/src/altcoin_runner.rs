@@ -2348,6 +2348,47 @@ fn cross_selected(
     Some(selected.into_iter().map(|item| (item, side)).collect())
 }
 
+fn cross_execution_pool(
+    ranks: &[CrossRank],
+    selected: &[(CrossRank, i32)],
+    names: usize,
+) -> Vec<(CrossRank, i32, bool)> {
+    let Some((_, side)) = selected.first() else {
+        return Vec::new();
+    };
+    let primary_symbols = selected
+        .iter()
+        .map(|(rank, _)| rank.symbol.as_str())
+        .collect::<HashSet<_>>();
+    let reserve_limit = names.saturating_mul(2);
+    let reserves = if *side > 0 {
+        ranks
+            .iter()
+            .rev()
+            .filter(|rank| {
+                rank.trailing_return > 0.0 && !primary_symbols.contains(rank.symbol.as_str())
+            })
+            .take(reserve_limit)
+            .cloned()
+            .collect::<Vec<_>>()
+    } else {
+        ranks
+            .iter()
+            .filter(|rank| {
+                rank.trailing_return < 0.0 && !primary_symbols.contains(rank.symbol.as_str())
+            })
+            .take(reserve_limit)
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    selected
+        .iter()
+        .cloned()
+        .map(|(rank, side)| (rank, side, false))
+        .chain(reserves.into_iter().map(|rank| (rank, *side, true)))
+        .collect()
+}
+
 fn cross_leg_return(
     bars: &[Bar],
     signal_index: usize,
@@ -2476,10 +2517,11 @@ fn cross_section_analysis(
         cross.base_gross_multiple
     };
     let signal_ms = boundary_ms - 1;
+    let execution_pool = cross_execution_pool(&ranks, &selected, cross.names);
     let candidates = if universe_ready {
-        selected
+        execution_pool
             .iter()
-            .map(|(rank, side)| Candidate {
+            .map(|(rank, side, reserve)| Candidate {
                 symbol: rank.symbol.clone(),
                 signal_ms,
                 setup_origin_ms: signal_ms,
@@ -2494,7 +2536,12 @@ fn cross_section_analysis(
                 score: rank.trailing_return.abs(),
                 entry_phase: "cross_section_momentum".to_owned(),
                 breakout_level: 0.0,
-                entry_trigger: "scheduled_cross_section_momentum".to_owned(),
+                entry_trigger: if *reserve {
+                    "scheduled_cross_section_momentum_reserve"
+                } else {
+                    "scheduled_cross_section_momentum"
+                }
+                .to_owned(),
                 // `gross_multiple` is a basket budget.  Every selected leg
                 // receives an equal share so increasing N diversifies the
                 // cross-section instead of multiplying account leverage.
@@ -2512,6 +2559,13 @@ fn cross_section_analysis(
     let selected_json: Vec<Value> = selected
         .iter()
         .map(|(rank, side)| {
+            json!({"symbol":rank.symbol,"side":side,"return_12h":rank.trailing_return,"volume_24h":rank.volume_24h})
+        })
+        .collect();
+    let reserve_json: Vec<Value> = execution_pool
+        .iter()
+        .filter(|(_, _, reserve)| *reserve)
+        .map(|(rank, side, _)| {
             json!({"symbol":rank.symbol,"side":side,"return_12h":rank.trailing_return,"volume_24h":rank.volume_24h})
         })
         .collect();
@@ -2557,10 +2611,11 @@ fn cross_section_analysis(
         "strong_signal":strong_signal,
         "universe_rule":format!("同名现货与 USDT 永续、24h 成交额达标；每 3 小时等权执行截面最强或最弱的 {} 币",cross.names),
         "selected":selected_json,
+        "execution_reserves":reserve_json,
         "reentry_exclusions":reentry_exclusions,
         "ranked_extremes":ranked_extremes,
         "gate":{"ready":gate_ready,"open":high_conviction,"samples":history.len(),"required_samples":cross.gate_window,"sum_return":history.iter().sum::<f64>(),"profit_factor":profit_factor,"required_profit_factor":cross.gate_min_profit_factor,"returns":history,"baskets":shadow_baskets},
-        "execution":{"legs_required":cross.names,"gross_multiple":gross_multiple,"gross_per_leg":gross_multiple/cross.names as f64,"allocation":"equal_weight_shared_gross","base_gross_multiple":cross.base_gross_multiple,"active_gross_multiple":cross.active_gross_multiple,"strong_excess_return":cross.strong_excess_return,"strong_gross_multiple":cross.strong_gross_multiple,"stop_pct":cross.stop_pct,"trail_activation_pct":cross.trail_activation_pct,"trail_pct":cross.trail_pct,"partial_take_profit_fraction":cross.partial_take_profit_fraction,"rebalance_hours":cross.hold_hours,"same_signal_carry":true,"daily_loss_limit":impulse.daily_loss_limit}
+        "execution":{"legs_required":cross.names,"reserve_count":reserve_json.len(),"gross_multiple":gross_multiple,"gross_per_leg":gross_multiple/cross.names as f64,"allocation":"equal_weight_shared_gross","base_gross_multiple":cross.base_gross_multiple,"active_gross_multiple":cross.active_gross_multiple,"strong_excess_return":cross.strong_excess_return,"strong_gross_multiple":cross.strong_gross_multiple,"stop_pct":cross.stop_pct,"trail_activation_pct":cross.trail_activation_pct,"trail_pct":cross.trail_pct,"partial_take_profit_fraction":cross.partial_take_profit_fraction,"rebalance_hours":cross.hold_hours,"same_signal_carry":true,"daily_loss_limit":impulse.daily_loss_limit}
     });
     (candidates, status)
 }
@@ -3725,7 +3780,10 @@ async fn resolve_live_cross_rebalance(
 ) -> Result<bool> {
     let selected: Vec<Candidate> = candidates
         .iter()
-        .filter(|candidate| is_cross_candidate(candidate))
+        .filter(|candidate| {
+            is_cross_candidate(candidate)
+                && candidate.entry_trigger == "scheduled_cross_section_momentum"
+        })
         .cloned()
         .collect();
     let current: Vec<Position> = state
@@ -3803,7 +3861,9 @@ fn resolve_dry_cross_rebalance(
 ) -> Result<bool> {
     let selected: Vec<Candidate> = candidates
         .iter()
-        .filter(|item| is_cross_candidate(item))
+        .filter(|item| {
+            is_cross_candidate(item) && item.entry_trigger == "scheduled_cross_section_momentum"
+        })
         .cloned()
         .collect();
     let current: Vec<Position> = state
@@ -5433,14 +5493,27 @@ pub async fn run_altcoin_impulse(
                         .seen_signal
                         .insert(signal_key.to_owned(), cross_signal_ms);
                     state.cross_section_pending = candidates.clone();
+                    let primary_symbols = candidates
+                        .iter()
+                        .filter(|item| item.entry_trigger == "scheduled_cross_section_momentum")
+                        .map(|item| item.symbol.clone())
+                        .collect::<Vec<_>>();
+                    let reserve_symbols = candidates
+                        .iter()
+                        .filter(|item| {
+                            item.entry_trigger == "scheduled_cross_section_momentum_reserve"
+                        })
+                        .map(|item| item.symbol.clone())
+                        .collect::<Vec<_>>();
                     status["execution_state"] = if let Some(candidate) = candidates.first() {
                         json!({
                             "status":"awaiting_liquidity",
                             "symbol":candidate.symbol,
                             "side":candidate.side,
-                            "symbols":candidates.iter().map(|item| item.symbol.clone()).collect::<Vec<_>>(),
-                            "legs_total":candidates.len(),
-                            "legs_pending":candidates.len(),
+                            "symbols":primary_symbols,
+                            "reserve_symbols":reserve_symbols,
+                            "legs_total":cross_cfg.names,
+                            "candidates_pending":candidates.len(),
                             "retry_count":0,
                             "created_ms":scan_ms,
                             "expires_ms":cross_signal_ms + cfg.max_signal_age_seconds as i64 * 1_000,
@@ -6457,20 +6530,24 @@ pub async fn run_altcoin_impulse(
                             json!({"ts_ms":scan_ms,"event":"entry_rejected","stage":"liquidity_check","symbol":candidate.symbol,"reason":reason,"target_notional":notional}),
                         )?;
                         if cross_candidate {
+                            state
+                                .cross_section_pending
+                                .retain(|item| item.symbol != candidate.symbol);
                             let retry_count = state.cross_section_status["execution_state"]
                                 ["retry_count"]
                                 .as_u64()
                                 .unwrap_or(0)
                                 + 1;
                             state.cross_section_status["execution_state"] = json!({
-                                "status":"retrying_liquidity",
+                                "status":"trying_next_candidate",
                                 "symbol":candidate.symbol,
                                 "side":candidate.side,
                                 "retry_count":retry_count,
                                 "last_check_ms":scan_ms,
-                                "next_retry_ms":scan_ms + cfg.poll_seconds.max(15) as i64 * 1_000,
+                                "next_symbol":state.cross_section_pending.first().map(|item| item.symbol.clone()),
                                 "expires_ms":candidate.signal_ms + max_signal_age_ms,
                                 "reason":reason,
+                                "resolution":"candidate_skipped_next_rank_immediate",
                                 "market_data_source":"binance_mainnet_public"
                             });
                             save_state(&state_path, &state)?;
@@ -6585,22 +6662,26 @@ pub async fn run_altcoin_impulse(
                         reason,
                     );
                     if cross_candidate {
+                        state
+                            .cross_section_pending
+                            .retain(|item| item.symbol != candidate.symbol);
                         let retry_count = state.cross_section_status["execution_state"]
                             ["retry_count"]
                             .as_u64()
                             .unwrap_or(0)
                             + 1;
                         state.cross_section_status["execution_state"] = json!({
-                            "status":"retrying_liquidity",
+                            "status":"trying_next_candidate",
                             "symbol":candidate.symbol,
                             "side":candidate.side,
                             "symbols":state.cross_section_pending.iter().map(|item| item.symbol.clone()).collect::<Vec<_>>(),
                             "legs_pending":state.cross_section_pending.len(),
                             "retry_count":retry_count,
                             "last_check_ms":scan_ms,
-                            "next_retry_ms":scan_ms + cfg.poll_seconds.max(15) as i64 * 1_000,
+                            "next_symbol":state.cross_section_pending.first().map(|item| item.symbol.clone()),
                             "expires_ms":candidate.signal_ms + max_signal_age_ms,
                             "reason":blockers.join(" / "),
+                            "resolution":"candidate_skipped_next_rank_immediate",
                             "market_data_source":"binance_mainnet_public"
                         });
                         save_state(&state_path, &state)?;
@@ -6631,6 +6712,7 @@ pub async fn run_altcoin_impulse(
             let mut protection_order_id = None;
             let mut protection_order_ids = Vec::new();
             let mut actual_leverage = cfg.exchange_leverage;
+            let mut execution_mark_at_order = None;
             if let Some(client) = rest.as_ref() {
                 actual_leverage = match client
                     .set_leverage_up_to(
@@ -6757,10 +6839,41 @@ pub async fn run_altcoin_impulse(
                         continue;
                     }
                 };
+                execution_mark_at_order = Some(execution_mark);
+                let adverse_signal_drift =
+                    candidate.side as f64 * (execution_mark / candidate.price - 1.0);
+                let signal_drift_limit = if cross_candidate {
+                    cfg.max_entry_slippage_pct.min(0.0075)
+                } else {
+                    cfg.max_entry_slippage_pct
+                };
+                if adverse_signal_drift > signal_drift_limit {
+                    let reason = format!(
+                        "信号后不利漂移 {:.1}bps > {:.1}bps",
+                        adverse_signal_drift * 10_000.0,
+                        signal_drift_limit * 10_000.0
+                    );
+                    state.note_execution_issue(
+                        scan_ms,
+                        &candidate.symbol,
+                        "signal_drift",
+                        reason.clone(),
+                    );
+                    append_event(
+                        &event_path,
+                        json!({"ts_ms":scan_ms,"event":"entry_rejected","stage":"signal_drift","symbol":candidate.symbol,"side":candidate.side,"signal_price":candidate.price,"execution_mark_price":execution_mark,"adverse_signal_drift_bps":adverse_signal_drift*10_000.0,"limit_bps":signal_drift_limit*10_000.0,"reason":reason,"resolution":if cross_candidate {"candidate_skipped_next_rank_immediate"} else {"signal_rejected"}}),
+                    )?;
+                    continue;
+                }
+                let execution_slippage_limit = if cross_candidate {
+                    cfg.max_entry_slippage_pct.min(0.002)
+                } else {
+                    cfg.max_entry_slippage_pct
+                };
                 let (raw_guard_price, guard_price) = clamp_entry_guard_price(
                     candidate.side,
-                    candidate.price,
-                    cfg.max_entry_slippage_pct,
+                    execution_mark,
+                    execution_slippage_limit,
                     execution_mark,
                     filters.multiplier_up,
                     filters.multiplier_down,
@@ -6769,7 +6882,7 @@ pub async fn run_altcoin_impulse(
                 if (guard_price - raw_guard_price).abs() > filters.tick_size * 0.5 {
                     append_event(
                         &event_path,
-                        json!({"ts_ms":scan_ms,"event":"entry_price_guard_clamped","symbol":candidate.symbol,"side":side,"signal_price":candidate.price,"execution_mark_price":execution_mark,"raw_guard_price":raw_guard_price,"clamped_guard_price":guard_price,"multiplier_up":filters.multiplier_up,"multiplier_down":filters.multiplier_down}),
+                        json!({"ts_ms":scan_ms,"event":"entry_price_guard_clamped","symbol":candidate.symbol,"side":side,"signal_price":candidate.price,"execution_mark_price":execution_mark,"adverse_signal_drift_bps":adverse_signal_drift*10_000.0,"execution_slippage_limit_bps":execution_slippage_limit*10_000.0,"raw_guard_price":raw_guard_price,"clamped_guard_price":guard_price,"multiplier_up":filters.multiplier_up,"multiplier_down":filters.multiplier_down}),
                     )?;
                 }
                 let order = match client
@@ -6950,7 +7063,7 @@ pub async fn run_altcoin_impulse(
             if candidate.entry_phase == "overextended_long" {
                 overextension_slot_taken = true;
             }
-            let event = json!({"ts_ms":scan_ms,"event":"entry","strategy":micro_strategy,"setup_id":trial_key,"origin_signal_ms":setup_origin_ms,"symbol":candidate.symbol,"side":candidate.side,"entry_phase":candidate.entry_phase,"entry_trigger":candidate.entry_trigger,"risk_scale":candidate.risk_scale,"direction_risk_scale":direction_risk_scale,"effective_risk_scale":effective_risk_scale,"signal_age_ms":signal_age_ms(scan_ms,candidate.signal_ms),"max_signal_age_ms":max_signal_age_ms,"signal":candidate,"entry_price":entry,"qty":qty,"notional":qty*entry,"requested_leverage":cfg.exchange_leverage,"actual_leverage":actual_leverage,"margin_estimate":qty*entry/actual_leverage as f64,"risk_usd":qty*entry*risk_distance,"price_stop_risk_usd":qty*entry*stop_pct,"stop_pct":stop_pct,"trail_activation_pct":if pulse_candidate {Some(cfg.pulse_trail_activation_pct)} else if cross_candidate {Some(cross_cfg.trail_activation_pct)} else if shock_candidate {Some(shock_cfg.trail_activation_pct)} else {Some(cfg.trail_activation_pct)},"trail_pct":if pulse_candidate {Some(cfg.pulse_trail_pct)} else if cross_candidate {Some(cross_cfg.trail_pct)} else if shock_candidate {Some(shock_cfg.trail_pct)} else {Some(cfg.trail_pct)},"partial_take_profit_fraction":if cross_candidate {Some(cross_cfg.partial_take_profit_fraction)} else if shock_candidate {None} else {Some(cfg.partial_take_profit_fraction)},"max_hold_hours":if cross_candidate {Value::Null} else if shock_candidate {json!(shock_cfg.max_hold_hours)} else {json!(cfg.max_hold_hours)},"rebalance_hours":if cross_candidate {Some(cross_cfg.hold_hours as u32)} else {None},"risk_execution_buffer_pct":cfg.risk_execution_buffer_pct,"fee":fee});
+            let event = json!({"ts_ms":scan_ms,"event":"entry","strategy":micro_strategy,"setup_id":trial_key,"origin_signal_ms":setup_origin_ms,"symbol":candidate.symbol,"side":candidate.side,"entry_phase":candidate.entry_phase,"entry_trigger":candidate.entry_trigger,"risk_scale":candidate.risk_scale,"direction_risk_scale":direction_risk_scale,"effective_risk_scale":effective_risk_scale,"signal_age_ms":signal_age_ms(scan_ms,candidate.signal_ms),"max_signal_age_ms":max_signal_age_ms,"signal":candidate,"entry_price":entry,"execution_mark_price":execution_mark_at_order,"execution_slippage_bps":execution_mark_at_order.map(|mark| candidate.side as f64*(entry/mark-1.0)*10_000.0),"signal_to_fill_bps":candidate.side as f64*(entry/candidate.price-1.0)*10_000.0,"qty":qty,"notional":qty*entry,"requested_leverage":cfg.exchange_leverage,"actual_leverage":actual_leverage,"margin_estimate":qty*entry/actual_leverage as f64,"risk_usd":qty*entry*risk_distance,"price_stop_risk_usd":qty*entry*stop_pct,"stop_pct":stop_pct,"trail_activation_pct":if pulse_candidate {Some(cfg.pulse_trail_activation_pct)} else if cross_candidate {Some(cross_cfg.trail_activation_pct)} else if shock_candidate {Some(shock_cfg.trail_activation_pct)} else {Some(cfg.trail_activation_pct)},"trail_pct":if pulse_candidate {Some(cfg.pulse_trail_pct)} else if cross_candidate {Some(cross_cfg.trail_pct)} else if shock_candidate {Some(shock_cfg.trail_pct)} else {Some(cfg.trail_pct)},"partial_take_profit_fraction":if cross_candidate {Some(cross_cfg.partial_take_profit_fraction)} else if shock_candidate {None} else {Some(cfg.partial_take_profit_fraction)},"max_hold_hours":if cross_candidate {Value::Null} else if shock_candidate {json!(shock_cfg.max_hold_hours)} else {json!(cfg.max_hold_hours)},"rebalance_hours":if cross_candidate {Some(cross_cfg.hold_hours as u32)} else {None},"risk_execution_buffer_pct":cfg.risk_execution_buffer_pct,"fee":fee});
             append_event(&event_path, event.clone())?;
             state.record_trade(event);
         }
@@ -8729,11 +8842,15 @@ mod tests {
         assert_eq!(status["gate"]["samples"], 30);
         assert_eq!(status["min_universe_size"], 5);
         assert_eq!(status["selected"].as_array().unwrap().len(), 5);
-        assert_eq!(candidates.len(), 5);
+        assert_eq!(candidates.len(), 6);
+        assert_eq!(status["execution"]["reserve_count"], 1);
         let basket_gross = status["execution"]["gross_multiple"].as_f64().unwrap();
         assert!(
             (candidates
                 .iter()
+                .filter(|candidate| {
+                    candidate.entry_trigger == "scheduled_cross_section_momentum"
+                })
                 .map(|candidate| candidate.risk_scale)
                 .sum::<f64>()
                 - basket_gross)
@@ -8741,6 +8858,10 @@ mod tests {
                 < f64::EPSILON
         );
         assert_eq!(candidates[0].entry_phase, "cross_section_momentum");
+        assert_eq!(
+            candidates.last().unwrap().entry_trigger,
+            "scheduled_cross_section_momentum_reserve"
+        );
         assert_eq!(candidates[0].side, 1);
         assert!(super::cross_section_status_complete(&status));
         let excluded = std::collections::HashSet::from([candidates[0].symbol.clone()]);
