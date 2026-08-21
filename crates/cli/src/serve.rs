@@ -8,7 +8,7 @@
 //!
 //! 端口默认 8088（前端 vite dev server 已配置 /api 代理到此端口）。
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
@@ -661,9 +661,125 @@ async fn portfolio_mr_journal(
         "dry" | "paper" | "live" => {}
         _ => return Err((StatusCode::BAD_REQUEST, "mode 应为 dry/paper/live".into())),
     }
-    read_json_file(&format!("data/journal/portfolio-mr-{mode}.json"))
-        .await
-        .map(Json)
+    let directory = std::path::Path::new("data/journal");
+    let history_prefix = format!("portfolio-mr-{mode}.history-");
+    let mut paths = std::fs::read_dir(directory)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with(&history_prefix) && name.ends_with(".json"))
+        })
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths.push(directory.join(format!("portfolio-mr-{mode}.json")));
+
+    let mut journals = Vec::with_capacity(paths.len());
+    for path in &paths {
+        let text = tokio::fs::read_to_string(path).await.map_err(|_| {
+            (
+                StatusCode::NOT_FOUND,
+                format!("文件不存在: {}", path.display()),
+            )
+        })?;
+        let journal = serde_json::from_str(&text).map_err(|error| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("JSON 解析失败 {}: {error}", path.display()),
+            )
+        })?;
+        journals.push(journal);
+    }
+    merge_journal_history(journals).map(Json)
+}
+
+fn merge_journal_history(
+    mut journals: Vec<serde_json::Value>,
+) -> Result<serde_json::Value, (StatusCode, String)> {
+    if journals.is_empty() {
+        return Err((StatusCode::NOT_FOUND, "BTC journal 不存在".into()));
+    }
+    let active = journals.pop().expect("checked non-empty journal list");
+    let history_count = journals.len();
+    let mut merged = journals.first().cloned().unwrap_or_else(|| active.clone());
+
+    for field in ["intents", "fills", "equity_curve", "evals"] {
+        let mut seen = HashSet::new();
+        let mut rows = Vec::new();
+        for journal in journals.iter().chain(std::iter::once(&active)) {
+            if let Some(items) = journal.get(field).and_then(serde_json::Value::as_array) {
+                for item in items {
+                    let key = serde_json::to_string(item).unwrap_or_default();
+                    if seen.insert(key) {
+                        rows.push(item.clone());
+                    }
+                }
+            }
+        }
+        rows.sort_by_key(|row| {
+            row.get("ts_ms")
+                .or_else(|| row.get("ts"))
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or_default()
+        });
+        merged[field] = serde_json::Value::Array(rows);
+    }
+
+    // Runtime recovery must continue to use only the active journal. This
+    // endpoint merges history for display and analysis; it never writes files.
+    merged["engine"] = active
+        .get("engine")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
+    if let Some(active_meta) = active.get("meta") {
+        let oldest_from = merged["meta"].get("from").cloned();
+        merged["meta"] = active_meta.clone();
+        if let Some(from) = oldest_from {
+            merged["meta"]["from"] = from;
+        }
+    }
+    merged["history_archives"] = serde_json::json!(history_count);
+    Ok(merged)
+}
+
+#[cfg(test)]
+mod journal_history_tests {
+    use super::merge_journal_history;
+
+    fn journal(from: &str, fill_ts: i64, engine: &str) -> serde_json::Value {
+        serde_json::json!({
+            "meta":{"symbol":"BTCUSDT","from":from,"to":"live","strategy":"s","initial_cash":1000.0,"final_equity":1000.0},
+            "intents":[{"ts_ms":fill_ts-1,"side":"Buy"}],
+            "fills":[{"ts":fill_ts,"side":"Buy","price":1.0,"qty":1.0}],
+            "equity_curve":[{"ts_ms":fill_ts,"equity":1000.0}],
+            "evals":[],
+            "engine":{"strategy_hash":engine}
+        })
+    }
+
+    #[test]
+    fn merges_archives_but_keeps_active_engine() {
+        let merged = merge_journal_history(vec![
+            journal("2026-08-20", 10, "old"),
+            journal("2026-08-22", 20, "current"),
+        ])
+        .unwrap();
+        assert_eq!(merged["fills"].as_array().unwrap().len(), 2);
+        assert_eq!(merged["meta"]["from"], "2026-08-20");
+        assert_eq!(merged["engine"]["strategy_hash"], "current");
+        assert_eq!(merged["history_archives"], 1);
+    }
+
+    #[test]
+    fn active_journal_alone_is_unchanged() {
+        let merged = merge_journal_history(vec![journal("2026-08-22", 20, "current")]).unwrap();
+        assert_eq!(merged["fills"].as_array().unwrap().len(), 1);
+        assert_eq!(merged["engine"]["strategy_hash"], "current");
+        assert_eq!(merged["history_archives"], 0);
+    }
 }
 
 // ============================================================================
