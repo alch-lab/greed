@@ -4,10 +4,9 @@
 # 把 greed.example.com 换成你的域名。
 
 greed.example.com {
-	# gzip is deliberately preferred over zstd here. Some embedded browsers and
-	# older WebViews advertise zstd but fail to decode ES modules, leaving the UI
-	# completely blank. gzip keeps the dashboard compatible with those clients.
-	encode gzip
+	# Keep dashboard assets uncompressed. Some embedded browsers incorrectly
+	# negotiate compressed ES modules through an IP-based HTTP origin and then
+	# leave the page blank. The bundle is small enough that compatibility wins.
 
 	# API → 控制面（只监听本机 127.0.0.1:8088，不直接暴露）
 	handle /api/* {
