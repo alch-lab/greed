@@ -706,7 +706,7 @@ fn merge_journal_history(
     let history_count = journals.len();
     let mut merged = journals.first().cloned().unwrap_or_else(|| active.clone());
 
-    for field in ["intents", "fills", "equity_curve", "evals"] {
+    for field in ["intents", "fills", "evals"] {
         let mut seen = HashSet::new();
         let mut rows = Vec::new();
         for journal in journals.iter().chain(std::iter::once(&active)) {
@@ -728,6 +728,35 @@ fn merge_journal_history(
         merged[field] = serde_json::Value::Array(rows);
     }
 
+    let journal_pnl = |journal: &serde_json::Value| {
+        let meta = &journal["meta"];
+        meta["final_equity"].as_f64().unwrap_or_default()
+            - meta["initial_cash"].as_f64().unwrap_or_default()
+    };
+    let history_pnl = journals.iter().map(journal_pnl).sum::<f64>();
+    let mut equity_rows = Vec::new();
+    let mut equity_seen = HashSet::new();
+    let mut offset = 0.0;
+    for (index, journal) in journals.iter().chain(std::iter::once(&active)).enumerate() {
+        if let Some(points) = journal["equity_curve"].as_array() {
+            for point in points {
+                let mut shifted = point.clone();
+                if let Some(equity) = shifted["equity"].as_f64() {
+                    shifted["equity"] = serde_json::json!(equity + offset);
+                }
+                let key = serde_json::to_string(&shifted).unwrap_or_default();
+                if equity_seen.insert(key) {
+                    equity_rows.push(shifted);
+                }
+            }
+        }
+        if index < journals.len() {
+            offset += journal_pnl(journal);
+        }
+    }
+    equity_rows.sort_by_key(|row| row["ts_ms"].as_i64().unwrap_or_default());
+    merged["equity_curve"] = serde_json::Value::Array(equity_rows);
+
     // Runtime recovery must continue to use only the active journal. This
     // endpoint merges history for display and analysis; it never writes files.
     merged["engine"] = active
@@ -740,8 +769,12 @@ fn merge_journal_history(
         if let Some(from) = oldest_from {
             merged["meta"]["from"] = from;
         }
+        if let Some(final_equity) = merged["meta"]["final_equity"].as_f64() {
+            merged["meta"]["final_equity"] = serde_json::json!(final_equity + history_pnl);
+        }
     }
     merged["history_archives"] = serde_json::json!(history_count);
+    merged["history_pnl"] = serde_json::json!(history_pnl);
     Ok(merged)
 }
 
@@ -762,15 +795,17 @@ mod journal_history_tests {
 
     #[test]
     fn merges_archives_but_keeps_active_engine() {
-        let merged = merge_journal_history(vec![
-            journal("2026-08-20", 10, "old"),
-            journal("2026-08-22", 20, "current"),
-        ])
-        .unwrap();
+        let mut history = journal("2026-08-20", 10, "old");
+        history["meta"]["final_equity"] = serde_json::json!(1153.0);
+        let merged =
+            merge_journal_history(vec![history, journal("2026-08-22", 20, "current")]).unwrap();
         assert_eq!(merged["fills"].as_array().unwrap().len(), 2);
         assert_eq!(merged["meta"]["from"], "2026-08-20");
         assert_eq!(merged["engine"]["strategy_hash"], "current");
         assert_eq!(merged["history_archives"], 1);
+        assert_eq!(merged["history_pnl"], 153.0);
+        assert_eq!(merged["meta"]["final_equity"], 1153.0);
+        assert_eq!(merged["equity_curve"][1]["equity"], 1153.0);
     }
 
     #[test]
