@@ -84,8 +84,8 @@ pub async fn run_trade(
     });
     // 显式模式下覆盖端点选择（Paper 强制 testnet，Live 强制主网）
     match mode {
-        TradeMode::Paper => account.testnet = true,
-        TradeMode::Live => account.testnet = false,
+        TradeMode::Paper => account.use_standard_environment(true),
+        TradeMode::Live => account.use_standard_environment(false),
         TradeMode::Dry => {}
     }
 
@@ -197,7 +197,7 @@ pub async fn run_trade(
                 info!(ws = %ws_base, "行情=主网公共 WS，执行=testnet（信号价格与回测同环境）");
             }
             (
-                live::AnyBroker::testnet(rest, &collector.symbol, filters),
+                live::AnyBroker::exchange(rest, &collector.symbol, filters),
                 sleeve_cash,
                 filters.step_size,
                 filters.market_step_size,

@@ -334,8 +334,8 @@ async fn preflight_account(
     let mut account = AccountConfig::from_toml_str(&base_text)
         .with_context(|| format!("解析配置 [account] 失败: {}", args.config))?;
     match mode {
-        TradeMode::Paper => account.testnet = true,
-        TradeMode::Live => account.testnet = false,
+        TradeMode::Paper => account.use_standard_environment(true),
+        TradeMode::Live => account.use_standard_environment(false),
         TradeMode::Dry => {}
     }
     let (key, secret) = match (account.api_key(), account.api_secret()) {
@@ -345,6 +345,10 @@ async fn preflight_account(
     let http = data::live::build_http_client(collector.effective_proxy().as_deref());
     let client = live::RestClient::new(http, account.rest_base(), key, secret);
     client.sync_time().await?;
+    anyhow::ensure!(
+        !client.position_mode_is_hedged().await?,
+        "组合策略只支持币安单向持仓模式（One-way Mode）；请先关闭 Hedge Mode"
+    );
     let wallet = client.wallet_balance_usdt().await?;
     let required = cfg.mr_capital_usdt + cfg.altcoin_capital_usdt;
     anyhow::ensure!(
@@ -363,6 +367,25 @@ async fn preflight_account(
             positions.is_empty(),
             "组合首次启动要求 Binance 账户空仓，当前仍有持仓 {positions:?}；请先平仓/重置模拟账户"
         );
+        let open_orders = client.open_order_symbols().await?;
+        anyhow::ensure!(
+            open_orders.is_empty(),
+            "组合首次启动要求 Binance 账户无挂单，当前仍有挂单 {open_orders:?}；请先撤销全部普通单和条件单"
+        );
+    }
+    if mode == TradeMode::Live {
+        anyhow::ensure!(
+            account.rest_base() == "https://fapi.binance.com"
+                && account.ws_base() == "wss://fstream.binance.com/market",
+            "实盘端点校验失败，拒绝启动"
+        );
+        let filters = client.symbol_filters("BTCUSDT").await?;
+        let (mark, _) = client.premium_index("BTCUSDT").await?;
+        let test_qty = (filters.min_notional * 2.0 / mark).max(filters.market_step_size * 2.0);
+        client
+            .test_market_order_permission("BTCUSDT", test_qty, &filters)
+            .await
+            .context("实盘 API TRADE 权限或订单参数预检失败")?;
     }
     Ok(wallet)
 }
@@ -486,16 +509,16 @@ mod tests {
     }
 
     #[test]
-    fn deployed_portfolio_has_two_one_thousand_usdt_sleeves() {
+    fn deployed_portfolio_has_two_fifteen_hundred_usdt_sleeves() {
         let cfg = deployed_config();
-        assert_eq!(cfg.mr_capital_usdt, 1_000.0);
-        assert_eq!(cfg.altcoin_capital_usdt, 1_000.0);
+        assert_eq!(cfg.mr_capital_usdt, 1_500.0);
+        assert_eq!(cfg.altcoin_capital_usdt, 1_500.0);
         assert_eq!(cfg.mr_risk_pct, 0.0125);
         assert_eq!(cfg.mr_max_risk_pct, 0.0125);
         assert_eq!(cfg.mr_leverage, 5);
         assert_eq!(cfg.mr_strategy, "config/strategy-final.toml");
         assert_eq!(cfg.altcoin_strategy, "config/strategy-altcoin-impulse.toml");
-        assert!(!cfg.allow_live);
+        assert!(cfg.allow_live);
     }
 
     #[test]
@@ -512,26 +535,26 @@ mod tests {
     fn aggregate_keeps_sleeve_equity_separate() {
         let cfg = deployed_config();
         let mr = json!({
-            "state":"running","equity":1_025.0,"cash":1_020.0,"execution_healthy":true,
+            "state":"running","equity":1_525.0,"cash":1_520.0,"execution_healthy":true,
             "performance":{"completed_trades":3,"wins":2}
         });
         let altcoin = json!({
-            "state":"running","equity":980.0,"cash":975.0,"execution_healthy":true,
+            "state":"running","equity":1_480.0,"cash":1_475.0,"execution_healthy":true,
             "altcoin_impulse":{"total_exits":7,"wins":4}
         });
         let status = aggregate_status(
             TradeMode::Paper,
             "config/strategy-portfolio.toml",
             1,
-            2_000.0,
+            3_000.0,
             &cfg,
             &mr,
             &altcoin,
         );
-        assert_eq!(status["equity"], 2_005.0);
+        assert_eq!(status["equity"], 3_005.0);
         assert_eq!(status["portfolio"]["combined_pnl"], 5.0);
-        assert_eq!(status["portfolio"]["mr"]["equity"], 1_025.0);
-        assert_eq!(status["portfolio"]["altcoin"]["equity"], 980.0);
+        assert_eq!(status["portfolio"]["mr"]["equity"], 1_525.0);
+        assert_eq!(status["portfolio"]["altcoin"]["equity"], 1_480.0);
         assert_eq!(status["portfolio"]["performance"]["completed_trades"], 10);
         assert_eq!(status["portfolio"]["performance"]["wins"], 6);
         assert_eq!(status["portfolio"]["performance"]["win_rate"], 0.6);

@@ -2,7 +2,7 @@
 //!
 //! - [`DryBroker`]：包装回测模拟撮合器（`--dry-run`），不碰网络签名接口；
 //!   成交价格/费用与回测完全一致（同一 FeeModel）。
-//! - [`TestnetBroker`]：币安 testnet 实盘下单；成交检测轮询
+//! - [`ExchangeBroker`]：币安 Demo/主网下单；成交检测轮询
 //!   `GET /fapi/v1/userTrades`（游标去重），拿回真实成交价/手续费/maker 标记，
 //!   经本地登记表映射回下单原因。
 //!
@@ -71,7 +71,7 @@ pub struct DryBroker {
     inner: Broker,
 }
 
-pub struct TestnetBroker {
+pub struct ExchangeBroker {
     rest: RestClient,
     symbol: String,
     filters: SymbolFilters,
@@ -96,7 +96,7 @@ pub enum AnyBroker {
     Dry(DryBroker),
     // REST 客户端及交易所状态明显大于本地撮合器，使用间接存储避免每个
     // AnyBroker 都按最大 variant 分配栈空间。
-    Testnet(Box<TestnetBroker>),
+    Exchange(Box<ExchangeBroker>),
 }
 
 impl AnyBroker {
@@ -106,8 +106,8 @@ impl AnyBroker {
         })
     }
 
-    pub fn testnet(rest: RestClient, symbol: &str, filters: SymbolFilters) -> Self {
-        AnyBroker::Testnet(Box::new(TestnetBroker {
+    pub fn exchange(rest: RestClient, symbol: &str, filters: SymbolFilters) -> Self {
+        AnyBroker::Exchange(Box::new(ExchangeBroker {
             rest,
             symbol: symbol.to_string(),
             filters,
@@ -126,7 +126,7 @@ impl AnyBroker {
     /// 每次进程启动时被重复记账。引擎尚未下单时做一次基线定位，可保证后续只消费本次
     /// 进程启动以后产生的成交。
     pub async fn prime_fill_cursor(&mut self) -> Result<(), RestError> {
-        let AnyBroker::Testnet(b) = self else {
+        let AnyBroker::Exchange(b) = self else {
             return Ok(());
         };
         let trades = b.rest.user_trades(&b.symbol, 0).await?;
@@ -143,7 +143,7 @@ impl AnyBroker {
     }
 
     /// 提交订单。Dry：市价单立即成交（与回测一致）；
-    /// Testnet：全部走挂单登记，成交经 `poll_fills` 异步回报。
+    /// Demo/主网：全部走挂单登记，成交经 `poll_fills` 异步回报。
     pub async fn submit(
         &mut self,
         ts: Timestamp,
@@ -152,7 +152,7 @@ impl AnyBroker {
     ) -> Result<Option<Execution>, RestError> {
         match self {
             AnyBroker::Dry(b) => Ok(b.inner.submit(ts, ref_price, order)),
-            AnyBroker::Testnet(b) => {
+            AnyBroker::Exchange(b) => {
                 let (kind, price, stop_price, reduce_only) = match order.kind {
                     OrderKind::Market => ("MARKET", None, None, false),
                     OrderKind::Limit(lp) => ("LIMIT", Some(lp.to_f64()), None, false),
@@ -188,7 +188,7 @@ impl AnyBroker {
                     kind,
                     qty = order.qty.to_f64(),
                     reason = %order.reason,
-                    "testnet 订单已提交"
+                    "Binance 订单已提交"
                 );
                 b.open.insert(
                     order_id,
@@ -205,18 +205,18 @@ impl AnyBroker {
         }
     }
 
-    /// 新成交价到达（Dry：驱动模拟撮合；Testnet：忽略，成交靠 poll_fills）。
+    /// 新成交价到达（Dry：驱动模拟撮合；交易所：忽略，成交靠 poll_fills）。
     pub async fn on_trade_price(&mut self, ts: Timestamp, price: Price) -> Vec<Execution> {
         match self {
             AnyBroker::Dry(b) => b.inner.on_trade_price(ts, price),
-            AnyBroker::Testnet(_) => Vec::new(),
+            AnyBroker::Exchange(_) => Vec::new(),
         }
     }
 
-    /// 轮询成交回报（Testnet：userTrades 游标；Dry：空）。
+    /// 轮询成交回报（Demo/主网：userTrades 游标；Dry：空）。
     /// 返回按成交时间升序的 Execution（真实价/费/maker）。
     pub async fn poll_fills(&mut self) -> Vec<Execution> {
-        let AnyBroker::Testnet(b) = self else {
+        let AnyBroker::Exchange(b) = self else {
             return Vec::new();
         };
         let trades = match b.rest.user_trades(&b.symbol, b.last_trade_id + 1).await {
@@ -302,7 +302,7 @@ impl AnyBroker {
                 fee,
                 maker = ut.maker,
                 reason = %reason,
-                "testnet 成交"
+                "Binance 成交"
             );
             out.push(Execution {
                 order_id: Some(ut.order_id),
@@ -323,7 +323,7 @@ impl AnyBroker {
     pub fn last_submitted_order_id(&self) -> Option<i64> {
         match self {
             AnyBroker::Dry(_) => None,
-            AnyBroker::Testnet(b) => b.last_submitted_order_id,
+            AnyBroker::Exchange(b) => b.last_submitted_order_id,
         }
     }
 
@@ -331,7 +331,7 @@ impl AnyBroker {
     pub fn execution_healthy(&self) -> bool {
         match self {
             AnyBroker::Dry(_) => true,
-            AnyBroker::Testnet(b) => b.execution_healthy,
+            AnyBroker::Exchange(b) => b.execution_healthy,
         }
     }
 
@@ -339,7 +339,7 @@ impl AnyBroker {
     pub async fn exchange_position_risk(&self) -> Result<Option<PositionRisk>, RestError> {
         match self {
             AnyBroker::Dry(_) => Ok(None),
-            AnyBroker::Testnet(b) => b.rest.position_risk(&b.symbol).await.map(Some),
+            AnyBroker::Exchange(b) => b.rest.position_risk(&b.symbol).await.map(Some),
         }
     }
 
@@ -352,7 +352,7 @@ impl AnyBroker {
         remaining_qty: f64,
         since_ms: i64,
     ) -> Result<Vec<Execution>, RestError> {
-        let AnyBroker::Testnet(b) = self else {
+        let AnyBroker::Exchange(b) = self else {
             return Ok(Vec::new());
         };
         let expected_side = position_side.opposite();
@@ -403,7 +403,7 @@ impl AnyBroker {
     pub async fn cancel_all(&mut self) {
         match self {
             AnyBroker::Dry(b) => b.inner.cancel_all(),
-            AnyBroker::Testnet(b) => match b.rest.cancel_all_open_orders(&b.symbol).await {
+            AnyBroker::Exchange(b) => match b.rest.cancel_all_open_orders(&b.symbol).await {
                 Ok(()) => b.open.clear(),
                 Err(e) => warn!(error = %e, "testnet 普通单/Algo 条件单全部撤单失败"),
             },
@@ -414,13 +414,13 @@ impl AnyBroker {
     pub fn rest(&self) -> Option<&RestClient> {
         match self {
             AnyBroker::Dry(_) => None,
-            AnyBroker::Testnet(b) => Some(&b.rest),
+            AnyBroker::Exchange(b) => Some(&b.rest),
         }
     }
 
     /// 定期重对时（防长跑时钟漂移触发 -1021）。Dry 无操作。
     pub async fn resync_time(&mut self) {
-        if let AnyBroker::Testnet(b) = self {
+        if let AnyBroker::Exchange(b) = self {
             if let Err(e) = b.rest.sync_time().await {
                 warn!(error = %e, "定期对时失败（下周期重试）");
             }

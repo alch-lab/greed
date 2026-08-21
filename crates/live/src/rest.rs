@@ -28,6 +28,21 @@ pub enum RestError {
     Data(String),
 }
 
+impl RestError {
+    /// Binance documents some 503 responses and client-side timeouts as
+    /// execution-unknown: the matching engine may already have accepted the
+    /// order. Callers must stop/reconcile instead of submitting a replacement.
+    pub fn execution_may_be_unknown(&self) -> bool {
+        match self {
+            Self::Http(error) => error.is_timeout(),
+            Self::Binance { code: 503, msg } => {
+                msg.contains("Unknown error") || msg.contains("check your request")
+            }
+            _ => false,
+        }
+    }
+}
+
 /// 交易对精度约束（来自 exchangeInfo）。
 #[derive(Debug, Clone, Copy)]
 pub struct SymbolFilters {
@@ -688,6 +703,46 @@ impl RestClient {
         Ok(())
     }
 
+    /// Account position mode. The engines intentionally use Binance one-way
+    /// mode (`positionSide=BOTH`) and never send LONG/SHORT hedge-mode fields.
+    pub async fn position_mode_is_hedged(&self) -> Result<bool, RestError> {
+        let value = self
+            .signed(reqwest::Method::GET, "/fapi/v1/positionSide/dual", &[])
+            .await?;
+        value["dualSidePosition"]
+            .as_bool()
+            .or_else(|| {
+                value["dualSidePosition"]
+                    .as_str()
+                    .and_then(|text| text.parse().ok())
+            })
+            .ok_or_else(|| RestError::Data("positionSide/dual 响应异常".into()))
+    }
+
+    /// Validate TRADE permission and the production order schema without
+    /// placing an order. Binance's `/order/test` performs normal validation but
+    /// never reaches the matching engine.
+    pub async fn test_market_order_permission(
+        &self,
+        symbol: &str,
+        qty: f64,
+        filters: &SymbolFilters,
+    ) -> Result<(), RestError> {
+        let quantity = quantity_string("MARKET", qty, filters);
+        self.signed(
+            reqwest::Method::POST,
+            "/fapi/v1/order/test",
+            &[
+                ("symbol", symbol.to_owned()),
+                ("side", "BUY".into()),
+                ("type", "MARKET".into()),
+                ("quantity", quantity),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
     /// 尝试请求目标杠杆；若交易所返回 -4028（该标的不支持），逐级回退到可用值。
     pub async fn set_leverage_up_to(
         &self,
@@ -823,6 +878,28 @@ impl RestClient {
                 (amount.abs() > 1e-12).then_some((symbol, amount))
             })
             .collect())
+    }
+
+    /// Symbols with any regular or conditional open order. Used only by the
+    /// first-start production preflight; an orphan stop must not be inherited
+    /// by a fresh virtual sleeve.
+    pub async fn open_order_symbols(&self) -> Result<Vec<String>, RestError> {
+        let regular = self
+            .signed(reqwest::Method::GET, "/fapi/v1/openOrders", &[])
+            .await?;
+        let algo = self
+            .signed(reqwest::Method::GET, "/fapi/v1/openAlgoOrders", &[])
+            .await?;
+        let mut symbols = regular
+            .as_array()
+            .into_iter()
+            .flatten()
+            .chain(algo.as_array().into_iter().flatten())
+            .filter_map(|order| order["symbol"].as_str().map(str::to_owned))
+            .collect::<Vec<_>>();
+        symbols.sort();
+        symbols.dedup();
+        Ok(symbols)
     }
 
     /// 撤销本交易对全部挂单。
@@ -1015,6 +1092,25 @@ impl RestClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_documented_unknown_503_is_treated_as_ambiguous_execution() {
+        assert!(RestError::Binance {
+            code: 503,
+            msg: "Unknown error, please check your request or try again later.".into(),
+        }
+        .execution_may_be_unknown());
+        assert!(!RestError::Binance {
+            code: 503,
+            msg: "Service Unavailable.".into(),
+        }
+        .execution_may_be_unknown());
+        assert!(!RestError::Binance {
+            code: 502,
+            msg: "Bad Gateway".into(),
+        }
+        .execution_may_be_unknown());
+    }
 
     /// 币安官方文档签名示例（spot 文档，HMAC 算法与合约一致）。
     #[test]

@@ -4651,8 +4651,8 @@ pub async fn run_altcoin_impulse(
         TradeMode::Live
     });
     match mode {
-        TradeMode::Paper => account.testnet = true,
-        TradeMode::Live => account.testnet = false,
+        TradeMode::Paper => account.use_standard_environment(true),
+        TradeMode::Live => account.use_standard_environment(false),
         TradeMode::Dry => {}
     }
     anyhow::ensure!(
@@ -6914,6 +6914,13 @@ pub async fn run_altcoin_impulse(
                             &event_path,
                             json!({"ts_ms":scan_ms,"event":"entry_rejected","stage":"entry_order","symbol":candidate.symbol,"reason":reason,"formatted_qty":formatted_qty}),
                         )?;
+                        if error.execution_may_be_unknown() {
+                            anyhow::bail!(
+                                "{} 下单结果未知，已停止执行器以避免重复下单；重启时将与交易所仓位对账: {}",
+                                candidate.symbol,
+                                reason
+                            );
+                        }
                         continue;
                     }
                 };
@@ -8572,14 +8579,16 @@ mod tests {
     }
 
     #[test]
-    fn deployed_altcoin_config_is_open_ended_paper_ready() {
+    fn deployed_altcoin_config_is_live_ready_with_daily_cap() {
         let strategy: super::StrategyFile = toml::from_str(include_str!(
             "../../../config/strategy-altcoin-impulse.toml"
         ))
         .unwrap();
         assert!(strategy.altcoin_impulse.enabled);
         assert!(strategy.altcoin_cross_section.enabled);
-        assert_eq!(strategy.altcoin_impulse.max_daily_entries, 0);
+        assert_eq!(strategy.altcoin_impulse.capital_usdt, 1_500.0);
+        assert_eq!(strategy.altcoin_impulse.max_daily_entries, 15);
+        assert!(strategy.altcoin_impulse.allow_live);
         assert_eq!(strategy.altcoin_impulse.max_positions, 5);
         assert_eq!(strategy.altcoin_impulse.scan_limit, 120);
         assert_eq!(strategy.altcoin_impulse.max_daily_entry_bonus, 0);
@@ -8637,7 +8646,7 @@ mod tests {
         assert_eq!(strategy.altcoin_impulse.intrabar_rebound_pct, 0.003);
         assert_eq!(strategy.altcoin_impulse.extreme_direct_risk_scale, 0.33);
         assert!(strategy.altcoin_impulse.pulse_exhaustion_enabled);
-        assert!(!strategy.altcoin_impulse.pulse_exhaustion_allow_live);
+        assert!(strategy.altcoin_impulse.pulse_exhaustion_allow_live);
         assert_eq!(strategy.altcoin_impulse.pulse_initial_return_1h, 0.06);
         assert_eq!(strategy.altcoin_impulse.pulse_initial_volume_ratio, 10.0);
         assert_eq!(strategy.altcoin_impulse.pulse_oi_change_1h, 0.20);

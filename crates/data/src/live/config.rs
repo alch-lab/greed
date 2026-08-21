@@ -139,12 +139,21 @@ impl AccountConfig {
         }
     }
 
+    /// Select a Binance environment explicitly and discard endpoint overrides.
+    /// A `--mode live` request must never inherit a Demo/Testnet URL left in a
+    /// shared config file (and paper must never inherit a production URL).
+    pub fn use_standard_environment(&mut self, testnet: bool) {
+        self.testnet = testnet;
+        self.rest_base.clear();
+        self.ws_base.clear();
+    }
+
     pub fn ws_base(&self) -> &str {
         if !self.ws_base.is_empty() {
             &self.ws_base
         } else if self.testnet {
             // 新 Demo Trading 合约 WS（裸 host，路径由使用方拼接 /ws/...）
-            "wss://demo-fapi.binance.com"
+            "wss://demo-fstream.binance.com"
         } else {
             // 旧版裸路径已于 2026-04-23 退役，市场数据走 /market
             "wss://fstream.binance.com/market"
@@ -200,7 +209,18 @@ book_snapshot_ms = 10000
         let acc = AccountConfig::from_toml_str("").unwrap();
         assert!(acc.testnet);
         assert_eq!(acc.rest_base(), "https://demo-fapi.binance.com");
-        assert_eq!(acc.ws_base(), "wss://demo-fapi.binance.com");
+        assert_eq!(acc.ws_base(), "wss://demo-fstream.binance.com");
+    }
+
+    #[test]
+    fn explicit_environment_discards_stale_endpoint_overrides() {
+        let mut account = AccountConfig::from_toml_str(
+            "[account]\ntestnet=true\nrest_base='https://demo-fapi.binance.com'\nws_base='wss://demo-fstream.binance.com'\n",
+        )
+        .unwrap();
+        account.use_standard_environment(false);
+        assert_eq!(account.rest_base(), "https://fapi.binance.com");
+        assert_eq!(account.ws_base(), "wss://fstream.binance.com/market");
     }
 
     #[test]

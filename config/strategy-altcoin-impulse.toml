@@ -4,7 +4,7 @@
 
 [altcoin_impulse]
 enabled = true
-capital_usdt = 1000.0
+capital_usdt = 1500.0
 exchange_leverage = 10
 # 标的不支持 10x 时自动回退，最低接受 5x；再低会因保证金占用过高而跳过。
 min_exchange_leverage = 5
@@ -18,9 +18,10 @@ short_risk_scale = 1.0
 max_directional_funding_rate = 0.003
 max_directional_premium = 0.010
 max_positions = 5
-# 0 表示不限制北京时间自然日内的开仓次数；仍受日回撤、仓位槽、冷却与流动性约束。
-max_daily_entries = 0
-# 每日开仓已无限，不需要临时加额。
+# 实盘/模拟盘统一限制为北京时间自然日最多 15 次开仓；已有仓位的部分止盈和平仓
+# 不占用开仓额度。实盘禁止通过前端临时增加额度。
+max_daily_entries = 15
+# 实盘不允许临时加额。
 max_daily_entry_bonus = 0
 daily_loss_limit = 0.04
 max_gross_multiple = 0.50
@@ -90,9 +91,9 @@ extreme_direct_risk_scale = 0.33
 # 路径效率、收盘位置或回踩确认；币种池、数据时效、流动性和账户风控仍共享。
 # 八日因果分钟回放显示，25% OI / 4.5% 回落确认过晚。这里恢复到相邻参数
 # 也保持为正的 20% OI / 3.5% 回落，同时保留现货滞后和真实可成交性硬门槛。
-# 仅 paper/dry 启用；它拥有独立的 1 个仓位槽和 1.0x 权益名义额度。
+# Demo 与实盘使用同一逻辑；它拥有独立的 1 个仓位槽和 1.0x 权益名义额度。
 pulse_exhaustion_enabled = true
-pulse_exhaustion_allow_live = false
+pulse_exhaustion_allow_live = true
 pulse_initial_return_1h = 0.06
 pulse_initial_volume_ratio = 10.0
 pulse_perp_return_1h = 0.06
@@ -148,8 +149,8 @@ min_close_location = 0.70
 scan_limit = 120
 poll_seconds = 60
 
-# 高风险模块默认禁止主网实盘；paper/dry 不受影响。
-allow_live = false
+# 主截面与独立衰竭空均允许主网实盘，保证 paper/live 使用同一策略组合。
+allow_live = true
 
 [altcoin_cross_section]
 # 12h/3h 截面动量直接执行。全池 12h 中位涨幅达到 1% 时做多最强币，
