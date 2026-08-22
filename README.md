@@ -1,98 +1,34 @@
 # greed
 
-BTCUSDT 永续 TRDR 市场地图 + 订单流力竭交易系统（Rust）。生产路径只有一个模型：
-
-`现货/合约流动性区域 → 30m 跨市场 Delta + OI + 趋势 → 10 秒力竭 → 3/5 分钟确认 → 结构风控`
-
-模型同时消费 Binance、Bybit、OKX 主网现货与永续逐笔成交、深度订单簿、永续 OI 和
-强平事件。现货只提供确认数据；模拟盘/实盘仍只使用一个 Binance USDⓈ-M 合约账户执行，
-不会建立现货腿，也不需要 Bybit/OKX 账户或 API key。
-
-## 代码结构
+可组合的加密货币策略研究与模拟盘系统。目前只有公开行情、回测和本地 paper 撮合，
+没有交易所鉴权或实盘下单代码。
 
 ```text
-crates/core       事件、类型和插件接口
-crates/data       Binance 导入、采集和本地数据湖
-crates/signals    TrdrMarketMap 上游地图 + OrderFlowExhaustion 入场确认
-crates/strategy   OrderFlowEntry、账户保护和分批出场
-crates/backtest   逐笔回测、撮合、账户和 Journal
-crates/live       主网公共行情 + dry/testnet/live 执行
-crates/cli        greed 命令行与 HTTP 控制面
-config/base.toml              市场和账户配置
-config/strategy-final.toml    唯一生产策略配置
+greed-kernel    领域合同、Artifact、DAG
+greed-strategy  原语、市场状态、策略组合、组合风控
+greed-runtime   官方历史数据回测、公开实时行情、paper broker、日志
 ```
 
-详细规则见 [docs/ORDERFLOW_MODEL.md](docs/ORDERFLOW_MODEL.md)。
-
-## 构建与验证
+## 验证与回测
 
 ```bash
-cargo fmt --all -- --check
 cargo test --workspace
 cargo build --release
-./target/release/greed validate \
-  --strategy config/strategy-final.toml --market perp --symbol BTCUSDT --lake data/lake
+
+./target/release/greed validate --config config/paper.toml
+./target/release/greed backtest --config config/paper.toml \
+  --train-from 2026-08-08 --split 2026-08-15 --to 2026-08-21
 ```
 
-## 回测
+回测自动下载并缓存 Binance 官方归档，训练段只负责选参数，验证段不参与选择。
+
+## 一周模拟盘
 
 ```bash
-./target/release/greed backtest \
-  --market perp --symbol BTCUSDT --from 2026-01-01 --to 2026-06-30 \
-  --lake data/lake --strategy config/strategy-final.toml \
-  --cash 100000 --risk-pct 0.002 --max-risk-pct 0.005 --trials 1 \
-  --out out/orderflow-2026h1 --journal data/journal/orderflow-2026h1.json
+./target/release/greed once --config config/paper.toml
+./target/release/greed paper --config config/paper.toml
+./target/release/greed report --journal data/runtime/paper-events.jsonl
 ```
 
-回测按时间合并逐笔成交、OI、资金费事件；订单簿文件存在时也会送入同一个信号插件。
-手续费、滑点、分批止盈和结构止损均走撮合/账户层，不在研究脚本里另算。
-
-## 模拟盘与实盘
-
-在 Binance Demo Trading 创建合约 API key，密钥只放环境变量：
-
-```bash
-export BINANCE_API_KEY='...'
-export BINANCE_API_SECRET='...'
-
-# 不下真实订单
-./target/release/greed trade --config config/base.toml \
-  --strategy config/strategy-final.toml --dry-run --risk-pct 0.002 --max-risk-pct 0.005
-
-# Demo Futures 真实撮合
-./target/release/greed trade --config config/base.toml \
-  --strategy config/strategy-final.toml --risk-pct 0.002 --max-risk-pct 0.005
-```
-
-paper/dry 的信号来自主网公共行情，订单在 Demo Futures 执行。启动时会同步服务器时间、
-设置逐仓和杠杆并清理遗留挂单。若交易所已有仓位，只有它与同一策略 Journal 中可恢复
-仓位完全一致时才会接管；否则拒绝启动。进程退出保留保护性止损。
-
-订单流基线只用真实逐笔成交，默认需要 120 个 10 秒桶（约 20 分钟）；TRDR Delta/趋势
-窗口为 30 分钟。不会用 K 线合成 Delta。生产信号硬性要求至少 2 家现货 + 2 家永续逐笔、
-至少 4 个完整盘口、现货/永续区域共振、色带持续 30 秒及连续 footprint 失衡；任一不足
-只记录观察样本。balanced 与 quality 两层均可执行。
-
-## 控制面与前端
-
-```bash
-./target/release/greed serve --port 8088
-cd ../greed-web
-npm ci
-npm run build
-npm run dev
-```
-
-前端分别展示 TRDR 市场地图和入场确认漏斗：色带区域、盘口覆盖、跨市场 Delta、OI 象限、
-趋势过滤、五个质量层级、真实意图和成交、持仓、权益与自动重启状态。
-
-## 数据
-
-```bash
-./target/release/greed ingest --market perp --symbol BTCUSDT \
-  --from 2026-01-01 --to 2026-06-30 --lake data/lake
-./target/release/greed collect --config config/base.toml
-```
-
-原始逐笔、订单簿和 OI 数据保存在 `data/lake/`；Journal 在 `data/journal/`。密钥、
-研究附件和大体量市场数据不得提交到 Git。
+详细边界、数据含义、部署步骤与实盘门槛见
+[架构与模拟盘说明](docs/ARCHITECTURE.zh-CN.md)。

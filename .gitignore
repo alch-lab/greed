@@ -5,3 +5,5 @@ Cargo.lock.bak
 out/
 *.log
 .DS_Store
+/data/backtest/cache/
+/data/runtime/

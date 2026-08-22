@@ -1,0 +1,25 @@
+[runtime]
+# proxy = "http://127.0.0.1:7890"
+
+[paper]
+initial_cash_usd = 3000.0
+max_positions = 7
+
+[strategy]
+majors = ["BTCUSDT", "ETHUSDT"]
+altcoins = [
+  "BNBUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT", "ADAUSDT", "LINKUSDT",
+  "AVAXUSDT", "SUIUSDT", "LTCUSDT", "BCHUSDT", "TRXUSDT", "DOTUSDT",
+]
+
+[strategy.primitives]
+breadth_horizon_bars = 96
+
+[strategy.recipes]
+cross_names = 2
+cross_rebalance_bars = 24
+
+[strategy.risk]
+# 3000 USDT: majors 1500 + altcoins 1500. Other risk values use defaults.
+major_max_gross = 0.50
+alt_max_gross = 0.50

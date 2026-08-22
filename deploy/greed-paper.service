@@ -1,0 +1,23 @@
+[Unit]
+Description=greed paper strategy sampler
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/greed
+ExecStart=/opt/greed/target/release/greed paper --config config/paper.toml
+Restart=always
+RestartSec=10
+
+# The binary contains no authenticated exchange client or live-order command.
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/greed/data/runtime
+User=greed
+Group=greed
+
+[Install]
+WantedBy=multi-user.target

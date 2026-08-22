@@ -1,0 +1,174 @@
+{
+  "source": "Binance public data archive (data.binance.vision)",
+  "data_limitations": [
+    "15m OHLC cannot reveal intrabar path; stop is conservatively evaluated before take-profit",
+    "historical depth is percentage-band depth, not a reconstructable level-2 book",
+    "Coinbase premium, ETF flow and liquidation websocket are observation-only because no reliable archive is available",
+    "two weeks is a parameter smoke test, not evidence of durable alpha"
+  ],
+  "training": [
+    {
+      "profile": "balanced",
+      "from": "2026-08-08",
+      "to": "2026-08-14",
+      "starting_equity_usd": 3000.0,
+      "ending_equity_usd": 2986.0513525881565,
+      "net_pnl_usd": -13.948647411843467,
+      "return_pct": -0.004649549137281106,
+      "max_drawdown_pct": 0.004806038372304707,
+      "entries": 6,
+      "completed_trades": 6,
+      "win_rate": 0.16666666666666666,
+      "profit_factor": 0.1261552284861029,
+      "fees_usd": 2.39842189940047,
+      "pnl_by_recipe": {
+        "alt_cross_section_momentum": -4.687623262605109,
+        "major_trend_pullback": -9.261024149238931
+      },
+      "entries_by_recipe": {
+        "alt_cross_section_momentum": 4,
+        "major_trend_pullback": 2
+      }
+    },
+    {
+      "profile": "responsive",
+      "from": "2026-08-08",
+      "to": "2026-08-14",
+      "starting_equity_usd": 3000.0,
+      "ending_equity_usd": 2961.1922771896047,
+      "net_pnl_usd": -38.80772281039526,
+      "return_pct": -0.01293590760346508,
+      "max_drawdown_pct": 0.01350315175963661,
+      "entries": 22,
+      "completed_trades": 22,
+      "win_rate": 0.22727272727272727,
+      "profit_factor": 0.2896245876362281,
+      "fees_usd": 7.439200914247527,
+      "pnl_by_recipe": {
+        "alt_cross_section_momentum": -29.274580307125948,
+        "major_trend_pullback": -9.53314250326891
+      },
+      "entries_by_recipe": {
+        "alt_cross_section_momentum": 19,
+        "major_trend_pullback": 3
+      }
+    },
+    {
+      "profile": "selective",
+      "from": "2026-08-08",
+      "to": "2026-08-14",
+      "starting_equity_usd": 3000.0,
+      "ending_equity_usd": 2997.024074833153,
+      "net_pnl_usd": -2.9759251668469915,
+      "return_pct": -0.000991975055615657,
+      "max_drawdown_pct": 0.00125537834245506,
+      "entries": 1,
+      "completed_trades": 1,
+      "win_rate": 0.0,
+      "profit_factor": -0.0,
+      "fees_usd": 0.601187368898974,
+      "pnl_by_recipe": {
+        "major_trend_pullback": -2.975925166846875
+      },
+      "entries_by_recipe": {
+        "major_trend_pullback": 1
+      }
+    }
+  ],
+  "selected_profile": "balanced",
+  "validation": {
+    "profile": "balanced",
+    "from": "2026-08-15",
+    "to": "2026-08-21",
+    "starting_equity_usd": 3000.0,
+    "ending_equity_usd": 3026.808962508268,
+    "net_pnl_usd": 26.808962508267996,
+    "return_pct": 0.008936320836089306,
+    "max_drawdown_pct": 0.01078336280196599,
+    "entries": 32,
+    "completed_trades": 32,
+    "win_rate": 0.4375,
+    "profit_factor": 1.3658138883147557,
+    "fees_usd": 14.547121620407701,
+    "pnl_by_recipe": {
+      "alt_cross_section_momentum": 10.69346624369668,
+      "major_exhaustion_reversal": -9.103823583002182,
+      "major_trend_pullback": 25.219319847572404
+    },
+    "entries_by_recipe": {
+      "alt_cross_section_momentum": 16,
+      "major_exhaustion_reversal": 2,
+      "major_trend_pullback": 14
+    }
+  },
+  "recommended_parameters": {
+    "majors": [
+      "BTCUSDT",
+      "ETHUSDT"
+    ],
+    "altcoins": [
+      "BNBUSDT",
+      "SOLUSDT",
+      "XRPUSDT",
+      "DOGEUSDT",
+      "ADAUSDT",
+      "LINKUSDT",
+      "AVAXUSDT",
+      "SUIUSDT",
+      "LTCUSDT",
+      "BCHUSDT",
+      "TRXUSDT",
+      "DOTUSDT"
+    ],
+    "primitives": {
+      "trend_horizon_bars": 24,
+      "trend_min_return_pct": 0.006,
+      "trend_min_efficiency": 0.1,
+      "flow_window_bars": 4,
+      "min_spot_delta_share": 0.01,
+      "min_spot_directional_share": 0.15,
+      "max_spread_bps": 8.0,
+      "min_depth_usd": 100000.0,
+      "breadth_horizon_bars": 96,
+      "breadth_threshold": 0.01,
+      "breadth_min_participation": 0.55,
+      "alt_min_24h_volume_usd": 25000000.0,
+      "alt_min_open_interest_usd": 5000000.0,
+      "volume_profile_bars": 96,
+      "wall_min_notional_usd": 2000000.0,
+      "wall_min_polls": 3
+    },
+    "recipes": {
+      "major_trend_pullback_enabled": true,
+      "major_exhaustion_enabled": true,
+      "require_coinbase_premium": false,
+      "alt_cross_section_enabled": true,
+      "alt_shock_reversal_enabled": true,
+      "pullback_min_pct": 0.002,
+      "exhaustion_move_pct": 0.018,
+      "cross_names": 2,
+      "cross_rebalance_bars": 24,
+      "shock_min_return_pct": 0.045,
+      "shock_min_reversal_pct": 0.006,
+      "shock_min_volume_ratio": 2.5
+    },
+    "risk": {
+      "major_gross_per_trade": 0.2,
+      "alt_gross_per_trade": 0.1,
+      "major_max_gross": 0.5,
+      "alt_max_gross": 0.5,
+      "max_total_gross": 1.0,
+      "initial_stop_pct": 0.008,
+      "first_take_profit_pct": 0.012,
+      "alt_cross_stop_pct": 0.015,
+      "alt_cross_take_profit_pct": 0.025,
+      "alt_cross_max_hold_minutes": 720,
+      "first_take_profit_fraction": 0.5,
+      "trailing_activation_pct": 0.012,
+      "trailing_distance_pct": 0.006,
+      "max_hold_minutes": 240,
+      "daily_loss_limit_pct": 0.025,
+      "peak_drawdown_halt_pct": 0.05
+    }
+  }
+}

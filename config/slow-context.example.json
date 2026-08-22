@@ -1,0 +1,10 @@
+{
+  "as_of_ms": 0,
+  "symbols": {
+    "BTCUSDT": {
+      "etf_daily_flow_usd": null,
+      "etf_rolling_5d_flow_usd": null,
+      "cme_basis_pct": null
+    }
+  }
+}

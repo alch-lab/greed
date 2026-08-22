@@ -1,76 +1,36 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/core",
-    "crates/data",
-    "crates/signals",
-    "crates/strategy",
-    "crates/backtest",
-    "crates/live",
-    "crates/cli",
+    "crates/greed-kernel",
+    "crates/greed-strategy",
+    "crates/greed-runtime",
 ]
 
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
-repository = "https://example.com/trdr-quant"
+repository = "https://github.com/wonder/greed"
 
-# 统一依赖版本，子 crate 用 { workspace = true } 引用
 [workspace.dependencies]
-# 内部 crate
-tcore     = { path = "crates/core", package = "core" }
-data      = { path = "crates/data" }
-signals   = { path = "crates/signals" }
-strategy  = { path = "crates/strategy" }
-backtest  = { path = "crates/backtest" }
-live      = { path = "crates/live" }
+greed-kernel = { path = "crates/greed-kernel" }
+greed-strategy = { path = "crates/greed-strategy" }
 
-# 异步运行时（PR-11 采集器 / 实盘启用）
 tokio = { version = "1", features = ["full"] }
-
-# 序列化
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
-
-# 配置与错误处理
-config    = { version = "0.14", default-features = false, features = ["toml"] }
 thiserror = "1"
 anyhow    = "1"
 toml      = "0.8"
-
-# 日志
 tracing            = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
-
-# 数据层
-csv      = "1"
-reqwest  = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
-parquet2 = {version = "0.17", features = ["zstd"]}
+csv = "1"
+reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "gzip"] }
 zip      = { version = "2", default-features = false, features = ["deflate"] }
 chrono   = { version = "0.4", default-features = false, features = ["std", "clock"] }
-bytes    = "1"
-bincode  = "1"
-crc32fast = "1"
-
-# CLI（ingest）
 clap = { version = "4", features = ["derive"] }
-
-# 实时采集
-tokio-tungstenite = { version = "0.24", features = ["rustls-tls-webpki-roots"]}
-futures-util = { version = "0.3", default-features = false }
-
-# 实盘签名（HMAC-SHA256）
-hmac = "0.12"
-sha2 = "0.10"
-# 测试
-proptest = "1"
 
 [profile.release]
 opt-level = 3
-# The service is dominated by exchange/network I/O. Cross-crate LTO and a
-# LTO adds substantial deployment build time for negligible operational benefit.
-# Keep one codegen unit because production hosts are memory constrained; higher
-# values can make rustc's LLVM workers exceed the server memory limit.
 lto = false
 codegen-units = 1
