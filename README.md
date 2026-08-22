@@ -31,7 +31,7 @@ cargo build --release
 ```
 
 `paper` 启动后同时在 `127.0.0.1:8088` 提供只读监控接口：
-`/api/health`、`/api/status`、`/api/events`、`/api/history` 和 `/api/backtest`。监听地址可通过
+`/api/health`、`/api/status`、`/api/events` 和 `/api/history`。监听地址可通过
 `runtime.http_listen` 调整；生产环境应保持回环监听，由带访问控制的 Web 代理转发。
 
 详细边界、数据含义、部署步骤与实盘门槛见

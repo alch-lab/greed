@@ -19,8 +19,6 @@ struct ApiState {
     status_path: PathBuf,
     journal_path: PathBuf,
     history_path: PathBuf,
-    current_backtest_path: PathBuf,
-    robustness_backtest_path: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -41,15 +39,12 @@ pub async fn start(config: &RuntimeConfig) -> Result<tokio::task::JoinHandle<()>
         status_path: config.status_path.clone().into(),
         journal_path: config.journal_path.clone().into(),
         history_path: config.history_path.clone().into(),
-        current_backtest_path: "data/backtest/report-final.json".into(),
-        robustness_backtest_path: "data/backtest/report-robustness.json".into(),
     };
     let router = Router::new()
         .route("/api/health", get(health))
         .route("/api/status", get(status))
         .route("/api/events", get(events))
         .route("/api/history", get(history))
-        .route("/api/backtest", get(backtest))
         .with_state(state);
     Ok(tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, router).await {
@@ -69,13 +64,6 @@ async fn health(State(state): State<ApiState>) -> Json<Value> {
 
 async fn status(State(state): State<ApiState>) -> Response {
     json_file(&state.status_path)
-}
-
-async fn backtest(State(state): State<ApiState>) -> Json<Value> {
-    Json(json!({
-        "current": read_json(&state.current_backtest_path).ok(),
-        "robustness": read_json(&state.robustness_backtest_path).ok(),
-    }))
 }
 
 async fn events(State(state): State<ApiState>, Query(query): Query<EventQuery>) -> Response {
