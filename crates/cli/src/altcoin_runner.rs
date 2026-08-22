@@ -4715,10 +4715,18 @@ pub async fn run_altcoin_impulse(
             format!("data/journal/altcoin-{}.jsonl", mode.as_str()),
         )
     };
-    let initial_cash = if let Some(client) = rest.as_ref() {
-        client.wallet_balance_usdt().await?.min(cfg.capital_usdt)
+    // In portfolio mode `args.cash` is the wallet-adjusted sleeve ceiling.
+    // Existing state still restores its own realized cash below; this value is
+    // only used for a first run or when that sleeve's state file is missing.
+    let sleeve_capital = if args.portfolio_mode && args.cash.is_finite() && args.cash > 0.0 {
+        args.cash.min(cfg.capital_usdt)
     } else {
         cfg.capital_usdt
+    };
+    let initial_cash = if let Some(client) = rest.as_ref() {
+        client.wallet_balance_usdt().await?.min(sleeve_capital)
+    } else {
+        sleeve_capital
     };
     let mut state = std::fs::read(&state_path)
         .ok()

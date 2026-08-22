@@ -61,6 +61,23 @@ fn default_mr_cb_daily_dd_pct() -> f64 {
     0.02
 }
 
+/// The configured sleeve capitals are allocation ceilings and performance
+/// baselines, not a permanent wallet-balance requirement.  When the account
+/// has realized a loss (or paid fees), keep the configured split but scale a
+/// fresh/missing sleeve state down to the capital that actually remains.
+fn effective_sleeve_capitals(wallet: f64, cfg: &PortfolioConfig) -> (f64, f64) {
+    let configured_total = cfg.mr_capital_usdt + cfg.altcoin_capital_usdt;
+    let scale = if configured_total > 0.0 {
+        (wallet / configured_total).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
+    (
+        cfg.mr_capital_usdt * scale,
+        cfg.altcoin_capital_usdt * scale,
+    )
+}
+
 pub fn is_portfolio_strategy(path: &str) -> bool {
     std::fs::read_to_string(path)
         .ok()
@@ -403,9 +420,19 @@ async fn preflight_account(
     let wallet = client.wallet_balance_usdt().await?;
     let required = cfg.mr_capital_usdt + cfg.altcoin_capital_usdt;
     anyhow::ensure!(
-        wallet + 1e-6 >= required,
-        "组合需要至少 {required:.2} USDT 账户钱包余额，当前只有 {wallet:.2} USDT"
+        wallet.is_finite() && wallet > 0.0,
+        "组合账户钱包余额无效，当前为 {wallet:.2} USDT"
     );
+    if wallet + 1e-6 < required {
+        let (mr_effective, altcoin_effective) = effective_sleeve_capitals(wallet, cfg);
+        warn!(
+            wallet,
+            configured_total = required,
+            mr_effective,
+            altcoin_effective,
+            "钱包低于组合初始本金（含已实现亏损/手续费），允许续跑并按原比例缩放缺失状态的 sleeve 本金"
+        );
+    }
     let mr_journal = format!("data/journal/portfolio-mr-{}.json", mode.as_str());
     let altcoin_state = format!(
         "data/journal/portfolio-altcoin-{}.state.json",
@@ -455,11 +482,13 @@ pub async fn run_portfolio(
         "组合策略默认禁止实盘；只允许模拟盘或 dry"
     );
     let account_wallet = preflight_account(&args, &cfg, mode).await?;
+    let (mr_effective_capital, altcoin_effective_capital) =
+        effective_sleeve_capitals(account_wallet, &cfg);
     let started_ms = chrono::Utc::now().timestamp_millis();
     let mut mr_args = args.clone();
     mr_args.strategy = cfg.mr_strategy.clone();
     mr_args.journal = Some(format!("data/journal/portfolio-mr-{}.json", mode.as_str()));
-    mr_args.cash = cfg.mr_capital_usdt;
+    mr_args.cash = mr_effective_capital;
     mr_args.risk_pct = cfg.mr_risk_pct;
     mr_args.max_risk_pct = cfg.mr_max_risk_pct;
     mr_args.leverage = cfg.mr_leverage;
@@ -473,7 +502,7 @@ pub async fn run_portfolio(
         "data/journal/portfolio-altcoin-{}.jsonl",
         mode.as_str()
     ));
-    altcoin_args.cash = cfg.altcoin_capital_usdt;
+    altcoin_args.cash = altcoin_effective_capital;
     altcoin_args.portfolio_mode = true;
 
     let (child_shutdown_tx, child_shutdown_rx) = watch::channel(false);
@@ -500,8 +529,10 @@ pub async fn run_portfolio(
     info!(
         mode = mode.as_str(),
         account_wallet,
-        mr_capital = cfg.mr_capital_usdt,
-        altcoin_capital = cfg.altcoin_capital_usdt,
+        mr_configured_capital = cfg.mr_capital_usdt,
+        altcoin_configured_capital = cfg.altcoin_capital_usdt,
+        mr_effective_capital,
+        altcoin_effective_capital,
         "单账户双策略组合已启动"
     );
 
@@ -574,6 +605,22 @@ mod tests {
         assert_eq!(cfg.mr_strategy, "config/strategy-final.toml");
         assert_eq!(cfg.altcoin_strategy, "config/strategy-altcoin-impulse.toml");
         assert!(cfg.allow_live);
+    }
+
+    #[test]
+    fn realized_wallet_loss_scales_fresh_sleeves_without_blocking_restart() {
+        let cfg = deployed_config();
+        let (mr, altcoin) = effective_sleeve_capitals(2_907.27, &cfg);
+        assert!((mr - 1_453.635).abs() < 1e-9);
+        assert!((altcoin - 1_453.635).abs() < 1e-9);
+    }
+
+    #[test]
+    fn wallet_profit_does_not_expand_sleeves_above_configured_caps() {
+        let cfg = deployed_config();
+        let (mr, altcoin) = effective_sleeve_capitals(3_200.0, &cfg);
+        assert_eq!(mr, 1_500.0);
+        assert_eq!(altcoin, 1_500.0);
     }
 
     #[test]
