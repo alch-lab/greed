@@ -85,8 +85,10 @@ journalctl -u greed-paper -f
 持久文件：
 
 - `data/runtime/paper-events.jsonl`：蜡烛、盘口/OI/外部快照、全量 Artifact、模拟成交和错误。
-- `data/runtime/paper-history.jsonl`：供监控页读取的紧凑权益曲线和模拟成交历史。
-- `data/runtime/paper-state.json`：账户、仓位、止损、已实现盈亏、已见候选，原子更新。
+- `data/runtime/paper-history.jsonl`：供监控页读取的紧凑权益曲线、Major/Altcoin 漏斗和模拟成交历史。
+- `data/runtime/paper-state.json`：账户、仓位、止损、已见候选，以及 Major/Altcoin 各自的
+  1500 USDT 账本，原子更新。旧状态首次迁移时无法可靠归属的历史已实现盈亏会单列为
+  `unattributed_realized_pnl_usd`，不会伪造到任一策略。
 - `data/runtime/status.json`：当前账户、持仓、候选、风控和所有原语状态。
 - `data/runtime/slow-context.json`：确认后的 ETF/CME 日频输入，可参考示例文件。
 
@@ -97,6 +99,12 @@ journalctl -u greed-paper -f
   > data/runtime/week-1-report.json
 ```
 
+报告按 Major/Altcoin、recipe 和北京时间自然日拆分成交数、手续费、已实现净盈亏、胜率、
+PF 和平均持仓时间；同时包含两套资金曲线的最大回撤/日亏损、候选漏斗及高频 blocker、
+程序重启与 commit/config 版本、帧空窗，以及 Binance 各接口请求、失败、429/418、重试、
+备用域名和延迟统计。因此只要保留 `paper-events.jsonl`，一周后可以定位“哪套策略、哪条
+recipe、哪一天、卡在哪一关、当时接口是否异常”。
+
 ## 一周评审门槛
 
 先评数据，再评收益：
@@ -104,7 +112,8 @@ journalctl -u greed-paper -f
 1. 主行情轮询成功率至少 99%，没有连续五分钟空窗。
 2. BTC/ETH 现货、永续、OI、盘口和 Coinbase 数据完整率分别统计。
 3. Block/Unknown 的主要原因可解释，不能出现缺数据却 Pass。
-4. 每个 recipe 的多空候选数量、成交数量、费用后 PF、最大回撤和 MAE/MFE 分开统计。
+4. 每个 recipe 的多空候选数量、成交数量、费用后 PF 分开统计；Major/Altcoin 分账检查
+   最大回撤。若需要 MAE/MFE，再由全量 candle 和成交事件进行离线重放，不能用当前价近似。
 5. paper 状态跨重启连续，不能重复开同一个 candidate。
 6. 高滑点、接口中断和同 K 止损/止盈冲突按保守路径重放。
 

@@ -9,6 +9,10 @@ use std::collections::{BTreeMap, BTreeSet};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaperPosition {
     pub candidate_id: String,
+    #[serde(default = "unknown_recipe")]
+    pub recipe: String,
+    #[serde(default = "default_asset_class")]
+    pub asset_class: AssetClass,
     pub symbol: String,
     pub side: Side,
     pub entry_ms: i64,
@@ -23,6 +27,67 @@ pub struct PaperPosition {
     pub extreme_price: f64,
     pub realized_pnl_usd: f64,
     pub last_bar_ms: i64,
+}
+
+fn unknown_recipe() -> String {
+    "unknown".into()
+}
+
+fn default_asset_class() -> AssetClass {
+    AssetClass::Major
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SleeveLedger {
+    pub initial_equity_usd: f64,
+    pub realized_pnl_usd: f64,
+    pub fees_usd: f64,
+    pub peak_equity_usd: f64,
+    pub risk_day_start_equity_usd: f64,
+    pub risk_day: String,
+}
+
+impl SleeveLedger {
+    fn new(initial: f64) -> Self {
+        Self {
+            initial_equity_usd: initial,
+            realized_pnl_usd: 0.0,
+            fees_usd: 0.0,
+            peak_equity_usd: initial,
+            risk_day_start_equity_usd: initial,
+            risk_day: String::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SleeveLedgers {
+    pub major: SleeveLedger,
+    pub altcoin: SleeveLedger,
+    #[serde(default)]
+    pub unattributed_realized_pnl_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SleeveSnapshot {
+    pub initial_equity_usd: f64,
+    pub equity_usd: f64,
+    pub cash_usd: f64,
+    pub realized_pnl_usd: f64,
+    pub unrealized_pnl_usd: f64,
+    pub fees_usd: f64,
+    pub peak_equity_usd: f64,
+    pub drawdown_pct: f64,
+    pub daily_loss_pct: f64,
+    pub gross_exposure_usd: f64,
+    pub open_positions: usize,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct SleeveSnapshots {
+    pub major: SleeveSnapshot,
+    pub altcoin: SleeveSnapshot,
+    pub unattributed_realized_pnl_usd: f64,
 }
 
 pub struct BrokerEvent {
@@ -40,6 +105,8 @@ pub struct PaperBroker {
     risk_day: String,
     positions: BTreeMap<String, PaperPosition>,
     seen: BTreeSet<String>,
+    #[serde(default)]
+    sleeves: Option<SleeveLedgers>,
 }
 impl PaperBroker {
     pub fn new(config: PaperConfig) -> Self {
@@ -53,9 +120,22 @@ impl PaperBroker {
             risk_day: String::new(),
             positions: BTreeMap::new(),
             seen: BTreeSet::new(),
+            sleeves: Some(Self::new_sleeves(cash)),
         }
     }
-    pub fn load_or_new(config: PaperConfig, path: &str) -> anyhow::Result<Self> {
+    fn new_sleeves(total: f64) -> SleeveLedgers {
+        let major = total / 2.0;
+        SleeveLedgers {
+            major: SleeveLedger::new(major),
+            altcoin: SleeveLedger::new(total - major),
+            unattributed_realized_pnl_usd: 0.0,
+        }
+    }
+    pub fn load_or_new(
+        config: PaperConfig,
+        path: &str,
+        major_symbols: &[String],
+    ) -> anyhow::Result<Self> {
         match std::fs::read_to_string(path) {
             Ok(text) => {
                 let mut broker: Self = serde_json::from_str(&text)?;
@@ -63,6 +143,33 @@ impl PaperBroker {
                 // are durable state.  A deliberate config change takes effect
                 // after restart without rewriting historical positions.
                 broker.config = config;
+                for position in broker.positions.values_mut() {
+                    position.asset_class = if major_symbols.contains(&position.symbol) {
+                        AssetClass::Major
+                    } else {
+                        AssetClass::Altcoin
+                    };
+                    if position.recipe == "unknown" {
+                        position.recipe = recipe_from_candidate(&position.candidate_id).into();
+                    }
+                }
+                if broker.sleeves.is_none() {
+                    let mut sleeves = Self::new_sleeves(broker.config.initial_cash_usd);
+                    let attributed: f64 = broker
+                        .positions
+                        .values()
+                        .map(|position| {
+                            let ledger = match position.asset_class {
+                                AssetClass::Major => &mut sleeves.major,
+                                AssetClass::Altcoin => &mut sleeves.altcoin,
+                            };
+                            ledger.realized_pnl_usd += position.realized_pnl_usd;
+                            position.realized_pnl_usd
+                        })
+                        .sum();
+                    sleeves.unattributed_realized_pnl_usd = broker.realized - attributed;
+                    broker.sleeves = Some(sleeves);
+                }
                 Ok(broker)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::new(config)),
@@ -83,6 +190,91 @@ impl PaperBroker {
         chrono::DateTime::from_timestamp_millis(ms + 8 * 3_600_000)
             .map(|dt| dt.format("%Y-%m-%d").to_string())
             .unwrap_or_default()
+    }
+    fn ledgers(&self) -> &SleeveLedgers {
+        self.sleeves
+            .as_ref()
+            .expect("sleeve ledgers initialized by constructor or migration")
+    }
+    fn ledger_mut(&mut self, asset_class: AssetClass) -> &mut SleeveLedger {
+        let sleeves = self
+            .sleeves
+            .as_mut()
+            .expect("sleeve ledgers initialized by constructor or migration");
+        match asset_class {
+            AssetClass::Major => &mut sleeves.major,
+            AssetClass::Altcoin => &mut sleeves.altcoin,
+        }
+    }
+    fn sleeve_snapshot(&self, frame: &MarketFrame, asset_class: AssetClass) -> SleeveSnapshot {
+        let ledger = match asset_class {
+            AssetClass::Major => &self.ledgers().major,
+            AssetClass::Altcoin => &self.ledgers().altcoin,
+        };
+        let mut unrealized = 0.0;
+        let mut gross = 0.0;
+        let mut open_positions = 0;
+        for position in self
+            .positions
+            .values()
+            .filter(|position| position.asset_class == asset_class)
+        {
+            let Some(instrument) = frame.instrument(&position.symbol) else {
+                continue;
+            };
+            unrealized += position.side.sign()
+                * (instrument.price - position.entry_price)
+                * position.remaining_quantity;
+            gross += instrument.price * position.remaining_quantity;
+            open_positions += 1;
+        }
+        let cash = ledger.initial_equity_usd + ledger.realized_pnl_usd;
+        let equity = cash + unrealized;
+        let peak = ledger.peak_equity_usd.max(equity);
+        SleeveSnapshot {
+            initial_equity_usd: ledger.initial_equity_usd,
+            equity_usd: equity,
+            cash_usd: cash,
+            realized_pnl_usd: ledger.realized_pnl_usd,
+            unrealized_pnl_usd: unrealized,
+            fees_usd: ledger.fees_usd,
+            peak_equity_usd: peak,
+            drawdown_pct: ((peak - equity) / peak.max(1.0)).max(0.0),
+            daily_loss_pct: ((ledger.risk_day_start_equity_usd - equity)
+                / ledger.risk_day_start_equity_usd.max(1.0))
+            .max(0.0),
+            gross_exposure_usd: gross,
+            open_positions,
+        }
+    }
+    pub fn sleeve_snapshots(&self, frame: &MarketFrame) -> SleeveSnapshots {
+        SleeveSnapshots {
+            major: self.sleeve_snapshot(frame, AssetClass::Major),
+            altcoin: self.sleeve_snapshot(frame, AssetClass::Altcoin),
+            unattributed_realized_pnl_usd: self.ledgers().unattributed_realized_pnl_usd,
+        }
+    }
+    fn roll_sleeve_day(&mut self, frame: &MarketFrame) {
+        let day = Self::current_day(frame.as_of_ms);
+        let major_equity = self.sleeve_snapshot(frame, AssetClass::Major).equity_usd;
+        let alt_equity = self.sleeve_snapshot(frame, AssetClass::Altcoin).equity_usd;
+        for (asset_class, equity) in [
+            (AssetClass::Major, major_equity),
+            (AssetClass::Altcoin, alt_equity),
+        ] {
+            let ledger = self.ledger_mut(asset_class);
+            if ledger.risk_day != day {
+                ledger.risk_day.clone_from(&day);
+                ledger.risk_day_start_equity_usd = equity;
+            }
+        }
+    }
+    fn update_sleeve_peaks(&mut self, frame: &MarketFrame) {
+        for asset_class in [AssetClass::Major, AssetClass::Altcoin] {
+            let equity = self.sleeve_snapshot(frame, asset_class).equity_usd;
+            let ledger = self.ledger_mut(asset_class);
+            ledger.peak_equity_usd = ledger.peak_equity_usd.max(equity);
+        }
     }
     pub fn positions(&self) -> &BTreeMap<String, PaperPosition> {
         &self.positions
@@ -163,6 +355,7 @@ impl PaperBroker {
             self.risk_day = day;
             self.risk_day_start = self.marked_account(frame).equity_usd;
         }
+        self.roll_sleeve_day(frame);
         let mut events = Vec::new();
         let symbols: Vec<_> = self.positions.keys().cloned().collect();
         for symbol in symbols {
@@ -265,6 +458,7 @@ impl PaperBroker {
         }
         let equity = self.marked_account(frame).equity_usd;
         self.peak_equity = self.peak_equity.max(equity);
+        self.update_sleeve_peaks(frame);
         events
     }
     pub fn close_all(&mut self, frame: &MarketFrame, reason: &str) -> Vec<BrokerEvent> {
@@ -308,6 +502,9 @@ impl PaperBroker {
         let pnl = gross - exit_fee;
         self.cash += pnl;
         self.realized += pnl;
+        let ledger = self.ledger_mut(position.asset_class);
+        ledger.realized_pnl_usd += pnl;
+        ledger.fees_usd += exit_fee;
         position.realized_pnl_usd += pnl;
         position.remaining_quantity = (position.remaining_quantity - quantity).max(0.0);
         BrokerEvent {
@@ -316,7 +513,7 @@ impl PaperBroker {
             } else {
                 "paper_exit".into()
             },
-            payload: serde_json::json!({"ts_ms":ts_ms,"candidate_id":position.candidate_id,"symbol":position.symbol,"side":position.side,"entry_price":position.entry_price,"exit_price":exit,"quantity":quantity,"remaining_quantity":position.remaining_quantity,"gross_pnl_usd":gross,"fee_usd":exit_fee,"pnl_usd":pnl,"reason":reason}),
+            payload: serde_json::json!({"ts_ms":ts_ms,"candidate_id":position.candidate_id,"recipe":position.recipe,"asset_class":position.asset_class,"symbol":position.symbol,"side":position.side,"entry_price":position.entry_price,"exit_price":exit,"quantity":quantity,"remaining_quantity":position.remaining_quantity,"gross_pnl_usd":gross,"fee_usd":exit_fee,"pnl_usd":pnl,"reason":reason}),
         }
     }
     pub fn apply_plans(
@@ -335,13 +532,25 @@ impl PaperBroker {
             {
                 continue;
             }
-            if let Some(event) = self.open(frame, plan) {
+            let recipe = evaluation
+                .artifacts
+                .values()
+                .filter_map(|record| record.artifact.candidate())
+                .find(|candidate| candidate.id == plan.candidate_id)
+                .map(|candidate| candidate.recipe.as_str())
+                .unwrap_or_else(|| recipe_from_candidate(&plan.candidate_id));
+            if let Some(event) = self.open(frame, plan, recipe) {
                 events.push(event);
             }
         }
         events
     }
-    fn open(&mut self, frame: &MarketFrame, plan: &PositionPlan) -> Option<BrokerEvent> {
+    fn open(
+        &mut self,
+        frame: &MarketFrame,
+        plan: &PositionPlan,
+        recipe: &str,
+    ) -> Option<BrokerEvent> {
         let instrument = frame.instrument(&plan.symbol)?;
         if instrument.price <= 0.0 || plan.reference_price <= 0.0 {
             return None;
@@ -364,11 +573,16 @@ impl PaperBroker {
         let entry_fee = entry * quantity * fee;
         self.cash -= entry_fee;
         self.realized -= entry_fee;
+        let ledger = self.ledger_mut(instrument.asset_class);
+        ledger.realized_pnl_usd -= entry_fee;
+        ledger.fees_usd += entry_fee;
         self.seen.insert(plan.candidate_id.clone());
         self.positions.insert(
             plan.symbol.clone(),
             PaperPosition {
                 candidate_id: plan.candidate_id.clone(),
+                recipe: recipe.into(),
+                asset_class: instrument.asset_class,
                 symbol: plan.symbol.clone(),
                 side: plan.side,
                 entry_ms: frame.as_of_ms,
@@ -387,8 +601,22 @@ impl PaperBroker {
         );
         Some(BrokerEvent {
             kind: "paper_entry".into(),
-            payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"symbol":plan.symbol,"side":plan.side,"entry_price":entry,"quantity":quantity,"notional_usd":plan.notional_usd,"fee_usd":entry_fee,"stop_price":rebased_stop,"paper_only":true}),
+            payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"asset_class":instrument.asset_class,"symbol":plan.symbol,"side":plan.side,"entry_price":entry,"quantity":quantity,"notional_usd":plan.notional_usd,"fee_usd":entry_fee,"stop_price":rebased_stop,"paper_only":true}),
         })
+    }
+}
+
+fn recipe_from_candidate(candidate_id: &str) -> &'static str {
+    if candidate_id.contains("trend_pullback") || candidate_id.contains("trend-pullback") {
+        "major_trend_pullback"
+    } else if candidate_id.contains("exhaustion") {
+        "major_exhaustion_reversal"
+    } else if candidate_id.contains("cross_section") || candidate_id.contains("cross-section") {
+        "alt_cross_section_momentum"
+    } else if candidate_id.contains("shock_reversal") || candidate_id.contains("shock-reversal") {
+        "alt_shock_reversal"
+    } else {
+        "unknown"
     }
 }
 
@@ -530,10 +758,32 @@ mod tests {
         broker.apply_plans(&frame(1_000_000, 100.0, 100.0, 100.0), &evaluation());
         let path = std::env::temp_dir().join(format!("greed-paper-{}.json", std::process::id()));
         broker.save(path.to_str().unwrap()).unwrap();
-        let restored =
-            PaperBroker::load_or_new(PaperConfig::default(), path.to_str().unwrap()).unwrap();
+        let restored = PaperBroker::load_or_new(
+            PaperConfig::default(),
+            path.to_str().unwrap(),
+            &["BTCUSDT".into()],
+        )
+        .unwrap();
         assert!(restored.positions().contains_key("BTCUSDT"));
         assert!(restored.seen.contains("candidate-1"));
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn sleeve_ledger_attributes_fees_and_pnl_to_major() {
+        let mut broker = PaperBroker::new(PaperConfig::default());
+        let entry_frame = frame(1_000_000, 100.0, 100.0, 100.0);
+        let events = broker.apply_plans(&entry_frame, &evaluation());
+        assert_eq!(events[0].payload["asset_class"], "major");
+        assert_eq!(events[0].payload["recipe"], "unknown");
+        let after_entry = broker.sleeve_snapshots(&entry_frame);
+        assert!(after_entry.major.realized_pnl_usd < 0.0);
+        assert_eq!(after_entry.altcoin.realized_pnl_usd, 0.0);
+
+        let exit_frame = frame(1_900_000, 103.0, 103.0, 103.0);
+        broker.close_all(&exit_frame, "test_exit");
+        let after_exit = broker.sleeve_snapshots(&exit_frame);
+        assert!(after_exit.major.realized_pnl_usd > 0.0);
+        assert_eq!(after_exit.altcoin.realized_pnl_usd, 0.0);
     }
 }

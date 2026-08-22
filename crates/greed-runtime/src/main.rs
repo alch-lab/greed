@@ -10,8 +10,8 @@ use anyhow::{Context, Result};
 use broker::PaperBroker;
 use clap::{Parser, Subcommand};
 use config::AppConfig;
-use greed_kernel::{Artifact, GraphEvaluation};
-use greed_strategy::build_graph;
+use greed_kernel::{Artifact, AssetClass, GraphEvaluation, Verdict};
+use greed_strategy::{build_graph, StrategyConfig};
 use journal::{Journal, SampleRecorder, StatusWriter};
 use source::BinancePaperSource;
 use std::time::Duration;
@@ -96,6 +96,111 @@ fn summarize(evaluation: &GraphEvaluation) -> serde_json::Value {
     serde_json::json!({"node_order":evaluation.node_order,"candidates":candidates,"plans":plans})
 }
 
+fn strategy_funnels(
+    strategy: &StrategyConfig,
+    evaluation: &GraphEvaluation,
+    broker: &PaperBroker,
+) -> serde_json::Value {
+    serde_json::json!({
+        "major": strategy_funnel(AssetClass::Major, strategy, evaluation, broker),
+        "altcoin": strategy_funnel(AssetClass::Altcoin, strategy, evaluation, broker),
+    })
+}
+
+fn strategy_funnel(
+    asset_class: AssetClass,
+    strategy: &StrategyConfig,
+    evaluation: &GraphEvaluation,
+    broker: &PaperBroker,
+) -> serde_json::Value {
+    let is_symbol = |symbol: &str| match asset_class {
+        AssetClass::Major => strategy.majors.iter().any(|value| value == symbol),
+        AssetClass::Altcoin => strategy.altcoins.iter().any(|value| value == symbol),
+    };
+    let candidates: Vec<_> = evaluation
+        .artifacts
+        .values()
+        .filter_map(|record| record.artifact.candidate())
+        .filter(|candidate| is_symbol(&candidate.symbol))
+        .collect();
+    let passed = candidates
+        .iter()
+        .filter(|candidate| candidate.verdict == Verdict::Pass)
+        .count();
+    let unknown = candidates
+        .iter()
+        .filter(|candidate| candidate.verdict == Verdict::Unknown)
+        .count();
+    let blocked = candidates.len() - passed - unknown;
+    let plans = evaluation
+        .artifacts
+        .values()
+        .filter_map(|record| match &record.artifact {
+            Artifact::PositionPlan(value) if is_symbol(&value.symbol) => Some(value),
+            _ => None,
+        })
+        .count();
+    let open_positions = broker
+        .positions()
+        .values()
+        .filter(|position| position.asset_class == asset_class)
+        .count();
+    let blockers: Vec<_> = candidates
+        .iter()
+        .flat_map(|candidate| candidate.blockers.iter())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .take(8)
+        .collect();
+    let current_stage = if open_positions > 0 {
+        "position_management"
+    } else if candidates.is_empty() {
+        "signal_scan"
+    } else if passed == 0 {
+        "signal_gates"
+    } else if plans == 0 {
+        "risk_sizing"
+    } else {
+        "paper_execution"
+    };
+    serde_json::json!({
+        "asset_class": asset_class,
+        "current_stage": current_stage,
+        "candidate_counts": {"total":candidates.len(),"pass":passed,"unknown":unknown,"block":blocked},
+        "plans": plans,
+        "open_positions": open_positions,
+        "blockers": blockers,
+    })
+}
+
+fn runtime_identity(config: &AppConfig, started_ms: i64) -> serde_json::Value {
+    let config_bytes = serde_json::to_vec(config).unwrap_or_default();
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in config_bytes {
+        hash ^= u64::from(byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    serde_json::json!({
+        "run_id": format!("{}-{}", started_ms, std::process::id()),
+        "started_ms": started_ms,
+        "version": env!("CARGO_PKG_VERSION"),
+        "git_commit": git_commit(),
+        "config_hash": format!("{hash:016x}"),
+    })
+}
+
+fn git_commit() -> Option<String> {
+    let head = std::fs::read_to_string(".git/HEAD").ok()?;
+    let head = head.trim();
+    if let Some(reference) = head.strip_prefix("ref: ") {
+        std::fs::read_to_string(format!(".git/{reference}"))
+            .ok()
+            .map(|value| value.trim().chars().take(12).collect())
+    } else {
+        Some(head.chars().take(12).collect())
+    }
+}
+
 async fn one_frame(
     config: &AppConfig,
     source: &mut BinancePaperSource,
@@ -169,17 +274,21 @@ async fn main() -> Result<()> {
 }
 
 async fn run_paper(config: AppConfig, iterations: u64) -> Result<()> {
+    let started_ms = chrono::Utc::now().timestamp_millis();
+    let identity = runtime_identity(&config, started_ms);
     let _monitor = monitor::start(&config.runtime).await?;
     let mut source = BinancePaperSource::new(config.runtime.clone())?;
-    let mut broker =
-        PaperBroker::load_or_new(config.paper.clone(), &config.runtime.paper_state_path)?;
+    let mut broker = PaperBroker::load_or_new(
+        config.paper.clone(),
+        &config.runtime.paper_state_path,
+        &config.strategy.majors,
+    )?;
     let journal = Journal::new(&config.runtime.journal_path)?;
     let history = Journal::new(&config.runtime.history_path)?;
     let status = StatusWriter::new(&config.runtime.status_path);
-    journal.append(
-        "runner_start",
-        serde_json::json!({"paper_only":true,"config":config}),
-    )?;
+    let start_payload = serde_json::json!({"paper_only":true,"config":config,"runtime":identity});
+    journal.append("runner_start", start_payload.clone())?;
+    history.append("runner_start", start_payload)?;
     let mut graph = build_graph(&config.strategy)?;
     let mut samples = SampleRecorder::default();
     let mut completed = 0u64;
@@ -190,7 +299,8 @@ async fn run_paper(config: AppConfig, iterations: u64) -> Result<()> {
         {
             Ok(mut frame) => {
                 samples.record(&journal, &frame)?;
-                journal.append("data_health", source.health())?;
+                let data_health = source.health();
+                journal.append("data_health", data_health.clone())?;
                 let broker_events = broker.mark_to_market(&frame);
                 for event in broker_events {
                     history.append(&event.kind, event.payload.clone())?;
@@ -206,17 +316,22 @@ async fn run_paper(config: AppConfig, iterations: u64) -> Result<()> {
                 }
                 broker.save(&config.runtime.paper_state_path)?;
                 let account = broker.marked_account(&frame);
-                history.append(
-                    "paper_equity",
-                    serde_json::json!({
-                        "ts_ms": frame.as_of_ms,
-                        "equity_usd": account.equity_usd,
-                        "cash_usd": account.cash_usd,
-                        "realized_pnl_usd": account.realized_pnl_usd,
-                        "gross_exposure_usd": account.gross_exposure_usd,
-                    }),
-                )?;
-                status.write(&serde_json::json!({"as_of_ms":frame.as_of_ms,"paper_only":true,"account":account,"positions":broker.positions(),"graph":summarize(&evaluation),"artifacts":evaluation.artifacts,"data_health":source.health()}))?;
+                let sleeves = broker.sleeve_snapshots(&frame);
+                let funnels = strategy_funnels(&config.strategy, &evaluation, &broker);
+                let observation = serde_json::json!({
+                    "ts_ms": frame.as_of_ms,
+                    "equity_usd": account.equity_usd,
+                    "cash_usd": account.cash_usd,
+                    "realized_pnl_usd": account.realized_pnl_usd,
+                    "gross_exposure_usd": account.gross_exposure_usd,
+                    "sleeves": sleeves,
+                    "funnels": funnels,
+                    "data_health": data_health,
+                    "runtime": identity,
+                });
+                history.append("paper_equity", observation.clone())?;
+                journal.append("paper_equity", observation)?;
+                status.write(&serde_json::json!({"as_of_ms":frame.as_of_ms,"paper_only":true,"account":account,"sleeves":sleeves,"funnels":funnels,"positions":broker.positions(),"graph":summarize(&evaluation),"artifacts":evaluation.artifacts,"data_health":data_health,"runtime":identity}))?;
                 completed += 1;
                 info!(
                     iteration = completed,
@@ -226,6 +341,8 @@ async fn run_paper(config: AppConfig, iterations: u64) -> Result<()> {
             }
             Err(error) => {
                 warn!(error=%error,"paper frame failed; no strategy evaluation or order simulation performed");
+                let data_health = source.health();
+                journal.append("data_health", data_health)?;
                 journal.append(
                     "frame_error",
                     serde_json::json!({"error":error.to_string()}),

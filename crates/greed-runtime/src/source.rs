@@ -9,8 +9,36 @@ use reqwest::{Client, StatusCode};
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, VecDeque},
-    time::Duration,
+    sync::Mutex,
+    time::{Duration, Instant},
 };
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+struct EndpointTelemetry {
+    requests: u64,
+    successes: u64,
+    failures: u64,
+    rate_limits: u64,
+    total_latency_ms: u64,
+    max_latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, serde::Serialize)]
+struct ApiTelemetry {
+    requests: u64,
+    successes: u64,
+    failures: u64,
+    rate_limits: u64,
+    retries: u64,
+    fallback_attempts: u64,
+    fallback_successes: u64,
+    total_latency_ms: u64,
+    max_latency_ms: u64,
+    frames_requested: u64,
+    frames_succeeded: u64,
+    frames_failed: u64,
+    endpoints: BTreeMap<String, EndpointTelemetry>,
+}
 
 pub struct BinancePaperSource {
     config: RuntimeConfig,
@@ -18,6 +46,7 @@ pub struct BinancePaperSource {
     oi_history: BTreeMap<String, VecDeque<(i64, f64)>>,
     last_success_ms: Option<i64>,
     last_error: Option<String>,
+    telemetry: Mutex<ApiTelemetry>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -48,24 +77,88 @@ impl BinancePaperSource {
             oi_history: BTreeMap::new(),
             last_success_ms: None,
             last_error: None,
+            telemetry: Mutex::new(ApiTelemetry::default()),
         })
     }
     pub fn health(&self) -> Value {
-        serde_json::json!({"last_success_ms":self.last_success_ms,"last_error":self.last_error,"paper_only":true})
+        let telemetry = self
+            .telemetry
+            .lock()
+            .expect("telemetry mutex poisoned")
+            .clone();
+        let average_latency_ms = (telemetry.requests > 0)
+            .then_some(telemetry.total_latency_ms as f64 / telemetry.requests as f64);
+        serde_json::json!({"last_success_ms":self.last_success_ms,"last_error":self.last_error,"paper_only":true,"telemetry":telemetry,"average_latency_ms":average_latency_ms})
+    }
+    fn endpoint_key(url: &str) -> String {
+        reqwest::Url::parse(url)
+            .ok()
+            .map(|value| format!("{}{}", value.host_str().unwrap_or("unknown"), value.path()))
+            .unwrap_or_else(|| "invalid_url".into())
+    }
+    fn record_request(&self, url: &str, elapsed_ms: u64, success: bool, rate_limited: bool) {
+        let mut telemetry = self.telemetry.lock().expect("telemetry mutex poisoned");
+        telemetry.requests += 1;
+        telemetry.total_latency_ms += elapsed_ms;
+        telemetry.max_latency_ms = telemetry.max_latency_ms.max(elapsed_ms);
+        if success {
+            telemetry.successes += 1;
+        } else {
+            telemetry.failures += 1;
+        }
+        if rate_limited {
+            telemetry.rate_limits += 1;
+        }
+        let endpoint = telemetry
+            .endpoints
+            .entry(Self::endpoint_key(url))
+            .or_default();
+        endpoint.requests += 1;
+        endpoint.total_latency_ms += elapsed_ms;
+        endpoint.max_latency_ms = endpoint.max_latency_ms.max(elapsed_ms);
+        if success {
+            endpoint.successes += 1;
+        } else {
+            endpoint.failures += 1;
+        }
+        if rate_limited {
+            endpoint.rate_limits += 1;
+        }
     }
     async fn get(&self, url: String) -> Result<Value> {
         let mut error = None;
         for attempt in 0..2 {
+            if attempt > 0 {
+                self.telemetry
+                    .lock()
+                    .expect("telemetry mutex poisoned")
+                    .retries += 1;
+            }
             tokio::time::sleep(Duration::from_millis(self.config.request_spacing_ms)).await;
+            let started = Instant::now();
             match self.http.get(&url).send().await {
                 Ok(response) if response.status().is_success() => {
-                    let body = response.text().await?;
-                    return Ok(serde_json::from_str(&body)?);
+                    let result = response
+                        .text()
+                        .await
+                        .map_err(anyhow::Error::from)
+                        .and_then(|body| serde_json::from_str(&body).map_err(Into::into));
+                    self.record_request(
+                        &url,
+                        started.elapsed().as_millis() as u64,
+                        result.is_ok(),
+                        false,
+                    );
+                    if result.is_ok() {
+                        return result;
+                    }
+                    error = result.err();
                 }
                 Ok(response)
                     if response.status() == StatusCode::TOO_MANY_REQUESTS
                         || response.status().as_u16() == 418 =>
                 {
+                    self.record_request(&url, started.elapsed().as_millis() as u64, false, true);
                     let retry = response
                         .headers()
                         .get("retry-after")
@@ -77,9 +170,13 @@ impl BinancePaperSource {
                     tokio::time::sleep(Duration::from_secs(retry)).await;
                 }
                 Ok(response) => {
+                    self.record_request(&url, started.elapsed().as_millis() as u64, false, false);
                     error = Some(anyhow!("{} returned {}", url, response.status()));
                 }
-                Err(value) => error = Some(value.into()),
+                Err(value) => {
+                    self.record_request(&url, started.elapsed().as_millis() as u64, false, false);
+                    error = Some(value.into());
+                }
             }
             if attempt < 1 {
                 tokio::time::sleep(Duration::from_millis(250 * (attempt + 1))).await;
@@ -89,9 +186,23 @@ impl BinancePaperSource {
     }
     async fn get_from_bases(&self, bases: &[String], suffix: &str) -> Result<Value> {
         let mut errors = Vec::new();
-        for base in bases {
+        for (index, base) in bases.iter().enumerate() {
+            if index > 0 {
+                self.telemetry
+                    .lock()
+                    .expect("telemetry mutex poisoned")
+                    .fallback_attempts += 1;
+            }
             match self.get(format!("{base}{suffix}")).await {
-                Ok(value) => return Ok(value),
+                Ok(value) => {
+                    if index > 0 {
+                        self.telemetry
+                            .lock()
+                            .expect("telemetry mutex poisoned")
+                            .fallback_successes += 1;
+                    }
+                    return Ok(value);
+                }
                 Err(error) => errors.push(format!("{base}: {error}")),
             }
         }
@@ -313,13 +424,27 @@ impl BinancePaperSource {
         account: AccountFrame,
     ) -> Result<MarketFrame> {
         let now = chrono::Utc::now().timestamp_millis();
+        self.telemetry
+            .lock()
+            .expect("telemetry mutex poisoned")
+            .frames_requested += 1;
         self.last_error = None;
         let result = self.fetch_inner(strategy, account, now).await;
         match &result {
             Ok(_) => {
                 self.last_success_ms = Some(now);
+                self.telemetry
+                    .lock()
+                    .expect("telemetry mutex poisoned")
+                    .frames_succeeded += 1;
             }
-            Err(error) => self.last_error = Some(error.to_string()),
+            Err(error) => {
+                self.last_error = Some(error.to_string());
+                self.telemetry
+                    .lock()
+                    .expect("telemetry mutex poisoned")
+                    .frames_failed += 1;
+            }
         }
         result
     }
@@ -480,4 +605,31 @@ fn sweep_slippage(levels: &[(f64, f64)], notional: f64, reference: f64) -> Optio
     }
     let vwap = cost / qty;
     Some((vwap / reference - 1.0).abs() * 10_000.0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn telemetry_tracks_failures_rate_limits_and_latency() {
+        let source = BinancePaperSource::new(RuntimeConfig::default()).unwrap();
+        source.record_request(
+            "https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT",
+            25,
+            false,
+            true,
+        );
+        source.record_request(
+            "https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT",
+            15,
+            true,
+            false,
+        );
+        let health = source.health();
+        assert_eq!(health["telemetry"]["requests"], 2);
+        assert_eq!(health["telemetry"]["failures"], 1);
+        assert_eq!(health["telemetry"]["rate_limits"], 1);
+        assert_eq!(health["average_latency_ms"], 20.0);
+    }
 }

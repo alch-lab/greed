@@ -34,5 +34,9 @@ cargo build --release
 `/api/health`、`/api/status`、`/api/events` 和 `/api/history`。监听地址可通过
 `runtime.http_listen` 调整；生产环境应保持回环监听，由带访问控制的 Web 代理转发。
 
+状态和历史会分别记录 Major/Altcoin 两个 1500 USDT 虚拟账本、每套策略当前执行阶段与
+blocker、recipe 归属、程序 commit/config 版本及 Binance 限流/重试/延迟遥测。`report`
+会把这些事件汇总成逐日、分资金桶、分 recipe 的一周审计报告。
+
 详细边界、数据含义、部署步骤与实盘门槛见
 [架构与模拟盘说明](docs/ARCHITECTURE.zh-CN.md)。

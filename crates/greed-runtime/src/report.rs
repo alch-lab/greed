@@ -1,31 +1,238 @@
 use anyhow::{Context, Result};
+use serde::Serialize;
 use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet},
     io::BufRead,
 };
 
+#[derive(Debug, Clone, Default)]
+struct Performance {
+    entries: u64,
+    partial_exits: u64,
+    completed_trades: u64,
+    wins: u64,
+    losses: u64,
+    fees_usd: f64,
+    net_realized_pnl_usd: f64,
+    gross_profit_usd: f64,
+    gross_loss_usd: f64,
+    total_hold_ms: i64,
+}
+
+impl Performance {
+    fn entry(&mut self, fee: f64) {
+        self.entries += 1;
+        self.fees_usd += fee;
+        self.net_realized_pnl_usd -= fee;
+    }
+    fn exit_leg(&mut self, pnl: f64, fee: f64, partial: bool) {
+        self.fees_usd += fee;
+        self.net_realized_pnl_usd += pnl;
+        if partial {
+            self.partial_exits += 1;
+        }
+    }
+    fn complete(&mut self, trade_pnl: f64, hold_ms: i64) {
+        self.completed_trades += 1;
+        self.total_hold_ms += hold_ms.max(0);
+        if trade_pnl > 0.0 {
+            self.wins += 1;
+            self.gross_profit_usd += trade_pnl;
+        } else if trade_pnl < 0.0 {
+            self.losses += 1;
+            self.gross_loss_usd += -trade_pnl;
+        }
+    }
+    fn value(&self) -> Value {
+        serde_json::json!({
+            "entries":self.entries,
+            "partial_exits":self.partial_exits,
+            "completed_trades":self.completed_trades,
+            "wins":self.wins,
+            "losses":self.losses,
+            "win_rate":(self.completed_trades>0).then_some(self.wins as f64/self.completed_trades as f64),
+            "fees_usd":self.fees_usd,
+            "net_realized_pnl_usd":self.net_realized_pnl_usd,
+            "profit_factor":(self.gross_loss_usd>0.0).then_some(self.gross_profit_usd/self.gross_loss_usd),
+            "average_hold_minutes":(self.completed_trades>0).then_some(self.total_hold_ms as f64/self.completed_trades as f64/60_000.0),
+        })
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OpenTrade {
+    sleeve: String,
+    recipe: String,
+    entry_ms: i64,
+    net_pnl_usd: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct FunnelStats {
+    unique_candidates: u64,
+    pass: u64,
+    unknown: u64,
+    block: u64,
+    plans: u64,
+    entries: u64,
+    blockers: BTreeMap<String, u64>,
+    stopped_stages: BTreeMap<String, u64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct DailyPerformance {
+    entries: u64,
+    exit_legs: u64,
+    fees_usd: f64,
+    net_realized_pnl_usd: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct EquityRisk {
+    observations: u64,
+    min_equity_usd: Option<f64>,
+    max_equity_usd: Option<f64>,
+    max_drawdown_pct: f64,
+    max_daily_loss_pct: f64,
+}
+
+impl EquityRisk {
+    fn observe(&mut self, value: &Value) {
+        let Some(equity) = value["equity_usd"].as_f64() else {
+            return;
+        };
+        self.observations += 1;
+        self.min_equity_usd = Some(self.min_equity_usd.map_or(equity, |old| old.min(equity)));
+        self.max_equity_usd = Some(self.max_equity_usd.map_or(equity, |old| old.max(equity)));
+        self.max_drawdown_pct = self
+            .max_drawdown_pct
+            .max(value["drawdown_pct"].as_f64().unwrap_or(0.0));
+        self.max_daily_loss_pct = self
+            .max_daily_loss_pct
+            .max(value["daily_loss_pct"].as_f64().unwrap_or(0.0));
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct EndpointTotals {
+    requests: u64,
+    successes: u64,
+    failures: u64,
+    rate_limits: u64,
+    total_latency_ms: u64,
+    max_latency_ms: u64,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+struct TelemetryTotals {
+    requests: u64,
+    successes: u64,
+    failures: u64,
+    rate_limits: u64,
+    retries: u64,
+    fallback_attempts: u64,
+    fallback_successes: u64,
+    total_latency_ms: u64,
+    max_latency_ms: u64,
+    frames_requested: u64,
+    frames_succeeded: u64,
+    frames_failed: u64,
+    endpoints: BTreeMap<String, EndpointTotals>,
+}
+
+impl TelemetryTotals {
+    fn from_value(value: &Value) -> Self {
+        let n = |key: &str| value[key].as_u64().unwrap_or(0);
+        let endpoints = value["endpoints"]
+            .as_object()
+            .map(|values| {
+                values
+                    .iter()
+                    .map(|(key, value)| {
+                        let n = |name: &str| value[name].as_u64().unwrap_or(0);
+                        (
+                            key.clone(),
+                            EndpointTotals {
+                                requests: n("requests"),
+                                successes: n("successes"),
+                                failures: n("failures"),
+                                rate_limits: n("rate_limits"),
+                                total_latency_ms: n("total_latency_ms"),
+                                max_latency_ms: n("max_latency_ms"),
+                            },
+                        )
+                    })
+                    .collect()
+            })
+            .unwrap_or_default();
+        Self {
+            requests: n("requests"),
+            successes: n("successes"),
+            failures: n("failures"),
+            rate_limits: n("rate_limits"),
+            retries: n("retries"),
+            fallback_attempts: n("fallback_attempts"),
+            fallback_successes: n("fallback_successes"),
+            total_latency_ms: n("total_latency_ms"),
+            max_latency_ms: n("max_latency_ms"),
+            frames_requested: n("frames_requested"),
+            frames_succeeded: n("frames_succeeded"),
+            frames_failed: n("frames_failed"),
+            endpoints,
+        }
+    }
+    fn add(&mut self, other: &Self) {
+        self.requests += other.requests;
+        self.successes += other.successes;
+        self.failures += other.failures;
+        self.rate_limits += other.rate_limits;
+        self.retries += other.retries;
+        self.fallback_attempts += other.fallback_attempts;
+        self.fallback_successes += other.fallback_successes;
+        self.total_latency_ms += other.total_latency_ms;
+        self.max_latency_ms = self.max_latency_ms.max(other.max_latency_ms);
+        self.frames_requested += other.frames_requested;
+        self.frames_succeeded += other.frames_succeeded;
+        self.frames_failed += other.frames_failed;
+        for (key, value) in &other.endpoints {
+            let endpoint = self.endpoints.entry(key.clone()).or_default();
+            endpoint.requests += value.requests;
+            endpoint.successes += value.successes;
+            endpoint.failures += value.failures;
+            endpoint.rate_limits += value.rate_limits;
+            endpoint.total_latency_ms += value.total_latency_ms;
+            endpoint.max_latency_ms = endpoint.max_latency_ms.max(value.max_latency_ms);
+        }
+    }
+}
+
 pub fn build(path: &str) -> Result<Value> {
     let file = std::fs::File::open(path).with_context(|| format!("open journal {path}"))?;
     let mut records = 0u64;
     let mut frame_errors = 0u64;
-    let mut entries = 0u64;
-    let mut exits = 0u64;
-    let mut partial_exits = 0u64;
-    let mut entry_fees = 0.0;
-    let mut exit_fees = 0.0;
-    let mut exit_net_pnl = 0.0;
-    let mut profitable_exit_legs = 0u64;
-    let mut losing_exit_legs = 0u64;
-    let mut gross_profit = 0.0;
-    let mut gross_loss = 0.0;
-    let mut candidates = BTreeSet::new();
+    let mut successful_frames = 0u64;
+    let mut runner_starts = 0u64;
     let mut candles = BTreeSet::new();
-    let mut recipe_counts: BTreeMap<String, u64> = BTreeMap::new();
-    let mut verdict_counts: BTreeMap<String, u64> = BTreeMap::new();
-    let mut blocker_counts: BTreeMap<String, u64> = BTreeMap::new();
-    let mut first_ms: Option<i64> = None;
-    let mut last_ms: Option<i64> = None;
+    let mut candidate_ids = BTreeSet::new();
+    let mut total = Performance::default();
+    let mut sleeves: BTreeMap<String, Performance> = BTreeMap::new();
+    let mut recipes: BTreeMap<String, Performance> = BTreeMap::new();
+    let mut sleeve_funnels: BTreeMap<String, FunnelStats> = BTreeMap::new();
+    let mut recipe_funnels: BTreeMap<String, FunnelStats> = BTreeMap::new();
+    let mut open_trades: BTreeMap<String, OpenTrade> = BTreeMap::new();
+    let mut first_ms = None;
+    let mut last_ms = None;
+    let mut last_frame_ms = None;
+    let mut max_frame_gap_ms = 0i64;
+    let mut versions = BTreeSet::new();
+    let mut config_hashes = BTreeSet::new();
+    let mut latest_sleeves = Value::Null;
+    let mut daily: BTreeMap<String, DailyPerformance> = BTreeMap::new();
+    let mut sleeve_risk: BTreeMap<String, EquityRisk> = BTreeMap::new();
+    let mut portfolio_risk = EquityRisk::default();
+    let mut telemetry = TelemetryTotals::default();
+    let mut current_run_telemetry = TelemetryTotals::default();
 
     for line in std::io::BufReader::new(file).lines() {
         let line = line?;
@@ -40,115 +247,355 @@ pub fn build(path: &str) -> Result<Value> {
         let kind = record["kind"].as_str().unwrap_or("unknown");
         let payload = &record["payload"];
         match kind {
+            "runner_start" => {
+                if runner_starts > 0 {
+                    telemetry.add(&current_run_telemetry);
+                    current_run_telemetry = TelemetryTotals::default();
+                }
+                runner_starts += 1;
+                if let Some(value) = payload["runtime"]["git_commit"].as_str() {
+                    versions.insert(value.to_owned());
+                }
+                if let Some(value) = payload["runtime"]["config_hash"].as_str() {
+                    config_hashes.insert(value.to_owned());
+                }
+            }
             "frame_error" => frame_errors += 1,
-            "paper_entry" => {
-                entries += 1;
-                entry_fees += payload["fee_usd"].as_f64().unwrap_or(0.0);
-            }
-            "paper_partial_exit" => {
-                partial_exits += 1;
-                record_exit_leg(
-                    payload,
-                    &mut exit_net_pnl,
-                    &mut exit_fees,
-                    &mut profitable_exit_legs,
-                    &mut losing_exit_legs,
-                    &mut gross_profit,
-                    &mut gross_loss,
-                );
-            }
-            "paper_exit" => {
-                exits += 1;
-                record_exit_leg(
-                    payload,
-                    &mut exit_net_pnl,
-                    &mut exit_fees,
-                    &mut profitable_exit_legs,
-                    &mut losing_exit_legs,
-                    &mut gross_profit,
-                    &mut gross_loss,
-                );
+            "data_health" => {
+                current_run_telemetry = TelemetryTotals::from_value(&payload["telemetry"]);
             }
             "market_candle" => {
-                let key = format!(
+                candles.insert(format!(
                     "{}:{:?}:{}",
                     payload["symbol"].as_str().unwrap_or(""),
                     payload["market"],
                     payload["bar"]["close_ms"].as_i64().unwrap_or(0)
-                );
-                candles.insert(key);
+                ));
             }
             "graph_evaluation" => {
-                if let Some(artifacts) = payload["artifacts"].as_object() {
-                    for record in artifacts.values() {
-                        if record["artifact"]["type"] != "candidate" {
-                            continue;
-                        }
-                        let value = &record["artifact"]["value"];
-                        let id = value["id"].as_str().unwrap_or("").to_owned();
-                        if id.is_empty() || !candidates.insert(id) {
-                            continue;
-                        }
-                        *recipe_counts
-                            .entry(value["recipe"].as_str().unwrap_or("unknown").into())
+                successful_frames += 1;
+                if let Some(ts) = recorded_ms {
+                    if let Some(previous) = last_frame_ms {
+                        max_frame_gap_ms = max_frame_gap_ms.max(ts - previous);
+                    }
+                    last_frame_ms = Some(ts);
+                }
+                record_candidates(
+                    payload,
+                    &mut candidate_ids,
+                    &mut sleeve_funnels,
+                    &mut recipe_funnels,
+                );
+                record_plans(payload, &mut sleeve_funnels, &mut recipe_funnels);
+            }
+            "paper_entry" => {
+                record_daily(payload, true, &mut daily);
+                record_entry(
+                    payload,
+                    &mut total,
+                    &mut sleeves,
+                    &mut recipes,
+                    &mut sleeve_funnels,
+                    &mut recipe_funnels,
+                    &mut open_trades,
+                );
+            }
+            "paper_partial_exit" | "paper_exit" => {
+                record_daily(payload, false, &mut daily);
+                record_exit(
+                    payload,
+                    kind == "paper_partial_exit",
+                    &mut total,
+                    &mut sleeves,
+                    &mut recipes,
+                    &mut open_trades,
+                );
+            }
+            "paper_equity" => {
+                latest_sleeves = payload["sleeves"].clone();
+                portfolio_risk.observe(payload);
+                for name in ["major", "altcoin"] {
+                    sleeve_risk
+                        .entry(name.into())
+                        .or_default()
+                        .observe(&payload["sleeves"][name]);
+                    if let Some(stage) = payload["funnels"][name]["current_stage"].as_str() {
+                        *sleeve_funnels
+                            .entry(name.into())
+                            .or_default()
+                            .stopped_stages
+                            .entry(stage.into())
                             .or_default() += 1;
-                        *verdict_counts
-                            .entry(value["verdict"].as_str().unwrap_or("unknown").into())
-                            .or_default() += 1;
-                        if let Some(blockers) = value["blockers"].as_array() {
-                            for blocker in blockers.iter().filter_map(Value::as_str) {
-                                *blocker_counts.entry(blocker.into()).or_default() += 1;
-                            }
-                        }
                     }
                 }
             }
             _ => {}
         }
     }
+    telemetry.add(&current_run_telemetry);
+    let sleeve_values: BTreeMap<_, _> = sleeves
+        .iter()
+        .map(|(key, value)| (key, value.value()))
+        .collect();
+    let recipe_values: BTreeMap<_, _> = recipes
+        .iter()
+        .map(|(key, value)| (key, value.value()))
+        .collect();
+    let observed_frames = successful_frames + frame_errors;
     Ok(serde_json::json!({
         "journal":path,
         "first_recorded_ms":first_ms,
         "last_recorded_ms":last_ms,
         "duration_hours":first_ms.zip(last_ms).map(|(first,last)|(last-first) as f64/3_600_000.0),
         "records":records,
+        "runner_starts":runner_starts,
+        "versions":versions,
+        "config_hashes":config_hashes,
         "unique_market_candles":candles.len(),
+        "successful_frames":successful_frames,
         "frame_errors":frame_errors,
-        "unique_candidates":candidates.len(),
-        "candidates_by_recipe":recipe_counts,
-        "candidates_by_verdict":verdict_counts,
-        "blockers":blocker_counts,
-        "paper_entries":entries,
-        "paper_partial_exits":partial_exits,
-        "paper_full_exits":exits,
-        "profitable_exit_legs":profitable_exit_legs,
-        "losing_exit_legs":losing_exit_legs,
-        "entry_fees_usd":entry_fees,
-        "exit_fees_usd":exit_fees,
-        "recorded_fees_usd":entry_fees+exit_fees,
-        "exit_net_pnl_usd_before_entry_fees":exit_net_pnl,
-        "net_realized_pnl_usd":exit_net_pnl-entry_fees,
-        "exit_leg_profit_factor_after_recorded_fees":if gross_loss+entry_fees > 0.0 {Some(gross_profit/(gross_loss+entry_fees))} else {None}
+        "frame_success_rate":(observed_frames>0).then_some(successful_frames as f64/observed_frames as f64),
+        "max_frame_gap_minutes":max_frame_gap_ms as f64/60_000.0,
+        "unique_candidates":candidate_ids.len(),
+        "portfolio_performance":total.value(),
+        "performance_by_sleeve":sleeve_values,
+        "performance_by_recipe":recipe_values,
+        "daily_performance":daily,
+        "portfolio_risk":portfolio_risk,
+        "risk_by_sleeve":sleeve_risk,
+        "funnel_by_sleeve":sleeve_funnels,
+        "funnel_by_recipe":recipe_funnels,
+        "latest_sleeve_equity":latest_sleeves,
+        "open_trade_count_at_report":open_trades.len(),
+        "api_telemetry":telemetry,
+        "api_average_latency_ms":(telemetry.requests>0).then_some(telemetry.total_latency_ms as f64/telemetry.requests as f64),
     }))
 }
 
-fn record_exit_leg(
+fn record_daily(payload: &Value, entry: bool, daily: &mut BTreeMap<String, DailyPerformance>) {
+    let ts_ms = payload["ts_ms"].as_i64().unwrap_or(0);
+    let day = chrono::DateTime::from_timestamp_millis(ts_ms)
+        .map(|value| {
+            value
+                .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("valid offset"))
+                .format("%Y-%m-%d")
+                .to_string()
+        })
+        .unwrap_or_else(|| "unknown".into());
+    let stats = daily.entry(day).or_default();
+    let fee = payload["fee_usd"].as_f64().unwrap_or(0.0);
+    stats.fees_usd += fee;
+    if entry {
+        stats.entries += 1;
+        stats.net_realized_pnl_usd -= fee;
+    } else {
+        stats.exit_legs += 1;
+        stats.net_realized_pnl_usd += payload["pnl_usd"].as_f64().unwrap_or(0.0);
+    }
+}
+
+fn classify(payload: &Value) -> (String, String) {
+    let symbol = payload["symbol"].as_str().unwrap_or("");
+    let sleeve = payload["asset_class"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| {
+            if matches!(symbol, "BTCUSDT" | "ETHUSDT") {
+                "major".into()
+            } else {
+                "altcoin".into()
+            }
+        });
+    let recipe = payload["recipe"]
+        .as_str()
+        .map(str::to_owned)
+        .unwrap_or_else(|| recipe_from_id(payload["candidate_id"].as_str().unwrap_or("")).into());
+    (sleeve, recipe)
+}
+
+fn recipe_from_id(id: &str) -> &'static str {
+    if id.contains("trend_pullback") || id.contains("trend-pullback") {
+        "major_trend_pullback"
+    } else if id.contains("exhaustion") {
+        "major_exhaustion_reversal"
+    } else if id.contains("cross_section") || id.contains("cross-section") {
+        "alt_cross_section_momentum"
+    } else if id.contains("shock_reversal") || id.contains("shock-reversal") {
+        "alt_shock_reversal"
+    } else {
+        "unknown"
+    }
+}
+
+fn sleeve_for_recipe(recipe: &str) -> &'static str {
+    if recipe.starts_with("major_") {
+        "major"
+    } else {
+        "altcoin"
+    }
+}
+
+fn record_candidates(
     payload: &Value,
-    net_pnl: &mut f64,
-    fees: &mut f64,
-    profitable: &mut u64,
-    losing: &mut u64,
-    gross_profit: &mut f64,
-    gross_loss: &mut f64,
+    ids: &mut BTreeSet<String>,
+    sleeves: &mut BTreeMap<String, FunnelStats>,
+    recipes: &mut BTreeMap<String, FunnelStats>,
 ) {
+    let Some(artifacts) = payload["artifacts"].as_object() else {
+        return;
+    };
+    for record in artifacts.values() {
+        if record["artifact"]["type"] != "candidate" {
+            continue;
+        }
+        let value = &record["artifact"]["value"];
+        let id = value["id"].as_str().unwrap_or("").to_owned();
+        if id.is_empty() || !ids.insert(id) {
+            continue;
+        }
+        let recipe = value["recipe"].as_str().unwrap_or("unknown").to_owned();
+        let sleeve = sleeve_for_recipe(&recipe).to_owned();
+        for stats in [
+            sleeves.entry(sleeve).or_default(),
+            recipes.entry(recipe).or_default(),
+        ] {
+            stats.unique_candidates += 1;
+            match value["verdict"].as_str().unwrap_or("unknown") {
+                "pass" => stats.pass += 1,
+                "block" => stats.block += 1,
+                _ => stats.unknown += 1,
+            }
+            if let Some(blockers) = value["blockers"].as_array() {
+                for blocker in blockers.iter().filter_map(Value::as_str) {
+                    *stats.blockers.entry(blocker.into()).or_default() += 1;
+                }
+            }
+        }
+    }
+}
+
+fn record_plans(
+    payload: &Value,
+    sleeves: &mut BTreeMap<String, FunnelStats>,
+    recipes: &mut BTreeMap<String, FunnelStats>,
+) {
+    let Some(artifacts) = payload["artifacts"].as_object() else {
+        return;
+    };
+    for record in artifacts.values() {
+        if record["artifact"]["type"] != "position_plan" {
+            continue;
+        }
+        let value = &record["artifact"]["value"];
+        let recipe = recipe_from_id(value["candidate_id"].as_str().unwrap_or("")).to_owned();
+        let sleeve = sleeve_for_recipe(&recipe).to_owned();
+        sleeves.entry(sleeve).or_default().plans += 1;
+        recipes.entry(recipe).or_default().plans += 1;
+    }
+}
+
+fn record_entry(
+    payload: &Value,
+    total: &mut Performance,
+    sleeves: &mut BTreeMap<String, Performance>,
+    recipes: &mut BTreeMap<String, Performance>,
+    sleeve_funnels: &mut BTreeMap<String, FunnelStats>,
+    recipe_funnels: &mut BTreeMap<String, FunnelStats>,
+    trades: &mut BTreeMap<String, OpenTrade>,
+) {
+    let (sleeve, recipe) = classify(payload);
+    let fee = payload["fee_usd"].as_f64().unwrap_or(0.0);
+    total.entry(fee);
+    sleeves.entry(sleeve.clone()).or_default().entry(fee);
+    recipes.entry(recipe.clone()).or_default().entry(fee);
+    sleeve_funnels.entry(sleeve.clone()).or_default().entries += 1;
+    recipe_funnels.entry(recipe.clone()).or_default().entries += 1;
+    trades.insert(
+        payload["candidate_id"].as_str().unwrap_or("").into(),
+        OpenTrade {
+            sleeve,
+            recipe,
+            entry_ms: payload["ts_ms"].as_i64().unwrap_or(0),
+            net_pnl_usd: -fee,
+        },
+    );
+}
+
+fn record_exit(
+    payload: &Value,
+    partial: bool,
+    total: &mut Performance,
+    sleeves: &mut BTreeMap<String, Performance>,
+    recipes: &mut BTreeMap<String, Performance>,
+    trades: &mut BTreeMap<String, OpenTrade>,
+) {
+    let id = payload["candidate_id"].as_str().unwrap_or("").to_owned();
+    let (fallback_sleeve, fallback_recipe) = classify(payload);
     let pnl = payload["pnl_usd"].as_f64().unwrap_or(0.0);
-    *net_pnl += pnl;
-    *fees += payload["fee_usd"].as_f64().unwrap_or(0.0);
-    if pnl > 0.0 {
-        *profitable += 1;
-        *gross_profit += pnl;
-    } else if pnl < 0.0 {
-        *losing += 1;
-        *gross_loss += -pnl;
+    let fee = payload["fee_usd"].as_f64().unwrap_or(0.0);
+    let trade = trades.entry(id.clone()).or_insert(OpenTrade {
+        sleeve: fallback_sleeve,
+        recipe: fallback_recipe,
+        entry_ms: payload["ts_ms"].as_i64().unwrap_or(0),
+        net_pnl_usd: 0.0,
+    });
+    trade.net_pnl_usd += pnl;
+    total.exit_leg(pnl, fee, partial);
+    sleeves
+        .entry(trade.sleeve.clone())
+        .or_default()
+        .exit_leg(pnl, fee, partial);
+    recipes
+        .entry(trade.recipe.clone())
+        .or_default()
+        .exit_leg(pnl, fee, partial);
+    if !partial {
+        let trade = trades.remove(&id).expect("trade inserted above");
+        let hold = payload["ts_ms"].as_i64().unwrap_or(0) - trade.entry_ms;
+        total.complete(trade.net_pnl_usd, hold);
+        sleeves
+            .entry(trade.sleeve)
+            .or_default()
+            .complete(trade.net_pnl_usd, hold);
+        recipes
+            .entry(trade.recipe)
+            .or_default()
+            .complete(trade.net_pnl_usd, hold);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn report_attributes_trade_and_api_health() {
+        let path = std::env::temp_dir().join(format!("greed-report-{}.jsonl", std::process::id()));
+        let lines = [
+            serde_json::json!({"recorded_ms":1,"kind":"runner_start","payload":{"runtime":{"git_commit":"abc","config_hash":"cfg"}}}),
+            serde_json::json!({"recorded_ms":2,"kind":"data_health","payload":{"telemetry":{"requests":10,"successes":9,"failures":1,"rate_limits":1,"retries":1,"frames_requested":1,"frames_succeeded":1}}}),
+            serde_json::json!({"recorded_ms":3,"kind":"paper_entry","payload":{"ts_ms":3,"candidate_id":"BTCUSDT.recipe.trend_pullback:BTCUSDT:3","recipe":"major_trend_pullback","asset_class":"major","symbol":"BTCUSDT","fee_usd":0.2}}),
+            serde_json::json!({"recorded_ms":4,"kind":"paper_exit","payload":{"ts_ms":64_000,"candidate_id":"BTCUSDT.recipe.trend_pullback:BTCUSDT:3","recipe":"major_trend_pullback","asset_class":"major","symbol":"BTCUSDT","fee_usd":0.2,"pnl_usd":5.0}}),
+        ];
+        std::fs::write(
+            &path,
+            lines
+                .iter()
+                .map(|value| serde_json::to_string(value).unwrap())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let value = build(path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            value["performance_by_sleeve"]["major"]["completed_trades"],
+            1
+        );
+        assert_eq!(
+            value["performance_by_recipe"]["major_trend_pullback"]["wins"],
+            1
+        );
+        assert_eq!(value["api_telemetry"]["rate_limits"], 1);
+        std::fs::remove_file(path).unwrap();
     }
 }
