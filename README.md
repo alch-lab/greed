@@ -30,5 +30,9 @@ cargo build --release
 ./target/release/greed report --journal data/runtime/paper-events.jsonl
 ```
 
+`paper` 启动后同时在 `127.0.0.1:8088` 提供只读监控接口：
+`/api/health`、`/api/status`、`/api/events` 和 `/api/backtest`。监听地址可通过
+`runtime.http_listen` 调整；生产环境应保持回环监听，由带访问控制的 Web 代理转发。
+
 详细边界、数据含义、部署步骤与实盘门槛见
 [架构与模拟盘说明](docs/ARCHITECTURE.zh-CN.md)。

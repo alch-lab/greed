@@ -2,6 +2,7 @@ mod backtest;
 mod broker;
 mod config;
 mod journal;
+mod monitor;
 mod report;
 mod source;
 
@@ -168,6 +169,7 @@ async fn main() -> Result<()> {
 }
 
 async fn run_paper(config: AppConfig, iterations: u64) -> Result<()> {
+    let _monitor = monitor::start(&config.runtime).await?;
     let mut source = BinancePaperSource::new(config.runtime.clone())?;
     let mut broker =
         PaperBroker::load_or_new(config.paper.clone(), &config.runtime.paper_state_path)?;

@@ -25,6 +25,7 @@ pub struct RuntimeConfig {
     pub status_path: String,
     pub paper_state_path: String,
     pub slow_context_path: Option<String>,
+    pub http_listen: String,
 }
 impl Default for RuntimeConfig {
     fn default() -> Self {
@@ -49,6 +50,7 @@ impl Default for RuntimeConfig {
             status_path: "data/runtime/status.json".into(),
             paper_state_path: "data/runtime/paper-state.json".into(),
             slow_context_path: Some("data/runtime/slow-context.json".into()),
+            http_listen: "127.0.0.1:8088".into(),
         }
     }
 }
