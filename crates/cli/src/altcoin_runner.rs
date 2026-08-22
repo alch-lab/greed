@@ -2652,6 +2652,25 @@ fn cross_section_status_complete(status: &Value) -> bool {
         })
 }
 
+/// Persisted execution status can outlive the wall-clock boundary it points
+/// at (for example when the runner was stopped during that boundary). Keep the
+/// display schedule monotonic even when no fresh ranking is eligible to trade.
+fn advance_cross_section_schedule(status: &mut Value, next_boundary_ms: i64) -> bool {
+    let root_stale = status["next_boundary_ms"]
+        .as_i64()
+        .is_some_and(|current| current < next_boundary_ms);
+    let execution_stale = status["execution_state"]["next_boundary_ms"]
+        .as_i64()
+        .is_some_and(|current| current < next_boundary_ms);
+    if root_stale {
+        status["next_boundary_ms"] = json!(next_boundary_ms);
+    }
+    if execution_stale {
+        status["execution_state"]["next_boundary_ms"] = json!(next_boundary_ms);
+    }
+    root_stale || execution_stale
+}
+
 fn cross_protective_exits_since(
     state: &PersistedState,
     since_ms: i64,
@@ -4962,6 +4981,15 @@ pub async fn run_altcoin_impulse(
             .collect();
         let cross_interval_ms = cross_cfg.hold_hours as i64 * 3_600_000;
         let cross_boundary_ms = scan_ms.div_euclid(cross_interval_ms) * cross_interval_ms;
+        let next_cross_boundary_ms = cross_boundary_ms + cross_interval_ms;
+        if cross_cfg.enabled
+            && advance_cross_section_schedule(
+                &mut state.cross_section_status,
+                next_cross_boundary_ms,
+            )
+        {
+            save_state(&state_path, &state)?;
+        }
         let scheduled_cross_signal_ms = cross_boundary_ms - 1;
         let scheduled_cross_due = cross_cfg.enabled
             && scan_ms.saturating_sub(cross_boundary_ms)
@@ -7704,19 +7732,34 @@ pub async fn run_altcoin_impulse(
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::{
-        adverse_excursion, adverse_fill_price, apply_daily_entry_bonus, apply_daily_risk_reset,
-        clamp_entry_guard_price, confirmation_plan, daily_entry_limit_reached,
-        default_entry_trigger, detected_exit_reason, directional_crowding_reason,
-        effective_max_spread_bps, entry_phase, evaluate, evaluate_pulse_impulse,
-        existing_stop_raw_fill, failed_breakout, first_week_progress, intrabar_pending_decision,
-        market_qty_chunks, observe_microstructure_trial, pending_decision, position_excursions,
-        pulse_exhaustion_candidate, pulse_exhaustion_runtime, realtime_trailing_stop,
-        recently_exited_opposite_side, recently_exited_symbol, record_daily_equity, record_exit,
-        record_partial_exit, recovery_profit_lock_stop, signal_age_ms, update_adverse_extreme,
+        advance_cross_section_schedule, adverse_excursion, adverse_fill_price,
+        apply_daily_entry_bonus, apply_daily_risk_reset, clamp_entry_guard_price,
+        confirmation_plan, daily_entry_limit_reached, default_entry_trigger, detected_exit_reason,
+        directional_crowding_reason, effective_max_spread_bps, entry_phase, evaluate,
+        evaluate_pulse_impulse, existing_stop_raw_fill, failed_breakout, first_week_progress,
+        intrabar_pending_decision, market_qty_chunks, observe_microstructure_trial,
+        pending_decision, position_excursions, pulse_exhaustion_candidate,
+        pulse_exhaustion_runtime, realtime_trailing_stop, recently_exited_opposite_side,
+        recently_exited_symbol, record_daily_equity, record_exit, record_partial_exit,
+        recovery_profit_lock_stop, signal_age_ms, update_adverse_extreme,
         update_microstructure_trials, Bar, Candidate, IntrabarPendingDecision, PendingDecision,
         PersistedState, Position, PulseExhaustionSetup,
     };
+
+    #[test]
+    fn stale_cross_section_rerank_time_advances_to_future_boundary() {
+        let mut status = json!({
+            "next_boundary_ms": 14,
+            "execution_state": {"status":"expired", "next_boundary_ms":14}
+        });
+        assert!(advance_cross_section_schedule(&mut status, 17));
+        assert_eq!(status["next_boundary_ms"], 17);
+        assert_eq!(status["execution_state"]["next_boundary_ms"], 17);
+        assert!(!advance_cross_section_schedule(&mut status, 17));
+    }
 
     #[test]
     fn live_capital_pause_keeps_pulse_shadow_discovery_running() {
