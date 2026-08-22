@@ -60,6 +60,50 @@ pub struct TradeArgs {
     pub portfolio_mode: bool,
 }
 
+/// Preserve a valid portfolio BTC journal before a strategy/version mismatch
+/// starts a fresh engine.  The control-plane endpoint merges these archives
+/// for display, while runtime recovery continues to read only the active file.
+fn archive_rejected_portfolio_journal(
+    journal_path: &str,
+    started_ms: i64,
+) -> Result<Option<std::path::PathBuf>> {
+    let path = std::path::Path::new(journal_path);
+    if !path.exists() {
+        return Ok(None);
+    }
+
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("读取待归档 BTC journal 失败: {}", path.display()))?;
+    let valid_json = serde_json::from_str::<serde_json::Value>(&text).is_ok();
+    let stem = path
+        .file_stem()
+        .and_then(|value| value.to_str())
+        .context("BTC journal 文件名无效")?;
+    let suffix = if valid_json { "history" } else { "invalid" };
+    let mut sequence = 0_u32;
+    let archive = loop {
+        let extra = if sequence == 0 {
+            String::new()
+        } else {
+            format!("-{sequence}")
+        };
+        let candidate = path.with_file_name(format!("{stem}.{suffix}-{started_ms}{extra}.json"));
+        if !candidate.exists() {
+            break candidate;
+        }
+        sequence += 1;
+    };
+
+    std::fs::rename(path, &archive).with_context(|| {
+        format!(
+            "归档旧 BTC journal 失败，拒绝覆盖: {} -> {}",
+            path.display(),
+            archive.display()
+        )
+    })?;
+    Ok(Some(archive))
+}
+
 /// 交易执行循环：行情 WS → LiveEngine → journal 落盘。
 ///
 /// - `shutdown`：收到 true 后优雅退出（落盘、不撤保护性止损）。
@@ -293,6 +337,14 @@ pub async fn run_trade(
             "交易所仓位与 journal 一致，重启后安全接管"
         );
     }
+    if !restored && args.portfolio_mode {
+        if let Some(archive) = archive_rejected_portfolio_journal(&journal_path, started_ms)? {
+            warn!(
+                archive = %archive.display(),
+                "BTC journal 无法恢复，旧历史已归档后再创建新运行状态"
+            );
+        }
+    }
     engine.persist_journal();
 
     // 订单流基线只接受真实逐笔成交，不用 K 线合成 Delta。默认约 200 秒完成预热。
@@ -459,4 +511,40 @@ pub async fn run_trade(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod journal_archive_tests {
+    use super::archive_rejected_portfolio_journal;
+
+    #[test]
+    fn rejected_portfolio_journal_is_archived_before_replacement() {
+        let unique = format!(
+            "greed-btc-journal-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let directory = std::env::temp_dir().join(unique);
+        std::fs::create_dir_all(&directory).unwrap();
+        let active = directory.join("portfolio-mr-live.json");
+        let old = serde_json::json!({"fills":[{"ts":1}],"engine":{"strategy_hash":"old"}});
+        std::fs::write(&active, serde_json::to_vec(&old).unwrap()).unwrap();
+
+        let archive = archive_rejected_portfolio_journal(active.to_str().unwrap(), 123)
+            .unwrap()
+            .unwrap();
+
+        assert!(!active.exists());
+        assert_eq!(
+            archive.file_name().unwrap().to_str().unwrap(),
+            "portfolio-mr-live.history-123.json"
+        );
+        let saved: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&archive).unwrap()).unwrap();
+        assert_eq!(saved, old);
+        std::fs::remove_dir_all(&directory).unwrap();
+    }
 }
