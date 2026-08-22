@@ -85,6 +85,7 @@ journalctl -u greed-paper -f
 持久文件：
 
 - `data/runtime/paper-events.jsonl`：蜡烛、盘口/OI/外部快照、全量 Artifact、模拟成交和错误。
+- `data/runtime/paper-history.jsonl`：供监控页读取的紧凑权益曲线和模拟成交历史。
 - `data/runtime/paper-state.json`：账户、仓位、止损、已实现盈亏、已见候选，原子更新。
 - `data/runtime/status.json`：当前账户、持仓、候选、风控和所有原语状态。
 - `data/runtime/slow-context.json`：确认后的 ETF/CME 日频输入，可参考示例文件。

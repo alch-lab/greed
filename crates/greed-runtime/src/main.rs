@@ -174,6 +174,7 @@ async fn run_paper(config: AppConfig, iterations: u64) -> Result<()> {
     let mut broker =
         PaperBroker::load_or_new(config.paper.clone(), &config.runtime.paper_state_path)?;
     let journal = Journal::new(&config.runtime.journal_path)?;
+    let history = Journal::new(&config.runtime.history_path)?;
     let status = StatusWriter::new(&config.runtime.status_path);
     journal.append(
         "runner_start",
@@ -192,6 +193,7 @@ async fn run_paper(config: AppConfig, iterations: u64) -> Result<()> {
                 journal.append("data_health", source.health())?;
                 let broker_events = broker.mark_to_market(&frame);
                 for event in broker_events {
+                    history.append(&event.kind, event.payload.clone())?;
                     journal.append(&event.kind, event.payload)?;
                 }
                 frame.account = broker.marked_account(&frame);
@@ -199,10 +201,22 @@ async fn run_paper(config: AppConfig, iterations: u64) -> Result<()> {
                 journal.append("graph_evaluation", serde_json::to_value(&evaluation)?)?;
                 let fill_events = broker.apply_plans(&frame, &evaluation);
                 for event in fill_events {
+                    history.append(&event.kind, event.payload.clone())?;
                     journal.append(&event.kind, event.payload)?;
                 }
                 broker.save(&config.runtime.paper_state_path)?;
-                status.write(&serde_json::json!({"as_of_ms":frame.as_of_ms,"paper_only":true,"account":broker.marked_account(&frame),"positions":broker.positions(),"graph":summarize(&evaluation),"artifacts":evaluation.artifacts,"data_health":source.health()}))?;
+                let account = broker.marked_account(&frame);
+                history.append(
+                    "paper_equity",
+                    serde_json::json!({
+                        "ts_ms": frame.as_of_ms,
+                        "equity_usd": account.equity_usd,
+                        "cash_usd": account.cash_usd,
+                        "realized_pnl_usd": account.realized_pnl_usd,
+                        "gross_exposure_usd": account.gross_exposure_usd,
+                    }),
+                )?;
+                status.write(&serde_json::json!({"as_of_ms":frame.as_of_ms,"paper_only":true,"account":account,"positions":broker.positions(),"graph":summarize(&evaluation),"artifacts":evaluation.artifacts,"data_health":source.health()}))?;
                 completed += 1;
                 info!(
                     iteration = completed,

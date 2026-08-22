@@ -27,9 +27,10 @@ impl StrategyNode for PositionPlannerNode {
         &self.dependencies
     }
     fn evaluate(&mut self, ctx: &NodeContext<'_>) -> Result<Vec<ArtifactRecord>, String> {
-        let daily_loss = (ctx.frame.account.risk_day_start_equity_usd
+        let daily_loss = ((ctx.frame.account.risk_day_start_equity_usd
             - ctx.frame.account.equity_usd)
-            / ctx.frame.account.risk_day_start_equity_usd.max(1.0);
+            / ctx.frame.account.risk_day_start_equity_usd.max(1.0))
+        .max(0.0);
         let drawdown = (ctx.frame.account.peak_equity_usd - ctx.frame.account.equity_usd)
             / ctx.frame.account.peak_equity_usd.max(1.0);
         let risk_halted = daily_loss >= self.config.daily_loss_limit_pct
