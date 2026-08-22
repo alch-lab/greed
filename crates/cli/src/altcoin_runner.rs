@@ -1493,6 +1493,12 @@ fn position_max_hold_hours(
     }
 }
 
+fn pulse_exhaustion_runtime(enabled: bool, allow_live: bool, mode: TradeMode) -> (bool, bool) {
+    // The first flag owns discovery/outcome labelling; the second owns only
+    // exchange execution. Live shadow research must survive a capital pause.
+    (enabled, enabled && (mode != TradeMode::Live || allow_live))
+}
+
 fn position_cooldown_hours(
     position: &Position,
     cfg: &AltcoinImpulseConfig,
@@ -2192,7 +2198,12 @@ pub(crate) async fn get_json(http: &reqwest::Client, url: &str) -> Result<Value>
     let candidates = public_url_candidates(url);
     for (attempt, candidate_url) in candidates.iter().enumerate() {
         let request = async {
-            let response = http.get(candidate_url).send().await?.error_for_status()?;
+            live::acquire_binance_request(live::binance_request_weight(candidate_url), false).await;
+            let response = http.get(candidate_url).send().await?;
+            let status = response.status();
+            let headers = response.headers().clone();
+            live::observe_binance_response(&headers, status).await;
+            let response = response.error_for_status()?;
             let text = response.text().await?;
             Ok::<Value, anyhow::Error>(serde_json::from_str(&text)?)
         };
@@ -4659,8 +4670,14 @@ pub async fn run_altcoin_impulse(
         mode != TradeMode::Live || cfg.allow_live,
         "该高风险策略默认禁止实盘；确认后设置 allow_live=true"
     );
-    let pulse_exhaustion_active = cfg.pulse_exhaustion_enabled
-        && (mode != TradeMode::Live || cfg.pulse_exhaustion_allow_live);
+    // Discovery and outcome labelling stay active in live mode even while the
+    // sleeve is denied real capital.  `pulse_exhaustion_allow_live` controls
+    // only exchange execution, not the paper/shadow research loop.
+    let (pulse_exhaustion_active, pulse_live_execution_allowed) = pulse_exhaustion_runtime(
+        cfg.pulse_exhaustion_enabled,
+        cfg.pulse_exhaustion_allow_live,
+        mode,
+    );
     let http = data::live::build_http_client(collector.effective_proxy().as_deref());
     // Signal discovery and pre-trade liquidity must describe the same real
     // market. Paper orders still go to Futures Demo below, but Demo/Testnet's
@@ -5474,6 +5491,15 @@ pub async fn run_altcoin_impulse(
                     candidates.clear();
                     status["stage"] = json!("post_exit_quality_missing");
                 }
+                let live_gate_open = status["gate"]["open"].as_bool().unwrap_or(false);
+                if mode == TradeMode::Live && !live_gate_open {
+                    for candidate in &mut candidates {
+                        candidate
+                            .blockers
+                            .push("实盘影子门控未开启：仅继续观测，不用真钱探索".into());
+                    }
+                    status["stage"] = json!("live_gate_blocked");
+                }
                 status["performance"] = cross_performance(&state);
                 status["evaluation_kind"] = json!(if early_cross_due {
                     "post_exit_15m_rerank"
@@ -5675,6 +5701,16 @@ pub async fn run_altcoin_impulse(
         } else {
             Vec::new()
         };
+        let broad_market_up = state.cross_section_status["market_regime"]
+            .as_str()
+            .is_some_and(|regime| regime == "broad_up");
+        if broad_market_up {
+            for candidate in &mut pulse_initial_candidates {
+                candidate
+                    .blockers
+                    .push("全市场 12h 中位数处于 broad_up，禁止逆势衰竭做空".into());
+            }
+        }
         if let Some(symbols) = execution_symbols.as_ref() {
             for candidate in &mut candidates {
                 if !symbols.contains(&candidate.symbol) {
@@ -5854,6 +5890,11 @@ pub async fn run_altcoin_impulse(
                 state.pulse_exhaustion_setups.remove(&symbol);
                 let mut candidate = enrich_candidate(http.clone(), candidate).await;
                 let metrics = apply_pulse_exhaustion_gates(&mut candidate, peak_retrace, &cfg);
+                if state.cross_section_status["market_regime"].as_str() == Some("broad_up") {
+                    candidate
+                        .blockers
+                        .push("全市场 12h 中位数处于 broad_up，禁止逆势衰竭做空".into());
+                }
                 if signal_age_ms(scan_ms, candidate.signal_ms) > max_signal_age_ms {
                     candidate.blockers.push(format!(
                         "确认 K 已超过 {} 秒实时执行窗口",
@@ -5929,7 +5970,7 @@ pub async fn run_altcoin_impulse(
                     }
                 }
                 state.latest_pulse_exhaustion = json!({
-                    "ts_ms":scan_ms,"stage":if eligible {"execution"} else {"rejected"},
+                    "ts_ms":scan_ms,"stage":if eligible && pulse_live_execution_allowed {"execution"} else if eligible {"shadow_observation"} else {"rejected"},
                     "symbol":symbol,"origin_signal_ms":setup.origin_signal_ms,
                     "confirmation_ms":candidate.signal_ms,
                     "initial_return_1h":setup.initial_return_1h,
@@ -5948,7 +5989,21 @@ pub async fn run_altcoin_impulse(
                         "signal":candidate
                     }),
                 )?;
-                if eligible {
+                if eligible && !pulse_live_execution_allowed {
+                    append_event(
+                        &event_path,
+                        json!({
+                            "ts_ms":scan_ms,"event":"pulse_exhaustion_shadow_entry",
+                            "strategy":"pulse_exhaustion_short","symbol":symbol,
+                            "side":candidate.side,"entry_price":candidate.price,
+                            "origin_signal_ms":candidate_origin_ms(&candidate),
+                            "confirmation_ms":candidate.signal_ms,
+                            "real_order_submitted":false,
+                            "reason":"实盘资金资格关闭，继续影子跟踪 MFE/MAE/到期收益"
+                        }),
+                    )?;
+                }
+                if eligible && pulse_live_execution_allowed {
                     // A confirmed exhaustion short has precedence over an unfinished
                     // continuation-long setup for the same symbol.  Keep the sleeves
                     // independent while preventing contradictory orders on one account.
@@ -7109,10 +7164,13 @@ pub async fn run_altcoin_impulse(
         let pulse_status = json!({
             "enabled":pulse_exhaustion_active,
             "configured":cfg.pulse_exhaustion_enabled,
-            "paper_only":!cfg.pulse_exhaustion_allow_live,
+            "paper_only":mode==TradeMode::Live && !cfg.pulse_exhaustion_allow_live,
+            "shadow_discovery_active":pulse_exhaustion_active,
+            "live_execution_allowed":pulse_live_execution_allowed,
             "stage":if !pulse_exhaustion_active {"disabled"}
                 else if pulse_position_count>0 {"position"}
-                else if latest_pulse_fresh {"execution"}
+                else if latest_pulse_fresh && pulse_live_execution_allowed {"execution"}
+                else if latest_pulse_fresh {"shadow_observation"}
                 else if !state.pulse_exhaustion_setups.is_empty() {"armed"}
                 else if latest_pulse_rejected {"rejected"}
                 else {"scan"},
@@ -7279,6 +7337,7 @@ pub async fn run_altcoin_impulse(
         status_payload["altcoin_impulse"]["pulse_exhaustion"] = pulse_status;
         status_payload["altcoin_impulse"]["entry_blocked"] =
             json!(daily_loss_blocked || first_week.entries_blocked);
+        status_payload["altcoin_impulse"]["daily_loss_limit"] = json!(cfg.daily_loss_limit);
         status_payload["altcoin_impulse"]["cross_section"] = state.cross_section_status.clone();
         status_payload["altcoin_impulse"]["shock_reversal"] = state.shock_reversal_status.clone();
         status_payload["altcoin_impulse"]["execution_model"] = json!(if shock_cfg.enabled {
@@ -7644,12 +7703,28 @@ mod tests {
         effective_max_spread_bps, entry_phase, evaluate, evaluate_pulse_impulse,
         existing_stop_raw_fill, failed_breakout, first_week_progress, intrabar_pending_decision,
         market_qty_chunks, observe_microstructure_trial, pending_decision, position_excursions,
-        pulse_exhaustion_candidate, realtime_trailing_stop, recently_exited_opposite_side,
-        recently_exited_symbol, record_daily_equity, record_exit, record_partial_exit,
-        recovery_profit_lock_stop, signal_age_ms, update_adverse_extreme,
+        pulse_exhaustion_candidate, pulse_exhaustion_runtime, realtime_trailing_stop,
+        recently_exited_opposite_side, recently_exited_symbol, record_daily_equity, record_exit,
+        record_partial_exit, recovery_profit_lock_stop, signal_age_ms, update_adverse_extreme,
         update_microstructure_trials, Bar, Candidate, IntrabarPendingDecision, PendingDecision,
         PersistedState, Position, PulseExhaustionSetup,
     };
+
+    #[test]
+    fn live_capital_pause_keeps_pulse_shadow_discovery_running() {
+        assert_eq!(
+            pulse_exhaustion_runtime(true, false, super::TradeMode::Live),
+            (true, false)
+        );
+        assert_eq!(
+            pulse_exhaustion_runtime(true, true, super::TradeMode::Live),
+            (true, true)
+        );
+        assert_eq!(
+            pulse_exhaustion_runtime(false, true, super::TradeMode::Paper),
+            (false, false)
+        );
+    }
 
     #[test]
     fn public_market_requests_rotate_away_from_a_stalled_primary_domain() {
@@ -8600,11 +8675,12 @@ mod tests {
         assert_eq!(strategy.altcoin_impulse.stop_pct, 0.010);
         assert_eq!(strategy.altcoin_impulse.max_gross_multiple, 0.50);
         assert_eq!(strategy.altcoin_impulse.first_week_duration_days, 7);
-        assert_eq!(strategy.altcoin_impulse.first_week_loss_limit, 0.12);
+        assert_eq!(strategy.altcoin_impulse.daily_loss_limit, 0.025);
+        assert_eq!(strategy.altcoin_impulse.first_week_loss_limit, 0.05);
         assert_eq!(strategy.altcoin_impulse.dry_slippage_bps, 5.0);
-        assert_eq!(strategy.altcoin_impulse.trail_activation_pct, 0.015);
-        assert_eq!(strategy.altcoin_impulse.trail_pct, 0.005);
-        assert_eq!(strategy.altcoin_impulse.partial_take_profit_fraction, 0.33);
+        assert_eq!(strategy.altcoin_impulse.trail_activation_pct, 0.018);
+        assert_eq!(strategy.altcoin_impulse.trail_pct, 0.0075);
+        assert_eq!(strategy.altcoin_impulse.partial_take_profit_fraction, 0.40);
         assert_eq!(strategy.altcoin_impulse.max_hold_hours, 2);
         assert_eq!(strategy.altcoin_impulse.loss_trim_trigger_pct, 0.01);
         assert!(!strategy.altcoin_impulse.loss_trim_enabled);
@@ -8646,12 +8722,12 @@ mod tests {
         assert_eq!(strategy.altcoin_impulse.intrabar_rebound_pct, 0.003);
         assert_eq!(strategy.altcoin_impulse.extreme_direct_risk_scale, 0.33);
         assert!(strategy.altcoin_impulse.pulse_exhaustion_enabled);
-        assert!(strategy.altcoin_impulse.pulse_exhaustion_allow_live);
+        assert!(!strategy.altcoin_impulse.pulse_exhaustion_allow_live);
         assert_eq!(strategy.altcoin_impulse.pulse_initial_return_1h, 0.06);
         assert_eq!(strategy.altcoin_impulse.pulse_initial_volume_ratio, 10.0);
         assert_eq!(strategy.altcoin_impulse.pulse_oi_change_1h, 0.20);
         assert_eq!(strategy.altcoin_impulse.pulse_min_peak_retrace, 0.035);
-        assert_eq!(strategy.altcoin_impulse.pulse_risk_scale, 0.625);
+        assert_eq!(strategy.altcoin_impulse.pulse_risk_scale, 0.40);
         assert_eq!(strategy.altcoin_impulse.pulse_max_positions, 1);
         assert_eq!(strategy.altcoin_impulse.pulse_max_gross_multiple, 1.00);
         assert_eq!(strategy.altcoin_impulse.pulse_stop_pct, 0.020);
@@ -8690,19 +8766,19 @@ mod tests {
             0.01
         );
         assert_eq!(strategy.altcoin_cross_section.base_gross_multiple, 0.15);
-        assert_eq!(strategy.altcoin_cross_section.active_gross_multiple, 1.00);
+        assert_eq!(strategy.altcoin_cross_section.active_gross_multiple, 0.50);
         assert_eq!(strategy.altcoin_cross_section.strong_excess_return, 0.12);
-        assert_eq!(strategy.altcoin_cross_section.strong_gross_multiple, 1.50);
+        assert_eq!(strategy.altcoin_cross_section.strong_gross_multiple, 0.50);
         assert_eq!(
             strategy.altcoin_cross_section.assumed_cost_bps_per_side,
             10.0
         );
         assert_eq!(strategy.altcoin_cross_section.stop_pct, 0.04);
-        assert_eq!(strategy.altcoin_cross_section.trail_activation_pct, 0.05);
-        assert_eq!(strategy.altcoin_cross_section.trail_pct, 0.02);
+        assert_eq!(strategy.altcoin_cross_section.trail_activation_pct, 0.015);
+        assert_eq!(strategy.altcoin_cross_section.trail_pct, 0.005);
         assert_eq!(
             strategy.altcoin_cross_section.partial_take_profit_fraction,
-            0.33
+            0.40
         );
         // The failed 15m shock-reversal alpha is intentionally absent from
         // the deployed configuration. The default remains disabled only so

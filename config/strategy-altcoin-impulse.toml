@@ -23,13 +23,14 @@ max_positions = 5
 max_daily_entries = 15
 # 实盘不允许临时加额。
 max_daily_entry_bonus = 0
-daily_loss_limit = 0.04
+daily_loss_limit = 0.025
 max_gross_multiple = 0.50
 # 模拟盘持续运行，不设盈利上限，也不因首个 7 天窗口结束而停止开仓。
 # 下面的 7 天窗口只用于首周亏损保护。
 first_week_duration_days = 7
-# 首周累计权益回撤达到 12% 时锁死新开仓；已有仓位继续由保护单管理。
-first_week_loss_limit = 0.12
+# 首周累计权益回撤达到 5% 时锁死新开仓；已有仓位继续由保护单管理。
+# 以 1,500 USDT sleeve 计，约 75 USDT 即停止继续试错。
+first_week_loss_limit = 0.05
 # dry 模式每次开/平仓各施加 5bp 不利滑点；手续费仍按单边 5bp 另计。
 dry_slippage_bps = 5.0
 
@@ -40,9 +41,11 @@ loss_trim_fraction = 0.50
 loss_trim_enabled = false
 # 仓位预算额外计入 0.5% 执行成本；STOP_MARKET 极端跳空仍无法保证绝对封顶。
 risk_execution_buffer_pct = 0.005
-trail_activation_pct = 0.015
-trail_pct = 0.005
-partial_take_profit_fraction = 0.33
+# 最近三日因果回放中，稍晚兑现并给余仓更宽跟踪能降低亏损与回撤；
+# 仍保持 1% 交易所硬止损，不放宽左尾风险。
+trail_activation_pct = 0.018
+trail_pct = 0.0075
+partial_take_profit_fraction = 0.40
 failed_breakout_window_minutes = 15
 failed_breakout_adverse_pct = 0.03
 failed_breakout_max_mfe_pct = 0.005
@@ -91,9 +94,10 @@ extreme_direct_risk_scale = 0.33
 # 路径效率、收盘位置或回踩确认；币种池、数据时效、流动性和账户风控仍共享。
 # 八日因果分钟回放显示，25% OI / 4.5% 回落确认过晚。这里恢复到相邻参数
 # 也保持为正的 20% OI / 3.5% 回落，同时保留现货滞后和真实可成交性硬门槛。
-# Demo 与实盘使用同一逻辑；它拥有独立的 1 个仓位槽和 1.0x 权益名义额度。
+# 继续在 dry/paper 记录样本；当前实盘样本只有一次且贡献了主要亏损，
+# 在滚动样本重新证明正期望前不再用真钱探索。broad_up 状态还会硬拦逆势空。
 pulse_exhaustion_enabled = true
-pulse_exhaustion_allow_live = true
+pulse_exhaustion_allow_live = false
 pulse_initial_return_1h = 0.06
 pulse_initial_volume_ratio = 10.0
 pulse_perp_return_1h = 0.06
@@ -101,11 +105,11 @@ pulse_oi_change_1h = 0.20
 pulse_max_spot_perp_ratio = 1.10
 pulse_min_peak_retrace = 0.035
 pulse_max_close_location = 0.80
-# 2% 止损 + 0.5% 执行缓冲下，0.625 风险倍率对应约 1.0x 权益名义仓位。
-pulse_risk_scale = 0.625
+# 2% 止损 + 0.5% 执行缓冲下，0.40 风险倍率对应约 0.64x 权益名义仓位。
+pulse_risk_scale = 0.40
 pulse_max_positions = 1
 pulse_max_gross_multiple = 1.00
-# 杠杆衰竭需要容纳反抽噪声，独立使用 2% 硬止损；到 +2% 兑现 33%，
+# 杠杆衰竭需要容纳反抽噪声，独立使用 2% 硬止损；到 +2% 兑现 40%，
 # 余仓按峰值回撤 0.75% 跟踪。主突破通道仍保持 1% / 1.5% / 0.5%。
 pulse_stop_pct = 0.020
 pulse_trail_activation_pct = 0.020
@@ -155,9 +159,9 @@ allow_live = true
 [altcoin_cross_section]
 # 12h/3h 截面动量直接执行。全池 12h 中位涨幅达到 1% 时做多最强币，
 # 其余市场状态做空最弱币；这是一条经过样本验证的偏空规则，并非只做空。
-# 最近 30 个已完成信号 PF >= 1.30 且累计
-# 收益为正时用 1.00x 权益；若候选相对全市场中位数还有至少 12% 超额动量，
-# 再升到 1.50x。其余状态用 0.15x 探索仓执行，不会停止交易。
+# 最近 30 个已完成信号 PF >= 1.30 且累计收益为正时才允许实盘；最近 7 天
+# 因果回放显示 1.00x/1.50x 会把最大回撤推到 17.05%，因此普通和强信号都
+# 限为 0.50x。其余状态仅在 dry/paper 用 0.15x 生成探索样本。
 enabled = true
 formation_hours = 12
 hold_hours = 3
@@ -169,15 +173,15 @@ gate_min_profit_factor = 1.30
 # 影子门控按每边 5bp taker 手续费 + 5bp 不利滑点计成本。
 assumed_cost_bps_per_side = 10.0
 base_gross_multiple = 0.15
-active_gross_multiple = 1.00
+active_gross_multiple = 0.50
 strong_excess_return = 0.12
-strong_gross_multiple = 1.50
+strong_gross_multiple = 0.50
 # 同币同向连续入选时保留原仓和已收紧的保护，不再每 3 小时平掉重开。
-# 4% 初始止损对应探索/增强/强信号组合风险约 0.6%/4%/6% 权益；盈利达到 5%
-# 兑现 33%，余仓按峰值回撤 2% 跟踪。3 小时只是重新排名边界。
+# 4% 初始止损对应实盘组合约 2% 权益风险；盈利达到 1.5% 兑现 40%，
+# 余仓按峰值回撤 0.5% 跟踪。3 小时只是重新排名边界。
 # 完整止盈/止损后，从下一根闭合 15m K 开始提前重排；当前 3h 窗口内
 # 已退出币不再重进，替代候选相对全池中位数须达到 strong_excess_return。
 stop_pct = 0.04
-trail_activation_pct = 0.05
-trail_pct = 0.02
-partial_take_profit_fraction = 0.33
+trail_activation_pct = 0.015
+trail_pct = 0.005
+partial_take_profit_fraction = 0.40

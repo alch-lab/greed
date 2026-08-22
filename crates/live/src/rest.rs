@@ -10,11 +10,156 @@
 use hmac::{Hmac, Mac};
 use serde::Deserialize;
 use sha2::Sha256;
-use std::collections::HashSet;
+use std::collections::{HashSet, VecDeque};
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::LazyLock;
+use std::time::{Duration, Instant};
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 type HmacSha256 = Hmac<Sha256>;
+
+const BINANCE_REQUEST_WEIGHT_LIMIT_1M: u32 = 2_400;
+const BINANCE_BACKGROUND_WEIGHT_CEILING_1M: u32 = 1_600;
+const BINANCE_CRITICAL_WEIGHT_CEILING_1M: u32 = BINANCE_REQUEST_WEIGHT_LIMIT_1M - 200;
+
+#[derive(Default)]
+struct BinanceBudgetState {
+    local_requests: VecDeque<(Instant, u32)>,
+    server_minute: i64,
+    server_used_weight: u32,
+    blocked_until: Option<Instant>,
+}
+
+static BINANCE_BUDGET: LazyLock<Mutex<BinanceBudgetState>> =
+    LazyLock::new(|| Mutex::new(BinanceBudgetState::default()));
+
+/// All Binance REST traffic in this process shares an IP request-weight
+/// budget.  Trading and protective-order traffic may use the reserved tail;
+/// scanners/account polling are held below a conservative ceiling.
+pub async fn acquire_binance_request(weight: u32, critical: bool) {
+    let weight = weight.max(1);
+    loop {
+        let now = Instant::now();
+        let wall_ms = chrono::Utc::now().timestamp_millis();
+        let wall_minute = wall_ms / 60_000;
+        let mut state = BINANCE_BUDGET.lock().await;
+        while state
+            .local_requests
+            .front()
+            .is_some_and(|(at, _)| now.duration_since(*at) >= Duration::from_secs(60))
+        {
+            state.local_requests.pop_front();
+        }
+        if state.server_minute != wall_minute {
+            state.server_minute = wall_minute;
+            state.server_used_weight = 0;
+        }
+        if let Some(until) = state.blocked_until {
+            if until > now {
+                let wait = until.duration_since(now);
+                drop(state);
+                tokio::time::sleep(wait).await;
+                continue;
+            }
+            state.blocked_until = None;
+        }
+        let local_used: u32 = state.local_requests.iter().map(|(_, value)| *value).sum();
+        let used = local_used.max(state.server_used_weight);
+        let ceiling = if critical {
+            BINANCE_CRITICAL_WEIGHT_CEILING_1M
+        } else {
+            BINANCE_BACKGROUND_WEIGHT_CEILING_1M
+        };
+        if used.saturating_add(weight) <= ceiling {
+            state.local_requests.push_back((now, weight));
+            return;
+        }
+        let local_wait = state
+            .local_requests
+            .front()
+            .map(|(at, _)| Duration::from_secs(60).saturating_sub(now.duration_since(*at)));
+        let minute_wait_ms = 60_000 - wall_ms.rem_euclid(60_000) + 100;
+        let minute_wait = Duration::from_millis(minute_wait_ms as u64);
+        let wait = local_wait.map_or(minute_wait, |value| value.min(minute_wait));
+        drop(state);
+        tokio::time::sleep(wait.max(Duration::from_millis(25))).await;
+    }
+}
+
+/// Conservative weights for the public endpoints used by the scanner.  The
+/// response header remains authoritative and updates the shared budget.
+pub fn binance_request_weight(url: &str) -> u32 {
+    if url.contains("/fapi/v1/aggTrades") {
+        20
+    } else if url.contains("/fapi/v1/depth") {
+        5
+    } else if url.contains("/klines") {
+        5
+    } else {
+        1
+    }
+}
+
+pub async fn observe_binance_response(
+    headers: &reqwest::header::HeaderMap,
+    status: reqwest::StatusCode,
+) {
+    let now = Instant::now();
+    let wall_minute = chrono::Utc::now().timestamp_millis() / 60_000;
+    let used = headers
+        .get("x-mbx-used-weight-1m")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u32>().ok());
+    let retry_after = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok());
+    let mut state = BINANCE_BUDGET.lock().await;
+    if state.server_minute != wall_minute {
+        state.server_minute = wall_minute;
+        state.server_used_weight = 0;
+    }
+    if let Some(used) = used {
+        state.server_used_weight = state.server_used_weight.max(used);
+    }
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::IM_A_TEAPOT
+    {
+        let seconds = retry_after.unwrap_or(if status == reqwest::StatusCode::IM_A_TEAPOT {
+            120
+        } else {
+            60
+        });
+        state.blocked_until = Some(now + Duration::from_secs(seconds.max(1)));
+    }
+}
+
+async fn backoff_binance_budget(seconds: u64) {
+    let mut state = BINANCE_BUDGET.lock().await;
+    let until = Instant::now() + Duration::from_secs(seconds.max(1));
+    if state.blocked_until.is_none_or(|current| current < until) {
+        state.blocked_until = Some(until);
+    }
+}
+
+fn rate_limit_backoff_seconds(message: &str) -> u64 {
+    let now_ms = chrono::Utc::now().timestamp_millis();
+    let banned_until = message
+        .split("banned until")
+        .nth(1)
+        .and_then(|tail| tail.split_whitespace().next())
+        .and_then(|value| {
+            value
+                .trim_matches(|ch: char| !ch.is_ascii_digit())
+                .parse::<i64>()
+                .ok()
+        });
+    banned_until
+        .map(|until| ((until - now_ms).max(1) as u64).div_ceil(1_000) + 1)
+        .unwrap_or(60)
+        .clamp(1, 3 * 24 * 60 * 60)
+}
 
 #[derive(Debug, Error)]
 pub enum RestError {
@@ -408,8 +553,23 @@ impl RestClient {
 
     /// 无签名 GET 并解析 JSON。
     async fn get_json(&self, url: &str) -> Result<serde_json::Value, RestError> {
-        let text = self.http.get(url).send().await?.text().await?;
-        Ok(serde_json::from_str(&text)?)
+        acquire_binance_request(binance_request_weight(url), false).await;
+        let response = self.http.get(url).send().await?;
+        let status = response.status();
+        let headers = response.headers().clone();
+        observe_binance_response(&headers, status).await;
+        let text = response.text().await?;
+        let value: serde_json::Value =
+            serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text.clone()));
+        if !status.is_success() {
+            let code = value["code"].as_i64().unwrap_or(status.as_u16() as i64);
+            let msg = value["msg"].as_str().unwrap_or(&text).to_string();
+            if code == -1003 {
+                backoff_binance_budget(rate_limit_backoff_seconds(&msg)).await;
+            }
+            return Err(RestError::Binance { code, msg });
+        }
+        Ok(value)
     }
 
     /// 与服务器对时（漂移 >1s 时签名会被拒）。
@@ -454,6 +614,17 @@ impl RestClient {
         let query = qs.join("&");
         let sig = self.sign(&query);
         let url = format!("{}{}?{}&signature={}", self.base, path, query, sig);
+        let critical = method != reqwest::Method::GET;
+        let weight = if path.contains("userTrades")
+            || path.contains("positionRisk")
+            || path.contains("account")
+            || path.contains("balance")
+        {
+            5
+        } else {
+            1
+        };
+        acquire_binance_request(weight, critical).await;
         let resp = self
             .http
             .request(method, &url)
@@ -461,12 +632,17 @@ impl RestClient {
             .send()
             .await?;
         let status = resp.status();
+        let headers = resp.headers().clone();
+        observe_binance_response(&headers, status).await;
         let text = resp.text().await?;
         let v: serde_json::Value =
             serde_json::from_str(&text).unwrap_or(serde_json::Value::String(text.clone()));
         if !status.is_success() {
             let code = v["code"].as_i64().unwrap_or(status.as_u16() as i64);
             let msg = v["msg"].as_str().unwrap_or(&text).to_string();
+            if code == -1003 {
+                backoff_binance_budget(rate_limit_backoff_seconds(&msg)).await;
+            }
             return Err(RestError::Binance { code, msg });
         }
         Ok(v)
@@ -1110,6 +1286,18 @@ mod tests {
             msg: "Bad Gateway".into(),
         }
         .execution_may_be_unknown());
+    }
+
+    #[test]
+    fn rate_limit_backoff_honors_ban_expiry_from_binance_message() {
+        let until = chrono::Utc::now().timestamp_millis() + 125_000;
+        let seconds =
+            rate_limit_backoff_seconds(&format!("Way too many requests; IP banned until {until}."));
+        assert!((125..=127).contains(&seconds));
+        assert_eq!(
+            rate_limit_backoff_seconds("Too many requests; current limit is 2400"),
+            60
+        );
     }
 
     /// 币安官方文档签名示例（spot 文档，HMAC 算法与合约一致）。

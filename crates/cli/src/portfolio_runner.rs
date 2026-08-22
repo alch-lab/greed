@@ -30,6 +30,10 @@ pub struct PortfolioConfig {
     pub mr_max_risk_pct: f64,
     #[serde(default = "default_mr_leverage")]
     pub mr_leverage: u32,
+    #[serde(default = "default_mr_cb_max_daily_losses")]
+    pub mr_cb_max_daily_losses: u32,
+    #[serde(default = "default_mr_cb_daily_dd_pct")]
+    pub mr_cb_daily_dd_pct: f64,
 }
 
 #[derive(Debug, Deserialize)]
@@ -38,15 +42,23 @@ struct PortfolioFile {
 }
 
 fn default_mr_risk_pct() -> f64 {
-    0.0125
+    0.0075
 }
 
 fn default_mr_max_risk_pct() -> f64 {
-    0.0125
+    0.0075
 }
 
 fn default_mr_leverage() -> u32 {
-    5
+    3
+}
+
+fn default_mr_cb_max_daily_losses() -> u32 {
+    2
+}
+
+fn default_mr_cb_daily_dd_pct() -> f64 {
+    0.02
 }
 
 pub fn is_portfolio_strategy(path: &str) -> bool {
@@ -72,6 +84,10 @@ fn load_portfolio(path: &str) -> Result<PortfolioConfig> {
         "MR 风险参数要求 0 < risk_pct <= max_risk_pct"
     );
     anyhow::ensure!((1..=20).contains(&cfg.mr_leverage), "MR 杠杆必须为 1..=20");
+    anyhow::ensure!(
+        cfg.mr_cb_max_daily_losses > 0 && (0.005..=0.05).contains(&cfg.mr_cb_daily_dd_pct),
+        "MR 主网风控要求连续亏损熔断开启，且日内回撤限制在 0.5%..=5%"
+    );
     anyhow::ensure!(
         !is_altcoin_strategy(&cfg.mr_strategy),
         "MR 策略配置不能指向山寨币策略"
@@ -273,6 +289,40 @@ fn aggregate_status(
     let alt_wins = altcoin["altcoin_impulse"]["wins"].as_u64().unwrap_or(0);
     let completed_trades = btc_completed + alt_completed;
     let wins = btc_wins + alt_wins;
+    let mr_risk = mr.get("risk_control").cloned().unwrap_or_else(|| {
+        json!({
+            "halted":false,"reason_codes":[],"day_start_equity":0.0,
+            "current_equity":mr_equity,"daily_drawdown_pct":0.0,
+            "daily_drawdown_limit_pct":cfg.mr_cb_daily_dd_pct,
+            "consecutive_losses":0,"consecutive_loss_limit":cfg.mr_cb_max_daily_losses
+        })
+    });
+    let alt = &altcoin["altcoin_impulse"];
+    let alt_daily_halted = alt["daily_loss_blocked"].as_bool().unwrap_or(false);
+    let alt_first_week_halted = alt["first_week"]["entries_blocked"]
+        .as_bool()
+        .unwrap_or(false);
+    let mut alt_reason_codes = Vec::new();
+    if alt_daily_halted {
+        alt_reason_codes.push("daily_drawdown");
+    }
+    if alt_first_week_halted {
+        alt_reason_codes.push("first_week_loss");
+    }
+    let alt_risk = json!({
+        "halted":alt_daily_halted || alt_first_week_halted,
+        "reason_codes":alt_reason_codes,
+        "day_start_equity":alt["daily_risk_baseline_equity"].as_f64().unwrap_or(0.0),
+        "current_equity":altcoin_equity,
+        "daily_drawdown_limit_pct":alt["daily_loss_limit"].as_f64().unwrap_or(0.0),
+        "first_week":alt.get("first_week").cloned().unwrap_or(Value::Null)
+    });
+    let risk_control = json!({
+        "halted":mr_risk["halted"].as_bool().unwrap_or(false)
+            || alt_risk["halted"].as_bool().unwrap_or(false),
+        "btc":mr_risk,
+        "altcoin":alt_risk
+    });
     json!({
         "state":state,
         "mode":mode.as_str(),
@@ -295,6 +345,7 @@ fn aggregate_status(
             "combined_pnl":mr_equity+altcoin_equity-cfg.mr_capital_usdt-cfg.altcoin_capital_usdt,
             "mr_capital_usdt":cfg.mr_capital_usdt,
             "altcoin_capital_usdt":cfg.altcoin_capital_usdt,
+            "risk_control":risk_control,
             "performance":{
                 "completed_trades":completed_trades,
                 "wins":wins,
@@ -412,6 +463,8 @@ pub async fn run_portfolio(
     mr_args.risk_pct = cfg.mr_risk_pct;
     mr_args.max_risk_pct = cfg.mr_max_risk_pct;
     mr_args.leverage = cfg.mr_leverage;
+    mr_args.cb_max_daily_losses = cfg.mr_cb_max_daily_losses;
+    mr_args.cb_daily_dd_pct = cfg.mr_cb_daily_dd_pct;
     mr_args.portfolio_mode = true;
 
     let mut altcoin_args = args.clone();
@@ -513,9 +566,11 @@ mod tests {
         let cfg = deployed_config();
         assert_eq!(cfg.mr_capital_usdt, 1_500.0);
         assert_eq!(cfg.altcoin_capital_usdt, 1_500.0);
-        assert_eq!(cfg.mr_risk_pct, 0.0125);
-        assert_eq!(cfg.mr_max_risk_pct, 0.0125);
-        assert_eq!(cfg.mr_leverage, 5);
+        assert_eq!(cfg.mr_risk_pct, 0.0075);
+        assert_eq!(cfg.mr_max_risk_pct, 0.0075);
+        assert_eq!(cfg.mr_leverage, 3);
+        assert_eq!(cfg.mr_cb_max_daily_losses, 2);
+        assert_eq!(cfg.mr_cb_daily_dd_pct, 0.02);
         assert_eq!(cfg.mr_strategy, "config/strategy-final.toml");
         assert_eq!(cfg.altcoin_strategy, "config/strategy-altcoin-impulse.toml");
         assert!(cfg.allow_live);
@@ -558,6 +613,45 @@ mod tests {
         assert_eq!(status["portfolio"]["performance"]["completed_trades"], 10);
         assert_eq!(status["portfolio"]["performance"]["wins"], 6);
         assert_eq!(status["portfolio"]["performance"]["win_rate"], 0.6);
+        assert_eq!(status["portfolio"]["risk_control"]["halted"], false);
+    }
+
+    #[test]
+    fn aggregate_exposes_component_risk_halts_and_reasons() {
+        let cfg = deployed_config();
+        let mr = json!({
+            "state":"running","equity":1_470.0,"cash":1_470.0,
+            "risk_control":{
+                "halted":true,"reason_codes":["daily_drawdown"],
+                "day_start_equity":1_500.0,"current_equity":1_470.0,
+                "daily_drawdown_pct":0.02,"daily_drawdown_limit_pct":0.02,
+                "consecutive_losses":1,"consecutive_loss_limit":2
+            }
+        });
+        let altcoin = json!({
+            "state":"running","equity":1_460.0,"cash":1_460.0,
+            "altcoin_impulse":{
+                "daily_loss_blocked":false,"daily_loss_limit":0.025,
+                "daily_risk_baseline_equity":1_500.0,
+                "first_week":{"entries_blocked":true,"loss_limit_pct":0.05}
+            }
+        });
+        let status = aggregate_status(
+            TradeMode::Live,
+            "config/strategy-portfolio.toml",
+            1,
+            3_000.0,
+            &cfg,
+            &mr,
+            &altcoin,
+        );
+        let risk = &status["portfolio"]["risk_control"];
+        assert_eq!(risk["halted"], true);
+        assert_eq!(risk["btc"]["halted"], true);
+        assert_eq!(risk["btc"]["reason_codes"][0], "daily_drawdown");
+        assert_eq!(risk["altcoin"]["halted"], true);
+        assert_eq!(risk["altcoin"]["reason_codes"][0], "first_week_loss");
+        assert_eq!(risk["altcoin"]["daily_drawdown_limit_pct"], 0.025);
     }
 
     #[test]

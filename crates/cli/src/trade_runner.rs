@@ -263,6 +263,7 @@ pub async fn run_trade(
         run_id,
         mode: mode.as_str().into(),
         estimated_roundtrip_fee_bps: if market_entry { 8.0 } else { 6.0 },
+        portfolio_mode: args.portfolio_mode,
     };
     if let Some(parent) = std::path::Path::new(&journal_path).parent() {
         std::fs::create_dir_all(parent)?;

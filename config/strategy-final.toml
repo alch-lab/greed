@@ -111,6 +111,9 @@ reentry_cooldown_ms = 21600000
 require_source_coverage = true
 require_spot_perp_delta = true
 require_oi_support = true
+# 2h 延续方向必须与 6h 锚定方向同号；上涨大结构中的急跌只视为回调，
+# 不允许像 8 月 22 日事故那样追空。
+require_anchor_alignment = true
 
 [strategy.plugins.TacticalPullback]
 bucket_ms = 10000

@@ -63,6 +63,9 @@ pub struct LiveConfig {
     pub mode: String,
     /// 影子信号估算净收益时采用的往返费用（bps）。
     pub estimated_roundtrip_fee_bps: f64,
+    /// Shared-account portfolio sleeves must not compare their virtual cash
+    /// against the whole exchange wallet.
+    pub portfolio_mode: bool,
 }
 
 /// 挂起中的入场（testnet：已下单待成交；dry：限价单待触发）。
@@ -77,6 +80,9 @@ struct PendingEntry {
     submitted_ts_ms: i64,
     reference_price: f64,
     planned_price: f64,
+    /// Signal-time stop distance. Market fills can differ from the decision
+    /// price, so the hard stop is rebuilt from the real average fill.
+    stop_distance_pct: f64,
     qty: f64,
     reason: String,
 }
@@ -170,6 +176,8 @@ pub struct EngineSnapshot {
     pub effective_risk_pct: f64,
     pub estimated_risk_usd: f64,
     pub estimated_notional_usd: f64,
+    /// 当前策略级熔断是否已经禁止新开仓，以及可直接展示的触发依据。
+    pub risk_control: RiskControlSnap,
     pub position: Option<PositionSnap>,
     /// 以完整开仓到完全平仓为一笔，部分止盈不会重复计数。
     pub performance: PerformanceSnap,
@@ -196,6 +204,18 @@ pub struct EngineSnapshot {
     pub shadow_outcomes_run: usize,
     /// userTrades 是否在 30 秒内成功轮询过；false 时引擎禁止新开仓。
     pub execution_healthy: bool,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct RiskControlSnap {
+    pub halted: bool,
+    pub reason_codes: Vec<String>,
+    pub day_start_equity: f64,
+    pub current_equity: f64,
+    pub daily_drawdown_pct: f64,
+    pub daily_drawdown_limit_pct: f64,
+    pub consecutive_losses: u32,
+    pub consecutive_loss_limit: u32,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -287,6 +307,12 @@ struct EngineState {
     last_entry_order: Option<EntryOrderStatusSnap>,
     #[serde(default)]
     tiered_exit: Option<TieredExitPlan>,
+    #[serde(default)]
+    pending_protective_stop: Option<Price>,
+    #[serde(default)]
+    protective_stop_failure_since_ms: Option<i64>,
+    #[serde(default)]
+    protective_stop_failures: u32,
 }
 
 const ENGINE_STATE_VERSION: u32 = 2;
@@ -295,6 +321,42 @@ const POSITION_RECONCILE_INTERVAL_MS: i64 = 10_000;
 const EXIT_RETRY_BACKOFF_MS: i64 = 10_000;
 const PROTECTIVE_STOP_MIN_UPDATE_MS: i64 = 5_000;
 const PROTECTIVE_STOP_MIN_IMPROVEMENT_BPS: f64 = 2.0;
+const PROTECTIVE_STOP_RETRY_MS: i64 = 2_000;
+const PROTECTIVE_STOP_FAIL_CLOSE_MS: i64 = 10_000;
+const PROTECTIVE_STOP_FAIL_CLOSE_ATTEMPTS: u32 = 3;
+
+fn stop_distance_pct(entry: Price, stop: Price) -> f64 {
+    let entry = entry.to_f64();
+    if entry <= 0.0 {
+        return 0.0;
+    }
+    ((stop.to_f64() - entry) / entry).abs()
+}
+
+/// Preserve the signal's dollar-risk geometry after a market order fills.
+///
+/// The old implementation submitted the signal-time absolute stop unchanged.
+/// An adverse fill could therefore put a short stop below the real entry (or a
+/// long stop above it), which Binance rejects as "would immediately trigger".
+fn stop_from_actual_fill(side: Side, fill: Price, distance_pct: f64) -> Price {
+    let fill = fill.to_f64();
+    let distance_pct = distance_pct.max(1e-6);
+    Price::from_f64(match side {
+        Side::Buy => fill * (1.0 - distance_pct),
+        Side::Sell => fill * (1.0 + distance_pct),
+    })
+}
+
+fn stop_already_crossed(side: Side, mark: Price, stop: Price) -> bool {
+    match side {
+        Side::Buy => mark <= stop,
+        Side::Sell => mark >= stop,
+    }
+}
+
+fn risk_day_cst(ts_ms: i64) -> i64 {
+    (ts_ms + 8 * 3_600_000) / 86_400_000
+}
 
 fn protective_stop_should_update(
     side: Side,
@@ -360,6 +422,10 @@ pub struct LiveEngine {
     last_time_sync_ms: i64,
     last_protective_stop_submit_ms: i64,
     last_protective_stop_price: Option<Price>,
+    /// Desired exchange hard stop while submission/replacement is retrying.
+    pending_protective_stop: Option<Price>,
+    protective_stop_failure_since_ms: Option<i64>,
+    protective_stop_failures: u32,
     exit_retry_after_ms: i64,
     /// 重启恢复持仓后，首个行情节拍按 journal 止损价重挂保护性止损
     needs_stop_rearm: bool,
@@ -424,6 +490,9 @@ impl LiveEngine {
             last_time_sync_ms: 0,
             last_protective_stop_submit_ms: 0,
             last_protective_stop_price: None,
+            pending_protective_stop: None,
+            protective_stop_failure_since_ms: None,
+            protective_stop_failures: 0,
             exit_retry_after_ms: 0,
             needs_stop_rearm: false,
         };
@@ -553,7 +622,18 @@ impl LiveEngine {
             warn!("非组合模式恢复：丢弃 journal 中的持仓（交易所侧已由人工/启动检查处理）");
         }
         let position = if allow_position { state.position } else { None };
-        let needs_rearm = position.and_then(|p| p.stop_price).is_some();
+        let restored_pending_stop = state.pending_protective_stop.or_else(|| {
+            position.and_then(|p| {
+                p.stop_price.or_else(|| {
+                    Some(stop_from_actual_fill(
+                        p.side,
+                        p.entry_price,
+                        self.config.strategy_stop_pct,
+                    ))
+                })
+            })
+        });
+        let needs_rearm = position.is_some() && restored_pending_stop.is_some();
 
         self.account = Account::from_parts(state.initial_cash, state.cash, position, journal.fills);
         self.intents = journal.intents;
@@ -585,6 +665,9 @@ impl LiveEngine {
         } else {
             None
         };
+        self.pending_protective_stop = restored_pending_stop;
+        self.protective_stop_failure_since_ms = state.protective_stop_failure_since_ms;
+        self.protective_stop_failures = state.protective_stop_failures;
         self.needs_stop_rearm = needs_rearm;
         self.sync_position_flag();
 
@@ -963,6 +1046,25 @@ impl LiveEngine {
                 .and_then(|sp| sp.eval_note())
         };
         let performance = completed_trade_performance(self.account.fills());
+        let daily_drawdown_pct = if self.cb_day_start_equity > 0.0 {
+            (1.0 - equity / self.cb_day_start_equity).max(0.0)
+        } else {
+            0.0
+        };
+        let mut risk_reason_codes = Vec::new();
+        if self.config.cb_daily_dd_pct > 0.0
+            && daily_drawdown_pct + f64::EPSILON >= self.config.cb_daily_dd_pct
+        {
+            risk_reason_codes.push("daily_drawdown".to_owned());
+        }
+        if self.config.cb_max_daily_losses > 0
+            && self.cb_consec_losses >= self.config.cb_max_daily_losses
+        {
+            risk_reason_codes.push("consecutive_losses".to_owned());
+        }
+        if self.cb_on && risk_reason_codes.is_empty() {
+            risk_reason_codes.push("circuit_breaker_latched".to_owned());
+        }
         EngineSnapshot {
             last_price: px.map(|p| p.to_f64()),
             equity,
@@ -977,6 +1079,16 @@ impl LiveEngine {
                 equity * effective_risk_pct / self.config.strategy_stop_pct
             } else {
                 0.0
+            },
+            risk_control: RiskControlSnap {
+                halted: self.cb_on,
+                reason_codes: risk_reason_codes,
+                day_start_equity: self.cb_day_start_equity,
+                current_equity: equity,
+                daily_drawdown_pct,
+                daily_drawdown_limit_pct: self.config.cb_daily_dd_pct,
+                consecutive_losses: self.cb_consec_losses,
+                consecutive_loss_limit: self.config.cb_max_daily_losses,
             },
             position: self.account.position().map(|p| {
                 let strategy = match p.strategy_tag {
@@ -1032,6 +1144,24 @@ impl LiveEngine {
         self.update_env_flags(trade.ts, trade.price);
         self.cb_update(trade.ts, trade.price);
 
+        // A daily-drawdown circuit breaker is a hard risk boundary, not merely
+        // an entry filter. Flatten the existing sleeve before evaluating any
+        // further signal or position-management action.
+        if self.cb_on && self.account.position().is_some() && self.pending_exit.is_none() {
+            let qty = self.account.position().map(|position| position.qty);
+            if let Some(qty) = qty {
+                warn!(
+                    equity = self.account.equity(trade.price),
+                    baseline = self.cb_day_start_equity,
+                    "BTC 日内回撤熔断触发，执行全平并禁止新开仓"
+                );
+                self.market_close(trade, qty, "daily_drawdown_circuit_breaker", None)
+                    .await;
+                self.persist_journal();
+                return;
+            }
+        }
+
         // 1) 撮合/成交回报（dry：本地模拟撮合；testnet：本地挂单不消费价格）
         let had_position = self.account.position().is_some();
         let execs = self.broker.on_trade_price(trade.ts, trade.price).await;
@@ -1067,7 +1197,7 @@ impl LiveEngine {
         if self.needs_stop_rearm {
             self.needs_stop_rearm = false;
             if let Some(p) = self.account.position().copied() {
-                if let Some(stop) = p.stop_price {
+                if let Some(stop) = self.pending_protective_stop.or(p.stop_price) {
                     info!(stop = stop.to_f64(), "恢复持仓：重挂保护性止损");
                     self.place_protective_stop_forced(trade.ts, trade.price, stop)
                         .await;
@@ -1218,6 +1348,8 @@ impl LiveEngine {
             }
         }
 
+        self.enforce_required_protection(now).await;
+
         // 市价减仓通常数秒内成交。超时不盲目重发（否则可能重复减仓），且旧保护
         // 止损仍留在交易所；只记录一次明确告警，等待 userTrades 恢复后自动收敛。
         if let Some(pending) = self.pending_exit.as_mut() {
@@ -1320,7 +1452,7 @@ impl LiveEngine {
         }
 
         // 钱包对账（1h）：本地记账 vs testnet 钱包，漂移告警
-        if now_ms - self.last_reconcile_ms >= 3_600_000 {
+        if !self.config.portfolio_mode && now_ms - self.last_reconcile_ms >= 3_600_000 {
             self.last_reconcile_ms = now_ms;
             if let Some(rest) = self.broker.rest() {
                 match rest.wallet_balance_usdt().await {
@@ -1681,6 +1813,8 @@ impl LiveEngine {
         );
 
         let is_limit = intent.limit_price.is_some();
+        let planned_entry = intent.limit_price.unwrap_or(trade.price);
+        let planned_stop_distance_pct = stop_distance_pct(planned_entry, intent.stop_price);
         // 限价单按 entry_ttl 撤销；市价单一旦受理便不能按超时当作“未成交”，
         // 否则 userTrades 延迟会让真实仓位失去保护。market 的 expire_ts 只作诊断基准。
         let ttl = if is_limit {
@@ -1742,7 +1876,9 @@ impl LiveEngine {
                     is_maker: ex.is_maker,
                     reason: ex.reason,
                 });
-                self.place_protective_stop_forced(trade.ts, trade.price, intent.stop_price)
+                let actual_stop =
+                    stop_from_actual_fill(intent.side, ex.price, planned_stop_distance_pct);
+                self.place_protective_stop_forced(trade.ts, ex.price, actual_stop)
                     .await;
             }
             Ok(None) => {
@@ -1770,6 +1906,7 @@ impl LiveEngine {
                     submitted_ts_ms: trade.ts.as_millis(),
                     reference_price: trade.price.to_f64(),
                     planned_price: intent.limit_price.unwrap_or(trade.price).to_f64(),
+                    stop_distance_pct: planned_stop_distance_pct,
                     qty: qty.to_f64(),
                     reason: intent.reason.clone(),
                 });
@@ -1894,6 +2031,7 @@ impl LiveEngine {
             return;
         }
 
+        self.last_protective_stop_submit_ms = ts.as_millis();
         self.broker.cancel_all().await;
         match self
             .broker
@@ -1922,6 +2060,9 @@ impl LiveEngine {
                 }
                 self.last_protective_stop_submit_ms = ts.as_millis();
                 self.last_protective_stop_price = Some(stop);
+                self.pending_protective_stop = None;
+                self.protective_stop_failure_since_ms = None;
+                self.protective_stop_failures = 0;
                 self.append_research(
                     "protective_stop_accepted",
                     ts.as_millis(),
@@ -1934,6 +2075,10 @@ impl LiveEngine {
                 );
             }
             Err(e) => {
+                self.pending_protective_stop = Some(stop);
+                self.protective_stop_failure_since_ms
+                    .get_or_insert(ts.as_millis());
+                self.protective_stop_failures = self.protective_stop_failures.saturating_add(1);
                 error!(error = %e, "保护性止损挂单失败");
                 self.append_research(
                     "protective_stop_rejected",
@@ -1973,10 +2118,97 @@ impl LiveEngine {
             if let Some(p) = self.account.position_mut() {
                 p.tp1_price = pe.tp1_price;
             }
-            let ref_price = self.latest_price.unwrap_or(pe.stop_price);
-            self.place_protective_stop_forced(now, ref_price, pe.stop_price)
+            let (side, entry_price) = self
+                .account
+                .position()
+                .map(|position| (position.side, position.entry_price))
+                .expect("position checked above");
+            let actual_stop = stop_from_actual_fill(side, entry_price, pe.stop_distance_pct);
+            if actual_stop != pe.stop_price {
+                self.append_research(
+                    "protective_stop_rebased_to_fill",
+                    now.as_millis(),
+                    serde_json::json!({
+                        "planned_entry":pe.planned_price,
+                        "actual_entry":entry_price.to_f64(),
+                        "planned_stop":pe.stop_price.to_f64(),
+                        "actual_stop":actual_stop.to_f64(),
+                        "stop_distance_pct":pe.stop_distance_pct,
+                    }),
+                );
+            }
+            let ref_price = self.latest_price.unwrap_or(entry_price);
+            self.place_protective_stop_forced(now, ref_price, actual_stop)
                 .await;
             self.pending_entry = None;
+        }
+    }
+
+    /// A live position is never allowed to remain naked indefinitely. Retry a
+    /// rejected hard stop briefly; if the market has crossed it or protection
+    /// is still unavailable after three attempts / ten seconds, reduce-only
+    /// market-close the whole position.
+    async fn enforce_required_protection(&mut self, now: Timestamp) {
+        if self.pending_exit.is_some() {
+            return;
+        }
+        let Some(position) = self.account.position().copied() else {
+            self.pending_protective_stop = None;
+            self.protective_stop_failure_since_ms = None;
+            self.protective_stop_failures = 0;
+            return;
+        };
+        let Some(stop) = self.pending_protective_stop else {
+            return;
+        };
+        let mark = self.latest_price.unwrap_or(position.entry_price);
+        let failed_for_ms = self
+            .protective_stop_failure_since_ms
+            .map(|started| now.as_millis().saturating_sub(started))
+            .unwrap_or(0);
+        let fail_close = stop_already_crossed(position.side, mark, stop)
+            || failed_for_ms >= PROTECTIVE_STOP_FAIL_CLOSE_MS
+            || self.protective_stop_failures >= PROTECTIVE_STOP_FAIL_CLOSE_ATTEMPTS;
+        if fail_close && now.as_millis() >= self.exit_retry_after_ms {
+            error!(
+                stop = stop.to_f64(),
+                mark = mark.to_f64(),
+                failures = self.protective_stop_failures,
+                failed_for_ms,
+                "保护止损持续失败，执行 fail-close 全平"
+            );
+            self.append_research(
+                "protective_stop_fail_close",
+                now.as_millis(),
+                serde_json::json!({
+                    "side":format!("{:?}", position.side),
+                    "qty":position.qty.to_f64(),
+                    "entry_price":position.entry_price.to_f64(),
+                    "stop_price":stop.to_f64(),
+                    "mark_price":mark.to_f64(),
+                    "failures":self.protective_stop_failures,
+                    "failed_for_ms":failed_for_ms,
+                }),
+            );
+            let emergency_trade = Trade {
+                ts: now,
+                exchange: tcore::types::Exchange::BinanceFutures,
+                symbol: self.symbol.clone(),
+                price: mark,
+                qty: Qty::ZERO,
+                is_buyer_maker: false,
+            };
+            self.market_close(
+                &emergency_trade,
+                position.qty,
+                "protective_stop_fail_closed",
+                None,
+            )
+            .await;
+        } else if !fail_close
+            && now.as_millis() - self.last_protective_stop_submit_ms >= PROTECTIVE_STOP_RETRY_MS
+        {
+            self.place_protective_stop_forced(now, mark, stop).await;
         }
     }
 
@@ -2396,7 +2628,7 @@ impl LiveEngine {
     }
 
     fn cb_update(&mut self, ts: Timestamp, price: Price) {
-        let day = ts.as_millis() / 86_400_000;
+        let day = risk_day_cst(ts.as_millis());
         if day != self.cb_day {
             self.cb_day = day;
             self.cb_day_start_equity = self.account.equity(price);
@@ -2458,6 +2690,9 @@ impl LiveEngine {
             shadow_outcomes_run: self.shadow_outcomes_run,
             last_entry_order: self.last_entry_order.clone(),
             tiered_exit: self.tiered_exit,
+            pending_protective_stop: self.pending_protective_stop,
+            protective_stop_failure_since_ms: self.protective_stop_failure_since_ms,
+            protective_stop_failures: self.protective_stop_failures,
         };
         let journal = Journal {
             meta: JournalMeta {
@@ -2656,6 +2891,7 @@ trigger = "OrderFlowEntry"
             run_id: format!("test-{tag}"),
             mode: "dry".into(),
             estimated_roundtrip_fee_bps: 6.0,
+            portfolio_mode: false,
         }
     }
 
@@ -3070,6 +3306,7 @@ location_buckets = 10
         });
         eng.cb_day = 42;
         eng.cb_consec_losses = 2;
+        eng.cb_on = true;
         eng.tiered_exit = Some(TieredExitPlan {
             tight_stop: Price::from_f64(59_500.0),
             runner_stop: Price::from_f64(59_000.0),
@@ -3097,6 +3334,10 @@ location_buckets = 10
         assert!(eng2.needs_stop_rearm);
         assert_eq!(eng2.cb_day, 42);
         assert_eq!(eng2.cb_consec_losses, 2);
+        let risk = eng2.snapshot().risk_control;
+        assert!(risk.halted);
+        assert_eq!(risk.consecutive_losses, 2);
+        assert_eq!(risk.reason_codes, ["circuit_breaker_latched"]);
         assert_eq!(eng2.tiered_exit.unwrap().tight_close_fraction, 0.8);
 
         // 恢复后首个行情节拍：重挂保护性止损且不丢失止损价
@@ -3241,5 +3482,61 @@ location_buckets = 10
             100.02,
             5_000
         ));
+    }
+
+    #[test]
+    fn market_stop_is_rebased_from_real_fill() {
+        let planned_entry = Price::from_f64(77_779.5);
+        let planned_stop = Price::from_f64(77_973.94875);
+        let actual_fill = Price::from_f64(77_974.5);
+        let distance = stop_distance_pct(planned_entry, planned_stop);
+        let actual_stop = stop_from_actual_fill(Side::Sell, actual_fill, distance);
+
+        assert!((distance - 0.0025).abs() < 1e-9);
+        assert!(actual_stop > actual_fill);
+        assert!((actual_stop.to_f64() - 78_169.43625).abs() < 1e-6);
+        assert!(!stop_already_crossed(Side::Sell, actual_fill, actual_stop));
+    }
+
+    #[test]
+    fn risk_day_rolls_at_beijing_midnight() {
+        let before_midnight_utc = 86_400_000 - 8 * 3_600_000 - 1;
+        let at_midnight_utc = before_midnight_utc + 1;
+        assert_eq!(risk_day_cst(before_midnight_utc), 0);
+        assert_eq!(risk_day_cst(at_midnight_utc), 1);
+    }
+
+    #[tokio::test]
+    async fn repeated_stop_failure_fail_closes_position() {
+        let cfg = test_config("stop-fail-close");
+        let _ = std::fs::remove_file(&cfg.journal_path);
+        let mut eng = LiveEngine::new(
+            noop_strategy(),
+            AnyBroker::dry(FeeModel::default()),
+            cfg.clone(),
+            1_500.0,
+            "2026-08-22".into(),
+        );
+        eng.latest_price = Some(Price::from_f64(101.0));
+        eng.account.apply_fill(FillRequest {
+            ts: Timestamp::from_millis(1_000),
+            side: Side::Sell,
+            price: Price::from_f64(100.0),
+            qty: Qty::from_f64(1.0),
+            fee: 0.05,
+            is_maker: false,
+            reason: "open".into(),
+        });
+        eng.pending_protective_stop = Some(Price::from_f64(100.25));
+        eng.protective_stop_failure_since_ms = Some(1_000);
+        eng.protective_stop_failures = PROTECTIVE_STOP_FAIL_CLOSE_ATTEMPTS;
+
+        eng.enforce_required_protection(Timestamp::from_millis(3_000))
+            .await;
+
+        assert!(eng.account.position().is_none());
+        assert_eq!(eng.account.fills().len(), 2);
+        assert_eq!(eng.account.fills()[1].reason, "protective_stop_fail_closed");
+        let _ = std::fs::remove_file(&cfg.journal_path);
     }
 }

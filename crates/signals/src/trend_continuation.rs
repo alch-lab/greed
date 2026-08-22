@@ -20,6 +20,7 @@ pub struct Config {
     require_source_coverage: bool,
     require_spot_perp_delta: bool,
     require_oi_support: bool,
+    require_anchor_alignment: bool,
 }
 
 impl Config {
@@ -47,6 +48,7 @@ impl Config {
             require_source_coverage: b("require_source_coverage", true),
             require_spot_perp_delta: b("require_spot_perp_delta", true),
             require_oi_support: b("require_oi_support", true),
+            require_anchor_alignment: b("require_anchor_alignment", true),
         }
     }
 }
@@ -90,6 +92,10 @@ impl TrendContinuation {
             .unwrap_or(0.0);
         let slow_efficiency = trend
             .and_then(|value| value.get("slow_efficiency"))
+            .and_then(Json::as_f64)
+            .unwrap_or(0.0);
+        let anchor_return = trend
+            .and_then(|value| value.get("anchor_return_pct"))
             .and_then(Json::as_f64)
             .unwrap_or(0.0);
         let regime = trend
@@ -149,7 +155,15 @@ impl TrendContinuation {
             .and_then(Json::as_str)
             .unwrap_or("neutral");
         let sign = side.map_or(0.0, |value| if value == Side::Buy { 1.0 } else { -1.0 });
-        let price_ready = side.is_some();
+        // A 2h sell impulse inside a still-rising 6h structure is a pullback,
+        // not a proven down-trend.  The production incident entered exactly
+        // that shape (2h -1.19%, 6h +0.48%) and was squeezed immediately.
+        let anchor_ready = !self.cfg.require_anchor_alignment
+            || side.is_none_or(|value| match value {
+                Side::Buy => anchor_return >= 0.0,
+                Side::Sell => anchor_return <= 0.0,
+            });
+        let price_ready = side.is_some() && anchor_ready;
         let delta_ready = expected == delta_direction && delta_tier >= self.cfg.min_delta_tier;
         let coverage_ready = !self.cfg.require_source_coverage || source_coverage;
         let cross_market_ready =
@@ -183,6 +197,7 @@ impl TrendContinuation {
             (!flat).then_some("position_open"),
             (!reentry_ready).then_some("reentry_cooldown"),
             (!price_ready).then_some("strong_price_trend"),
+            (!anchor_ready).then_some("anchor_direction_conflict"),
             (!delta_ready).then_some("delta_alignment"),
             (!coverage_ready).then_some("source_coverage"),
             (!cross_market_ready).then_some("spot_perp_delta"),
@@ -200,6 +215,8 @@ impl TrendContinuation {
             "side":side.map(side_name),
             "slow_return_pct":slow_return,
             "slow_efficiency":slow_efficiency,
+            "anchor_return_pct":anchor_return,
+            "anchor_alignment_ready":anchor_ready,
             "regime":regime,
             "max_return_pct":self.cfg.max_return_pct,
             "delta_tier":delta_tier,
@@ -247,6 +264,7 @@ impl TrendContinuation {
                 "estimated_roundtrip_fee_bps":8.0,
                 "slow_return_pct":slow_return,
                 "slow_efficiency":slow_efficiency,
+                "anchor_return_pct":anchor_return,
                 "delta_tier":delta_tier,
                 "delta_direction":delta_direction,
                 "spot_delta_usd":spot_delta,
@@ -330,5 +348,35 @@ mod tests {
         assert!(plugin.on_event(&trade(2_010_000, 101.1), &ctx).is_empty());
         let reentry = plugin.on_event(&trade(4_000_000, 102.0), &ctx);
         assert_eq!(reentry.len(), 1);
+    }
+
+    #[test]
+    fn blocks_two_hour_short_inside_rising_six_hour_anchor() {
+        let mut plugin = TrendContinuation::from_params(&json!({"warmup_ms":1800000}));
+        let mut ctx = Ctx::default();
+        ctx.set_latest(Signal::new(
+            SignalKind::TrendRegime,
+            Timestamp::from_millis(2_000_000),
+            "test",
+            json!({"regime":"trend_down","slow_return_pct":-0.0119,
+                "slow_efficiency":0.151,"anchor_return_pct":0.0048}),
+        ));
+        ctx.set_latest(Signal::new(
+            SignalKind::DeltaTier,
+            Timestamp::from_millis(2_000_000),
+            "test",
+            json!({"tier":4,"direction":"sell","source_coverage_complete":true,
+                "spot_delta_usd":-1.0,"perp_delta_usd":-2.0,
+                "oi_quadrant":"long_liquidation"}),
+        ));
+        assert!(plugin.on_event(&trade(0, 100.0), &ctx).is_empty());
+        assert!(plugin.on_event(&trade(2_000_000, 99.0), &ctx).is_empty());
+        let note = plugin.eval_note().unwrap();
+        assert_eq!(note["anchor_alignment_ready"], false);
+        assert!(note["blockers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value == "anchor_direction_conflict"));
     }
 }

@@ -13,6 +13,8 @@ import argparse
 import copy
 import json
 import math
+import gzip
+import pickle
 import statistics
 import time
 import tomllib
@@ -530,7 +532,10 @@ def replay(
         value = equity()
         peak = max(peak, value)
         max_drawdown = max(max_drawdown, 1 - value / peak)
-        window_closing_equity[min((ts - start_ms) // DAY_MS, 2)] = value
+        # Preserve one close for every requested day. The original three-day
+        # helper clamped longer replays into bucket 3, leaving the total intact
+        # but making seven-day attribution misleading.
+        window_closing_equity[(ts - start_ms) // DAY_MS] = value
 
     for symbol in list(positions):
         p = positions[symbol]
@@ -579,6 +584,10 @@ def main() -> None:
     parser.add_argument("--strategy", default="config/strategy-altcoin-impulse.toml")
     parser.add_argument("--output", default="out/altcoin-current-3d.json")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--data-cache",
+        help="optional gzip pickle containing this exact window's fetched 15m/1m bars",
+    )
     parser.add_argument("--compare", action="store_true")
     parser.add_argument(
         "--exit-grid",
@@ -592,15 +601,26 @@ def main() -> None:
     end_ms = min(args.end_ms or now_ms, now_ms) // MINUTE_MS * MINUTE_MS
     start_ms = end_ms - args.days * DAY_MS
     fetch_start = start_ms - 8 * DAY_MS
-    symbols = universe(end_ms)
-    bars_15m: dict[str, list[Bar]] = {}
-    with ThreadPoolExecutor(max_workers=4) as pool:
-        jobs = [pool.submit(fetch_15m, symbol, fetch_start, end_ms) for symbol in symbols]
-        for count, job in enumerate(as_completed(jobs), 1):
-            symbol, bars = job.result()
-            bars_15m[symbol] = bars
-            if count % 100 == 0:
-                print(f"15m {count}/{len(symbols)}", flush=True)
+    cache_path = Path(args.data_cache) if args.data_cache else None
+    cached = None
+    if cache_path and cache_path.exists():
+        with gzip.open(cache_path, "rb") as handle:
+            cached = pickle.load(handle)
+        if cached.get("start_ms") != start_ms or cached.get("end_ms") != end_ms:
+            raise ValueError("data cache window does not match --days/--end-ms")
+    if cached:
+        symbols = cached["symbols"]
+        bars_15m = cached["bars_15m"]
+    else:
+        symbols = universe(end_ms)
+        bars_15m: dict[str, list[Bar]] = {}
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            jobs = [pool.submit(fetch_15m, symbol, fetch_start, end_ms) for symbol in symbols]
+            for count, job in enumerate(as_completed(jobs), 1):
+                symbol, bars = job.result()
+                bars_15m[symbol] = bars
+                if count % 100 == 0:
+                    print(f"15m {count}/{len(symbols)}", flush=True)
     configs = {"current": cfg}
     if args.exit_grid:
         for stop_pct in (0.010, 0.012, 0.015):
@@ -669,12 +689,30 @@ def main() -> None:
             for signal in values
         }
     )
-    minute_bars: dict[str, list[Bar]] = {}
+    minute_bars: dict[str, list[Bar]] = cached.get("minute_bars", {}) if cached else {}
+    missing_minutes = [symbol for symbol in signal_symbols if symbol not in minute_bars]
     with ThreadPoolExecutor(max_workers=4) as pool:
-        jobs = [pool.submit(fetch_1m, symbol, start_ms - BAR_MS, end_ms) for symbol in signal_symbols]
+        jobs = [
+            pool.submit(fetch_1m, symbol, start_ms - BAR_MS, end_ms)
+            for symbol in missing_minutes
+        ]
         for job in as_completed(jobs):
             symbol, bars = job.result()
             minute_bars[symbol] = bars
+    if cache_path and not cached:
+        cache_path.parent.mkdir(parents=True, exist_ok=True)
+        with gzip.open(cache_path, "wb") as handle:
+            pickle.dump(
+                {
+                    "start_ms": start_ms,
+                    "end_ms": end_ms,
+                    "symbols": symbols,
+                    "bars_15m": bars_15m,
+                    "minute_bars": minute_bars,
+                },
+                handle,
+                protocol=pickle.HIGHEST_PROTOCOL,
+            )
     variants = {
         name: replay(batches_by_variant[name], bars_15m, minute_bars, start_ms, end_ms, variant_cfg)
         for name, variant_cfg in configs.items()

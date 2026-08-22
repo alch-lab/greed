@@ -83,9 +83,11 @@ pub struct ExchangeBroker {
     execution_healthy: bool,
     consecutive_poll_failures: u32,
     last_poll_success: Instant,
+    poll_backoff_until: Option<Instant>,
 }
 
 const EXECUTION_STALE_AFTER: Duration = Duration::from_secs(30);
+const RATE_LIMIT_BACKOFF: Duration = Duration::from_secs(30);
 
 fn execution_channel_healthy(since_success: Duration) -> bool {
     since_success < EXECUTION_STALE_AFTER
@@ -117,6 +119,7 @@ impl AnyBroker {
             execution_healthy: true,
             consecutive_poll_failures: 0,
             last_poll_success: Instant::now(),
+            poll_backoff_until: None,
         }))
     }
 
@@ -219,6 +222,13 @@ impl AnyBroker {
         let AnyBroker::Exchange(b) = self else {
             return Vec::new();
         };
+        if b.poll_backoff_until
+            .is_some_and(|until| until > Instant::now())
+        {
+            b.execution_healthy = execution_channel_healthy(b.last_poll_success.elapsed());
+            return Vec::new();
+        }
+        b.poll_backoff_until = None;
         let trades = match b.rest.user_trades(&b.symbol, b.last_trade_id + 1).await {
             Ok(t) => {
                 if !b.execution_healthy {
@@ -230,6 +240,7 @@ impl AnyBroker {
                 b.last_poll_success = Instant::now();
                 b.consecutive_poll_failures = 0;
                 b.execution_healthy = true;
+                b.poll_backoff_until = None;
                 t
             }
             Err(e) => {
@@ -237,6 +248,12 @@ impl AnyBroker {
                 let stale_for = b.last_poll_success.elapsed();
                 let was_healthy = b.execution_healthy;
                 b.execution_healthy = execution_channel_healthy(stale_for);
+                // Binance -1003 explicitly asks clients to stop polling. A
+                // fixed backoff prevents the old 2-second retry loop from
+                // extending an IP ban and lets the health gate turn false.
+                if e.to_string().contains("-1003") {
+                    b.poll_backoff_until = Some(Instant::now() + RATE_LIMIT_BACKOFF);
+                }
                 // 瞬时 502 不应封死策略，也不应每 2 秒刷屏；超过 30 秒才禁止新增风险。
                 if b.consecutive_poll_failures == 1
                     || (was_healthy && !b.execution_healthy)
