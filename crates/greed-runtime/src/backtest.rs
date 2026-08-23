@@ -61,6 +61,8 @@ pub struct BacktestReport {
     selected_profile: String,
     validation: ResultRow,
     validation_profiles: Vec<ResultRow>,
+    configured_validation: ResultRow,
+    cost_stress_validation: ResultRow,
     recommended_parameters: StrategyConfig,
 }
 
@@ -135,6 +137,19 @@ pub async fn run(
         validation_profiles.push(simulate(name, strategy, &config, &data, split, to)?);
     }
     let validation = validation_profiles[selected].clone();
+    let configured_validation =
+        simulate("configured", &config.strategy, &config, &data, split, to)?;
+    let mut stressed = config.clone();
+    stressed.backtest.fee_bps_per_side *= 2.0;
+    stressed.backtest.slippage_bps_per_side *= 2.0;
+    let cost_stress_validation = simulate(
+        "configured_cost_2x",
+        &config.strategy,
+        &stressed,
+        &data,
+        split,
+        to,
+    )?;
     Ok(BacktestReport {
         source: "Binance public data archive (data.binance.vision)",
         data_limitations: vec![
@@ -142,12 +157,15 @@ pub async fn run(
             "historical depth is percentage-band depth, not a reconstructable level-2 book",
             "Coinbase premium, ETF flow and liquidation websocket are observation-only because no reliable archive is available",
             "dynamic live-universe discovery is evaluated on the configured historical symbols only; it is not a survivorship-bias-free all-contract backtest",
+            "live one-minute websocket candles are observation-only and do not influence this backtest or order decisions",
             "a limited date range is a parameter smoke test, not evidence of durable alpha",
         ],
         training,
         selected_profile: selected_name.clone(),
         validation,
         validation_profiles,
+        configured_validation,
+        cost_stress_validation,
         recommended_parameters: selected_strategy.clone(),
     })
 }
@@ -413,6 +431,7 @@ fn frame_at(
                     }),
                     values: history(&source.fast_perpetual, ts),
                 }),
+                micro_perpetual: None,
                 book: depth.map(|(bid_depth, ask_depth)| BookState {
                     meta: meta(DataQuality::Partial),
                     bid: price * 0.99995,

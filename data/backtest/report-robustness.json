@@ -5,6 +5,7 @@
     "historical depth is percentage-band depth, not a reconstructable level-2 book",
     "Coinbase premium, ETF flow and liquidation websocket are observation-only because no reliable archive is available",
     "dynamic live-universe discovery is evaluated on the configured historical symbols only; it is not a survivorship-bias-free all-contract backtest",
+    "live one-minute websocket candles are observation-only and do not influence this backtest or order decisions",
     "a limited date range is a parameter smoke test, not evidence of durable alpha"
   ],
   "training": [
@@ -13,26 +14,26 @@
       "from": "2026-07-22",
       "to": "2026-07-29",
       "starting_equity_usd": 3000.0,
-      "ending_equity_usd": 3000.8773965391033,
-      "net_pnl_usd": 0.8773965391033016,
-      "return_pct": 0.0002924655130345233,
-      "max_drawdown_pct": 0.0016944802929891116,
+      "ending_equity_usd": 3000.3231770934817,
+      "net_pnl_usd": 0.32317709348171775,
+      "return_pct": 0.0001077256978272434,
+      "max_drawdown_pct": 0.000996714743574048,
       "entries": 29,
       "completed_trades": 29,
       "win_rate": 0.4827586206896552,
-      "profit_factor": 1.1659822621573523,
-      "fees_usd": 2.3251093760848023,
+      "profit_factor": 1.0966599069346592,
+      "fees_usd": 1.7083486419972662,
       "pnl_by_recipe": {
-        "alt_early_impulse": -0.9380715112318592,
-        "alt_outlier_continuation": 0.49168323277900483,
-        "alt_outlier_pullback_reclaim": 1.323784817557371
+        "alt_early_impulse": -0.7991767547879842,
+        "alt_outlier_continuation": 0.1956878728798656,
+        "alt_outlier_pullback_reclaim": 0.9266659753906721
       },
       "pnl_by_recipe_and_side": {
-        "alt_early_impulse:buy": -1.3304241903362977,
-        "alt_early_impulse:sell": 0.3923526791044382,
-        "alt_outlier_continuation:buy": 0.6836935085799072,
-        "alt_outlier_continuation:sell": -0.19201027580090244,
-        "alt_outlier_pullback_reclaim:sell": 1.323784817557371
+        "alt_early_impulse:buy": -0.9311488977649405,
+        "alt_early_impulse:sell": 0.13197214297695625,
+        "alt_outlier_continuation:buy": 0.44345220904064814,
+        "alt_outlier_continuation:sell": -0.24776433616078256,
+        "alt_outlier_pullback_reclaim:sell": 0.9266659753906721
       },
       "entries_by_recipe": {
         "alt_early_impulse": 7,
@@ -45,26 +46,26 @@
       "from": "2026-07-22",
       "to": "2026-07-29",
       "starting_equity_usd": 3000.0,
-      "ending_equity_usd": 3000.4138950516644,
-      "net_pnl_usd": 0.41389505166443996,
-      "return_pct": 0.00013796501722151966,
-      "max_drawdown_pct": 0.0013280279863217889,
+      "ending_equity_usd": 3000.168515348651,
+      "net_pnl_usd": 0.16851534865099893,
+      "return_pct": 0.000056171782883751575,
+      "max_drawdown_pct": 0.0006773327358228678,
       "entries": 17,
       "completed_trades": 17,
       "win_rate": 0.47058823529411764,
-      "profit_factor": 1.106623085151203,
-      "fees_usd": 1.754826935406686,
+      "profit_factor": 1.0806585388221077,
+      "fees_usd": 1.1352277286771184,
       "pnl_by_recipe": {
-        "alt_early_impulse": -0.9380577585965526,
-        "alt_outlier_continuation": 0.9798837182068223,
-        "alt_outlier_pullback_reclaim": 0.3720690920546933
+        "alt_early_impulse": -0.7991431930735418,
+        "alt_outlier_continuation": 0.707198536355254,
+        "alt_outlier_pullback_reclaim": 0.26046000536914854
       },
       "pnl_by_recipe_and_side": {
-        "alt_early_impulse:buy": -1.3302367788273384,
-        "alt_early_impulse:sell": 0.3921790202307855,
-        "alt_outlier_continuation:buy": 0.9070230879254784,
-        "alt_outlier_continuation:sell": 0.07286063028134404,
-        "alt_outlier_pullback_reclaim:sell": 0.3720690920546933
+        "alt_early_impulse:buy": -0.9310753109817365,
+        "alt_early_impulse:sell": 0.13193211790819467,
+        "alt_outlier_continuation:buy": 0.6561477882249678,
+        "alt_outlier_continuation:sell": 0.05105074813028625,
+        "alt_outlier_pullback_reclaim:sell": 0.26046000536914854
       },
       "entries_by_recipe": {
         "alt_early_impulse": 7,
@@ -77,24 +78,24 @@
       "from": "2026-07-22",
       "to": "2026-07-29",
       "starting_equity_usd": 3000.0,
-      "ending_equity_usd": 2999.3157316848124,
-      "net_pnl_usd": -0.6842683151876372,
-      "return_pct": -0.00022808943839591755,
-      "max_drawdown_pct": 0.0012833095227470883,
+      "ending_equity_usd": 2999.3785544821803,
+      "net_pnl_usd": -0.6214455178196658,
+      "return_pct": -0.00020714850593983591,
+      "max_drawdown_pct": 0.0006515982824036936,
       "entries": 9,
       "completed_trades": 9,
       "win_rate": 0.4444444444444444,
-      "profit_factor": 0.8109739779496382,
-      "fees_usd": 1.3494197213389503,
+      "profit_factor": 0.677612398396067,
+      "fees_usd": 0.8635787338761536,
       "pnl_by_recipe": {
-        "alt_early_impulse": -0.9379263734105971,
-        "alt_outlier_continuation": 0.25365805822350224
+        "alt_early_impulse": -0.7990348020742689,
+        "alt_outlier_continuation": 0.1775892842555586
       },
       "pnl_by_recipe_and_side": {
-        "alt_early_impulse:buy": -1.329944300815718,
-        "alt_early_impulse:sell": 0.3920179274051209,
-        "alt_outlier_continuation:buy": 0.46040555970696334,
-        "alt_outlier_continuation:sell": -0.2067475014834611
+        "alt_early_impulse:buy": -0.9309280474580048,
+        "alt_early_impulse:sell": 0.13189324538373598,
+        "alt_outlier_continuation:buy": 0.3223010121347108,
+        "alt_outlier_continuation:sell": -0.1447117278791522
       },
       "entries_by_recipe": {
         "alt_early_impulse": 7,
@@ -106,23 +107,23 @@
       "from": "2026-07-22",
       "to": "2026-07-29",
       "starting_equity_usd": 3000.0,
-      "ending_equity_usd": 2999.424337199142,
-      "net_pnl_usd": -0.5756628008580265,
-      "return_pct": -0.00019188760028598928,
-      "max_drawdown_pct": 0.001379506108706765,
+      "ending_equity_usd": 2999.7651062181717,
+      "net_pnl_usd": -0.23489378182830478,
+      "return_pct": -0.00007829792727609419,
+      "max_drawdown_pct": 0.0006122191300021358,
       "entries": 11,
       "completed_trades": 11,
       "win_rate": 0.36363636363636365,
-      "profit_factor": 0.8485020628009685,
-      "fees_usd": 1.0659861778045814,
+      "profit_factor": 0.8608796745836077,
+      "fees_usd": 0.47055980651327023,
       "pnl_by_recipe": {
-        "alt_early_impulse": -0.2922298399964375,
-        "alt_outlier_continuation": -0.28343296086254866
+        "alt_early_impulse": -0.10166465996575771,
+        "alt_outlier_continuation": -0.133229121863667
       },
       "pnl_by_recipe_and_side": {
-        "alt_early_impulse:sell": -0.2922298399964375,
-        "alt_outlier_continuation:buy": 0.38396919844059,
-        "alt_outlier_continuation:sell": -0.6674021593031386
+        "alt_early_impulse:sell": -0.10166465996575771,
+        "alt_outlier_continuation:buy": 0.1743045251002973,
+        "alt_outlier_continuation:sell": -0.30753364696396424
       },
       "entries_by_recipe": {
         "alt_early_impulse": 4,
@@ -134,26 +135,26 @@
       "from": "2026-07-22",
       "to": "2026-07-29",
       "starting_equity_usd": 3000.0,
-      "ending_equity_usd": 2999.4674466443957,
-      "net_pnl_usd": -0.5325533556042501,
-      "return_pct": -0.0001775177852013643,
-      "max_drawdown_pct": 0.0013869293686857862,
+      "ending_equity_usd": 2999.463254312649,
+      "net_pnl_usd": -0.5367456873509582,
+      "return_pct": -0.00017891522911694935,
+      "max_drawdown_pct": 0.0006871481642045981,
       "entries": 15,
       "completed_trades": 15,
       "win_rate": 0.6,
-      "profit_factor": 0.8803154023618882,
-      "fees_usd": 1.6348301805592094,
+      "profit_factor": 0.78600505256651,
+      "fees_usd": 1.0513015583137342,
       "pnl_by_recipe": {
-        "alt_early_impulse": -0.9379062714019144,
-        "alt_outlier_continuation": 0.0771854703921938,
-        "alt_outlier_pullback_reclaim": 0.32816744540468046
+        "alt_early_impulse": -0.7990372873699478,
+        "alt_outlier_continuation": 0.032566367560373045,
+        "alt_outlier_pullback_reclaim": 0.22972523245720425
       },
       "pnl_by_recipe_and_side": {
-        "alt_early_impulse:buy": -1.3299847076359157,
-        "alt_early_impulse:sell": 0.3920784362340014,
-        "alt_outlier_continuation:buy": 0.7815429518785628,
-        "alt_outlier_continuation:sell": -0.7043574814863689,
-        "alt_outlier_pullback_reclaim:sell": 0.32816744540468046
+        "alt_early_impulse:buy": -0.9309438370952183,
+        "alt_early_impulse:sell": 0.1319065497252706,
+        "alt_outlier_continuation:buy": 0.5255685763873805,
+        "alt_outlier_continuation:sell": -0.4930022088270075,
+        "alt_outlier_pullback_reclaim:sell": 0.22972523245720425
       },
       "entries_by_recipe": {
         "alt_early_impulse": 7,
@@ -168,26 +169,26 @@
     "from": "2026-07-30",
     "to": "2026-08-07",
     "starting_equity_usd": 3000.0,
-    "ending_equity_usd": 2993.205400061292,
-    "net_pnl_usd": -6.794599938707961,
-    "return_pct": -0.002264866646236041,
-    "max_drawdown_pct": 0.0024095526610203003,
+    "ending_equity_usd": 2995.281228762844,
+    "net_pnl_usd": -4.718771237156034,
+    "return_pct": -0.0015729237457187129,
+    "max_drawdown_pct": 0.0016742786046485074,
     "entries": 13,
     "completed_trades": 13,
     "win_rate": 0.3076923076923077,
-    "profit_factor": 0.19746401525964904,
-    "fees_usd": 1.2547775192493387,
+    "profit_factor": 0.17638941295631624,
+    "fees_usd": 0.8202128374076486,
     "pnl_by_recipe": {
-      "alt_early_impulse": -2.4189491392379128,
-      "alt_outlier_continuation": -1.5265228673570732,
-      "major_trend_pullback": -2.849127932110854
+      "alt_early_impulse": -1.6928467137462535,
+      "alt_outlier_continuation": -1.0308320191940814,
+      "major_trend_pullback": -1.9950925042159275
     },
     "pnl_by_recipe_and_side": {
-      "alt_early_impulse:buy": -3.2732865597022025,
-      "alt_early_impulse:sell": 0.8543374204642898,
-      "alt_outlier_continuation:buy": -0.9190619695206578,
-      "alt_outlier_continuation:sell": -0.6074608978364153,
-      "major_trend_pullback:sell": -2.849127932110854
+      "alt_early_impulse:buy": -2.2912645055689085,
+      "alt_early_impulse:sell": 0.5984177918226551,
+      "alt_outlier_continuation:buy": -0.6054853832843733,
+      "alt_outlier_continuation:sell": -0.4253466359097082,
+      "major_trend_pullback:sell": -1.9950925042159275
     },
     "entries_by_recipe": {
       "alt_early_impulse": 3,
@@ -201,26 +202,26 @@
       "from": "2026-07-30",
       "to": "2026-08-07",
       "starting_equity_usd": 3000.0,
-      "ending_equity_usd": 2992.0323538263547,
-      "net_pnl_usd": -7.967646173645335,
-      "return_pct": -0.0026558820578818088,
-      "max_drawdown_pct": 0.0028563584662813063,
+      "ending_equity_usd": 2994.190460736897,
+      "net_pnl_usd": -5.809539263103034,
+      "return_pct": -0.0019365130877010417,
+      "max_drawdown_pct": 0.0020769530876796395,
       "entries": 20,
       "completed_trades": 20,
       "win_rate": 0.25,
-      "profit_factor": 0.1904322758321081,
-      "fees_usd": 1.5844657364202128,
+      "profit_factor": 0.16525851183534454,
+      "fees_usd": 1.0780034845071205,
       "pnl_by_recipe": {
-        "alt_early_impulse": -2.4189491392379128,
-        "alt_outlier_continuation": -2.6995691022955612,
-        "major_trend_pullback": -2.849127932110854
+        "alt_early_impulse": -1.6928467137462535,
+        "alt_outlier_continuation": -2.121600045140816,
+        "major_trend_pullback": -1.9950925042159275
       },
       "pnl_by_recipe_and_side": {
-        "alt_early_impulse:buy": -3.2732865597022025,
-        "alt_early_impulse:sell": 0.8543374204642898,
-        "alt_outlier_continuation:buy": -1.0750525322536812,
-        "alt_outlier_continuation:sell": -1.6245165700418798,
-        "major_trend_pullback:sell": -2.849127932110854
+        "alt_early_impulse:buy": -2.2912645055689085,
+        "alt_early_impulse:sell": 0.5984177918226551,
+        "alt_outlier_continuation:buy": -0.983851085104394,
+        "alt_outlier_continuation:sell": -1.1377489600364221,
+        "major_trend_pullback:sell": -1.9950925042159275
       },
       "entries_by_recipe": {
         "alt_early_impulse": 3,
@@ -233,26 +234,26 @@
       "from": "2026-07-30",
       "to": "2026-08-07",
       "starting_equity_usd": 3000.0,
-      "ending_equity_usd": 2993.205400061292,
-      "net_pnl_usd": -6.794599938707961,
-      "return_pct": -0.002264866646236041,
-      "max_drawdown_pct": 0.0024095526610203003,
+      "ending_equity_usd": 2995.281228762844,
+      "net_pnl_usd": -4.718771237156034,
+      "return_pct": -0.0015729237457187129,
+      "max_drawdown_pct": 0.0016742786046485074,
       "entries": 13,
       "completed_trades": 13,
       "win_rate": 0.3076923076923077,
-      "profit_factor": 0.19746401525964904,
-      "fees_usd": 1.2547775192493387,
+      "profit_factor": 0.17638941295631624,
+      "fees_usd": 0.8202128374076486,
       "pnl_by_recipe": {
-        "alt_early_impulse": -2.4189491392379128,
-        "alt_outlier_continuation": -1.5265228673570732,
-        "major_trend_pullback": -2.849127932110854
+        "alt_early_impulse": -1.6928467137462535,
+        "alt_outlier_continuation": -1.0308320191940814,
+        "major_trend_pullback": -1.9950925042159275
       },
       "pnl_by_recipe_and_side": {
-        "alt_early_impulse:buy": -3.2732865597022025,
-        "alt_early_impulse:sell": 0.8543374204642898,
-        "alt_outlier_continuation:buy": -0.9190619695206578,
-        "alt_outlier_continuation:sell": -0.6074608978364153,
-        "major_trend_pullback:sell": -2.849127932110854
+        "alt_early_impulse:buy": -2.2912645055689085,
+        "alt_early_impulse:sell": 0.5984177918226551,
+        "alt_outlier_continuation:buy": -0.6054853832843733,
+        "alt_outlier_continuation:sell": -0.4253466359097082,
+        "major_trend_pullback:sell": -1.9950925042159275
       },
       "entries_by_recipe": {
         "alt_early_impulse": 3,
@@ -265,26 +266,26 @@
       "from": "2026-07-30",
       "to": "2026-08-07",
       "starting_equity_usd": 3000.0,
-      "ending_equity_usd": 2993.962636376904,
-      "net_pnl_usd": -6.037363623096098,
-      "return_pct": -0.0020124545410320493,
-      "max_drawdown_pct": 0.0023478552616841663,
+      "ending_equity_usd": 2995.743798062273,
+      "net_pnl_usd": -4.256201937726928,
+      "return_pct": -0.0014187339792423037,
+      "max_drawdown_pct": 0.0016438694453062453,
       "entries": 8,
       "completed_trades": 8,
       "win_rate": 0.375,
-      "profit_factor": 0.17699159914656523,
-      "fees_usd": 1.0304604970347304,
+      "profit_factor": 0.17130431000954124,
+      "fees_usd": 0.7057908904127982,
       "pnl_by_recipe": {
-        "alt_early_impulse": -2.4189491392379128,
-        "alt_outlier_continuation": -0.7692865517464498,
-        "major_trend_pullback": -2.849127932110854
+        "alt_early_impulse": -1.6928467137462535,
+        "alt_outlier_continuation": -0.5682627197646084,
+        "major_trend_pullback": -1.9950925042159275
       },
       "pnl_by_recipe_and_side": {
-        "alt_early_impulse:buy": -3.2732865597022025,
-        "alt_early_impulse:sell": 0.8543374204642898,
-        "alt_outlier_continuation:buy": -0.1618256539100344,
-        "alt_outlier_continuation:sell": -0.6074608978364153,
-        "major_trend_pullback:sell": -2.849127932110854
+        "alt_early_impulse:buy": -2.2912645055689085,
+        "alt_early_impulse:sell": 0.5984177918226551,
+        "alt_outlier_continuation:buy": -0.14291608385490018,
+        "alt_outlier_continuation:sell": -0.4253466359097082,
+        "major_trend_pullback:sell": -1.9950925042159275
       },
       "entries_by_recipe": {
         "alt_early_impulse": 3,
@@ -297,25 +298,25 @@
       "from": "2026-07-30",
       "to": "2026-08-07",
       "starting_equity_usd": 3000.0,
-      "ending_equity_usd": 2996.2548591772206,
-      "net_pnl_usd": -3.7451408227793763,
-      "return_pct": -0.001248380274259775,
-      "max_drawdown_pct": 0.001393213694259505,
+      "ending_equity_usd": 2997.460605923758,
+      "net_pnl_usd": -2.5393940762419334,
+      "return_pct": -0.0008464646920806063,
+      "max_drawdown_pct": 0.0009478932971624474,
       "entries": 10,
       "completed_trades": 10,
       "win_rate": 0.4,
-      "profit_factor": 0.3088086802199448,
-      "fees_usd": 0.9001137892210391,
+      "profit_factor": 0.28479344859328354,
+      "fees_usd": 0.5807207669665848,
       "pnl_by_recipe": {
-        "alt_early_impulse": 0.8552704903133606,
-        "alt_outlier_continuation": -1.7481716884512264,
-        "major_trend_pullback": -2.8522396246411335
+        "alt_early_impulse": 0.5988751472000429,
+        "alt_outlier_continuation": -1.1416519211704022,
+        "major_trend_pullback": -1.9966173022711624
       },
       "pnl_by_recipe_and_side": {
-        "alt_early_impulse:sell": 0.8552704903133606,
-        "alt_outlier_continuation:buy": -1.1400473484727682,
-        "alt_outlier_continuation:sell": -0.6081243399784583,
-        "major_trend_pullback:sell": -2.8522396246411335
+        "alt_early_impulse:sell": 0.5988751472000429,
+        "alt_outlier_continuation:buy": -0.7159802037309577,
+        "alt_outlier_continuation:sell": -0.42567171743944443,
+        "major_trend_pullback:sell": -1.9966173022711624
       },
       "entries_by_recipe": {
         "alt_early_impulse": 1,
@@ -328,26 +329,26 @@
       "from": "2026-07-30",
       "to": "2026-08-07",
       "starting_equity_usd": 3000.0,
-      "ending_equity_usd": 2993.800716963938,
-      "net_pnl_usd": -6.199283036061843,
-      "return_pct": -0.002066427678687255,
-      "max_drawdown_pct": 0.002292896872817834,
+      "ending_equity_usd": 2995.7331972023317,
+      "net_pnl_usd": -4.266802797668333,
+      "return_pct": -0.001422267599222815,
+      "max_drawdown_pct": 0.0016053722306040665,
       "entries": 12,
       "completed_trades": 12,
       "win_rate": 0.3333333333333333,
-      "profit_factor": 0.20739696495875226,
-      "fees_usd": 1.2100793411155384,
+      "profit_factor": 0.18940833225835196,
+      "fees_usd": 0.7889166317713152,
       "pnl_by_recipe": {
-        "alt_early_impulse": -2.4189322387869225,
-        "alt_outlier_continuation": -0.9311269696143851,
-        "major_trend_pullback": -2.8492238276608024
+        "alt_early_impulse": -1.6928384243764407,
+        "alt_outlier_continuation": -0.5788248661087617,
+        "major_trend_pullback": -1.9951395071827827
       },
       "pnl_by_recipe_and_side": {
-        "alt_early_impulse:buy": -3.2732984144207693,
-        "alt_early_impulse:sell": 0.8543661756338468,
-        "alt_outlier_continuation:buy": -0.41366673254685027,
-        "alt_outlier_continuation:sell": -0.5174602370675347,
-        "major_trend_pullback:sell": -2.8492238276608024
+        "alt_early_impulse:buy": -2.2912703144985858,
+        "alt_early_impulse:sell": 0.5984318901221451,
+        "alt_outlier_continuation:buy": -0.2164974591585146,
+        "alt_outlier_continuation:sell": -0.3623274069502471,
+        "major_trend_pullback:sell": -1.9951395071827827
       },
       "entries_by_recipe": {
         "alt_early_impulse": 3,
@@ -356,6 +357,70 @@
       }
     }
   ],
+  "configured_validation": {
+    "profile": "configured",
+    "from": "2026-07-30",
+    "to": "2026-08-07",
+    "starting_equity_usd": 3000.0,
+    "ending_equity_usd": 2995.743798062273,
+    "net_pnl_usd": -4.256201937726928,
+    "return_pct": -0.0014187339792423037,
+    "max_drawdown_pct": 0.0016438694453062453,
+    "entries": 8,
+    "completed_trades": 8,
+    "win_rate": 0.375,
+    "profit_factor": 0.17130431000954124,
+    "fees_usd": 0.7057908904127982,
+    "pnl_by_recipe": {
+      "alt_early_impulse": -1.6928467137462535,
+      "alt_outlier_continuation": -0.5682627197646084,
+      "major_trend_pullback": -1.9950925042159275
+    },
+    "pnl_by_recipe_and_side": {
+      "alt_early_impulse:buy": -2.2912645055689085,
+      "alt_early_impulse:sell": 0.5984177918226551,
+      "alt_outlier_continuation:buy": -0.14291608385490018,
+      "alt_outlier_continuation:sell": -0.4253466359097082,
+      "major_trend_pullback:sell": -1.9950925042159275
+    },
+    "entries_by_recipe": {
+      "alt_early_impulse": 3,
+      "alt_outlier_continuation": 4,
+      "major_trend_pullback": 1
+    }
+  },
+  "cost_stress_validation": {
+    "profile": "configured_cost_2x",
+    "from": "2026-07-30",
+    "to": "2026-08-07",
+    "starting_equity_usd": 3000.0,
+    "ending_equity_usd": 2994.67869755423,
+    "net_pnl_usd": -5.321302445770016,
+    "return_pct": -0.0017737674819233717,
+    "max_drawdown_pct": 0.0019342780259583928,
+    "entries": 8,
+    "completed_trades": 8,
+    "win_rate": 0.375,
+    "profit_factor": 0.09376064001572981,
+    "fees_usd": 1.4114333985258227,
+    "pnl_by_recipe": {
+      "alt_early_impulse": -2.2692231508086627,
+      "alt_outlier_continuation": -0.7407380889460018,
+      "major_trend_pullback": -2.3113412060140384
+    },
+    "pnl_by_recipe_and_side": {
+      "alt_early_impulse:buy": -2.6166533263015657,
+      "alt_early_impulse:sell": 0.34743017549290284,
+      "alt_outlier_continuation:buy": -0.2678318925866859,
+      "alt_outlier_continuation:sell": -0.47290619635931586,
+      "major_trend_pullback:sell": -2.3113412060140384
+    },
+    "entries_by_recipe": {
+      "alt_early_impulse": 3,
+      "alt_outlier_continuation": 4,
+      "major_trend_pullback": 1
+    }
+  },
   "recommended_parameters": {
     "majors": [
       "BTCUSDT",
@@ -400,7 +465,9 @@
       "alt_min_open_interest_usd": 5000000.0,
       "volume_profile_bars": 96,
       "wall_min_notional_usd": 2000000.0,
-      "wall_min_polls": 3
+      "wall_min_polls": 3,
+      "regime_volatility_window_bars": 32,
+      "regime_shock_volatility_ratio": 1.8
     },
     "recipes": {
       "major_trend_pullback_enabled": true,
@@ -445,7 +512,7 @@
     },
     "risk": {
       "major_gross_per_trade": 0.2,
-      "major_short_size_multiplier": 0.5,
+      "major_short_size_multiplier": 0.35,
       "alt_gross_per_trade": 0.1,
       "alt_neutral_anchor_size_multiplier": 0.3,
       "alt_neutral_anchor_stop_pct": 0.012,
@@ -456,6 +523,7 @@
       "alt_outlier_neutral_size_multiplier": 0.75,
       "alt_outlier_breadth_opposed_size_multiplier": 0.35,
       "alt_outlier_breadth_neutral_size_multiplier": 0.65,
+      "alt_shock_regime_size_multiplier": 0.5,
       "alt_outlier_stop_pct": 0.012,
       "alt_outlier_take_profit_pct": 0.02,
       "alt_outlier_max_hold_minutes": 120,
@@ -485,7 +553,9 @@
       "rolling_pf_window": 10,
       "rolling_pf_min_trades": 3,
       "rolling_pf_floor": 1.0,
-      "rolling_pf_cooldown_minutes": 720
+      "rolling_pf_cooldown_minutes": 720,
+      "rolling_pf_probe_size_multiplier": 0.7,
+      "rolling_pf_epoch": 2
     }
   }
 }

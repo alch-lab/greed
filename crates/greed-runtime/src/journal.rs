@@ -23,6 +23,7 @@ impl SampleRecorder {
                 .iter()
                 .chain(std::iter::once(&instrument.perpetual))
                 .chain(instrument.fast_perpetual.iter())
+                .chain(instrument.micro_perpetual.iter())
             {
                 for bar in series.values.iter().filter(|bar| bar.closed) {
                     let market = match series.market {

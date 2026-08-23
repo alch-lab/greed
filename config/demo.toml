@@ -48,6 +48,8 @@ trend_min_efficiency = 0.20
 breadth_horizon_bars = 32
 breadth_threshold = 0.008
 breadth_min_participation = 0.60
+regime_volatility_window_bars = 32
+regime_shock_volatility_ratio = 1.80
 
 [strategy.recipes]
 alt_cross_section_enabled = false
@@ -89,7 +91,7 @@ shock_min_volume_ratio = 3.0
 
 [strategy.risk]
 # 3000 USDT: majors 1500 + altcoins 1500. The attack sleeve values below are explicit.
-major_short_size_multiplier = 0.50
+major_short_size_multiplier = 0.35
 major_max_gross = 0.50
 alt_max_gross = 0.50
 alt_neutral_anchor_size_multiplier = 0.30
@@ -104,6 +106,7 @@ alt_outlier_opposed_size_multiplier = 0.50
 alt_outlier_neutral_size_multiplier = 0.75
 alt_outlier_breadth_opposed_size_multiplier = 0.35
 alt_outlier_breadth_neutral_size_multiplier = 0.65
+alt_shock_regime_size_multiplier = 0.50
 alt_outlier_stop_pct = 0.012
 alt_outlier_take_profit_pct = 0.020
 alt_outlier_max_hold_minutes = 120
@@ -120,3 +123,5 @@ rolling_pf_window = 10
 rolling_pf_min_trades = 3
 rolling_pf_floor = 1.00
 rolling_pf_cooldown_minutes = 720
+rolling_pf_probe_size_multiplier = 0.70
+rolling_pf_epoch = 2

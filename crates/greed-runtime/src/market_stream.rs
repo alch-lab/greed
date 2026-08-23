@@ -57,6 +57,7 @@ pub struct StreamTelemetry {
     pub parse_errors: u64,
     pub last_error: Option<String>,
     pub subscribed_symbols: usize,
+    pub micro_candle_symbols: usize,
 }
 
 #[derive(Default)]
@@ -139,11 +140,14 @@ impl MarketStreamHub {
     }
 
     pub fn telemetry(&self) -> StreamTelemetry {
-        self.state
-            .read()
-            .expect("stream state poisoned")
-            .telemetry
-            .clone()
+        let state = self.state.read().expect("stream state poisoned");
+        let mut telemetry = state.telemetry.clone();
+        telemetry.micro_candle_symbols = state
+            .candles
+            .iter()
+            .filter(|((_, interval), values)| interval == "1m" && !values.is_empty())
+            .count();
+        telemetry
     }
 }
 
@@ -265,6 +269,7 @@ fn market_url(base: &str, symbols: &[String]) -> String {
         streams.push(format!("{symbol}@markPrice@1s"));
         if symbol != "btcusdt" && symbol != "ethusdt" {
             streams.push(format!("{symbol}@kline_5m"));
+            streams.push(format!("{symbol}@kline_1m"));
         }
     }
     format!(
@@ -621,6 +626,7 @@ mod tests {
         assert!(!market.contains("!ticker@arr"));
         assert!(market.contains("/market/stream?streams="));
         assert!(market.contains("ybusdt@kline_5m"));
+        assert!(market.contains("ybusdt@kline_1m"));
         assert!(!market.contains("btcusdt@kline_5m"));
         assert!(public.contains("/public/stream?streams="));
     }

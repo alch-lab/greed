@@ -442,8 +442,10 @@ fn record_diagnostics(
     };
     for key in [
         "alt.cross_section",
+        "alt.early_impulse",
         "alt.outlier_momentum",
         "alt.shock_reversal",
+        "portfolio.regime",
         "portfolio.risk",
     ] {
         let Some(value) = artifacts
@@ -527,6 +529,8 @@ fn recipe_from_id(id: &str) -> &'static str {
         "alt_cross_section_momentum"
     } else if id.contains("outlier_momentum") || id.contains("outlier-momentum") {
         "alt_outlier_continuation"
+    } else if id.contains("early_impulse") || id.contains("early-impulse") {
+        "alt_early_impulse"
     } else if id.contains("shock_reversal") || id.contains("shock-reversal") {
         "alt_shock_reversal"
     } else {

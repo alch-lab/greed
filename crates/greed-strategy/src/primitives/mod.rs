@@ -5,6 +5,7 @@ pub mod flow;
 pub mod liquidity;
 pub mod market_profile;
 pub mod price;
+pub mod regime;
 
 use greed_kernel::{ArtifactMeta, DataQuality};
 

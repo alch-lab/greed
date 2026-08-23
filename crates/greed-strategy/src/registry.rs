@@ -7,6 +7,7 @@ use crate::{
         liquidity::{LiquidityRegimeNode, OrderWallNode},
         market_profile::VolumeProfileNode,
         price::TrendRegimeNode,
+        regime::MarketRegimeNode,
     },
     recipes::{
         alt_cross_section::AltCrossSectionNode, alt_early_impulse::AltEarlyImpulseNode,
@@ -94,6 +95,11 @@ pub fn build_graph(config: &StrategyConfig) -> Result<StrategyGraph, GraphError>
             p.breadth_threshold,
             p.breadth_min_participation,
             &config.altcoins,
+        )));
+        nodes.push(Box::new(MarketRegimeNode::new(
+            anchor,
+            p.regime_volatility_window_bars,
+            p.regime_shock_volatility_ratio,
         )));
         if r.alt_cross_section_enabled {
             nodes.push(Box::new(AltCrossSectionNode::new(

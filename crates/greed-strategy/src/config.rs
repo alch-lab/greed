@@ -70,6 +70,8 @@ pub struct PrimitiveConfig {
     pub volume_profile_bars: usize,
     pub wall_min_notional_usd: f64,
     pub wall_min_polls: u32,
+    pub regime_volatility_window_bars: usize,
+    pub regime_shock_volatility_ratio: f64,
 }
 
 impl Default for PrimitiveConfig {
@@ -91,6 +93,8 @@ impl Default for PrimitiveConfig {
             volume_profile_bars: 96,
             wall_min_notional_usd: 2_000_000.0,
             wall_min_polls: 3,
+            regime_volatility_window_bars: 32,
+            regime_shock_volatility_ratio: 1.8,
         }
     }
 }
@@ -200,6 +204,7 @@ pub struct RiskConfig {
     pub alt_outlier_neutral_size_multiplier: f64,
     pub alt_outlier_breadth_opposed_size_multiplier: f64,
     pub alt_outlier_breadth_neutral_size_multiplier: f64,
+    pub alt_shock_regime_size_multiplier: f64,
     pub alt_outlier_stop_pct: f64,
     pub alt_outlier_take_profit_pct: f64,
     pub alt_outlier_max_hold_minutes: u32,
@@ -230,6 +235,8 @@ pub struct RiskConfig {
     pub rolling_pf_min_trades: usize,
     pub rolling_pf_floor: f64,
     pub rolling_pf_cooldown_minutes: u32,
+    pub rolling_pf_probe_size_multiplier: f64,
+    pub rolling_pf_epoch: u32,
 }
 
 impl Default for RiskConfig {
@@ -247,6 +254,7 @@ impl Default for RiskConfig {
             alt_outlier_neutral_size_multiplier: 0.75,
             alt_outlier_breadth_opposed_size_multiplier: 0.35,
             alt_outlier_breadth_neutral_size_multiplier: 0.65,
+            alt_shock_regime_size_multiplier: 0.50,
             alt_outlier_stop_pct: 0.012,
             alt_outlier_take_profit_pct: 0.020,
             alt_outlier_max_hold_minutes: 180,
@@ -277,6 +285,8 @@ impl Default for RiskConfig {
             rolling_pf_min_trades: 5,
             rolling_pf_floor: 0.80,
             rolling_pf_cooldown_minutes: 480,
+            rolling_pf_probe_size_multiplier: 0.35,
+            rolling_pf_epoch: 1,
         }
     }
 }
@@ -298,6 +308,11 @@ impl StrategyConfig {
         }
         if !(4..=96).contains(&self.primitives.trend_horizon_bars) {
             return Err("trend_horizon_bars must be between 4 and 96".into());
+        }
+        if !(16..=64).contains(&self.primitives.regime_volatility_window_bars)
+            || !(1.2..=4.0).contains(&self.primitives.regime_shock_volatility_ratio)
+        {
+            return Err("market regime volatility parameters are invalid".into());
         }
         if !(0.50..=0.90).contains(&self.primitives.breadth_min_participation) {
             return Err("breadth_min_participation must be between 0.50 and 0.90".into());
@@ -372,6 +387,7 @@ impl StrategyConfig {
             || self.risk.alt_outlier_breadth_opposed_size_multiplier == 0.0
             || !(0.0..=1.0).contains(&self.risk.alt_outlier_breadth_neutral_size_multiplier)
             || self.risk.alt_outlier_breadth_neutral_size_multiplier == 0.0
+            || !(0.10..=1.0).contains(&self.risk.alt_shock_regime_size_multiplier)
             || !(0.0..=0.03).contains(&self.risk.alt_outlier_stop_pct)
             || self.risk.alt_outlier_stop_pct == 0.0
             || !(0.0..=0.06).contains(&self.risk.alt_outlier_take_profit_pct)
@@ -415,6 +431,12 @@ impl StrategyConfig {
             return Err(
                 "rolling PF gate requires window >= min_trades >= 3 and floor in [0, 2]".into(),
             );
+        }
+        if !(0.10..=1.0).contains(&self.risk.rolling_pf_probe_size_multiplier) {
+            return Err("rolling PF probe size multiplier must be between 0.10 and 1.0".into());
+        }
+        if self.risk.rolling_pf_epoch == 0 {
+            return Err("rolling PF epoch must be positive".into());
         }
         Ok(())
     }

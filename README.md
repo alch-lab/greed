@@ -39,6 +39,10 @@ Demo 账户必须使用 One-way Mode，启动前不能留有不属于当前 runt
 保护单失败时，程序会停止新增订单；保护单提交失败时，已成交的入场会立即发送 reduce-only
 市价平仓，不会退回本地模拟成交。
 
+动态山寨币池使用独立的全市场 WebSocket 雷达。活跃合约同时采集 15m/5m 行情用于策略，
+并记录 observation-only 的 1m K 线；1m 数据暂不参与下单，用于一周 Demo 后评估更快确认
+能否在真实成交成本下改善入场。
+
 `paper` 启动后同时在 `127.0.0.1:8088` 提供只读监控接口：
 `/api/health`、`/api/status`、`/api/events` 和 `/api/history`。监听地址可通过
 `runtime.http_listen` 调整；生产环境应保持回环监听，由带访问控制的 Web 代理转发。

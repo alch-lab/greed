@@ -89,6 +89,7 @@ struct DemoState {
     seen: BTreeSet<String>,
     positions: BTreeMap<String, ExecutionMeta>,
     recipe_outcomes: BTreeMap<String, Vec<ExecutionOutcome>>,
+    performance_epoch: u32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,6 +151,7 @@ pub struct BinanceDemoExecution {
     majors: BTreeSet<String>,
     last_error: Option<String>,
     last_sync_ms: Option<i64>,
+    performance_epoch_reset: bool,
 }
 
 impl BinanceDemoExecution {
@@ -170,10 +172,15 @@ impl BinanceDemoExecution {
             builder = builder.proxy(reqwest::Proxy::all(proxy)?);
         }
         let client = builder.build()?;
-        let state = fs::read_to_string(&state_path)
+        let mut state: DemoState = fs::read_to_string(&state_path)
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default();
+        let performance_epoch_reset = state.performance_epoch != risk.rolling_pf_epoch;
+        if performance_epoch_reset {
+            state.recipe_outcomes.clear();
+            state.performance_epoch = risk.rolling_pf_epoch;
+        }
         let mut value = Self {
             client,
             config,
@@ -189,6 +196,7 @@ impl BinanceDemoExecution {
             majors: majors.iter().cloned().collect(),
             last_error: None,
             last_sync_ms: None,
+            performance_epoch_reset,
         };
         value.initialize().await?;
         Ok(value)
@@ -843,10 +851,8 @@ impl BinanceDemoExecution {
                 .map(|value| value.recipe.clone())
                 .unwrap_or_else(|| "unknown".into());
             let performance_key = gate_key(&recipe, plan.side);
-            if !self
-                .recipe_gate_status(&performance_key, frame.as_of_ms)
-                .allowed
-            {
+            let performance_gate = self.recipe_gate_status(&performance_key, frame.as_of_ms);
+            if !performance_gate.allowed {
                 self.state.seen.insert(plan.candidate_id.clone());
                 events.push(ExchangeEvent {
                     kind: "exchange_plan_rejected".into(),
@@ -858,7 +864,15 @@ impl BinanceDemoExecution {
                 .instrument(&plan.symbol)
                 .map(|value| value.asset_class)
                 .unwrap_or(AssetClass::Altcoin);
-            match self.place_bracket(plan).await {
+            let probe = asset_class == AssetClass::Altcoin
+                && (performance_gate.completed_trades < self.risk.rolling_pf_min_trades
+                    || performance_gate.next_probe_ms.is_some());
+            let size_multiplier = if probe {
+                self.risk.rolling_pf_probe_size_multiplier
+            } else {
+                1.0
+            };
+            match self.place_bracket(plan, size_multiplier).await {
                 Ok((entry_price, quantity, order_id)) => {
                     self.state.seen.insert(plan.candidate_id.clone());
                     self.state.positions.insert(
@@ -905,7 +919,7 @@ impl BinanceDemoExecution {
                         .and_then(|value| value.parse::<i64>().ok());
                     events.push(ExchangeEvent {
                         kind: "exchange_entry".into(),
-                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"asset_class":asset_class,"symbol":plan.symbol,"side":plan.side,"entry_price":entry_price,"quantity":quantity,"notional_usd":plan.notional_usd,"order_id":order_id,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
+                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"asset_class":asset_class,"symbol":plan.symbol,"side":plan.side,"entry_price":entry_price,"quantity":quantity,"notional_usd":plan.notional_usd * size_multiplier,"probe_size_multiplier":size_multiplier,"order_id":order_id,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
                     });
                 }
                 Err(error) => events.push(ExchangeEvent {
@@ -917,13 +931,17 @@ impl BinanceDemoExecution {
         events
     }
 
-    async fn place_bracket(&self, plan: &greed_kernel::PositionPlan) -> Result<(f64, f64, i64)> {
+    async fn place_bracket(
+        &self,
+        plan: &greed_kernel::PositionPlan,
+        size_multiplier: f64,
+    ) -> Result<(f64, f64, i64)> {
         let rules = self
             .rules
             .get(&plan.symbol)
             .ok_or_else(|| anyhow!("missing exchange rules for {}", plan.symbol))?;
         let quantity = floor_step(
-            plan.notional_usd / plan.reference_price,
+            plan.notional_usd * size_multiplier / plan.reference_price,
             rules.quantity_step,
         );
         if quantity < rules.min_quantity || quantity * plan.reference_price < rules.min_notional {
@@ -1232,6 +1250,8 @@ impl BinanceDemoExecution {
             "last_sync_ms": self.last_sync_ms,
             "last_error": self.last_error,
             "remote_matching": true,
+            "performance_epoch": self.state.performance_epoch,
+            "performance_epoch_reset": self.performance_epoch_reset,
         })
     }
 }

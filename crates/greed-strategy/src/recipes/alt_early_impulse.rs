@@ -54,6 +54,7 @@ impl AltEarlyImpulseNode {
             max_range_ratio,
             anchor_symbol: anchor_symbol.into(),
             dependencies: std::iter::once("alt.market_breadth".into())
+                .chain(std::iter::once("portfolio.market_regime".into()))
                 .chain(std::iter::once(format!("{anchor_symbol}.trend_regime")))
                 .chain(
                     symbols
@@ -73,6 +74,7 @@ struct Setup<'a> {
     volume_ratio: f64,
     return_z: f64,
     pullback_fraction: f64,
+    residual_1h: f64,
     discovery_latency_ms: i64,
     score: f64,
 }
@@ -121,6 +123,26 @@ impl StrategyNode for AltEarlyImpulseNode {
             .artifact("alt.breadth")
             .and_then(|artifact| artifact.state())
             .ok_or("breadth artifact missing")?;
+        let regime = ctx
+            .artifact("portfolio.regime")
+            .and_then(|artifact| artifact.state())
+            .ok_or("market regime artifact missing")?;
+        let mut market_returns_1h: Vec<_> = ctx
+            .frame
+            .instruments
+            .values()
+            .filter(|instrument| instrument.asset_class == AssetClass::Altcoin)
+            .filter_map(|instrument| {
+                let fast = instrument.fast_perpetual.as_ref().map(closed_bars)?;
+                (fast.len() >= 13)
+                    .then(|| fast.last().unwrap().close / fast[fast.len() - 13].close - 1.0)
+            })
+            .collect();
+        market_returns_1h.sort_by(f64::total_cmp);
+        let market_median_1h = market_returns_1h
+            .get(market_returns_1h.len() / 2)
+            .copied()
+            .unwrap_or_default();
         let mut eligible = 0u64;
         let mut missing_fast = 0u64;
         let mut impulse_hits = 0u64;
@@ -265,6 +287,7 @@ impl StrategyNode for AltEarlyImpulseNode {
             else {
                 continue;
             };
+            let residual_1h = side.sign() * (move_1h - market_median_1h);
             let average_range = fast[f - 20..f]
                 .iter()
                 .map(|bar| (bar.high - bar.low) / bar.close.max(f64::EPSILON))
@@ -285,6 +308,7 @@ impl StrategyNode for AltEarlyImpulseNode {
                 volume_ratio,
                 return_z,
                 pullback_fraction,
+                residual_1h,
                 discovery_latency_ms: (ctx.frame.as_of_ms - fast[impulse_index].close_ms).max(0),
                 score: return_z * 0.02 + move_1h.abs() + volume_ratio.ln_1p() * 0.01,
             });
@@ -302,6 +326,7 @@ impl StrategyNode for AltEarlyImpulseNode {
             ("selected_symbols".into(), selected as f64),
             ("best_move_15m".into(), best_move),
             ("best_volume_ratio".into(), best_volume),
+            ("market_median_return_1h".into(), market_median_1h),
         ]);
         let mut out = vec![ArtifactRecord {
             key: "alt.early_impulse".into(),
@@ -406,6 +431,7 @@ impl StrategyNode for AltEarlyImpulseNode {
                         "pullback_fraction".into(),
                         format!("{:.4}", setup.pullback_fraction),
                     ),
+                    ("residual_1h".into(), format!("{:.8}", setup.residual_1h)),
                     (
                         "discovery_latency_ms".into(),
                         setup.discovery_latency_ms.to_string(),
@@ -415,6 +441,7 @@ impl StrategyNode for AltEarlyImpulseNode {
                     ("hold_profile".into(), "alt_intraday".into()),
                     ("anchor_context".into(), anchor_context.into()),
                     ("breadth_context".into(), breadth_context.into()),
+                    ("market_regime".into(), regime.state.clone()),
                 ]),
             };
             out.push(ArtifactRecord {

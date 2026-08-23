@@ -62,6 +62,7 @@ impl AltOutlierMomentumNode {
             short_threshold_multiplier,
             anchor_symbol: anchor_symbol.into(),
             dependencies: std::iter::once("alt.market_breadth".into())
+                .chain(std::iter::once("portfolio.market_regime".into()))
                 .chain(std::iter::once(format!("{anchor_symbol}.trend_regime")))
                 .chain(
                     symbols
@@ -173,6 +174,10 @@ impl StrategyNode for AltOutlierMomentumNode {
             .artifact("alt.breadth")
             .and_then(|artifact| artifact.state())
             .ok_or("breadth artifact missing")?;
+        let regime = ctx
+            .artifact("portfolio.regime")
+            .and_then(|artifact| artifact.state())
+            .ok_or("market regime artifact missing")?;
         let mut eligible = 0u64;
         let mut move_hits = 0u64;
         let mut volume_hits = 0u64;
@@ -459,6 +464,7 @@ impl StrategyNode for AltOutlierMomentumNode {
                     ("hold_profile".into(), "alt_outlier".into()),
                     ("anchor_context".into(), anchor_context.into()),
                     ("breadth_context".into(), breadth_context.into()),
+                    ("market_regime".into(), regime.state.clone()),
                 ]),
             };
             out.push(ArtifactRecord {

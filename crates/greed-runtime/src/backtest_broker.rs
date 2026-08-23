@@ -530,7 +530,18 @@ impl BacktestBroker {
                 });
                 continue;
             }
-            if let Some(event) = self.open(frame, plan, recipe) {
+            let asset_class = frame
+                .instrument(&plan.symbol)
+                .map(|instrument| instrument.asset_class);
+            let probe = asset_class == Some(AssetClass::Altcoin)
+                && (gate.completed_trades < self.risk.rolling_pf_min_trades
+                    || gate.next_probe_ms.is_some());
+            let size_multiplier = if probe {
+                self.risk.rolling_pf_probe_size_multiplier
+            } else {
+                1.0
+            };
+            if let Some(event) = self.open(frame, plan, recipe, size_multiplier) {
                 events.push(event);
             }
         }
@@ -541,6 +552,7 @@ impl BacktestBroker {
         frame: &MarketFrame,
         plan: &PositionPlan,
         recipe: &str,
+        size_multiplier: f64,
     ) -> Option<BacktestEvent> {
         let instrument = frame.instrument(&plan.symbol)?;
         if instrument.price <= 0.0 || plan.reference_price <= 0.0 {
@@ -549,7 +561,8 @@ impl BacktestBroker {
         let slip = self.costs.slippage_bps_per_side / 10_000.0;
         let fee = self.costs.fee_bps_per_side / 10_000.0;
         let entry = instrument.price * (1.0 + plan.side.sign() * slip);
-        let quantity = plan.notional_usd / entry;
+        let effective_notional = plan.notional_usd * size_multiplier;
+        let quantity = effective_notional / entry;
         let reference = plan.reference_price;
         let stop_distance = (plan.stop_price / reference - 1.0).abs();
         let rebased_stop = entry * (1.0 - plan.side.sign() * stop_distance);
@@ -595,7 +608,7 @@ impl BacktestBroker {
         );
         Some(BacktestEvent {
             kind: "backtest_entry".into(),
-            payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"asset_class":instrument.asset_class,"symbol":plan.symbol,"side":plan.side,"entry_price":entry,"quantity":quantity,"notional_usd":plan.notional_usd,"fee_usd":entry_fee,"stop_price":rebased_stop,"backtest_only":true}),
+            payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"asset_class":instrument.asset_class,"symbol":plan.symbol,"side":plan.side,"entry_price":entry,"quantity":quantity,"notional_usd":effective_notional,"probe_size_multiplier":size_multiplier,"fee_usd":entry_fee,"stop_price":rebased_stop,"backtest_only":true}),
         })
     }
 }
@@ -673,6 +686,7 @@ mod tests {
                 values: vec![candle],
             },
             fast_perpetual: None,
+            micro_perpetual: None,
             book: Some(BookState {
                 meta,
                 bid: price,
@@ -792,6 +806,31 @@ mod tests {
         broker.close_all(&exit_frame, "test_exit");
         assert!(broker.sleeves.major.realized_pnl_usd > 0.0);
         assert_eq!(broker.sleeves.altcoin.realized_pnl_usd, 0.0);
+    }
+
+    #[test]
+    fn unproven_altcoin_recipe_starts_at_probe_size() {
+        let risk = RiskConfig {
+            rolling_pf_probe_size_multiplier: 0.70,
+            ..RiskConfig::default()
+        };
+        let mut broker = BacktestBroker::with_risk(
+            PortfolioConfig::default(),
+            BacktestConfig {
+                fee_bps_per_side: 0.0,
+                slippage_bps_per_side: 0.0,
+            },
+            risk,
+        );
+        let mut entry_frame = frame(1_000_000, 100.0, 100.0, 100.0);
+        entry_frame
+            .instruments
+            .get_mut("BTCUSDT")
+            .unwrap()
+            .asset_class = AssetClass::Altcoin;
+        let events = broker.apply_plans(&entry_frame, &evaluation());
+        assert_eq!(events[0].payload["probe_size_multiplier"], 0.70);
+        assert_eq!(events[0].payload["notional_usd"], 420.0);
     }
 
     #[test]

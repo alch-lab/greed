@@ -635,6 +635,37 @@ impl BinanceMarketSource {
         Ok(series.clone())
     }
 
+    fn stream_observation_klines(
+        &self,
+        symbol: &str,
+        interval: &str,
+        interval_ms: i64,
+        now: i64,
+    ) -> Option<CandleSeries> {
+        let (values, updated_ms) = self.stream.as_ref()?.candles(symbol, interval);
+        if values.is_empty() {
+            return None;
+        }
+        let fresh = updated_ms.is_some_and(|value| now - value <= 15_000);
+        Some(CandleSeries {
+            venue: "binance".into(),
+            market: MarketKind::Perpetual,
+            interval_ms,
+            meta: ObservationMeta {
+                event_ms: updated_ms.unwrap_or(now),
+                received_ms: updated_ms.unwrap_or(now),
+                expires_ms: updated_ms.unwrap_or_default() + 15_000,
+                source: "binance_ws_observation_kline".into(),
+                quality: if fresh {
+                    DataQuality::Complete
+                } else {
+                    DataQuality::Stale
+                },
+            },
+            values,
+        })
+    }
+
     async fn refresh_derivatives(
         &mut self,
         symbol: &str,
@@ -923,6 +954,11 @@ impl BinanceMarketSource {
                     }
                 }
             };
+            let micro_perpetual = if major {
+                None
+            } else {
+                self.stream_observation_klines(symbol, "1m", 60_000, now)
+            };
             let book = self
                 .stream
                 .as_ref()
@@ -982,6 +1018,7 @@ impl BinanceMarketSource {
                     spot,
                     perpetual,
                     fast_perpetual,
+                    micro_perpetual,
                     book,
                     derivatives,
                     external,

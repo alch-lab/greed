@@ -35,7 +35,11 @@ fn candidate_size_multiplier(config: &RiskConfig, tags: &BTreeMap<String, String
             Some("neutral") => config.alt_outlier_breadth_neutral_size_multiplier,
             _ => 1.0,
         };
-        anchor * breadth
+        let regime = match tags.get("market_regime").map(String::as_str) {
+            Some("shock") => config.alt_shock_regime_size_multiplier,
+            _ => 1.0,
+        };
+        anchor * breadth * regime
     } else if tags.get("anchor_confirmation").map(String::as_str) == Some("neutral") {
         config.alt_neutral_anchor_size_multiplier
     } else {
