@@ -3,18 +3,8 @@ use std::collections::BTreeMap;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum AssetClass {
-    Major,
-    Altcoin,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
 pub enum MarketKind {
-    Spot,
     Perpetual,
-    Futures,
-    Etf,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -119,21 +109,37 @@ pub struct DerivativesState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ExternalState {
+pub struct MicrostructureState {
     pub meta: ObservationMeta,
-    pub coinbase_raw_premium_pct: Option<f64>,
-    pub coinbase_true_premium_pct: Option<f64>,
-    pub etf_daily_flow_usd: Option<f64>,
-    pub etf_rolling_5d_flow_usd: Option<f64>,
-    pub cme_basis_pct: Option<f64>,
+    pub buy_notional_60s: f64,
+    pub sell_notional_60s: f64,
+    pub long_liquidations_60s: f64,
+    pub short_liquidations_60s: f64,
+}
+
+impl MicrostructureState {
+    pub fn trade_imbalance(&self) -> Option<f64> {
+        let total = self.buy_notional_60s + self.sell_notional_60s;
+        (total > 0.0).then_some((self.buy_notional_60s - self.sell_notional_60s) / total)
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CrossVenueState {
+    pub meta: ObservationMeta,
+    pub hyper_mark_price: f64,
+    pub hyper_open_interest_usd: f64,
+    pub hyper_funding_per_hour: f64,
+    pub hyper_premium_pct: Option<f64>,
+    pub binance_funding_per_hour: Option<f64>,
+    pub funding_gap_per_hour: Option<f64>,
+    pub mark_premium_pct: Option<f64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstrumentFrame {
     pub symbol: String,
-    pub asset_class: AssetClass,
     pub price: f64,
-    pub spot: Option<CandleSeries>,
     pub perpetual: CandleSeries,
     /// Optional short-interval perpetual candles used for execution timing.
     pub fast_perpetual: Option<CandleSeries>,
@@ -142,7 +148,8 @@ pub struct InstrumentFrame {
     pub micro_perpetual: Option<CandleSeries>,
     pub book: Option<BookState>,
     pub derivatives: Option<DerivativesState>,
-    pub external: Option<ExternalState>,
+    pub microstructure: Option<MicrostructureState>,
+    pub cross_venue: Option<CrossVenueState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -153,8 +160,6 @@ pub struct AccountFrame {
     pub peak_equity_usd: f64,
     pub risk_day_start_equity_usd: f64,
     pub gross_exposure_usd: f64,
-    pub major_gross_exposure_usd: f64,
-    pub alt_gross_exposure_usd: f64,
     pub open_positions: usize,
 }
 
@@ -188,11 +193,6 @@ pub enum CanonicalEvent {
     },
     Funding {
         symbol: String,
-        value: f64,
-        meta: ObservationMeta,
-    },
-    ExternalFlow {
-        name: String,
         value: f64,
         meta: ObservationMeta,
     },

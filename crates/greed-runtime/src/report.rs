@@ -408,13 +408,13 @@ pub fn build(path: &str) -> Result<Value> {
         "max_frame_gap_minutes":max_frame_gap_ms as f64/60_000.0,
         "unique_candidates":candidate_ids.len(),
         "portfolio_performance":total.value(),
-        "performance_by_sleeve":sleeve_values,
+        "performance_by_lane":sleeve_values,
         "performance_by_recipe":recipe_values,
         "performance_by_side":side_values,
         "performance_by_recipe_and_side":recipe_side_values,
         "daily_performance":daily,
         "portfolio_risk":portfolio_risk,
-        "funnel_by_sleeve":sleeve_funnels,
+        "funnel_by_lane":sleeve_funnels,
         "funnel_by_recipe":recipe_funnels,
         "diagnostic_state_counts":diagnostic_states,
         "diagnostic_reason_counts":diagnostic_reasons,
@@ -441,11 +441,9 @@ fn record_diagnostics(
         return;
     };
     for key in [
-        "alt.cross_section",
-        "alt.early_impulse",
-        "alt.outlier_momentum",
-        "alt.shock_reversal",
-        "portfolio.regime",
+        "lane.trend_continuation.status",
+        "lane.liquidation_impulse.status",
+        "lane.cross_venue_crowding.status",
         "portfolio.risk",
     ] {
         let Some(value) = artifacts
@@ -498,51 +496,31 @@ fn record_daily(payload: &Value, entry: bool, daily: &mut BTreeMap<String, Daily
 }
 
 fn classify(payload: &Value) -> (String, String) {
-    let symbol = payload["symbol"].as_str().unwrap_or("");
-    let sleeve = payload["asset_class"]
-        .as_str()
-        .map(str::to_owned)
-        .unwrap_or_else(|| {
-            if matches!(symbol, "BTCUSDT" | "ETHUSDT") {
-                "major".into()
-            } else {
-                "altcoin".into()
-            }
-        });
     let recipe = payload["recipe"]
         .as_str()
         .map(str::to_owned)
         .unwrap_or_else(|| recipe_from_id(payload["candidate_id"].as_str().unwrap_or("")).into());
-    (sleeve, recipe)
+    (lane_for_recipe(&recipe).into(), recipe)
 }
 
 fn recipe_from_id(id: &str) -> &'static str {
-    if id.contains("trend_pullback") || id.contains("trend-pullback") {
-        "major_trend_pullback"
-    } else if id.contains("exhaustion") {
-        "major_exhaustion_reversal"
-    } else if (id.contains("cross_section") || id.contains("cross-section"))
-        && id.contains("neutral")
-    {
-        "alt_cross_section_probe"
-    } else if id.contains("cross_section") || id.contains("cross-section") {
-        "alt_cross_section_momentum"
-    } else if id.contains("outlier_momentum") || id.contains("outlier-momentum") {
-        "alt_outlier_continuation"
-    } else if id.contains("early_impulse") || id.contains("early-impulse") {
-        "alt_early_impulse"
-    } else if id.contains("shock_reversal") || id.contains("shock-reversal") {
-        "alt_shock_reversal"
+    if id.contains("trend_continuation") {
+        "trend_continuation"
+    } else if id.contains("liquidation_impulse") {
+        "liquidation_impulse"
+    } else if id.contains("cross_venue_crowding") {
+        "cross_venue_crowding"
     } else {
         "unknown"
     }
 }
 
-fn sleeve_for_recipe(recipe: &str) -> &'static str {
-    if recipe.starts_with("major_") {
-        "major"
-    } else {
-        "altcoin"
+fn lane_for_recipe(recipe: &str) -> &'static str {
+    match recipe {
+        "trend_continuation" => "trend_continuation",
+        "liquidation_impulse" => "liquidation_impulse",
+        "cross_venue_crowding" => "cross_venue_crowding",
+        _ => "unknown",
     }
 }
 
@@ -565,7 +543,7 @@ fn record_candidates(
             continue;
         }
         let recipe = value["recipe"].as_str().unwrap_or("unknown").to_owned();
-        let sleeve = sleeve_for_recipe(&recipe).to_owned();
+        let sleeve = lane_for_recipe(&recipe).to_owned();
         for stats in [
             sleeves.entry(sleeve).or_default(),
             recipes.entry(recipe).or_default(),
@@ -599,7 +577,7 @@ fn record_plans(
         }
         let value = &record["artifact"]["value"];
         let recipe = recipe_from_id(value["candidate_id"].as_str().unwrap_or("")).to_owned();
-        let sleeve = sleeve_for_recipe(&recipe).to_owned();
+        let sleeve = lane_for_recipe(&recipe).to_owned();
         sleeves.entry(sleeve).or_default().plans += 1;
         recipes.entry(recipe).or_default().plans += 1;
     }
@@ -716,9 +694,9 @@ mod tests {
         let lines = [
             serde_json::json!({"recorded_ms":1,"kind":"runner_start","payload":{"runtime":{"git_commit":"abc","config_hash":"cfg"}}}),
             serde_json::json!({"recorded_ms":2,"kind":"data_health","payload":{"telemetry":{"requests":10,"successes":9,"failures":1,"rate_limits":1,"retries":1,"frames_requested":1,"frames_succeeded":1}}}),
-            serde_json::json!({"recorded_ms":3,"kind":"exchange_entry","payload":{"ts_ms":3,"candidate_id":"BTCUSDT.recipe.trend_pullback:BTCUSDT:3","recipe":"major_trend_pullback","asset_class":"major","symbol":"BTCUSDT","side":"buy","fee_usd":0.2}}),
-            serde_json::json!({"recorded_ms":4,"kind":"exchange_exit","payload":{"ts_ms":64_000,"candidate_id":"BTCUSDT.recipe.trend_pullback:BTCUSDT:3","recipe":"major_trend_pullback","asset_class":"major","symbol":"BTCUSDT","side":"buy","fee_usd":0.2,"pnl_usd":5.0}}),
-            serde_json::json!({"recorded_ms":5,"kind":"exchange_plan_rejected","payload":{"ts_ms":65_000,"candidate_id":"alt.recipe.cross_section:SOLUSDT:cycle-1","recipe":"alt_cross_section_momentum","asset_class":"altcoin","symbol":"SOLUSDT","side":"buy","reason":"rolling_profit_factor_gate"}}),
+            serde_json::json!({"recorded_ms":3,"kind":"exchange_entry","payload":{"ts_ms":3,"candidate_id":"trend_continuation:BTCUSDT:3","recipe":"trend_continuation","lane":"trend_continuation","symbol":"BTCUSDT","side":"buy","fee_usd":0.2}}),
+            serde_json::json!({"recorded_ms":4,"kind":"exchange_exit","payload":{"ts_ms":64_000,"candidate_id":"trend_continuation:BTCUSDT:3","recipe":"trend_continuation","lane":"trend_continuation","symbol":"BTCUSDT","side":"buy","fee_usd":0.2,"pnl_usd":5.0}}),
+            serde_json::json!({"recorded_ms":5,"kind":"exchange_plan_rejected","payload":{"ts_ms":65_000,"candidate_id":"cross_venue_crowding:SOLUSDT:1","recipe":"cross_venue_crowding","lane":"cross_venue_crowding","symbol":"SOLUSDT","side":"buy","reason":"rolling_profit_factor_gate"}}),
         ];
         std::fs::write(
             &path,
@@ -731,20 +709,20 @@ mod tests {
         .unwrap();
         let value = build(path.to_str().unwrap()).unwrap();
         assert_eq!(
-            value["performance_by_sleeve"]["major"]["completed_trades"],
+            value["performance_by_lane"]["trend_continuation"]["completed_trades"],
             1
         );
         assert_eq!(
-            value["performance_by_recipe"]["major_trend_pullback"]["wins"],
+            value["performance_by_recipe"]["trend_continuation"]["wins"],
             1
         );
         assert_eq!(value["api_telemetry"]["rate_limits"], 1);
         assert_eq!(
-            value["performance_by_recipe_and_side"]["major_trend_pullback:buy"]["completed_trades"],
+            value["performance_by_recipe_and_side"]["trend_continuation:buy"]["completed_trades"],
             1
         );
         assert_eq!(
-            value["funnel_by_recipe"]["alt_cross_section_momentum"]["plan_rejections"],
+            value["funnel_by_recipe"]["cross_venue_crowding"]["plan_rejections"],
             1
         );
         std::fs::remove_file(path).unwrap();

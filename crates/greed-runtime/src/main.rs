@@ -1,5 +1,3 @@
-mod backtest;
-mod backtest_broker;
 mod config;
 mod execution;
 mod journal;
@@ -12,7 +10,7 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::AppConfig;
 use execution::BinanceDemoExecution;
-use greed_kernel::{AccountFrame, Artifact, AssetClass, GraphEvaluation, Verdict};
+use greed_kernel::{AccountFrame, Artifact, GraphEvaluation, Verdict};
 use greed_strategy::{build_graph, StrategyConfig};
 use journal::{Journal, SampleRecorder, StatusWriter};
 use source::BinanceMarketSource;
@@ -51,23 +49,8 @@ enum Command {
     },
     /// Summarize a completed or still-running paper JSONL journal.
     Report {
-        #[arg(long, default_value = "data/runtime/demo-events.jsonl")]
+        #[arg(long, default_value = "data/runtime/alpha-events.jsonl")]
         journal: String,
-    },
-    /// Download official archives, select parameters on train data and report untouched validation.
-    Backtest {
-        #[arg(long, default_value = "config/demo.toml")]
-        config: String,
-        #[arg(long)]
-        train_from: String,
-        #[arg(long)]
-        split: String,
-        #[arg(long)]
-        to: String,
-        #[arg(long, default_value = "data/backtest/cache")]
-        cache_dir: String,
-        #[arg(long, default_value = "data/backtest/report.json")]
-        output: String,
     },
 }
 
@@ -99,21 +82,18 @@ fn summarize(evaluation: &GraphEvaluation) -> serde_json::Value {
 }
 
 fn strategy_funnels_demo(
-    strategy: &StrategyConfig,
+    _strategy: &StrategyConfig,
     evaluation: &GraphEvaluation,
     execution: &BinanceDemoExecution,
 ) -> serde_json::Value {
     let positions = execution.position_snapshots();
-    let build = |asset_class: AssetClass| {
-        let is_symbol = |symbol: &str| match asset_class {
-            AssetClass::Major => strategy.majors.iter().any(|value| value == symbol),
-            AssetClass::Altcoin => strategy.altcoins.iter().any(|value| value == symbol),
-        };
+    let build = |lane: &str| {
+        let is_lane = |recipe: &str| recipe == lane;
         let candidates: Vec<_> = evaluation
             .artifacts
             .values()
             .filter_map(|record| record.artifact.candidate())
-            .filter(|candidate| is_symbol(&candidate.symbol))
+            .filter(|candidate| is_lane(&candidate.recipe))
             .collect();
         let passed = candidates
             .iter()
@@ -145,7 +125,12 @@ fn strategy_funnels_demo(
             .values()
             .filter_map(|record| match &record.artifact {
                 Artifact::PositionPlan(value)
-                    if is_symbol(&value.symbol)
+                    if evaluation
+                        .artifacts
+                        .values()
+                        .filter_map(|record| record.artifact.candidate())
+                        .find(|candidate| candidate.id == value.candidate_id)
+                        .is_some_and(|candidate| is_lane(&candidate.recipe))
                         && !execution.has_seen(&value.candidate_id)
                         && evaluation
                             .artifacts
@@ -169,7 +154,7 @@ fn strategy_funnels_demo(
             .count();
         let open_positions = positions
             .values()
-            .filter(|position| position.asset_class == asset_class)
+            .filter(|position| is_lane(&position.recipe))
             .count();
         let mut blocker_set = candidates
             .iter()
@@ -199,7 +184,7 @@ fn strategy_funnels_demo(
             "exchange_execution"
         };
         serde_json::json!({
-            "asset_class": asset_class,
+            "lane": lane,
             "current_stage": current_stage,
             "candidate_counts": {"total":candidates.len(),"pass":passed,"unknown":unknown,"block":candidates.len()-passed-unknown},
             "plans": plans,
@@ -209,7 +194,11 @@ fn strategy_funnels_demo(
             "blockers": blockers,
         })
     };
-    serde_json::json!({"major":build(AssetClass::Major),"altcoin":build(AssetClass::Altcoin)})
+    serde_json::json!({
+        "trend_continuation":build("trend_continuation"),
+        "liquidation_impulse":build("liquidation_impulse"),
+        "cross_venue_crowding":build("cross_venue_crowding")
+    })
 }
 
 fn runtime_identity(config: &AppConfig, started_ms: i64) -> serde_json::Value {
@@ -248,10 +237,10 @@ async fn one_frame(
     source.start_market_stream(&strategy).await?;
     if strategy.universe.dynamic_enabled {
         let discovery = source
-            .discover_altcoins(&strategy, chrono::Utc::now().timestamp_millis())
+            .discover_universe(&strategy, chrono::Utc::now().timestamp_millis())
             .await?;
         if !discovery.symbols.is_empty() {
-            strategy.altcoins = discovery.symbols;
+            strategy.symbols = discovery.symbols;
         }
     }
     let frame = source
@@ -264,8 +253,6 @@ async fn one_frame(
                 peak_equity_usd: config.portfolio.initial_equity_usd,
                 risk_day_start_equity_usd: config.portfolio.initial_equity_usd,
                 gross_exposure_usd: 0.0,
-                major_gross_exposure_usd: 0.0,
-                alt_gross_exposure_usd: 0.0,
                 open_positions: 0,
             },
         )
@@ -289,10 +276,13 @@ async fn main() -> Result<()> {
             let config = load(&config)?;
             let graph = build_graph(&config.strategy)?;
             drop(graph);
+            let enabled_lanes = usize::from(config.strategy.lanes.trend_continuation_enabled)
+                + usize::from(config.strategy.lanes.liquidation_impulse_enabled)
+                + usize::from(config.strategy.lanes.cross_venue_crowding_enabled);
             println!(
-                "valid: {} majors, {} altcoins, paper_only=true, execution={:?}",
-                config.strategy.majors.len(),
-                config.strategy.altcoins.len(),
+                "valid: {} seed symbols, {} funded alpha lane(s), paper_only=true, execution={:?}",
+                config.strategy.symbols.len(),
+                enabled_lanes,
                 config.execution.mode,
             );
             Ok(())
@@ -310,24 +300,6 @@ async fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&report::build(&journal)?)?
             );
-            Ok(())
-        }
-        Command::Backtest {
-            config,
-            train_from,
-            split,
-            to,
-            cache_dir,
-            output,
-        } => {
-            let report =
-                backtest::run(load(&config)?, &train_from, &split, &to, &cache_dir).await?;
-            let bytes = serde_json::to_vec_pretty(&report)?;
-            if let Some(parent) = std::path::Path::new(&output).parent() {
-                std::fs::create_dir_all(parent)?;
-            }
-            std::fs::write(&output, &bytes)?;
-            println!("{}", String::from_utf8(bytes)?);
             Ok(())
         }
     }
@@ -351,7 +323,6 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
         config.portfolio.clone(),
         config.strategy.risk.clone(),
         config.runtime.execution_state_path.clone(),
-        &config.strategy.majors,
         config.runtime.proxy.as_deref(),
     )
     .await
@@ -372,7 +343,7 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
     let mut last_universe_refresh_ms = 0i64;
     let mut universe_status = serde_json::json!({
         "as_of_ms": started_ms,
-        "symbols": active_strategy.altcoins.clone(),
+        "symbols": active_strategy.symbols.clone(),
         "dynamic": active_strategy.universe.dynamic_enabled,
     });
     let mut samples = SampleRecorder::default();
@@ -395,28 +366,25 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
             history.append(&event.kind, event.payload.clone())?;
             journal.append(&event.kind, event.payload)?;
         }
-        let refresh_ms = i64::from(config.strategy.universe.anomaly_scan_seconds) * 1_000;
+        let refresh_ms = i64::from(config.strategy.universe.refresh_seconds) * 1_000;
         if config.strategy.universe.dynamic_enabled
             && now_ms - last_universe_refresh_ms >= refresh_ms
         {
             last_universe_refresh_ms = now_ms;
-            match source.discover_altcoins(&config.strategy, now_ms).await {
+            match source.discover_universe(&config.strategy, now_ms).await {
                 Ok(mut discovery) => {
                     discovery
                         .symbols
                         .retain(|symbol| execution.supports_symbol(symbol));
                     for symbol in execution.position_symbols() {
-                        if !config.strategy.majors.contains(symbol)
-                            && !discovery.symbols.contains(symbol)
-                        {
+                        if !discovery.symbols.contains(symbol) {
                             discovery.symbols.push(symbol.clone());
                         }
                     }
                     discovery.symbols.sort();
-                    if !discovery.symbols.is_empty()
-                        && discovery.symbols != active_strategy.altcoins
+                    if !discovery.symbols.is_empty() && discovery.symbols != active_strategy.symbols
                     {
-                        active_strategy.altcoins.clone_from(&discovery.symbols);
+                        active_strategy.symbols.clone_from(&discovery.symbols);
                         graph = build_graph(&active_strategy)?;
                         source.set_stream_symbols(&active_strategy);
                     }
@@ -469,7 +437,7 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                     "as_of_ms":frame.as_of_ms,
                     "paper_only":true,
                     "account":account,
-                    "funnels":funnels,
+                    "lanes":funnels,
                     "recipe_gates":execution.recipe_gate_snapshots(frame.as_of_ms),
                     "positions":execution.position_snapshots(),
                     "graph":summarize(&evaluation),

@@ -18,19 +18,13 @@ pub struct SampleRecorder {
 impl SampleRecorder {
     pub fn record(&mut self, journal: &Journal, frame: &MarketFrame) -> Result<()> {
         for instrument in frame.instruments.values() {
-            for series in instrument
-                .spot
-                .iter()
-                .chain(std::iter::once(&instrument.perpetual))
+            for series in std::iter::once(&instrument.perpetual)
                 .chain(instrument.fast_perpetual.iter())
                 .chain(instrument.micro_perpetual.iter())
             {
                 for bar in series.values.iter().filter(|bar| bar.closed) {
                     let market = match series.market {
-                        MarketKind::Spot => "spot",
                         MarketKind::Perpetual => "perpetual",
-                        MarketKind::Futures => "futures",
-                        MarketKind::Etf => "etf",
                     };
                     let key = format!(
                         "{}:{market}:{}:{}",
@@ -49,11 +43,11 @@ impl SampleRecorder {
                 serde_json::json!({
                     "as_of_ms":frame.as_of_ms,
                     "symbol":instrument.symbol,
-                    "asset_class":instrument.asset_class,
                     "price":instrument.price,
                     "book":instrument.book,
                     "derivatives":instrument.derivatives,
-                    "external":instrument.external
+                    "microstructure":instrument.microstructure,
+                    "cross_venue":instrument.cross_venue
                 }),
             )?;
         }

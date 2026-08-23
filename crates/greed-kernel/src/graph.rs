@@ -162,8 +162,6 @@ mod tests {
                 peak_equity_usd: 3_000.0,
                 risk_day_start_equity_usd: 3_000.0,
                 gross_exposure_usd: 0.0,
-                major_gross_exposure_usd: 0.0,
-                alt_gross_exposure_usd: 0.0,
                 open_positions: 0,
             },
         }

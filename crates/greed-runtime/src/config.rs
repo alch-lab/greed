@@ -5,7 +5,6 @@ use serde::{Deserialize, Serialize};
 pub struct AppConfig {
     pub runtime: RuntimeConfig,
     pub portfolio: PortfolioConfig,
-    pub backtest: BacktestConfig,
     pub execution: ExecutionConfig,
     pub strategy: StrategyConfig,
 }
@@ -24,6 +23,7 @@ pub struct ExecutionConfig {
     pub api_key_env: String,
     pub api_secret_env: String,
     pub recv_window_ms: u64,
+    pub leverage: u8,
 }
 
 impl Default for ExecutionConfig {
@@ -34,6 +34,7 @@ impl Default for ExecutionConfig {
             api_key_env: "BINANCE_DEMO_API_KEY".into(),
             api_secret_env: "BINANCE_DEMO_API_SECRET".into(),
             recv_window_ms: 5_000,
+            leverage: 5,
         }
     }
 }
@@ -44,14 +45,12 @@ pub struct RuntimeConfig {
     pub binance_futures_base: String,
     pub binance_futures_fallbacks: Vec<String>,
     pub binance_futures_ws_base: String,
-    pub binance_spot_base: String,
-    pub binance_spot_fallbacks: Vec<String>,
-    pub coinbase_base: String,
+    pub hyperliquid_info_url: String,
+    pub hyperliquid_refresh_seconds: u64,
     pub proxy: Option<String>,
     pub poll_seconds: u64,
     pub stream_warmup_seconds: u64,
     pub oi_refresh_seconds: u64,
-    pub slow_market_refresh_seconds: u64,
     pub request_spacing_ms: u64,
     pub request_timeout_seconds: u64,
     pub candle_limit: usize,
@@ -59,7 +58,6 @@ pub struct RuntimeConfig {
     pub history_path: String,
     pub status_path: String,
     pub execution_state_path: String,
-    pub slow_context_path: Option<String>,
     pub http_listen: String,
 }
 impl Default for RuntimeConfig {
@@ -71,25 +69,19 @@ impl Default for RuntimeConfig {
                 "https://fapi2.binance.com".into(),
             ],
             binance_futures_ws_base: "wss://fstream.binance.com".into(),
-            binance_spot_base: "https://api.binance.com".into(),
-            binance_spot_fallbacks: vec![
-                "https://api1.binance.com".into(),
-                "https://api2.binance.com".into(),
-            ],
-            coinbase_base: "https://api.exchange.coinbase.com".into(),
+            hyperliquid_info_url: "https://api.hyperliquid.xyz/info".into(),
+            hyperliquid_refresh_seconds: 60,
             proxy: None,
             poll_seconds: 15,
-            stream_warmup_seconds: 5,
+            stream_warmup_seconds: 20,
             oi_refresh_seconds: 120,
-            slow_market_refresh_seconds: 60,
             request_spacing_ms: 150,
             request_timeout_seconds: 8,
             candle_limit: 160,
-            journal_path: "data/runtime/demo-events.jsonl".into(),
-            history_path: "data/runtime/demo-history.jsonl".into(),
-            status_path: "data/runtime/demo-status.json".into(),
-            execution_state_path: "data/runtime/binance-demo-state.json".into(),
-            slow_context_path: Some("data/runtime/slow-context.json".into()),
+            journal_path: "data/runtime/alpha-events.jsonl".into(),
+            history_path: "data/runtime/alpha-history.jsonl".into(),
+            status_path: "data/runtime/alpha-status.json".into(),
+            execution_state_path: "data/runtime/binance-alpha-state.json".into(),
             http_listen: "127.0.0.1:8088".into(),
         }
     }
@@ -104,24 +96,8 @@ pub struct PortfolioConfig {
 impl Default for PortfolioConfig {
     fn default() -> Self {
         Self {
-            initial_equity_usd: 3_000.0,
-            max_positions: 5,
-        }
-    }
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(default)]
-pub struct BacktestConfig {
-    pub fee_bps_per_side: f64,
-    pub slippage_bps_per_side: f64,
-}
-
-impl Default for BacktestConfig {
-    fn default() -> Self {
-        Self {
-            fee_bps_per_side: 5.0,
-            slippage_bps_per_side: 5.0,
+            initial_equity_usd: 2_000.0,
+            max_positions: 3,
         }
     }
 }
@@ -132,14 +108,17 @@ impl AppConfig {
         if !(5..=60).contains(&self.runtime.poll_seconds) {
             return Err("poll_seconds must be 5..=60".into());
         }
-        if !(1..=15).contains(&self.runtime.stream_warmup_seconds)
+        if !(5..=30).contains(&self.runtime.stream_warmup_seconds)
             || !(30..=600).contains(&self.runtime.oi_refresh_seconds)
-            || !(30..=600).contains(&self.runtime.slow_market_refresh_seconds)
+            || !(15..=300).contains(&self.runtime.hyperliquid_refresh_seconds)
         {
             return Err("stream/slow market refresh settings are outside safe bounds".into());
         }
         if !self.runtime.binance_futures_ws_base.starts_with("wss://") {
             return Err("binance_futures_ws_base must use wss".into());
+        }
+        if !self.runtime.hyperliquid_info_url.starts_with("https://") {
+            return Err("hyperliquid_info_url must use https".into());
         }
         if !(120..=1000).contains(&self.runtime.candle_limit) {
             return Err("candle_limit must be 120..=1000".into());
@@ -149,6 +128,9 @@ impl AppConfig {
         }
         if self.portfolio.max_positions == 0 {
             return Err("max_positions must be positive".into());
+        }
+        if self.portfolio.max_positions != self.strategy.risk.max_positions {
+            return Err("portfolio and strategy risk max_positions must match".into());
         }
         if ![
             "https://demo-fapi.binance.com",
@@ -162,6 +144,9 @@ impl AppConfig {
         }
         if !(1_000..=10_000).contains(&self.execution.recv_window_ms) {
             return Err("execution recv_window_ms must be 1000..=10000".into());
+        }
+        if !(1..=5).contains(&self.execution.leverage) {
+            return Err("demo leverage must be 1..=5".into());
         }
         Ok(())
     }

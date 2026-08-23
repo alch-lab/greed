@@ -1,62 +1,46 @@
 # greed
 
-可组合的加密货币策略研究与 Binance Demo 模拟交易系统。策略账户使用交易所模拟撮合，
-不会向 Binance 主网提交订单。历史回测使用独立的 K 线成交仿真，`paper/once` 无法调用它。
+统一币池、趋势复利 lane、Binance Demo 真实模拟撮合。运行时不会向 Binance 主网提交订单，
+也没有本地成交模拟器。
 
 ```text
-greed-kernel    领域合同、Artifact、DAG
-greed-strategy  原语、市场状态、策略组合、组合风控
-greed-runtime   官方历史数据回测、公开实时行情、Binance Demo 执行、日志
+greed-kernel    市场/账户契约、Artifact、策略 DAG
+greed-strategy  趋势续航 lane、研究采样模块与统一组合风控
+greed-runtime   Binance/Hyperliquid 公共数据、Binance Demo 执行、日志与监控 API
 ```
 
-## 验证与回测
+## 当前资金 lane
+
+- `trend_continuation`：识别 4h/12h 同向趋势，等待 15m 回踩 EMA21 后重新站回 EMA8，
+  再由主动成交、量能、价差和深度确认。多空完全对称，不追第一根脉冲。
+- `liquidation_impulse`、`cross_venue_crowding`：保留代码和数据采样，但默认不启用资金执行；
+  当前历史样本还不足以证明它们能改善组合。
+
+模块使用同一个最多 30 个 USDT 永续合约的动态币池，不再区分 major/altcoin。
+全市场发现与活跃合约行情以 WebSocket 为主；REST 只补首次入池的 K 线、低频 OI 和 Demo 账户/订单。
+
+## 验证与运行
 
 ```bash
 cargo test --workspace
 cargo build --release
-
 ./target/release/greed validate --config config/demo.toml
-./target/release/greed backtest --config config/demo.toml \
-  --train-from 2026-08-08 --split 2026-08-15 --to 2026-08-21
+./target/release/greed once --config config/demo.toml
 ```
 
-回测自动下载并缓存 Binance 官方归档，训练段只负责选参数，验证段不参与选择。
-
-## 一周模拟盘
+模拟盘需要 Binance Futures Demo key：
 
 ```bash
-sudo install -m 600 /dev/null /etc/greed-paper.env
-# 在 /etc/greed-paper.env 中填写 Binance Demo API key/secret：
-# BINANCE_DEMO_API_KEY=...
-# BINANCE_DEMO_API_SECRET=...
-
-./target/release/greed once --config config/demo.toml
+export BINANCE_DEMO_API_KEY='...'
+export BINANCE_DEMO_API_SECRET='...'
 ./target/release/greed paper --config config/demo.toml
-./target/release/greed report --journal data/runtime/demo-events.jsonl
 ```
 
+Hyperliquid 仅通过公开 `info` API 提供跨场数据，不需要 API key。只有未来改为在 Hyperliquid
+下单时才需要钱包/交易授权。
+
 Demo 账户必须使用 One-way Mode，启动前不能留有不属于当前 runtime 的仓位。认证、账户同步或
-保护单失败时，程序会停止新增订单；保护单提交失败时，已成交的入场会立即发送 reduce-only
-市价平仓，不会退回本地模拟成交。
+保护单失败会停止新增订单；保护单提交失败时，已成交入场会立即发送 reduce-only 市价平仓。
 
-动态山寨币池使用独立的全市场 WebSocket 雷达。活跃合约同时采集 15m/5m 行情用于策略，
-并记录 observation-only 的 1m K 线；1m 数据暂不参与下单，用于一周 Demo 后评估更快确认
-能否在真实成交成本下改善入场。
-
-`paper` 启动后同时在 `127.0.0.1:8088` 提供只读监控接口：
-`/api/health`、`/api/status`、`/api/events` 和 `/api/history`。监听地址可通过
-`runtime.http_listen` 调整；生产环境应保持回环监听，由带访问控制的 Web 代理转发。
-
-状态和历史记录交易所账户、订单、成交、拒单、保护退出、策略阶段、程序 commit/config
-版本、WebSocket 连接/重连/消息空窗及 Binance REST 权重/限流/重试/延迟遥测。部分止盈和
-保本止损调整也作为独立交易所事件记录。
-
-Major 使用高确认、低频参数；Altcoin 通过 Binance 全市场 WebSocket ticker 每分钟重排
-高流动性与异动合约，最多对 30 个标的做完整评估。15m/5m K 线、mark price 和 20 档盘口
-持续由 WebSocket 更新；REST 只在币种首次入池时补历史，并每 120 秒补一次没有官方推送流
-的 OI。进攻分支使用 15m 早期启动和 5m 结构/量能确认，异动延续只保留 2% 观察仓。所有
-仓位在 0.75R 平 25% 后把剩余止损移动到含费用缓冲的保本价，1R 再平 30%，剩余 45%
-争取 2.5R 并使用单向移动保护。
-
-详细边界、数据含义、部署步骤与实盘门槛见
-[架构与模拟盘说明](docs/ARCHITECTURE.zh-CN.md)。
+监控 API 默认监听 `127.0.0.1:8088`：`/api/health`、`/api/status`、`/api/events`、
+`/api/history`。详细设计与一周验证指标见 [架构说明](docs/ARCHITECTURE.zh-CN.md)。

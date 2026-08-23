@@ -6,4 +6,6 @@ out/
 *.log
 .DS_Store
 /data/backtest/cache/
+/data/alpha-backtest/cache/
 /data/runtime/
+__pycache__/

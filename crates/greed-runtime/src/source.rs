@@ -2,7 +2,7 @@ use crate::config::RuntimeConfig;
 use crate::market_stream::MarketStreamHub;
 use anyhow::{anyhow, Result};
 use greed_kernel::{
-    AccountFrame, AssetClass, Candle, CandleSeries, DataQuality, DerivativesState, ExternalState,
+    AccountFrame, Candle, CandleSeries, CrossVenueState, DataQuality, DerivativesState,
     InstrumentFrame, MarketFrame, MarketKind, ObservationMeta,
 };
 use greed_strategy::StrategyConfig;
@@ -55,8 +55,8 @@ pub struct BinanceMarketSource {
     stream: Option<MarketStreamHub>,
     candle_cache: BTreeMap<(String, String), CandleSeries>,
     derivatives_cache: BTreeMap<String, CachedValue<DerivativesState>>,
-    spot_cache: BTreeMap<String, CachedValue<CandleSeries>>,
-    external_cache: BTreeMap<String, CachedValue<ExternalState>>,
+    cross_venue_cache: BTreeMap<String, CachedValue<CrossVenueState>>,
+    cross_venue_refreshed_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -107,19 +107,6 @@ fn median_abs(values: impl Iterator<Item = Option<f64>>, floor: f64) -> f64 {
         .max(floor)
 }
 
-#[derive(Debug, serde::Deserialize)]
-struct SlowContextFile {
-    as_of_ms: i64,
-    #[serde(default)]
-    symbols: BTreeMap<String, SlowSymbolContext>,
-}
-
-#[derive(Debug, serde::Deserialize)]
-struct SlowSymbolContext {
-    etf_daily_flow_usd: Option<f64>,
-    etf_rolling_5d_flow_usd: Option<f64>,
-    cme_basis_pct: Option<f64>,
-}
 impl BinanceMarketSource {
     pub fn new(config: RuntimeConfig) -> Result<Self> {
         let mut builder = Client::builder()
@@ -141,20 +128,14 @@ impl BinanceMarketSource {
             stream: None,
             candle_cache: BTreeMap::new(),
             derivatives_cache: BTreeMap::new(),
-            spot_cache: BTreeMap::new(),
-            external_cache: BTreeMap::new(),
+            cross_venue_cache: BTreeMap::new(),
+            cross_venue_refreshed_ms: 0,
         })
     }
 
     pub async fn start_market_stream(&mut self, strategy: &StrategyConfig) -> Result<()> {
         let stream = MarketStreamHub::start(self.config.binance_futures_ws_base.clone());
-        let symbols: Vec<_> = strategy
-            .majors
-            .iter()
-            .chain(strategy.altcoins.iter())
-            .cloned()
-            .collect();
-        stream.set_symbols(&symbols);
+        stream.set_symbols(&strategy.symbols);
         self.stream = Some(stream);
         let deadline = chrono::Utc::now().timestamp_millis()
             + i64::try_from(self.config.stream_warmup_seconds).unwrap_or(5) * 1_000;
@@ -190,17 +171,11 @@ impl BinanceMarketSource {
 
     pub fn set_stream_symbols(&self, strategy: &StrategyConfig) {
         if let Some(stream) = &self.stream {
-            let symbols: Vec<_> = strategy
-                .majors
-                .iter()
-                .chain(strategy.altcoins.iter())
-                .cloned()
-                .collect();
-            stream.set_symbols(&symbols);
+            stream.set_symbols(&strategy.symbols);
         }
     }
 
-    pub async fn discover_altcoins(
+    pub async fn discover_universe(
         &mut self,
         strategy: &StrategyConfig,
         now_ms: i64,
@@ -208,9 +183,9 @@ impl BinanceMarketSource {
         if !strategy.universe.dynamic_enabled {
             return Ok(UniverseDiscovery {
                 as_of_ms: now_ms,
-                symbols: strategy.altcoins.clone(),
-                eligible_contracts: strategy.altcoins.len(),
-                liquid_contracts: strategy.altcoins.len(),
+                symbols: strategy.symbols.clone(),
+                eligible_contracts: strategy.symbols.len(),
+                liquid_contracts: strategy.symbols.len(),
                 rolling_history_ready: 0,
                 leaders: Vec::new(),
             });
@@ -229,12 +204,7 @@ impl BinanceMarketSource {
                 .filter(|symbol| symbol.ends_with("USDT"))
                 .cloned(),
         );
-        let eligible: BTreeSet<_> = self
-            .eligible_contracts
-            .iter()
-            .filter(|symbol| !strategy.majors.contains(*symbol))
-            .cloned()
-            .collect();
+        let eligible: BTreeSet<_> = self.eligible_contracts.iter().cloned().collect();
         let mut rows = Vec::new();
         for (symbol, ticker) in tickers {
             if !eligible.contains(&symbol) || now_ms - ticker.received_ms > 15_000 {
@@ -274,7 +244,7 @@ impl BinanceMarketSource {
             .filter(|(_, _, _, _, return_5m, _, _)| return_5m.is_some())
             .count();
         let mut selected: BTreeSet<String> = strategy
-            .altcoins
+            .symbols
             .iter()
             .filter(|symbol| eligible.contains(*symbol))
             .cloned()
@@ -314,7 +284,7 @@ impl BinanceMarketSource {
                 .unwrap_or(0.0)
                 .total_cmp(&selected_scores.get(a).copied().unwrap_or(0.0))
         });
-        symbols.truncate(strategy.universe.max_altcoins);
+        symbols.truncate(strategy.universe.max_symbols);
         symbols.sort();
         let selected_symbols: BTreeSet<_> = symbols.iter().map(String::as_str).collect();
         let leaders = by_movement
@@ -350,7 +320,7 @@ impl BinanceMarketSource {
         let average_latency_ms = (telemetry.requests > 0)
             .then_some(telemetry.total_latency_ms as f64 / telemetry.requests as f64);
         let stream = self.stream.as_ref().map(MarketStreamHub::telemetry);
-        serde_json::json!({"last_success_ms":self.last_success_ms,"last_error":self.last_error,"paper_only":true,"transport":"websocket_primary","stream":stream,"telemetry":telemetry,"average_latency_ms":average_latency_ms})
+        serde_json::json!({"last_success_ms":self.last_success_ms,"last_error":self.last_error,"paper_only":true,"transport":"websocket_primary","cross_venue_symbols":self.cross_venue_cache.len(),"hyperliquid_last_refresh_ms":self.cross_venue_refreshed_ms,"stream":stream,"telemetry":telemetry,"average_latency_ms":average_latency_ms})
     }
     fn endpoint_key(url: &str) -> String {
         reqwest::Url::parse(url)
@@ -481,14 +451,32 @@ impl BinanceMarketSource {
         }
         Err(anyhow!(errors.join(" | ")))
     }
+    async fn post_json(&self, url: &str, body: Value) -> Result<Value> {
+        let started = Instant::now();
+        let response = self.http.post(url).json(&body).send().await?;
+        let rate_limited = response.status() == StatusCode::TOO_MANY_REQUESTS;
+        if !response.status().is_success() {
+            let status = response.status();
+            self.record_request(
+                url,
+                started.elapsed().as_millis() as u64,
+                false,
+                rate_limited,
+            );
+            return Err(anyhow!("{url} returned {status}"));
+        }
+        let value = response.json::<Value>().await;
+        self.record_request(
+            url,
+            started.elapsed().as_millis() as u64,
+            value.is_ok(),
+            false,
+        );
+        Ok(value?)
+    }
     fn futures_bases(&self) -> Vec<String> {
         std::iter::once(self.config.binance_futures_base.clone())
             .chain(self.config.binance_futures_fallbacks.clone())
-            .collect()
-    }
-    fn spot_bases(&self) -> Vec<String> {
-        std::iter::once(self.config.binance_spot_base.clone())
-            .chain(self.config.binance_spot_fallbacks.clone())
             .collect()
     }
     fn meta(now: i64, ttl: i64, source: &str, quality: DataQuality) -> ObservationMeta {
@@ -500,27 +488,6 @@ impl BinanceMarketSource {
             quality,
         }
     }
-    async fn klines(
-        &self,
-        bases: &[String],
-        path: &str,
-        symbol: &str,
-        market: MarketKind,
-        now: i64,
-    ) -> Result<CandleSeries> {
-        self.klines_at_interval(
-            bases,
-            path,
-            symbol,
-            market,
-            "15m",
-            900_000,
-            self.config.candle_limit,
-            now,
-        )
-        .await
-    }
-
     #[allow(clippy::too_many_arguments)]
     async fn klines_at_interval(
         &self,
@@ -728,13 +695,12 @@ impl BinanceMarketSource {
         symbol: &str,
         price: f64,
         now: i64,
+        force_refresh: bool,
     ) -> Result<DerivativesState> {
         let refresh_ms = i64::try_from(self.config.oi_refresh_seconds).unwrap_or(120) * 1_000;
-        if self
-            .derivatives_cache
-            .get(symbol)
-            .is_none_or(|cached| now - cached.refreshed_ms >= refresh_ms)
-        {
+        if self.derivatives_cache.get(symbol).is_none_or(|cached| {
+            now - cached.refreshed_ms >= if force_refresh { 15_000 } else { refresh_ms }
+        }) {
             let value = self.refresh_derivatives(symbol, price, now).await?;
             self.derivatives_cache.insert(
                 symbol.into(),
@@ -771,115 +737,119 @@ impl BinanceMarketSource {
         }
         Ok(value)
     }
-    async fn coinbase_external(
-        &self,
-        symbol: &str,
-        binance_spot: f64,
-        now: i64,
-    ) -> Result<ExternalState> {
-        let asset = symbol.trim_end_matches("USDT");
-        let asset_url = format!("{}/products/{asset}-USD/ticker", self.config.coinbase_base);
-        let usdt_url = format!("{}/products/USDT-USD/ticker", self.config.coinbase_base);
-        let asset_value = self.get(asset_url).await?;
-        let usdt_value = self.get(usdt_url).await;
-        let usd: f64 = asset_value["price"].as_str().unwrap_or("0").parse()?;
-        let raw = usd / binance_spot - 1.0;
-        let (true_premium, quality) = match usdt_value {
-            Ok(value) => {
-                let usdt: f64 = value["price"].as_str().unwrap_or("0").parse()?;
-                (
-                    Some(usd / (binance_spot * usdt) - 1.0),
-                    DataQuality::Complete,
-                )
+
+    async fn refresh_cross_venue(&mut self, symbols: &[String], now: i64) -> Result<()> {
+        let url = self.config.hyperliquid_info_url.clone();
+        let contexts = self
+            .post_json(&url, serde_json::json!({"type":"metaAndAssetCtxs"}))
+            .await?;
+        let predicted = self
+            .post_json(&url, serde_json::json!({"type":"predictedFundings"}))
+            .await?;
+        let universe = contexts
+            .get(0)
+            .and_then(|v| v.get("universe"))
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("Hyperliquid metadata is missing universe"))?;
+        let values = contexts
+            .get(1)
+            .and_then(Value::as_array)
+            .ok_or_else(|| anyhow!("Hyperliquid metadata is missing asset contexts"))?;
+        let mut funding_by_coin: BTreeMap<String, (Option<f64>, Option<f64>)> = BTreeMap::new();
+        if let Some(rows) = predicted.as_array() {
+            for row in rows {
+                let Some(parts) = row.as_array() else {
+                    continue;
+                };
+                let Some(coin) = parts.first().and_then(Value::as_str) else {
+                    continue;
+                };
+                let mut hyper = None;
+                let mut binance = None;
+                if let Some(venues) = parts.get(1).and_then(Value::as_array) {
+                    for venue in venues {
+                        let Some(pair) = venue.as_array() else {
+                            continue;
+                        };
+                        let Some(name) = pair.first().and_then(Value::as_str) else {
+                            continue;
+                        };
+                        let Some(data) = pair.get(1).filter(|v| v.is_object()) else {
+                            continue;
+                        };
+                        let rate = data
+                            .get("fundingRate")
+                            .and_then(Value::as_str)
+                            .and_then(|v| v.parse::<f64>().ok());
+                        let hours = data
+                            .get("fundingIntervalHours")
+                            .and_then(Value::as_u64)
+                            .unwrap_or(8)
+                            .max(1) as f64;
+                        match name {
+                            "HlPerp" => hyper = rate.map(|v| v / hours),
+                            "BinPerp" => binance = rate.map(|v| v / hours),
+                            _ => {}
+                        }
+                    }
+                }
+                funding_by_coin.insert(coin.to_string(), (hyper, binance));
             }
-            Err(_) => (None, DataQuality::Partial),
-        };
-        let slow = self.read_slow_context(symbol, now);
-        Ok(ExternalState {
-            meta: Self::meta(now, 90_000, "coinbase_exchange", quality),
-            coinbase_raw_premium_pct: Some(raw),
-            coinbase_true_premium_pct: true_premium,
-            etf_daily_flow_usd: slow.as_ref().and_then(|value| value.etf_daily_flow_usd),
-            etf_rolling_5d_flow_usd: slow
+        }
+        let wanted: BTreeSet<_> = symbols.iter().map(|s| s.trim_end_matches("USDT")).collect();
+        for (meta, ctx) in universe.iter().zip(values) {
+            let Some(coin) = meta.get("name").and_then(Value::as_str) else {
+                continue;
+            };
+            if !wanted.contains(coin) {
+                continue;
+            }
+            let number = |key: &str| {
+                ctx.get(key)
+                    .and_then(Value::as_str)
+                    .and_then(|v| v.parse::<f64>().ok())
+            };
+            let Some(mark) = number("markPx") else {
+                continue;
+            };
+            let oi = number("openInterest").unwrap_or(0.0) * mark;
+            let premium = number("premium");
+            let (hyper_funding, binance_funding) = funding_by_coin
+                .get(coin)
+                .copied()
+                .unwrap_or((number("funding"), None));
+            let hyper_funding = hyper_funding.unwrap_or(0.0);
+            let symbol = format!("{coin}USDT");
+            let binance_mark = self
+                .stream
                 .as_ref()
-                .and_then(|value| value.etf_rolling_5d_flow_usd),
-            cme_basis_pct: slow.as_ref().and_then(|value| value.cme_basis_pct),
-        })
-    }
-
-    async fn cached_spot(&mut self, symbol: &str, now: i64) -> Result<CandleSeries> {
-        let refresh_ms =
-            i64::try_from(self.config.slow_market_refresh_seconds).unwrap_or(60) * 1_000;
-        if self
-            .spot_cache
-            .get(symbol)
-            .is_none_or(|cached| now - cached.refreshed_ms >= refresh_ms)
-        {
-            let value = self
-                .klines(
-                    &self.spot_bases(),
-                    "/api/v3/klines",
-                    symbol,
-                    MarketKind::Spot,
+                .and_then(|stream| stream.mark(&symbol))
+                .map(|m| m.mark_price);
+            let value = CrossVenueState {
+                meta: Self::meta(
                     now,
-                )
-                .await?;
-            self.spot_cache.insert(
-                symbol.into(),
+                    i64::try_from(self.config.hyperliquid_refresh_seconds).unwrap_or(60) * 2_000,
+                    "hyperliquid_public_info",
+                    DataQuality::Complete,
+                ),
+                hyper_mark_price: mark,
+                hyper_open_interest_usd: oi,
+                hyper_funding_per_hour: hyper_funding,
+                hyper_premium_pct: premium,
+                binance_funding_per_hour: binance_funding,
+                funding_gap_per_hour: binance_funding.map(|v| hyper_funding - v),
+                mark_premium_pct: binance_mark.filter(|v| *v > 0.0).map(|v| mark / v - 1.0),
+            };
+            self.cross_venue_cache.insert(
+                symbol,
                 CachedValue {
                     refreshed_ms: now,
                     value,
                 },
             );
         }
-        Ok(self
-            .spot_cache
-            .get(symbol)
-            .expect("spot cache inserted above")
-            .value
-            .clone())
-    }
-
-    async fn cached_external(
-        &mut self,
-        symbol: &str,
-        binance_spot: f64,
-        now: i64,
-    ) -> Result<ExternalState> {
-        let refresh_ms =
-            i64::try_from(self.config.slow_market_refresh_seconds).unwrap_or(60) * 1_000;
-        if self
-            .external_cache
-            .get(symbol)
-            .is_none_or(|cached| now - cached.refreshed_ms >= refresh_ms)
-        {
-            let value = self.coinbase_external(symbol, binance_spot, now).await?;
-            self.external_cache.insert(
-                symbol.into(),
-                CachedValue {
-                    refreshed_ms: now,
-                    value,
-                },
-            );
-        }
-        Ok(self
-            .external_cache
-            .get(symbol)
-            .expect("external cache inserted above")
-            .value
-            .clone())
-    }
-
-    fn read_slow_context(&self, symbol: &str, now: i64) -> Option<SlowSymbolContext> {
-        let path = self.config.slow_context_path.as_deref()?;
-        let text = std::fs::read_to_string(path).ok()?;
-        let mut context: SlowContextFile = serde_json::from_str(&text).ok()?;
-        // Confirmed ETF/CME context is slow, but an old value must not live
-        // forever.  Forty-eight hours covers weekends without hiding outages.
-        if now - context.as_of_ms > 48 * 3_600_000 || context.as_of_ms > now + 60_000 {
-            return None;
-        }
-        context.symbols.remove(symbol)
+        self.cross_venue_refreshed_ms = now;
+        Ok(())
     }
     pub async fn fetch_frame(
         &mut self,
@@ -920,45 +890,35 @@ impl BinanceMarketSource {
         let mut instruments = BTreeMap::new();
         let mut warnings = Vec::new();
         self.set_stream_symbols(strategy);
-        for symbol in strategy.majors.iter().chain(strategy.altcoins.iter()) {
-            let major = strategy.majors.contains(symbol);
+        let hyper_refresh_ms =
+            i64::try_from(self.config.hyperliquid_refresh_seconds).unwrap_or(60) * 1_000;
+        if strategy.lanes.cross_venue_crowding_enabled
+            && now - self.cross_venue_refreshed_ms >= hyper_refresh_ms
+        {
+            if let Err(error) = self.refresh_cross_venue(&strategy.symbols, now).await {
+                warnings.push(format!("hyperliquid context: {error}"));
+            }
+        }
+        for symbol in &strategy.symbols {
             let perpetual = match self
                 .streamed_klines(symbol, "15m", 900_000, self.config.candle_limit, now)
                 .await
             {
                 Ok(series) => series,
-                Err(error) if major => {
-                    warnings.push(format!("perpetual klines {symbol}: {error}"));
-                    CandleSeries {
-                        venue: "binance".into(),
-                        market: MarketKind::Perpetual,
-                        interval_ms: 900_000,
-                        meta: Self::meta(now, 0, "binance_ws_kline", DataQuality::Missing),
-                        values: vec![],
-                    }
-                }
                 Err(error) => {
                     warnings.push(format!("perpetual klines {symbol}: {error}"));
                     continue;
                 }
             };
             let price = perpetual.values.last().map(|bar| bar.close).unwrap_or(0.0);
-            let fast_perpetual = if major {
-                None
-            } else {
-                match self.streamed_klines(symbol, "5m", 300_000, 120, now).await {
-                    Ok(value) => Some(value),
-                    Err(error) => {
-                        warnings.push(format!("fast perpetual klines {symbol}: {error}"));
-                        None
-                    }
+            let fast_perpetual = match self.streamed_klines(symbol, "5m", 300_000, 120, now).await {
+                Ok(value) => Some(value),
+                Err(error) => {
+                    warnings.push(format!("fast perpetual klines {symbol}: {error}"));
+                    None
                 }
             };
-            let micro_perpetual = if major {
-                None
-            } else {
-                self.stream_observation_klines(symbol, "1m", 60_000, now)
-            };
+            let micro_perpetual = self.stream_observation_klines(symbol, "1m", 60_000, now);
             let book = self
                 .stream
                 .as_ref()
@@ -966,8 +926,19 @@ impl BinanceMarketSource {
             if book.as_ref().is_none_or(|value| !value.meta.usable_at(now)) {
                 warnings.push(format!("websocket depth stale or missing {symbol}"));
             }
+            let microstructure = self
+                .stream
+                .as_ref()
+                .and_then(|stream| stream.microstructure(symbol, now));
+            let liquidation_burst = microstructure.as_ref().is_some_and(|value| {
+                value.long_liquidations_60s + value.short_liquidations_60s
+                    >= strategy.lanes.liquidation_min_notional_usd
+            });
             let derivatives = if price > 0.0 {
-                match self.cached_derivatives(symbol, price, now).await {
+                match self
+                    .cached_derivatives(symbol, price, now, liquidation_burst)
+                    .await
+                {
                     Ok(value) => Some(value),
                     Err(error) => {
                         warnings.push(format!("derivatives {symbol}: {error}"));
@@ -977,51 +948,22 @@ impl BinanceMarketSource {
             } else {
                 None
             };
-            let (spot, book, derivatives, external) = if major {
-                let spot = match self.cached_spot(symbol, now).await {
-                    Ok(value) => Some(value),
-                    Err(error) => {
-                        warnings.push(format!("spot klines {symbol}: {error}"));
-                        None
-                    }
-                };
-                let spot_price = spot
-                    .as_ref()
-                    .and_then(|series| series.values.last())
-                    .map(|bar| bar.close)
-                    .unwrap_or(price);
-                let external = if spot_price > 0.0 {
-                    match self.cached_external(symbol, spot_price, now).await {
-                        Ok(value) => Some(value),
-                        Err(error) => {
-                            warnings.push(format!("external {symbol}: {error}"));
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-                (spot, book, derivatives, external)
-            } else {
-                (None, book, derivatives, None)
-            };
+            let cross_venue = self
+                .cross_venue_cache
+                .get(symbol)
+                .map(|cached| cached.value.clone());
             instruments.insert(
                 symbol.clone(),
                 InstrumentFrame {
                     symbol: symbol.clone(),
-                    asset_class: if major {
-                        AssetClass::Major
-                    } else {
-                        AssetClass::Altcoin
-                    },
                     price,
-                    spot,
                     perpetual,
                     fast_perpetual,
                     micro_perpetual,
                     book,
                     derivatives,
-                    external,
+                    microstructure,
+                    cross_venue,
                 },
             );
         }

@@ -1,7 +1,7 @@
 use crate::{primitives::meta, RiskConfig};
 use greed_kernel::{
-    Artifact, ArtifactRecord, AssetClass, DataQuality, NodeContext, PositionPlan, StateArtifact,
-    StrategyNode, Verdict,
+    Artifact, ArtifactRecord, DataQuality, NodeContext, PositionPlan, StateArtifact, StrategyNode,
+    Verdict,
 };
 use std::collections::BTreeMap;
 
@@ -20,33 +20,6 @@ impl PositionPlannerNode {
     }
 }
 
-fn candidate_size_multiplier(config: &RiskConfig, tags: &BTreeMap<String, String>) -> f64 {
-    if matches!(
-        tags.get("stop_profile").map(String::as_str),
-        Some("alt_outlier" | "alt_intraday")
-    ) {
-        let anchor = match tags.get("anchor_context").map(String::as_str) {
-            Some("opposed") => config.alt_outlier_opposed_size_multiplier,
-            Some("neutral") => config.alt_outlier_neutral_size_multiplier,
-            _ => 1.0,
-        };
-        let breadth = match tags.get("breadth_context").map(String::as_str) {
-            Some("opposed") => config.alt_outlier_breadth_opposed_size_multiplier,
-            Some("neutral") => config.alt_outlier_breadth_neutral_size_multiplier,
-            _ => 1.0,
-        };
-        let regime = match tags.get("market_regime").map(String::as_str) {
-            Some("shock") => config.alt_shock_regime_size_multiplier,
-            _ => 1.0,
-        };
-        anchor * breadth * regime
-    } else if tags.get("anchor_confirmation").map(String::as_str) == Some("neutral") {
-        config.alt_neutral_anchor_size_multiplier
-    } else {
-        1.0
-    }
-}
-
 impl StrategyNode for PositionPlannerNode {
     fn id(&self) -> &str {
         &self.id
@@ -55,48 +28,39 @@ impl StrategyNode for PositionPlannerNode {
         &self.dependencies
     }
     fn evaluate(&mut self, ctx: &NodeContext<'_>) -> Result<Vec<ArtifactRecord>, String> {
-        let daily_loss = ((ctx.frame.account.risk_day_start_equity_usd
-            - ctx.frame.account.equity_usd)
-            / ctx.frame.account.risk_day_start_equity_usd.max(1.0))
+        let a = &ctx.frame.account;
+        let daily = ((a.risk_day_start_equity_usd - a.equity_usd)
+            / a.risk_day_start_equity_usd.max(1.0))
         .max(0.0);
-        let drawdown = (ctx.frame.account.peak_equity_usd - ctx.frame.account.equity_usd)
-            / ctx.frame.account.peak_equity_usd.max(1.0);
-        let risk_halted = daily_loss >= self.config.daily_loss_limit_pct
-            || drawdown >= self.config.peak_drawdown_halt_pct;
-        let existing_gross =
-            ctx.frame.account.gross_exposure_usd / ctx.frame.account.equity_usd.max(1.0);
-        let mut major_gross =
-            ctx.frame.account.major_gross_exposure_usd / ctx.frame.account.equity_usd.max(1.0);
-        let mut alt_gross =
-            ctx.frame.account.alt_gross_exposure_usd / ctx.frame.account.equity_usd.max(1.0);
-        let mut metrics = BTreeMap::new();
-        metrics.insert("daily_loss_pct".into(), daily_loss);
-        metrics.insert("peak_drawdown_pct".into(), drawdown);
-        metrics.insert("gross_exposure_multiple".into(), existing_gross);
-        metrics.insert("major_gross_multiple".into(), major_gross);
-        metrics.insert("alt_gross_multiple".into(), alt_gross);
-        metrics.insert(
-            "open_positions".into(),
-            ctx.frame.account.open_positions as f64,
-        );
+        let dd = ((a.peak_equity_usd - a.equity_usd) / a.peak_equity_usd.max(1.0)).max(0.0);
+        let gross = a.gross_exposure_usd / a.equity_usd.max(1.0);
+        let halted = daily >= self.config.daily_loss_limit_pct
+            || dd >= self.config.peak_drawdown_halt_pct
+            || a.open_positions >= self.config.max_positions
+            || gross >= self.config.max_total_gross_multiple;
         let mut out = vec![ArtifactRecord {
             key: "portfolio.risk".into(),
             producer: self.id.clone(),
             artifact: Artifact::State(StateArtifact {
-                state: if risk_halted { "halted" } else { "open" }.into(),
-                score: daily_loss.max(drawdown).max(existing_gross),
+                state: if halted { "halted" } else { "open" }.into(),
+                score: daily.max(dd).max(gross),
                 side: None,
-                verdict: if risk_halted {
+                verdict: if halted {
                     Verdict::Block
                 } else {
                     Verdict::Pass
                 },
-                reasons: if risk_halted {
-                    vec!["daily loss or peak drawdown circuit breaker is active".into()]
+                reasons: if halted {
+                    vec!["daily loss, peak drawdown, position count, or gross exposure limit is active".into()]
                 } else {
                     vec![]
                 },
-                metrics,
+                metrics: BTreeMap::from([
+                    ("daily_loss_pct".into(), daily),
+                    ("peak_drawdown_pct".into(), dd),
+                    ("gross_exposure_multiple".into(), gross),
+                    ("open_positions".into(), a.open_positions as f64),
+                ]),
                 meta: meta(
                     ctx.frame.as_of_ms,
                     90_000,
@@ -106,198 +70,80 @@ impl StrategyNode for PositionPlannerNode {
                 ),
             }),
         }];
-        if risk_halted || existing_gross >= self.config.max_total_gross {
+        if halted {
             return Ok(out);
         }
         let mut candidates: Vec<_> = ctx
             .artifacts
             .values()
-            .filter_map(|record| record.artifact.candidate())
-            .filter(|candidate| {
-                candidate.verdict == Verdict::Pass && candidate.expires_ms >= ctx.frame.as_of_ms
-            })
+            .filter_map(|r| r.artifact.candidate())
+            .filter(|c| c.verdict == Verdict::Pass && c.expires_ms >= ctx.frame.as_of_ms)
             .collect();
         candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
-        let mut gross = existing_gross;
-        for candidate in candidates {
-            let Some(instrument) = ctx.frame.instrument(&candidate.symbol) else {
+        let mut planned_gross = gross;
+        let mut slots = self.config.max_positions.saturating_sub(a.open_positions);
+        for c in candidates {
+            if slots == 0 {
+                break;
+            }
+            let Some(i) = ctx.frame.instrument(&c.symbol) else {
                 continue;
             };
-            let fast_required =
-                candidate.tags.get("stop_profile").map(String::as_str) == Some("alt_intraday");
-            let market_fresh = instrument.perpetual.meta.usable_at(ctx.frame.as_of_ms)
-                && instrument
-                    .book
-                    .as_ref()
-                    .is_some_and(|book| book.meta.usable_at(ctx.frame.as_of_ms))
-                && (!fast_required
-                    || instrument
-                        .fast_perpetual
-                        .as_ref()
-                        .is_some_and(|series| series.meta.usable_at(ctx.frame.as_of_ms)));
-            if !market_fresh {
+            let market_ok = i
+                .book
+                .as_ref()
+                .is_some_and(|b| b.meta.usable_at(ctx.frame.as_of_ms))
+                && i.perpetual.meta.usable_at(ctx.frame.as_of_ms);
+            if !market_ok {
                 continue;
             }
-            let base_per_trade = if instrument.asset_class == AssetClass::Major {
-                self.config.major_gross_per_trade
-            } else if candidate.tags.get("stop_profile").map(String::as_str) == Some("alt_intraday")
-            {
-                self.config.alt_intraday_gross_per_trade
-            } else if candidate.tags.get("stop_profile").map(String::as_str) == Some("alt_outlier")
-            {
-                self.config.alt_outlier_gross_per_trade
+            let risk_pct = if c.confidence >= self.config.high_confidence_threshold {
+                self.config.high_confidence_risk_per_trade_pct
             } else {
-                self.config.alt_gross_per_trade
+                self.config.risk_per_trade_pct
             };
-            let neutral_anchor = candidate
-                .tags
-                .get("anchor_confirmation")
-                .map(String::as_str)
-                == Some("neutral");
-            let direction_multiplier = if instrument.asset_class == AssetClass::Major
-                && candidate.side == greed_kernel::Side::Sell
-            {
-                self.config.major_short_size_multiplier
-            } else {
-                1.0
-            };
-            let per_trade = base_per_trade
-                * direction_multiplier
-                * candidate_size_multiplier(&self.config, &candidate.tags);
-            let bucket_has_room = match instrument.asset_class {
-                AssetClass::Major => major_gross + per_trade <= self.config.major_max_gross,
-                AssetClass::Altcoin => alt_gross + per_trade <= self.config.alt_max_gross,
-            };
-            if gross + per_trade > self.config.max_total_gross + f64::EPSILON {
+            let notional = (a.equity_usd * risk_pct / self.config.initial_stop_pct)
+                .min(a.equity_usd * self.config.max_notional_per_trade_multiple);
+            let multiple = notional / a.equity_usd.max(1.0);
+            if planned_gross + multiple > self.config.max_total_gross_multiple + f64::EPSILON {
                 continue;
             }
-            if !bucket_has_room {
-                continue;
+            planned_gross += multiple;
+            slots -= 1;
+            let sign = c.side.sign();
+            let stop = c.reference_price * (1.0 - sign * self.config.initial_stop_pct);
+            let tp1 = c.reference_price
+                * (1.0 + sign * self.config.initial_stop_pct * self.config.first_take_profit_r);
+            let mut take_profit_prices = vec![(tp1, self.config.first_take_profit_fraction)];
+            if self.config.runner_take_profit_r > 0.0 {
+                let runner = c.reference_price
+                    * (1.0
+                        + sign * self.config.initial_stop_pct * self.config.runner_take_profit_r);
+                take_profit_prices.push((runner, 1.0 - self.config.first_take_profit_fraction));
             }
-            gross += per_trade;
-            match instrument.asset_class {
-                AssetClass::Major => major_gross += per_trade,
-                AssetClass::Altcoin => alt_gross += per_trade,
-            }
-            let stop_pct = if neutral_anchor {
-                self.config.alt_neutral_anchor_stop_pct
-            } else {
-                match candidate.tags.get("stop_profile").map(String::as_str) {
-                    Some("exhaustion") => self.config.initial_stop_pct * 0.75,
-                    Some("alt_shock") => self.config.initial_stop_pct * 1.5,
-                    Some("alt_outlier") => self.config.alt_outlier_stop_pct,
-                    Some("alt_intraday") => self.config.alt_intraday_stop_pct,
-                    Some("alt_cross") => self.config.alt_cross_stop_pct,
-                    _ => self.config.initial_stop_pct,
-                }
-            };
-            let legacy_take_profit_pct = if neutral_anchor {
-                self.config.alt_neutral_anchor_take_profit_pct
-            } else {
-                match candidate.tags.get("stop_profile").map(String::as_str) {
-                    Some("alt_outlier") => self.config.alt_outlier_take_profit_pct,
-                    Some("alt_cross") => self.config.alt_cross_take_profit_pct,
-                    _ => self.config.first_take_profit_pct,
-                }
-            };
-            let stop_price = candidate.reference_price * (1.0 - candidate.side.sign() * stop_pct);
-            let risk_distance = stop_pct;
-            let target = |r_multiple: f64| {
-                candidate.reference_price
-                    * (1.0 + candidate.side.sign() * risk_distance * r_multiple)
-            };
-            let runner_fraction =
-                (1.0 - self.config.risk_shield_fraction - self.config.second_take_profit_fraction)
-                    .max(0.0);
-            let take_profit_prices = if runner_fraction > f64::EPSILON {
-                vec![
-                    (
-                        target(self.config.risk_shield_r_multiple),
-                        self.config.risk_shield_fraction,
-                    ),
-                    (
-                        target(self.config.second_take_profit_r_multiple),
-                        self.config.second_take_profit_fraction,
-                    ),
-                    (
-                        target(self.config.runner_take_profit_r_multiple),
-                        runner_fraction,
-                    ),
-                ]
-            } else {
-                vec![(
-                    candidate.reference_price
-                        * (1.0 + candidate.side.sign() * legacy_take_profit_pct),
-                    1.0,
-                )]
-            };
-            let max_hold_minutes = if neutral_anchor {
-                self.config.alt_neutral_anchor_max_hold_minutes
-            } else {
-                match candidate.tags.get("hold_profile").map(String::as_str) {
-                    Some("alt_outlier") => self.config.alt_outlier_max_hold_minutes,
-                    Some("alt_intraday") => self.config.alt_intraday_max_hold_minutes,
-                    Some("alt_cross") => self.config.alt_cross_max_hold_minutes,
-                    _ => self.config.max_hold_minutes,
-                }
-            };
             let plan = PositionPlan {
-                candidate_id: candidate.id.clone(),
-                symbol: candidate.symbol.clone(),
-                side: candidate.side,
-                reference_price: candidate.reference_price,
-                notional_usd: ctx.frame.account.equity_usd * per_trade,
+                candidate_id: c.id.clone(),
+                symbol: c.symbol.clone(),
+                side: c.side,
+                reference_price: c.reference_price,
+                notional_usd: notional,
                 entry_limit: None,
-                stop_price,
+                stop_price: stop,
                 take_profit_prices,
-                break_even_after_fraction: Some(self.config.risk_shield_fraction),
-                break_even_buffer_pct: self.config.break_even_cost_buffer_pct,
-                trailing_activation_pct: Some(self.config.trailing_activation_pct),
+                break_even_after_fraction: Some(self.config.first_take_profit_fraction),
+                break_even_buffer_pct: self.config.break_even_buffer_pct,
+                trailing_activation_pct: Some(
+                    self.config.initial_stop_pct * self.config.first_take_profit_r,
+                ),
                 trailing_distance_pct: Some(self.config.trailing_distance_pct),
-                max_hold_ms: max_hold_minutes as i64 * 60_000,
+                max_hold_ms: i64::from(self.config.max_hold_minutes) * 60_000,
             };
             out.push(ArtifactRecord {
-                key: format!("plan.{}", candidate.id),
+                key: format!("plan.{}", c.id),
                 producer: self.id.clone(),
                 artifact: Artifact::PositionPlan(plan),
             });
         }
         Ok(out)
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn neutral_btc_anchor_reduces_altcoin_candidate_size() {
-        let config = RiskConfig::default();
-        let neutral = BTreeMap::from([("anchor_confirmation".into(), "neutral".into())]);
-        let confirmed = BTreeMap::from([("anchor_confirmation".into(), "confirmed".into())]);
-
-        assert_eq!(candidate_size_multiplier(&config, &neutral), 0.60);
-        assert_eq!(candidate_size_multiplier(&config, &confirmed), 1.0);
-    }
-
-    #[test]
-    fn outlier_candidate_uses_market_context_only_as_a_size_modifier() {
-        let config = RiskConfig::default();
-        let opposed = BTreeMap::from([
-            ("stop_profile".into(), "alt_outlier".into()),
-            ("anchor_context".into(), "opposed".into()),
-        ]);
-        let neutral = BTreeMap::from([
-            ("stop_profile".into(), "alt_outlier".into()),
-            ("anchor_context".into(), "neutral".into()),
-        ]);
-        assert_eq!(candidate_size_multiplier(&config, &opposed), 0.50);
-        assert_eq!(candidate_size_multiplier(&config, &neutral), 0.75);
-        let double_opposed = BTreeMap::from([
-            ("stop_profile".into(), "alt_outlier".into()),
-            ("anchor_context".into(), "opposed".into()),
-            ("breadth_context".into(), "opposed".into()),
-        ]);
-        assert_eq!(candidate_size_multiplier(&config, &double_opposed), 0.175);
     }
 }

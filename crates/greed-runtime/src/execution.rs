@@ -1,6 +1,6 @@
 use crate::config::{ExecutionConfig, PortfolioConfig};
 use anyhow::{anyhow, Context, Result};
-use greed_kernel::{AccountFrame, Artifact, AssetClass, GraphEvaluation, MarketFrame, Side};
+use greed_kernel::{AccountFrame, Artifact, GraphEvaluation, MarketFrame, Side};
 use greed_strategy::RiskConfig;
 use hmac::{Hmac, Mac};
 use reqwest::{Client, Method};
@@ -42,7 +42,6 @@ struct SymbolRules {
 struct ExecutionMeta {
     candidate_id: String,
     recipe: String,
-    asset_class: AssetClass,
     side: Side,
     entry_ms: i64,
     #[serde(default)]
@@ -102,7 +101,6 @@ struct ExecutionOutcome {
 pub struct DemoPositionSnapshot {
     pub candidate_id: String,
     pub recipe: String,
-    pub asset_class: AssetClass,
     pub symbol: String,
     pub side: Side,
     pub entry_ms: i64,
@@ -148,7 +146,6 @@ pub struct BinanceDemoExecution {
     state_path: String,
     state: DemoState,
     account: Option<RemoteAccount>,
-    majors: BTreeSet<String>,
     last_error: Option<String>,
     last_sync_ms: Option<i64>,
     performance_epoch_reset: bool,
@@ -160,7 +157,6 @@ impl BinanceDemoExecution {
         portfolio: PortfolioConfig,
         risk: RiskConfig,
         state_path: String,
-        majors: &[String],
         proxy: Option<&str>,
     ) -> Result<Self> {
         let api_key = env::var(&config.api_key_env)
@@ -193,7 +189,6 @@ impl BinanceDemoExecution {
             state_path,
             state,
             account: None,
-            majors: majors.iter().cloned().collect(),
             last_error: None,
             last_sync_ms: None,
             performance_epoch_reset,
@@ -307,6 +302,7 @@ impl BinanceDemoExecution {
                     .iter()
                     .filter(|(symbol, meta)| {
                         !meta.exit_requested
+                            && meta.max_hold_ms > 0
                             && now_ms - meta.entry_ms >= meta.max_hold_ms
                             && account.positions.contains_key(*symbol)
                     })
@@ -358,7 +354,6 @@ impl BinanceDemoExecution {
                             meta.entry_ms,
                             meta.candidate_id.clone(),
                             meta.recipe.clone(),
-                            meta.asset_class,
                             meta.side,
                         ))
                     })
@@ -370,7 +365,6 @@ impl BinanceDemoExecution {
                     entry_ms,
                     candidate_id,
                     recipe,
-                    asset_class,
                     side,
                 ) in partial_exits
                 {
@@ -394,7 +388,6 @@ impl BinanceDemoExecution {
                             "ts_ms":now_ms,
                             "candidate_id":candidate_id,
                             "recipe":recipe,
-                            "asset_class":asset_class,
                             "symbol":symbol,
                             "side":side,
                             "reason":"staged_take_profit",
@@ -540,9 +533,15 @@ impl BinanceDemoExecution {
                     .keys()
                     .filter(|symbol| {
                         self.state.positions.contains_key(*symbol)
-                            && !protected
-                                .get(*symbol)
-                                .is_some_and(|(stop, take)| *stop && *take)
+                            && !protected.get(*symbol).is_some_and(|(stop, take)| {
+                                *stop
+                                    && (*take
+                                        || self.state.positions.get(*symbol).is_some_and(|meta| {
+                                            meta.break_even_armed
+                                                || meta.last_observed_quantity
+                                                    < meta.initial_quantity - f64::EPSILON
+                                        }))
+                            })
                     })
                     .cloned()
                     .collect();
@@ -613,7 +612,6 @@ impl BinanceDemoExecution {
                                 "ts_ms": chrono::Utc::now().timestamp_millis(),
                                 "candidate_id": meta.candidate_id,
                                 "recipe": meta.recipe,
-                                "asset_class": meta.asset_class,
                                 "symbol": symbol,
                                 "side": meta.side,
                                 "exit_price": summary.as_ref().map(|value| value.0),
@@ -661,25 +659,18 @@ impl BinanceDemoExecution {
         }
         let peak = self.state.peak_equity_usd.unwrap_or(equity).max(equity);
         self.state.peak_equity_usd = Some(peak);
-        let mut major_gross = 0.0;
-        let mut alt_gross = 0.0;
-        for position in account.positions.values() {
-            let notional = position.quantity.abs() * position.mark_price;
-            if self.majors.contains(&position.symbol) {
-                major_gross += notional;
-            } else {
-                alt_gross += notional;
-            }
-        }
+        let gross = account
+            .positions
+            .values()
+            .map(|position| position.quantity.abs() * position.mark_price)
+            .sum();
         Ok(AccountFrame {
             equity_usd: equity,
             cash_usd: self.portfolio.initial_equity_usd + account.available_balance - baseline,
             realized_pnl_usd: realized,
             peak_equity_usd: peak,
             risk_day_start_equity_usd: self.state.risk_day_start_equity_usd.unwrap_or(equity),
-            gross_exposure_usd: major_gross + alt_gross,
-            major_gross_exposure_usd: major_gross,
-            alt_gross_exposure_usd: alt_gross,
+            gross_exposure_usd: gross,
             open_positions: account.positions.len(),
         })
     }
@@ -733,14 +724,9 @@ impl BinanceDemoExecution {
 
     pub fn recipe_gate_snapshots(&self, now_ms: i64) -> BTreeMap<String, RecipeGateStatus> {
         [
-            "major_trend_pullback",
-            "major_exhaustion_reversal",
-            "alt_outlier_continuation",
-            "alt_outlier_pullback_reclaim",
-            "alt_early_impulse",
-            "alt_cross_section_momentum",
-            "alt_cross_section_probe",
-            "alt_shock_reversal",
+            "trend_continuation",
+            "liquidation_impulse",
+            "cross_venue_crowding",
         ]
         .into_iter()
         .flat_map(|recipe| {
@@ -783,11 +769,6 @@ impl BinanceDemoExecution {
                         recipe: meta
                             .map(|value| value.recipe.clone())
                             .unwrap_or_else(|| "external".into()),
-                        asset_class: if self.majors.contains(symbol) {
-                            AssetClass::Major
-                        } else {
-                            AssetClass::Altcoin
-                        },
                         symbol: symbol.clone(),
                         side: position.side,
                         entry_ms: meta.map(|value| value.entry_ms).unwrap_or_default(),
@@ -860,27 +841,21 @@ impl BinanceDemoExecution {
                 });
                 continue;
             }
-            let asset_class = frame
-                .instrument(&plan.symbol)
-                .map(|value| value.asset_class)
-                .unwrap_or(AssetClass::Altcoin);
-            let probe = asset_class == AssetClass::Altcoin
-                && (performance_gate.completed_trades < self.risk.rolling_pf_min_trades
-                    || performance_gate.next_probe_ms.is_some());
+            let probe = performance_gate.completed_trades < self.risk.rolling_pf_min_trades
+                || performance_gate.next_probe_ms.is_some();
             let size_multiplier = if probe {
                 self.risk.rolling_pf_probe_size_multiplier
             } else {
                 1.0
             };
             match self.place_bracket(plan, size_multiplier).await {
-                Ok((entry_price, quantity, order_id)) => {
+                Ok((entry_price, quantity, order_id, stop_price, take_profit_prices)) => {
                     self.state.seen.insert(plan.candidate_id.clone());
                     self.state.positions.insert(
                         plan.symbol.clone(),
                         ExecutionMeta {
                             candidate_id: plan.candidate_id.clone(),
                             recipe: recipe.clone(),
-                            asset_class,
                             side: plan.side,
                             entry_ms: frame.as_of_ms,
                             entry_price,
@@ -888,9 +863,12 @@ impl BinanceDemoExecution {
                             last_observed_quantity: quantity,
                             cumulative_reported_fee_usd: 0.0,
                             cumulative_reported_pnl_usd: 0.0,
-                            stop_price: plan.stop_price,
-                            take_profit_price: plan.take_profit_prices.last().map(|value| value.0).unwrap_or_default(),
-                            take_profit_prices: plan.take_profit_prices.clone(),
+                            stop_price,
+                            take_profit_price: take_profit_prices
+                                .last()
+                                .map(|value| value.0)
+                                .unwrap_or_default(),
+                            take_profit_prices,
                             break_even_after_fraction: plan.break_even_after_fraction.map(|fraction| {
                                 self.rules
                                     .get(&plan.symbol)
@@ -919,12 +897,12 @@ impl BinanceDemoExecution {
                         .and_then(|value| value.parse::<i64>().ok());
                     events.push(ExchangeEvent {
                         kind: "exchange_entry".into(),
-                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"asset_class":asset_class,"symbol":plan.symbol,"side":plan.side,"entry_price":entry_price,"quantity":quantity,"notional_usd":plan.notional_usd * size_multiplier,"probe_size_multiplier":size_multiplier,"order_id":order_id,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
+                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"entry_price":entry_price,"quantity":quantity,"notional_usd":plan.notional_usd * size_multiplier,"probe_size_multiplier":size_multiplier,"order_id":order_id,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
                     });
                 }
                 Err(error) => events.push(ExchangeEvent {
                     kind: "exchange_order_rejected".into(),
-                    payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"asset_class":asset_class,"symbol":plan.symbol,"side":plan.side,"reason":error.to_string(),"venue":"binance_demo","paper_only":true}),
+                    payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"reason":error.to_string(),"venue":"binance_demo","paper_only":true}),
                 }),
             }
         }
@@ -935,7 +913,7 @@ impl BinanceDemoExecution {
         &self,
         plan: &greed_kernel::PositionPlan,
         size_multiplier: f64,
-    ) -> Result<(f64, f64, i64)> {
+    ) -> Result<(f64, f64, i64, f64, Vec<(f64, f64)>)> {
         let rules = self
             .rules
             .get(&plan.symbol)
@@ -949,14 +927,13 @@ impl BinanceDemoExecution {
                 "order is below Binance quantity or notional minimum"
             ));
         }
-        if plan.take_profit_prices.len() < 2 {
-            return Err(anyhow!("position plan requires staged take profits"));
+        if plan.take_profit_prices.is_empty() {
+            return Err(anyhow!("position plan requires at least one take profit"));
         }
-        for (_, fraction) in plan
-            .take_profit_prices
-            .iter()
-            .take(plan.take_profit_prices.len() - 1)
-        {
+        for (_, fraction) in &plan.take_profit_prices {
+            if *fraction >= 1.0 - f64::EPSILON {
+                continue;
+            }
             let partial = floor_step(quantity * fraction, rules.quantity_step);
             if partial < rules.min_quantity || partial * plan.reference_price < rules.min_notional {
                 return Err(anyhow!(
@@ -964,6 +941,16 @@ impl BinanceDemoExecution {
                 ));
             }
         }
+        self.signed(
+            Method::POST,
+            "/fapi/v1/leverage",
+            vec![
+                ("symbol".into(), plan.symbol.clone()),
+                ("leverage".into(), self.config.leverage.to_string()),
+            ],
+        )
+        .await
+        .with_context(|| format!("set {} leverage to {}x", plan.symbol, self.config.leverage))?;
         let client_id = client_order_id("entry", &plan.candidate_id);
         let entry = self
             .submit_or_lookup(
@@ -984,19 +971,35 @@ impl BinanceDemoExecution {
             .filter(|value| *value > 0.0)
             .unwrap_or(plan.reference_price);
         let order_id = entry["orderId"].as_i64().unwrap_or_default();
+        // Preserve the planned risk/reward distances from the actual exchange
+        // fill. A fast market can move between signal construction and fill;
+        // anchoring protection to the stale reference would silently change
+        // both the dollar risk and the take-profit geometry.
+        let sign = plan.side.sign();
+        let stop_distance = sign * (plan.reference_price - plan.stop_price)
+            / plan.reference_price.max(f64::EPSILON);
+        let stop_price = entry_price * (1.0 - sign * stop_distance);
+        let take_profit_prices: Vec<_> = plan
+            .take_profit_prices
+            .iter()
+            .map(|(target, fraction)| {
+                let distance = sign * (*target / plan.reference_price.max(f64::EPSILON) - 1.0);
+                (entry_price * (1.0 + sign * distance), *fraction)
+            })
+            .collect();
         let protective = async {
             self.place_close_all_trigger(
                 &plan.symbol,
                 plan.side.opposite(),
                 "STOP_MARKET",
-                plan.stop_price,
+                stop_price,
                 rules,
                 client_order_id("stop", &plan.candidate_id),
             )
             .await?;
-            for (index, (take_profit, fraction)) in plan.take_profit_prices.iter().enumerate() {
-                let last = index + 1 == plan.take_profit_prices.len();
-                if last {
+            for (index, (take_profit, fraction)) in take_profit_prices.iter().enumerate() {
+                let last = index + 1 == take_profit_prices.len();
+                if last && *fraction >= 1.0 - f64::EPSILON {
                     self.place_close_all_trigger(
                         &plan.symbol,
                         plan.side.opposite(),
@@ -1042,7 +1045,13 @@ impl BinanceDemoExecution {
                 "protective order failed; entry was immediately closed: {error}"
             ));
         }
-        Ok((entry_price, executed, order_id))
+        Ok((
+            entry_price,
+            executed,
+            order_id,
+            stop_price,
+            take_profit_prices,
+        ))
     }
 
     async fn place_close_all_trigger(
@@ -1250,6 +1259,7 @@ impl BinanceDemoExecution {
             "last_sync_ms": self.last_sync_ms,
             "last_error": self.last_error,
             "remote_matching": true,
+            "leverage": self.config.leverage,
             "performance_epoch": self.state.performance_epoch,
             "performance_epoch_reset": self.performance_epoch_reset,
         })

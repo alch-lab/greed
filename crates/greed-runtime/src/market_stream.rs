@@ -1,6 +1,8 @@
 use anyhow::{anyhow, Context, Result};
 use futures_util::{SinkExt, StreamExt};
-use greed_kernel::{BookState, Candle, DataQuality, ObservationMeta, PriceLevel};
+use greed_kernel::{
+    BookState, Candle, DataQuality, MicrostructureState, ObservationMeta, PriceLevel,
+};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
@@ -68,6 +70,8 @@ struct StreamState {
     candle_update_ms: BTreeMap<(String, String), i64>,
     books: BTreeMap<String, BookState>,
     marks: BTreeMap<String, StreamMark>,
+    trades: BTreeMap<String, VecDeque<(i64, bool, f64)>>,
+    liquidations: BTreeMap<String, VecDeque<(i64, bool, f64)>>,
     telemetry: StreamTelemetry,
 }
 
@@ -139,6 +143,51 @@ impl MarketStreamHub {
             .cloned()
     }
 
+    pub fn microstructure(&self, symbol: &str, now_ms: i64) -> Option<MicrostructureState> {
+        let symbol = symbol.to_uppercase();
+        let state = self.state.read().expect("stream state poisoned");
+        let trades = state.trades.get(&symbol)?;
+        let mut buy = 0.0;
+        let mut sell = 0.0;
+        for (_, is_buy, notional) in trades.iter().filter(|(ts, _, _)| *ts >= now_ms - 60_000) {
+            if *is_buy {
+                buy += notional
+            } else {
+                sell += notional
+            }
+        }
+        let mut long_liq = 0.0;
+        let mut short_liq = 0.0;
+        if let Some(values) = state.liquidations.get(&symbol) {
+            for (_, is_long, notional) in values.iter().filter(|(ts, _, _)| *ts >= now_ms - 60_000)
+            {
+                if *is_long {
+                    long_liq += notional
+                } else {
+                    short_liq += notional
+                }
+            }
+        }
+        let latest = trades.back().map(|value| value.0).unwrap_or_default();
+        Some(MicrostructureState {
+            meta: ObservationMeta {
+                event_ms: latest,
+                received_ms: latest,
+                expires_ms: latest + STREAM_TTL_MS,
+                source: "binance_ws_agg_trade_force_order".into(),
+                quality: if now_ms - latest <= STREAM_TTL_MS {
+                    DataQuality::Complete
+                } else {
+                    DataQuality::Stale
+                },
+            },
+            buy_notional_60s: buy,
+            sell_notional_60s: sell,
+            long_liquidations_60s: long_liq,
+            short_liquidations_60s: short_liq,
+        })
+    }
+
     pub fn telemetry(&self) -> StreamTelemetry {
         let state = self.state.read().expect("stream state poisoned");
         let mut telemetry = state.telemetry.clone();
@@ -157,7 +206,7 @@ async fn run_supervisor(
     mut symbols: watch::Receiver<Vec<String>>,
 ) {
     let radar_url = format!(
-        "{}/market/stream?streams=!ticker@arr",
+        "{}/stream?streams=!ticker@arr",
         base_url.trim_end_matches('/')
     );
     tokio::spawn(run_connection(
@@ -219,8 +268,17 @@ enum StreamRoute {
 async fn run_connection(route: StreamRoute, url: String, state: Arc<RwLock<StreamState>>) {
     let mut backoff = 1u64;
     loop {
-        match connect_async(&url).await {
-            Ok((stream, _)) => {
+        match tokio::time::timeout(Duration::from_secs(10), connect_async(&url)).await {
+            Err(_) => {
+                set_connected(
+                    &state,
+                    route,
+                    false,
+                    Some("websocket connect timed out after 10 seconds".into()),
+                );
+                warn!(url=%url, "Binance market websocket connection timed out");
+            }
+            Ok(Ok((stream, _))) => {
                 set_connected(&state, route, true, None);
                 backoff = 1;
                 let (mut writer, mut reader) = stream.split();
@@ -247,7 +305,7 @@ async fn run_connection(route: StreamRoute, url: String, state: Arc<RwLock<Strea
                 }
                 set_connected(&state, route, false, Some("websocket disconnected".into()));
             }
-            Err(error) => {
+            Ok(Err(error)) => {
                 set_connected(&state, route, false, Some(error.to_string()));
                 warn!(error=%error, "Binance market websocket connection failed");
             }
@@ -266,14 +324,14 @@ fn market_url(base: &str, symbols: &[String]) -> String {
     for symbol in symbols {
         let symbol = symbol.to_lowercase();
         streams.push(format!("{symbol}@kline_15m"));
+        streams.push(format!("{symbol}@kline_5m"));
+        streams.push(format!("{symbol}@kline_1m"));
         streams.push(format!("{symbol}@markPrice@1s"));
-        if symbol != "btcusdt" && symbol != "ethusdt" {
-            streams.push(format!("{symbol}@kline_5m"));
-            streams.push(format!("{symbol}@kline_1m"));
-        }
+        streams.push(format!("{symbol}@aggTrade"));
+        streams.push(format!("{symbol}@forceOrder"));
     }
     format!(
-        "{}/market/stream?streams={}",
+        "{}/stream?streams={}",
         base.trim_end_matches('/'),
         streams.join("/")
     )
@@ -285,10 +343,7 @@ fn public_url(base: &str, symbols: &[String]) -> String {
         .map(|symbol| format!("{}@depth20@1000ms", symbol.to_lowercase()))
         .collect::<Vec<_>>()
         .join("/");
-    format!(
-        "{}/public/stream?streams={streams}",
-        base.trim_end_matches('/')
-    )
+    format!("{}/stream?streams={streams}", base.trim_end_matches('/'))
 }
 
 fn handle_payload(
@@ -323,6 +378,8 @@ fn handle_payload(
     match payload.get("e").and_then(Value::as_str) {
         Some("kline") => update_kline(state, payload, received_ms),
         Some("markPriceUpdate") => update_mark(state, payload, received_ms),
+        Some("aggTrade") => update_trade(state, payload, received_ms),
+        Some("forceOrder") => update_liquidation(state, payload, received_ms),
         Some("24hrTicker") => update_ticker(state, payload, received_ms),
         _ if (payload.get("b").is_some() || payload.get("bids").is_some())
             && (payload.get("a").is_some() || payload.get("asks").is_some()) =>
@@ -331,6 +388,58 @@ fn handle_payload(
         }
         _ => Ok(()),
     }
+}
+
+fn update_trade(state: &Arc<RwLock<StreamState>>, value: &Value, received_ms: i64) -> Result<()> {
+    let symbol = string(value, "s")?.to_uppercase();
+    let notional = number(value, "p")? * number(value, "q")?;
+    let is_taker_buy = !value.get("m").and_then(Value::as_bool).unwrap_or(false);
+    let event_ms = value
+        .get("T")
+        .and_then(Value::as_i64)
+        .unwrap_or(received_ms);
+    let mut state = state.write().expect("stream state poisoned");
+    let values = state.trades.entry(symbol).or_default();
+    values.push_back((event_ms, is_taker_buy, notional));
+    while values
+        .front()
+        .is_some_and(|(ts, _, _)| *ts < received_ms - 120_000)
+    {
+        values.pop_front();
+    }
+    Ok(())
+}
+
+fn update_liquidation(
+    state: &Arc<RwLock<StreamState>>,
+    value: &Value,
+    received_ms: i64,
+) -> Result<()> {
+    let order = value
+        .get("o")
+        .ok_or_else(|| anyhow!("missing force order payload"))?;
+    let symbol = string(order, "s")?.to_uppercase();
+    let price = optional_number(order, "ap")
+        .filter(|v| *v > 0.0)
+        .unwrap_or(number(order, "p")?);
+    let quantity = optional_number(order, "z")
+        .filter(|v| *v > 0.0)
+        .unwrap_or(number(order, "q")?);
+    let is_long_liquidation = string(order, "S")? == "SELL";
+    let event_ms = order
+        .get("T")
+        .and_then(Value::as_i64)
+        .unwrap_or(received_ms);
+    let mut state = state.write().expect("stream state poisoned");
+    let values = state.liquidations.entry(symbol).or_default();
+    values.push_back((event_ms, is_long_liquidation, price * quantity));
+    while values
+        .front()
+        .is_some_and(|(ts, _, _)| *ts < received_ms - 120_000)
+    {
+        values.pop_front();
+    }
+    Ok(())
 }
 
 fn update_ticker(state: &Arc<RwLock<StreamState>>, value: &Value, received_ms: i64) -> Result<()> {
@@ -624,11 +733,13 @@ mod tests {
         let market = market_url("wss://fstream.binance.com", &symbols);
         let public = public_url("wss://fstream.binance.com", &symbols);
         assert!(!market.contains("!ticker@arr"));
-        assert!(market.contains("/market/stream?streams="));
+        assert!(market.contains("/stream?streams="));
         assert!(market.contains("ybusdt@kline_5m"));
         assert!(market.contains("ybusdt@kline_1m"));
-        assert!(!market.contains("btcusdt@kline_5m"));
-        assert!(public.contains("/public/stream?streams="));
+        assert!(market.contains("btcusdt@kline_5m"));
+        assert!(market.contains("btcusdt@aggTrade"));
+        assert!(market.contains("btcusdt@forceOrder"));
+        assert!(public.contains("/stream?streams="));
     }
 
     #[test]
