@@ -106,10 +106,15 @@ pub struct DemoPositionSnapshot {
     pub entry_ms: i64,
     pub entry_price: f64,
     pub quantity: f64,
+    pub initial_quantity: f64,
     pub remaining_quantity: f64,
     pub stop_price: f64,
     pub take_profit_prices: Vec<(f64, f64)>,
     pub max_hold_ms: i64,
+    pub break_even_armed: bool,
+    pub extreme_price: Option<f64>,
+    pub trailing_activation_pct: Option<f64>,
+    pub trailing_distance_pct: Option<f64>,
     pub current_price: Option<f64>,
     pub current_notional_usd: Option<f64>,
     pub unrealized_pnl_usd: Option<f64>,
@@ -774,6 +779,9 @@ impl BinanceDemoExecution {
                         entry_ms: meta.map(|value| value.entry_ms).unwrap_or_default(),
                         entry_price: position.entry_price,
                         quantity: position.quantity.abs(),
+                        initial_quantity: meta
+                            .map(|value| value.initial_quantity)
+                            .unwrap_or(position.quantity.abs()),
                         remaining_quantity: position.quantity.abs(),
                         stop_price: meta.map(|value| value.stop_price).unwrap_or_default(),
                         take_profit_prices: meta
@@ -786,6 +794,11 @@ impl BinanceDemoExecution {
                             })
                             .unwrap_or_default(),
                         max_hold_ms: meta.map(|value| value.max_hold_ms).unwrap_or_default(),
+                        break_even_armed: meta.map(|value| value.break_even_armed).unwrap_or(false),
+                        extreme_price: meta.map(|value| value.extreme_price),
+                        trailing_activation_pct: meta
+                            .and_then(|value| value.trailing_activation_pct),
+                        trailing_distance_pct: meta.and_then(|value| value.trailing_distance_pct),
                         current_price: Some(position.mark_price),
                         current_notional_usd: Some(notional),
                         unrealized_pnl_usd: Some(position.unrealized_pnl),
