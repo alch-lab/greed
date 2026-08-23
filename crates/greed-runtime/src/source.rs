@@ -300,7 +300,6 @@ impl BinanceMarketSource {
                 .total_cmp(&selected_scores.get(a).copied().unwrap_or(0.0))
         });
         symbols.truncate(strategy.universe.max_symbols);
-        symbols.sort();
         let selected_symbols: BTreeSet<_> = symbols.iter().map(String::as_str).collect();
         let leaders = by_movement
             .into_iter()

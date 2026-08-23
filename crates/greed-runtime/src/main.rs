@@ -373,16 +373,30 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
             && now_ms - last_universe_refresh_ms >= refresh_ms
         {
             last_universe_refresh_ms = now_ms;
-            match source.discover_universe(&config.strategy, now_ms).await {
+            // Mainnet market discovery can contain newly listed contracts that
+            // the Demo venue does not expose yet. Request a ranked reserve so
+            // filtering against Demo exchangeInfo can still fill all slots.
+            let mut discovery_strategy = config.strategy.clone();
+            discovery_strategy.universe.max_symbols = config
+                .strategy
+                .universe
+                .max_symbols
+                .saturating_add(10)
+                .min(50);
+            match source.discover_universe(&discovery_strategy, now_ms).await {
                 Ok(mut discovery) => {
-                    discovery
-                        .symbols
-                        .retain(|symbol| execution.supports_symbol(symbol));
-                    for symbol in execution.position_symbols() {
-                        if !discovery.symbols.contains(symbol) {
-                            discovery.symbols.push(symbol.clone());
-                        }
-                    }
+                    let position_symbols: Vec<_> = execution.position_symbols().cloned().collect();
+                    discovery.symbols.retain(|symbol| {
+                        execution.supports_symbol(symbol) && !position_symbols.contains(symbol)
+                    });
+                    discovery.symbols.truncate(
+                        config
+                            .strategy
+                            .universe
+                            .max_symbols
+                            .saturating_sub(position_symbols.len()),
+                    );
+                    discovery.symbols.extend(position_symbols);
                     discovery.symbols.sort();
                     if !discovery.symbols.is_empty() && discovery.symbols != active_strategy.symbols
                     {
