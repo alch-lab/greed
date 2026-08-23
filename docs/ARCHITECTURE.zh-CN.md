@@ -18,7 +18,7 @@ secret 只从环境变量读取，不写入 TOML、状态或日志。历史回�
 事件处理入口固定为：
 
 ```text
-MarketFrame → Primitive DAG → State DAG → Recipe → PositionPlanner
+Binance WebSocket → Market Cache → MarketFrame → Primitive DAG → State DAG → Recipe → PositionPlanner
             → Binance Demo → Account/Order Reconcile → Journal / Status / Report
 ```
 
@@ -38,8 +38,8 @@ MarketFrame → Primitive DAG → State DAG → Recipe → PositionPlanner
 - 风控：北京时间风险日、日亏损熔断、峰值回撤熔断、已有仓位总敞口上限。
 
 模拟资金为 3000 USDT，并硬分成主流币、山寨币各 1500 USDT 的独立资金桶。当前主流币
-单笔名义仓位 600 USDT，妖币动量基础单笔 150 USDT；任何一类都不能借用另一类未使用的预算，
-组合也不允许超过 3000 USDT 名义敞口。
+单笔名义仓位 600 USDT，早期脉冲单笔 240 USDT，异动探索仓 60 USDT；任何一类都不能借用
+另一类未使用的预算，组合也不允许超过 3000 USDT 名义敞口。
 
 尚未接入但合同已预留的数据包括逐笔成交 POC、强平 WebSocket、ETF 自动抓取、CME
 日终数据和多交易所盘口。这些应在一周样本确认数据质量后分批加入。
@@ -57,8 +57,10 @@ MarketFrame → Primitive DAG → State DAG → Recipe → PositionPlanner
 - `alt_shock_reversal`：一小时冲击、15m 强反转、量能异常和全市场方向锚。
 
 当前职责刻意不对称：Major 使用 24 小时趋势窗口、更高趋势效率和回踩/订单流确认，作为
-低频压仓石；Altcoin 是受控进攻桶。运行时每 15 分钟从全部可交易 USDT 永续中组合高流动性
-合约和涨跌异动合约，最多保留 30 个进入 15m/5m K 线、盘口和 OI 评估。妖币候选按
+低频压仓石；Altcoin 是受控进攻桶。运行时由全市场 ticker WebSocket 持续发现异动，每分钟
+按 15m、1h、24h 动量和流动性重排，最多保留 30 个进入 15m/5m K 线、盘口和 OI 评估。
+K 线、mark price 和 20 档盘口全部使用推送缓存；新币首次入池才用 REST 补历史，OI 因没有
+对应推送流而每 120 秒低频补充。妖币候选按
 15 分钟 cycle 去重、7～10 分钟过期、最长持仓 2 小时；BTC/广度用于确认和缩仓。冲击反转
 每帧记录距离移动、反转和量能门槛的差距，不再静默返回。
 
@@ -83,9 +85,11 @@ cargo build --release -p greed-runtime
 ./target/release/greed paper --config config/demo.toml
 ```
 
-服务器使用 `deploy/greed-paper.service`。需要网络代理时只填写
-`runtime.proxy`；程序会在每次请求前节流，并轮换 Binance 官方备用域名。单个非关键接口
-失败会降级为 `Unknown`，不会放宽策略门槛。
+服务器使用 `deploy/greed-paper.service`。`runtime.proxy` 只代理 REST；行情 WebSocket 需要
+服务器能够直连 `wss://fstream.binance.com`。REST 会节流并轮换 Binance 官方备用域名。
+WebSocket 自动应答 ping、指数退避重连，并在动态池变化时重建订阅；任一关键行情流超过
+15 秒未更新，position planner 不会生成新订单。单个非关键接口失败会降级为 `Unknown`，
+不会放宽策略门槛。
 
 创建仅用于 Binance Demo 的环境文件，并将 Demo 账户切换为 One-way Mode：
 
@@ -129,8 +133,9 @@ journalctl -u greed-paper -f
 
 报告按 Major/Altcoin、recipe、方向和北京时间自然日拆分成交数、手续费、已实现净盈亏、胜率、
 PF 和平均持仓时间；同时包含两套资金曲线的最大回撤/日亏损、候选漏斗及高频 blocker、
-程序重启与 commit/config 版本、帧空窗，以及 Binance 各接口请求、失败、429/418、重试、
-备用域名和延迟统计。山寨币两个 recipe 的每帧状态及原因也会汇总。因此只要保留
+程序重启与 commit/config 版本、帧空窗、WebSocket 可用率/重连/消息空窗，以及 Binance
+各接口请求、真实分钟权重、失败、429/418、重试、备用域名和延迟统计。山寨币两个 recipe
+的每帧状态及原因也会汇总。因此只要保留
 `demo-events.jsonl`，一周后可以定位“哪套策略、哪条
 recipe、哪一天、卡在哪一关、当时接口是否异常”。
 
@@ -138,7 +143,7 @@ recipe、哪一天、卡在哪一关、当时接口是否异常”。
 
 先评数据，再评收益：
 
-1. 主行情轮询成功率至少 99%，没有连续五分钟空窗。
+1. WebSocket 行情可用率至少 99.9%，没有连续一分钟消息空窗；REST 帧成功率至少 99%。
 2. BTC/ETH 现货、永续、OI、盘口和 Coinbase 数据完整率分别统计。
 3. Block/Unknown 的主要原因可解释，不能出现缺数据却 Pass。
 4. 每个 recipe 的多空候选数量、成交数量、费用后 PF 分开统计；Major/Altcoin 分账检查

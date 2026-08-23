@@ -29,3 +29,5 @@ axum = { workspace = true }
 hmac = { workspace = true }
 sha2 = { workspace = true }
 url = { workspace = true }
+futures-util = { workspace = true }
+tokio-tungstenite = { workspace = true }

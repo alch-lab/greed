@@ -43,11 +43,15 @@ impl Default for ExecutionConfig {
 pub struct RuntimeConfig {
     pub binance_futures_base: String,
     pub binance_futures_fallbacks: Vec<String>,
+    pub binance_futures_ws_base: String,
     pub binance_spot_base: String,
     pub binance_spot_fallbacks: Vec<String>,
     pub coinbase_base: String,
     pub proxy: Option<String>,
     pub poll_seconds: u64,
+    pub stream_warmup_seconds: u64,
+    pub oi_refresh_seconds: u64,
+    pub slow_market_refresh_seconds: u64,
     pub request_spacing_ms: u64,
     pub request_timeout_seconds: u64,
     pub candle_limit: usize,
@@ -66,6 +70,7 @@ impl Default for RuntimeConfig {
                 "https://fapi1.binance.com".into(),
                 "https://fapi2.binance.com".into(),
             ],
+            binance_futures_ws_base: "wss://fstream.binance.com".into(),
             binance_spot_base: "https://api.binance.com".into(),
             binance_spot_fallbacks: vec![
                 "https://api1.binance.com".into(),
@@ -73,7 +78,10 @@ impl Default for RuntimeConfig {
             ],
             coinbase_base: "https://api.exchange.coinbase.com".into(),
             proxy: None,
-            poll_seconds: 60,
+            poll_seconds: 15,
+            stream_warmup_seconds: 5,
+            oi_refresh_seconds: 120,
+            slow_market_refresh_seconds: 60,
             request_spacing_ms: 150,
             request_timeout_seconds: 8,
             candle_limit: 160,
@@ -121,8 +129,17 @@ impl Default for BacktestConfig {
 impl AppConfig {
     pub fn validate(&self) -> Result<(), String> {
         self.strategy.validate()?;
-        if self.runtime.poll_seconds < 15 {
-            return Err("poll_seconds must be at least 15".into());
+        if !(5..=60).contains(&self.runtime.poll_seconds) {
+            return Err("poll_seconds must be 5..=60".into());
+        }
+        if !(1..=15).contains(&self.runtime.stream_warmup_seconds)
+            || !(30..=600).contains(&self.runtime.oi_refresh_seconds)
+            || !(30..=600).contains(&self.runtime.slow_market_refresh_seconds)
+        {
+            return Err("stream/slow market refresh settings are outside safe bounds".into());
+        }
+        if !self.runtime.binance_futures_ws_base.starts_with("wss://") {
+            return Err("binance_futures_ws_base must use wss".into());
         }
         if !(120..=1000).contains(&self.runtime.candle_limit) {
             return Err("candle_limit must be 120..=1000".into());

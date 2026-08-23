@@ -22,6 +22,7 @@ impl SampleRecorder {
                 .spot
                 .iter()
                 .chain(std::iter::once(&instrument.perpetual))
+                .chain(instrument.fast_perpetual.iter())
             {
                 for bar in series.values.iter().filter(|bar| bar.closed) {
                     let market = match series.market {
@@ -30,11 +31,14 @@ impl SampleRecorder {
                         MarketKind::Futures => "futures",
                         MarketKind::Etf => "etf",
                     };
-                    let key = format!("{}:{market}:{}", instrument.symbol, bar.close_ms);
+                    let key = format!(
+                        "{}:{market}:{}:{}",
+                        instrument.symbol, series.interval_ms, bar.close_ms
+                    );
                     if self.seen_candles.insert(key) {
                         journal.append(
                             "market_candle",
-                            serde_json::json!({"symbol":instrument.symbol,"venue":series.venue,"market":series.market,"bar":bar,"meta":series.meta}),
+                            serde_json::json!({"symbol":instrument.symbol,"venue":series.venue,"market":series.market,"interval_ms":series.interval_ms,"bar":bar,"meta":series.meta}),
                         )?;
                     }
                 }

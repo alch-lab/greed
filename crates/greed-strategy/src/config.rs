@@ -43,7 +43,7 @@ impl Default for UniverseConfig {
             top_liquidity_names: 12,
             top_mover_names: 18,
             min_24h_quote_volume_usd: 25_000_000.0,
-            refresh_minutes: 15,
+            refresh_minutes: 1,
         }
     }
 }
@@ -276,7 +276,7 @@ impl StrategyConfig {
             || self.universe.top_liquidity_names + self.universe.top_mover_names
                 < self.universe.max_altcoins
             || self.universe.min_24h_quote_volume_usd <= 0.0
-            || !(5..=60).contains(&self.universe.refresh_minutes)
+            || !(1..=60).contains(&self.universe.refresh_minutes)
         {
             return Err("dynamic universe parameters are outside safe API ranges".into());
         }

@@ -1,8 +1,9 @@
 use crate::config::RuntimeConfig;
+use crate::market_stream::MarketStreamHub;
 use anyhow::{anyhow, Result};
 use greed_kernel::{
-    AccountFrame, AssetClass, BookState, Candle, CandleSeries, DataQuality, DerivativesState,
-    ExternalState, InstrumentFrame, MarketFrame, MarketKind, ObservationMeta, PriceLevel,
+    AccountFrame, AssetClass, Candle, CandleSeries, DataQuality, DerivativesState, ExternalState,
+    InstrumentFrame, MarketFrame, MarketKind, ObservationMeta,
 };
 use greed_strategy::StrategyConfig;
 use reqwest::{Client, StatusCode};
@@ -37,6 +38,8 @@ struct ApiTelemetry {
     frames_requested: u64,
     frames_succeeded: u64,
     frames_failed: u64,
+    latest_used_weight_1m: Option<u64>,
+    max_used_weight_1m: u64,
     endpoints: BTreeMap<String, EndpointTelemetry>,
 }
 
@@ -48,6 +51,18 @@ pub struct BinanceMarketSource {
     last_error: Option<String>,
     telemetry: Mutex<ApiTelemetry>,
     discovery_prices: BTreeMap<String, VecDeque<(i64, f64)>>,
+    eligible_contracts: BTreeSet<String>,
+    stream: Option<MarketStreamHub>,
+    candle_cache: BTreeMap<(String, String), CandleSeries>,
+    derivatives_cache: BTreeMap<String, CachedValue<DerivativesState>>,
+    spot_cache: BTreeMap<String, CachedValue<CandleSeries>>,
+    external_cache: BTreeMap<String, CachedValue<ExternalState>>,
+}
+
+#[derive(Debug, Clone)]
+struct CachedValue<T> {
+    refreshed_ms: i64,
+    value: T,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -65,6 +80,7 @@ pub struct UniverseLeader {
     pub symbol: String,
     pub quote_volume_24h_usd: f64,
     pub change_24h_pct: f64,
+    pub return_15m_pct: Option<f64>,
     pub return_1h_pct: Option<f64>,
 }
 
@@ -98,8 +114,69 @@ impl BinanceMarketSource {
             last_error: None,
             telemetry: Mutex::new(ApiTelemetry::default()),
             discovery_prices: BTreeMap::new(),
+            eligible_contracts: BTreeSet::new(),
+            stream: None,
+            candle_cache: BTreeMap::new(),
+            derivatives_cache: BTreeMap::new(),
+            spot_cache: BTreeMap::new(),
+            external_cache: BTreeMap::new(),
         })
     }
+
+    pub async fn start_market_stream(&mut self, strategy: &StrategyConfig) -> Result<()> {
+        let stream = MarketStreamHub::start(self.config.binance_futures_ws_base.clone());
+        let symbols: Vec<_> = strategy
+            .majors
+            .iter()
+            .chain(strategy.altcoins.iter())
+            .cloned()
+            .collect();
+        stream.set_symbols(&symbols);
+        self.stream = Some(stream);
+        let deadline = chrono::Utc::now().timestamp_millis()
+            + i64::try_from(self.config.stream_warmup_seconds).unwrap_or(5) * 1_000;
+        let tickers = loop {
+            let values = self
+                .stream
+                .as_ref()
+                .expect("market stream inserted above")
+                .tickers();
+            if !values.is_empty() || chrono::Utc::now().timestamp_millis() >= deadline {
+                break values;
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
+        };
+        self.eligible_contracts = tickers
+            .keys()
+            .filter(|symbol| symbol.ends_with("USDT"))
+            .cloned()
+            .collect();
+        if self.eligible_contracts.is_empty() {
+            let telemetry = self
+                .stream
+                .as_ref()
+                .expect("market stream inserted above")
+                .telemetry();
+            return Err(anyhow!(
+                "market websocket ticker cache did not warm up: {:?}",
+                telemetry
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn set_stream_symbols(&self, strategy: &StrategyConfig) {
+        if let Some(stream) = &self.stream {
+            let symbols: Vec<_> = strategy
+                .majors
+                .iter()
+                .chain(strategy.altcoins.iter())
+                .cloned()
+                .collect();
+            stream.set_symbols(&symbols);
+        }
+    }
+
     pub async fn discover_altcoins(
         &mut self,
         strategy: &StrategyConfig,
@@ -115,54 +192,38 @@ impl BinanceMarketSource {
                 leaders: Vec::new(),
             });
         }
-        let bases = self.futures_bases();
-        let (exchange, tickers) = tokio::try_join!(
-            self.get_from_bases(&bases, "/fapi/v1/exchangeInfo"),
-            self.get_from_bases(&bases, "/fapi/v1/ticker/24hr")
-        )?;
-        let eligible: BTreeSet<String> = exchange["symbols"]
-            .as_array()
-            .ok_or_else(|| anyhow!("exchangeInfo symbols is not an array"))?
+        let tickers = self
+            .stream
+            .as_ref()
+            .ok_or_else(|| anyhow!("market websocket is not started"))?
+            .tickers();
+        if tickers.is_empty() {
+            return Err(anyhow!("market websocket ticker cache is not warm"));
+        }
+        self.eligible_contracts.extend(
+            tickers
+                .keys()
+                .filter(|symbol| symbol.ends_with("USDT"))
+                .cloned(),
+        );
+        let eligible: BTreeSet<_> = self
+            .eligible_contracts
             .iter()
-            .filter(|value| {
-                value["status"] == "TRADING"
-                    && value["contractType"] == "PERPETUAL"
-                    && value["quoteAsset"] == "USDT"
-                    && value
-                        .get("underlyingType")
-                        .and_then(Value::as_str)
-                        .is_none_or(|kind| kind == "COIN")
-            })
-            .filter_map(|value| value["symbol"].as_str().map(str::to_owned))
-            .filter(|symbol| !strategy.majors.contains(symbol))
+            .filter(|symbol| !strategy.majors.contains(*symbol))
+            .cloned()
             .collect();
         let mut rows = Vec::new();
-        for ticker in tickers
-            .as_array()
-            .ok_or_else(|| anyhow!("24hr ticker response is not an array"))?
-        {
-            let Some(symbol) = ticker["symbol"].as_str() else {
-                continue;
-            };
-            if !eligible.contains(symbol) {
+        for (symbol, ticker) in tickers {
+            if !eligible.contains(&symbol) || now_ms - ticker.received_ms > 15_000 {
                 continue;
             }
-            let parse = |key: &str| {
-                ticker[key]
-                    .as_str()
-                    .and_then(|value| value.parse::<f64>().ok())
-            };
-            let (Some(price), Some(quote_volume), Some(change_24h_pct)) = (
-                parse("lastPrice"),
-                parse("quoteVolume"),
-                parse("priceChangePercent"),
-            ) else {
-                continue;
-            };
+            let price = ticker.price;
+            let quote_volume = ticker.quote_volume_24h;
+            let change_24h = ticker.change_24h();
             if price <= 0.0 || quote_volume < strategy.universe.min_24h_quote_volume_usd {
                 continue;
             }
-            let history = self.discovery_prices.entry(symbol.into()).or_default();
+            let history = self.discovery_prices.entry(symbol.clone()).or_default();
             history.push_back((now_ms, price));
             while history
                 .front()
@@ -170,21 +231,21 @@ impl BinanceMarketSource {
             {
                 history.pop_front();
             }
+            let return_15m = history
+                .iter()
+                .rev()
+                .find(|(ts, _)| *ts <= now_ms - 12 * 60_000)
+                .map(|(_, prior)| price / prior - 1.0);
             let return_1h = history
                 .iter()
                 .rev()
                 .find(|(ts, _)| *ts <= now_ms - 45 * 60_000)
                 .map(|(_, prior)| price / prior - 1.0);
-            rows.push((
-                symbol.to_owned(),
-                quote_volume,
-                change_24h_pct / 100.0,
-                return_1h,
-            ));
+            rows.push((symbol, quote_volume, change_24h, return_15m, return_1h));
         }
         let rolling_history_ready = rows
             .iter()
-            .filter(|(_, _, _, return_1h)| return_1h.is_some())
+            .filter(|(_, _, _, return_15m, _)| return_15m.is_some())
             .count();
         let mut selected: BTreeSet<String> = strategy
             .altcoins
@@ -194,7 +255,7 @@ impl BinanceMarketSource {
             .collect();
         let mut by_liquidity = rows.clone();
         by_liquidity.sort_by(|a, b| b.1.total_cmp(&a.1));
-        for (symbol, _, _, _) in by_liquidity
+        for (symbol, _, _, _, _) in by_liquidity
             .iter()
             .take(strategy.universe.top_liquidity_names)
         {
@@ -202,20 +263,26 @@ impl BinanceMarketSource {
         }
         let mut by_movement = rows.clone();
         by_movement.sort_by(|a, b| {
-            let score = |row: &(String, f64, f64, Option<f64>)| {
-                row.3.unwrap_or(row.2).abs().max(row.2.abs() * 0.35)
+            let score = |row: &(String, f64, f64, Option<f64>, Option<f64>)| {
+                row.3
+                    .unwrap_or_default()
+                    .abs()
+                    .mul_add(2.0, row.4.unwrap_or_default().abs())
+                    .max(row.2.abs() * 0.25)
             };
             score(b).total_cmp(&score(a))
         });
-        for (symbol, _, _, _) in by_movement.iter().take(strategy.universe.top_mover_names) {
+        for (symbol, _, _, _, _) in by_movement.iter().take(strategy.universe.top_mover_names) {
             selected.insert(symbol.clone());
         }
         let selected_scores: BTreeMap<_, _> = rows
             .iter()
-            .map(|(symbol, volume, change, rolling)| {
+            .map(|(symbol, volume, change, return_15m, return_1h)| {
                 (
                     symbol,
-                    rolling.unwrap_or(*change).abs().max(change.abs() * 0.35)
+                    return_15m.unwrap_or_default().abs() * 2.0
+                        + return_1h.unwrap_or_default().abs()
+                        + change.abs() * 0.25
                         + volume.ln_1p() * 1e-6,
                 )
             })
@@ -233,13 +300,14 @@ impl BinanceMarketSource {
         let selected_symbols: BTreeSet<_> = symbols.iter().map(String::as_str).collect();
         let leaders = by_movement
             .into_iter()
-            .filter(|(symbol, _, _, _)| selected_symbols.contains(symbol.as_str()))
+            .filter(|(symbol, _, _, _, _)| selected_symbols.contains(symbol.as_str()))
             .take(20)
             .map(
-                |(symbol, quote_volume, change_24h, return_1h)| UniverseLeader {
+                |(symbol, quote_volume, change_24h, return_15m, return_1h)| UniverseLeader {
                     symbol,
                     quote_volume_24h_usd: quote_volume,
                     change_24h_pct: change_24h * 100.0,
+                    return_15m_pct: return_15m.map(|value| value * 100.0),
                     return_1h_pct: return_1h.map(|value| value * 100.0),
                 },
             )
@@ -261,7 +329,8 @@ impl BinanceMarketSource {
             .clone();
         let average_latency_ms = (telemetry.requests > 0)
             .then_some(telemetry.total_latency_ms as f64 / telemetry.requests as f64);
-        serde_json::json!({"last_success_ms":self.last_success_ms,"last_error":self.last_error,"paper_only":true,"telemetry":telemetry,"average_latency_ms":average_latency_ms})
+        let stream = self.stream.as_ref().map(MarketStreamHub::telemetry);
+        serde_json::json!({"last_success_ms":self.last_success_ms,"last_error":self.last_error,"paper_only":true,"transport":"websocket_primary","stream":stream,"telemetry":telemetry,"average_latency_ms":average_latency_ms})
     }
     fn endpoint_key(url: &str) -> String {
         reqwest::Url::parse(url)
@@ -311,6 +380,17 @@ impl BinanceMarketSource {
             let started = Instant::now();
             match self.http.get(&url).send().await {
                 Ok(response) if response.status().is_success() => {
+                    let used_weight = response
+                        .headers()
+                        .get("x-mbx-used-weight-1m")
+                        .and_then(|value| value.to_str().ok())
+                        .and_then(|value| value.parse::<u64>().ok());
+                    if let Some(weight) = used_weight {
+                        let mut telemetry =
+                            self.telemetry.lock().expect("telemetry mutex poisoned");
+                        telemetry.latest_used_weight_1m = Some(weight);
+                        telemetry.max_used_weight_1m = telemetry.max_used_weight_1m.max(weight);
+                    }
                     let result = response
                         .text()
                         .await
@@ -471,68 +551,87 @@ impl BinanceMarketSource {
             values: bars,
         })
     }
-    async fn book(&self, symbol: &str, now: i64) -> Result<BookState> {
-        let suffix = format!("/fapi/v1/depth?symbol={symbol}&limit=20");
-        let value = self.get_from_bases(&self.futures_bases(), &suffix).await?;
-        let parse = |name: &str| -> Result<Vec<(f64, f64)>> {
-            value[name]
-                .as_array()
-                .ok_or_else(|| anyhow!("missing {name}"))?
-                .iter()
-                .map(|row| {
-                    let row = row.as_array().ok_or_else(|| anyhow!("invalid book row"))?;
-                    Ok((
-                        row[0].as_str().unwrap_or("0").parse()?,
-                        row[1].as_str().unwrap_or("0").parse()?,
-                    ))
-                })
-                .collect()
-        };
-        let bids = parse("bids")?;
-        let asks = parse("asks")?;
-        let bid = bids.first().map(|v| v.0).unwrap_or(0.0);
-        let ask = asks.first().map(|v| v.0).unwrap_or(0.0);
-        let bid_depth = bids.iter().map(|(p, q)| p * q).sum();
-        let ask_depth = asks.iter().map(|(p, q)| p * q).sum();
-        Ok(BookState {
-            meta: Self::meta(now, 30_000, "binance_depth", DataQuality::Complete),
-            bid,
-            ask,
-            bid_depth_usd: bid_depth,
-            ask_depth_usd: ask_depth,
-            expected_buy_slippage_bps: sweep_slippage(&asks, 300.0, ask),
-            expected_sell_slippage_bps: sweep_slippage(&bids, 300.0, bid),
-            bids: bids
-                .iter()
-                .map(|(price, quantity)| PriceLevel {
-                    price: *price,
-                    quantity: *quantity,
-                })
-                .collect(),
-            asks: asks
-                .iter()
-                .map(|(price, quantity)| PriceLevel {
-                    price: *price,
-                    quantity: *quantity,
-                })
-                .collect(),
-        })
-    }
-    async fn derivatives(
+
+    async fn streamed_klines(
         &mut self,
         symbol: &str,
-        price: f64,
+        interval: &str,
+        interval_ms: i64,
+        limit: usize,
+        now: i64,
+    ) -> Result<CandleSeries> {
+        let key = (symbol.to_string(), interval.to_string());
+        if !self.candle_cache.contains_key(&key) {
+            let bootstrap = self
+                .klines_at_interval(
+                    &self.futures_bases(),
+                    "/fapi/v1/klines",
+                    symbol,
+                    MarketKind::Perpetual,
+                    interval,
+                    interval_ms,
+                    limit,
+                    now,
+                )
+                .await?;
+            self.candle_cache.insert(key.clone(), bootstrap);
+        }
+        let (updates, updated_ms) = self
+            .stream
+            .as_ref()
+            .ok_or_else(|| anyhow!("market websocket is not started"))?
+            .candles(symbol, interval);
+        let series = self
+            .candle_cache
+            .get_mut(&key)
+            .expect("candle cache inserted above");
+        for candle in updates {
+            if let Some(existing) = series
+                .values
+                .iter_mut()
+                .find(|value| value.open_ms == candle.open_ms)
+            {
+                *existing = candle;
+            } else {
+                series.values.push(candle);
+            }
+        }
+        series.values.sort_by_key(|value| value.open_ms);
+        if series.values.len() > limit {
+            series.values.drain(..series.values.len() - limit);
+        }
+        let fresh = updated_ms.is_some_and(|value| now - value <= 15_000);
+        series.meta = ObservationMeta {
+            event_ms: updated_ms.unwrap_or(now),
+            received_ms: updated_ms.unwrap_or(now),
+            expires_ms: updated_ms.unwrap_or_default() + 15_000,
+            source: "binance_ws_kline".into(),
+            quality: if fresh {
+                DataQuality::Complete
+            } else {
+                DataQuality::Stale
+            },
+        };
+        Ok(series.clone())
+    }
+
+    async fn refresh_derivatives(
+        &mut self,
+        symbol: &str,
+        fallback_price: f64,
         now: i64,
     ) -> Result<DerivativesState> {
         let bases = self.futures_bases();
         let oi_value = self
             .get_from_bases(&bases, &format!("/fapi/v1/openInterest?symbol={symbol}"))
             .await?;
-        let premium = self
-            .get_from_bases(&bases, &format!("/fapi/v1/premiumIndex?symbol={symbol}"))
-            .await?;
+        let mark = self.stream.as_ref().and_then(|stream| stream.mark(symbol));
         let oi_units: f64 = oi_value["openInterest"].as_str().unwrap_or("0").parse()?;
-        let oi = oi_units * price;
+        let oi = oi_units
+            * mark
+                .as_ref()
+                .map(|value| value.mark_price)
+                .unwrap_or(fallback_price);
         let history = self.oi_history.entry(symbol.into()).or_default();
         history.push_back((now, oi));
         while history
@@ -548,24 +647,78 @@ impl BinanceMarketSource {
             .find(|(ts, value)| now - ts >= 10 * 60_000 && *value > 0.0)
             .map(|(_, previous)| oi / previous - 1.0);
         Ok(DerivativesState {
-            meta: Self::meta(now, 120_000, "binance_derivatives", DataQuality::Complete),
+            meta: Self::meta(
+                now,
+                i64::try_from(self.config.oi_refresh_seconds).unwrap_or(120) * 2_000,
+                "binance_ws_mark_rest_oi",
+                if mark
+                    .as_ref()
+                    .is_some_and(|value| now - value.received_ms <= 15_000)
+                {
+                    DataQuality::Complete
+                } else {
+                    DataQuality::Partial
+                },
+            ),
             open_interest_usd: Some(oi),
             open_interest_change_pct: change,
-            funding_rate: premium["lastFundingRate"]
-                .as_str()
-                .and_then(|v| v.parse().ok()),
-            basis_pct: premium["markPrice"]
-                .as_str()
-                .and_then(|v| v.parse::<f64>().ok())
-                .zip(
-                    premium["indexPrice"]
-                        .as_str()
-                        .and_then(|v| v.parse::<f64>().ok()),
-                )
-                .map(|(mark, index)| mark / index - 1.0),
+            funding_rate: mark.as_ref().and_then(|value| value.funding_rate),
+            basis_pct: mark
+                .as_ref()
+                .filter(|value| value.index_price > 0.0)
+                .map(|value| value.mark_price / value.index_price - 1.0),
             long_liquidations_usd: None,
             short_liquidations_usd: None,
         })
+    }
+
+    async fn cached_derivatives(
+        &mut self,
+        symbol: &str,
+        price: f64,
+        now: i64,
+    ) -> Result<DerivativesState> {
+        let refresh_ms = i64::try_from(self.config.oi_refresh_seconds).unwrap_or(120) * 1_000;
+        if self
+            .derivatives_cache
+            .get(symbol)
+            .is_none_or(|cached| now - cached.refreshed_ms >= refresh_ms)
+        {
+            let value = self.refresh_derivatives(symbol, price, now).await?;
+            self.derivatives_cache.insert(
+                symbol.into(),
+                CachedValue {
+                    refreshed_ms: now,
+                    value,
+                },
+            );
+        }
+        let mut value = self
+            .derivatives_cache
+            .get(symbol)
+            .expect("derivatives cache inserted above")
+            .value
+            .clone();
+        match self.stream.as_ref().and_then(|stream| stream.mark(symbol)) {
+            Some(mark) => {
+                value.funding_rate = mark.funding_rate;
+                value.basis_pct =
+                    (mark.index_price > 0.0).then_some(mark.mark_price / mark.index_price - 1.0);
+                value.meta.event_ms = mark.event_ms;
+                value.meta.received_ms = mark.received_ms;
+                value.meta.expires_ms = mark.received_ms + 15_000;
+                value.meta.quality = if now - mark.received_ms <= 15_000 {
+                    DataQuality::Complete
+                } else {
+                    DataQuality::Stale
+                };
+            }
+            None => {
+                value.meta.quality = DataQuality::Stale;
+                value.meta.expires_ms = 0;
+            }
+        }
+        Ok(value)
     }
     async fn coinbase_external(
         &self,
@@ -602,6 +755,70 @@ impl BinanceMarketSource {
             cme_basis_pct: slow.as_ref().and_then(|value| value.cme_basis_pct),
         })
     }
+
+    async fn cached_spot(&mut self, symbol: &str, now: i64) -> Result<CandleSeries> {
+        let refresh_ms =
+            i64::try_from(self.config.slow_market_refresh_seconds).unwrap_or(60) * 1_000;
+        if self
+            .spot_cache
+            .get(symbol)
+            .is_none_or(|cached| now - cached.refreshed_ms >= refresh_ms)
+        {
+            let value = self
+                .klines(
+                    &self.spot_bases(),
+                    "/api/v3/klines",
+                    symbol,
+                    MarketKind::Spot,
+                    now,
+                )
+                .await?;
+            self.spot_cache.insert(
+                symbol.into(),
+                CachedValue {
+                    refreshed_ms: now,
+                    value,
+                },
+            );
+        }
+        Ok(self
+            .spot_cache
+            .get(symbol)
+            .expect("spot cache inserted above")
+            .value
+            .clone())
+    }
+
+    async fn cached_external(
+        &mut self,
+        symbol: &str,
+        binance_spot: f64,
+        now: i64,
+    ) -> Result<ExternalState> {
+        let refresh_ms =
+            i64::try_from(self.config.slow_market_refresh_seconds).unwrap_or(60) * 1_000;
+        if self
+            .external_cache
+            .get(symbol)
+            .is_none_or(|cached| now - cached.refreshed_ms >= refresh_ms)
+        {
+            let value = self.coinbase_external(symbol, binance_spot, now).await?;
+            self.external_cache.insert(
+                symbol.into(),
+                CachedValue {
+                    refreshed_ms: now,
+                    value,
+                },
+            );
+        }
+        Ok(self
+            .external_cache
+            .get(symbol)
+            .expect("external cache inserted above")
+            .value
+            .clone())
+    }
+
     fn read_slow_context(&self, symbol: &str, now: i64) -> Option<SlowSymbolContext> {
         let path = self.config.slow_context_path.as_deref()?;
         let text = std::fs::read_to_string(path).ok()?;
@@ -650,19 +867,12 @@ impl BinanceMarketSource {
         now: i64,
     ) -> Result<MarketFrame> {
         let mut instruments = BTreeMap::new();
-        let futures_bases = self.futures_bases();
-        let spot_bases = self.spot_bases();
         let mut warnings = Vec::new();
+        self.set_stream_symbols(strategy);
         for symbol in strategy.majors.iter().chain(strategy.altcoins.iter()) {
             let major = strategy.majors.contains(symbol);
             let perpetual = match self
-                .klines(
-                    &futures_bases,
-                    "/fapi/v1/klines",
-                    symbol,
-                    MarketKind::Perpetual,
-                    now,
-                )
+                .streamed_klines(symbol, "15m", 900_000, self.config.candle_limit, now)
                 .await
             {
                 Ok(series) => series,
@@ -672,7 +882,7 @@ impl BinanceMarketSource {
                         venue: "binance".into(),
                         market: MarketKind::Perpetual,
                         interval_ms: 900_000,
-                        meta: Self::meta(now, 0, "binance_klines", DataQuality::Missing),
+                        meta: Self::meta(now, 0, "binance_ws_kline", DataQuality::Missing),
                         values: vec![],
                     }
                 }
@@ -685,19 +895,7 @@ impl BinanceMarketSource {
             let fast_perpetual = if major {
                 None
             } else {
-                match self
-                    .klines_at_interval(
-                        &futures_bases,
-                        "/fapi/v1/klines",
-                        symbol,
-                        MarketKind::Perpetual,
-                        "5m",
-                        300_000,
-                        120,
-                        now,
-                    )
-                    .await
-                {
+                match self.streamed_klines(symbol, "5m", 300_000, 120, now).await {
                     Ok(value) => Some(value),
                     Err(error) => {
                         warnings.push(format!("fast perpetual klines {symbol}: {error}"));
@@ -705,11 +903,26 @@ impl BinanceMarketSource {
                     }
                 }
             };
+            let book = self
+                .stream
+                .as_ref()
+                .and_then(|stream| stream.book(symbol, now));
+            if book.as_ref().is_none_or(|value| !value.meta.usable_at(now)) {
+                warnings.push(format!("websocket depth stale or missing {symbol}"));
+            }
+            let derivatives = if price > 0.0 {
+                match self.cached_derivatives(symbol, price, now).await {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        warnings.push(format!("derivatives {symbol}: {error}"));
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let (spot, book, derivatives, external) = if major {
-                let spot = match self
-                    .klines(&spot_bases, "/api/v3/klines", symbol, MarketKind::Spot, now)
-                    .await
-                {
+                let spot = match self.cached_spot(symbol, now).await {
                     Ok(value) => Some(value),
                     Err(error) => {
                         warnings.push(format!("spot klines {symbol}: {error}"));
@@ -721,26 +934,8 @@ impl BinanceMarketSource {
                     .and_then(|series| series.values.last())
                     .map(|bar| bar.close)
                     .unwrap_or(price);
-                let book = match self.book(symbol, now).await {
-                    Ok(value) => Some(value),
-                    Err(error) => {
-                        warnings.push(format!("depth {symbol}: {error}"));
-                        None
-                    }
-                };
-                let derivatives = if price > 0.0 {
-                    match self.derivatives(symbol, price, now).await {
-                        Ok(value) => Some(value),
-                        Err(error) => {
-                            warnings.push(format!("derivatives {symbol}: {error}"));
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
                 let external = if spot_price > 0.0 {
-                    match self.coinbase_external(symbol, spot_price, now).await {
+                    match self.cached_external(symbol, spot_price, now).await {
                         Ok(value) => Some(value),
                         Err(error) => {
                             warnings.push(format!("external {symbol}: {error}"));
@@ -752,24 +947,6 @@ impl BinanceMarketSource {
                 };
                 (spot, book, derivatives, external)
             } else {
-                let book = match self.book(symbol, now).await {
-                    Ok(value) => Some(value),
-                    Err(error) => {
-                        warnings.push(format!("depth {symbol}: {error}"));
-                        None
-                    }
-                };
-                let derivatives = if price > 0.0 {
-                    match self.derivatives(symbol, price, now).await {
-                        Ok(value) => Some(value),
-                        Err(error) => {
-                            warnings.push(format!("derivatives {symbol}: {error}"));
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
                 (None, book, derivatives, None)
             };
             instruments.insert(
@@ -800,30 +977,6 @@ impl BinanceMarketSource {
             account,
         })
     }
-}
-
-fn sweep_slippage(levels: &[(f64, f64)], notional: f64, reference: f64) -> Option<f64> {
-    if reference <= 0.0 {
-        return None;
-    }
-    let mut remaining = notional;
-    let mut qty = 0.0;
-    let mut cost = 0.0;
-    for (price, available) in levels {
-        let level_notional = price * available;
-        let take = remaining.min(level_notional);
-        qty += take / price;
-        cost += take;
-        remaining -= take;
-        if remaining <= f64::EPSILON {
-            break;
-        }
-    }
-    if remaining > f64::EPSILON || qty <= 0.0 {
-        return None;
-    }
-    let vwap = cost / qty;
-    Some((vwap / reference - 1.0).abs() * 10_000.0)
 }
 
 #[cfg(test)]

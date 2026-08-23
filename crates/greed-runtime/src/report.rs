@@ -140,6 +140,8 @@ struct TelemetryTotals {
     frames_requested: u64,
     frames_succeeded: u64,
     frames_failed: u64,
+    latest_used_weight_1m: Option<u64>,
+    max_used_weight_1m: u64,
     endpoints: BTreeMap<String, EndpointTotals>,
 }
 
@@ -181,6 +183,8 @@ impl TelemetryTotals {
             frames_requested: n("frames_requested"),
             frames_succeeded: n("frames_succeeded"),
             frames_failed: n("frames_failed"),
+            latest_used_weight_1m: value["latest_used_weight_1m"].as_u64(),
+            max_used_weight_1m: n("max_used_weight_1m"),
             endpoints,
         }
     }
@@ -197,6 +201,8 @@ impl TelemetryTotals {
         self.frames_requested += other.frames_requested;
         self.frames_succeeded += other.frames_succeeded;
         self.frames_failed += other.frames_failed;
+        self.latest_used_weight_1m = other.latest_used_weight_1m.or(self.latest_used_weight_1m);
+        self.max_used_weight_1m = self.max_used_weight_1m.max(other.max_used_weight_1m);
         for (key, value) in &other.endpoints {
             let endpoint = self.endpoints.entry(key.clone()).or_default();
             endpoint.requests += value.requests;
@@ -237,6 +243,11 @@ pub fn build(path: &str) -> Result<Value> {
     let mut portfolio_risk = EquityRisk::default();
     let mut telemetry = TelemetryTotals::default();
     let mut current_run_telemetry = TelemetryTotals::default();
+    let mut stream_observations = 0u64;
+    let mut stream_offline_observations = 0u64;
+    let mut stream_max_reconnects = 0u64;
+    let mut stream_max_parse_errors = 0u64;
+    let mut max_stream_message_gap_ms = 0i64;
 
     for line in std::io::BufReader::new(file).lines() {
         let line = line?;
@@ -267,12 +278,33 @@ pub fn build(path: &str) -> Result<Value> {
             "frame_error" => frame_errors += 1,
             "data_health" => {
                 current_run_telemetry = TelemetryTotals::from_value(&payload["telemetry"]);
+                if let Some(stream) = payload.get("stream").filter(|value| value.is_object()) {
+                    stream_observations += 1;
+                    if !stream["market_connected"].as_bool().unwrap_or(false)
+                        || !stream["public_connected"].as_bool().unwrap_or(false)
+                    {
+                        stream_offline_observations += 1;
+                    }
+                    stream_max_reconnects = stream_max_reconnects
+                        .max(stream["reconnects"].as_u64().unwrap_or_default());
+                    stream_max_parse_errors = stream_max_parse_errors
+                        .max(stream["parse_errors"].as_u64().unwrap_or_default());
+                    if let Some(now) = recorded_ms {
+                        for key in ["last_market_message_ms", "last_public_message_ms"] {
+                            if let Some(message_ms) = stream[key].as_i64() {
+                                max_stream_message_gap_ms =
+                                    max_stream_message_gap_ms.max(now - message_ms);
+                            }
+                        }
+                    }
+                }
             }
             "market_candle" => {
                 candles.insert(format!(
-                    "{}:{:?}:{}",
+                    "{}:{:?}:{}:{}",
                     payload["symbol"].as_str().unwrap_or(""),
                     payload["market"],
+                    payload["interval_ms"].as_i64().unwrap_or_default(),
                     payload["bar"]["close_ms"].as_i64().unwrap_or(0)
                 ));
             }
@@ -384,6 +416,14 @@ pub fn build(path: &str) -> Result<Value> {
         "open_trade_count_at_report":open_trades.len(),
         "api_telemetry":telemetry,
         "api_average_latency_ms":(telemetry.requests>0).then_some(telemetry.total_latency_ms as f64/telemetry.requests as f64),
+        "stream_health":{
+            "observations":stream_observations,
+            "offline_observations":stream_offline_observations,
+            "availability":(stream_observations>0).then_some(1.0-stream_offline_observations as f64/stream_observations as f64),
+            "max_reconnects":stream_max_reconnects,
+            "max_parse_errors":stream_max_parse_errors,
+            "max_message_gap_seconds":max_stream_message_gap_ms as f64/1_000.0,
+        },
     }))
 }
 

@@ -119,6 +119,21 @@ impl StrategyNode for PositionPlannerNode {
             let Some(instrument) = ctx.frame.instrument(&candidate.symbol) else {
                 continue;
             };
+            let fast_required =
+                candidate.tags.get("stop_profile").map(String::as_str) == Some("alt_intraday");
+            let market_fresh = instrument.perpetual.meta.usable_at(ctx.frame.as_of_ms)
+                && instrument
+                    .book
+                    .as_ref()
+                    .is_some_and(|book| book.meta.usable_at(ctx.frame.as_of_ms))
+                && (!fast_required
+                    || instrument
+                        .fast_perpetual
+                        .as_ref()
+                        .is_some_and(|series| series.meta.usable_at(ctx.frame.as_of_ms)));
+            if !market_fresh {
+                continue;
+            }
             let base_per_trade = if instrument.asset_class == AssetClass::Major {
                 self.config.major_gross_per_trade
             } else if candidate.tags.get("stop_profile").map(String::as_str) == Some("alt_intraday")

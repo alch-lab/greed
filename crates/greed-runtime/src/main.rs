@@ -3,6 +3,7 @@ mod backtest_broker;
 mod config;
 mod execution;
 mod journal;
+mod market_stream;
 mod monitor;
 mod report;
 mod source;
@@ -244,6 +245,7 @@ async fn one_frame(
     source: &mut BinanceMarketSource,
 ) -> Result<(greed_kernel::MarketFrame, GraphEvaluation)> {
     let mut strategy = config.strategy.clone();
+    source.start_market_stream(&strategy).await?;
     if strategy.universe.dynamic_enabled {
         let discovery = source
             .discover_altcoins(&strategy, chrono::Utc::now().timestamp_millis())
@@ -340,6 +342,10 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
     let identity = runtime_identity(&config, started_ms);
     let _monitor = monitor::start(&config.runtime).await?;
     let mut source = BinanceMarketSource::new(config.runtime.clone())?;
+    source
+        .start_market_stream(&config.strategy)
+        .await
+        .context("Binance market websocket initialization failed")?;
     let mut execution = BinanceDemoExecution::connect(
         config.execution.clone(),
         config.portfolio.clone(),
@@ -412,6 +418,7 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                     {
                         active_strategy.altcoins.clone_from(&discovery.symbols);
                         graph = build_graph(&active_strategy)?;
+                        source.set_stream_symbols(&active_strategy);
                     }
                     universe_status = serde_json::to_value(&discovery)?;
                     journal.append("universe_refresh", universe_status.clone())?;
@@ -427,6 +434,7 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
             Ok(mut frame) => {
                 samples.record(&journal, &frame)?;
                 let data_health = source.health();
+                journal.append("data_health", data_health.clone())?;
                 frame.account = execution.account_frame()?;
                 let evaluation = graph.evaluate(&frame)?;
                 journal.append("graph_evaluation", serde_json::to_value(&evaluation)?)?;
