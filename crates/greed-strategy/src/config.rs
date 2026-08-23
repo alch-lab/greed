@@ -78,6 +78,8 @@ pub struct RecipeConfig {
     pub exhaustion_move_pct: f64,
     pub cross_names: usize,
     pub cross_rebalance_bars: usize,
+    pub cross_opportunity_driven: bool,
+    pub alt_neutral_anchor_allowed: bool,
     pub shock_min_return_pct: f64,
     pub shock_min_reversal_pct: f64,
     pub shock_min_volume_ratio: f64,
@@ -95,6 +97,8 @@ impl Default for RecipeConfig {
             exhaustion_move_pct: 0.018,
             cross_names: 3,
             cross_rebalance_bars: 24,
+            cross_opportunity_driven: true,
+            alt_neutral_anchor_allowed: false,
             shock_min_return_pct: 0.045,
             shock_min_reversal_pct: 0.006,
             shock_min_volume_ratio: 2.5,
@@ -121,6 +125,10 @@ pub struct RiskConfig {
     pub max_hold_minutes: u32,
     pub daily_loss_limit_pct: f64,
     pub peak_drawdown_halt_pct: f64,
+    pub rolling_pf_window: usize,
+    pub rolling_pf_min_trades: usize,
+    pub rolling_pf_floor: f64,
+    pub rolling_pf_cooldown_minutes: u32,
 }
 
 impl Default for RiskConfig {
@@ -142,6 +150,10 @@ impl Default for RiskConfig {
             max_hold_minutes: 240,
             daily_loss_limit_pct: 0.025,
             peak_drawdown_halt_pct: 0.05,
+            rolling_pf_window: 10,
+            rolling_pf_min_trades: 5,
+            rolling_pf_floor: 0.80,
+            rolling_pf_cooldown_minutes: 480,
         }
     }
 }
@@ -179,6 +191,14 @@ impl StrategyConfig {
             || self.risk.alt_gross_per_trade > self.risk.alt_max_gross
         {
             return Err("per-trade gross may not exceed its capital bucket".into());
+        }
+        if self.risk.rolling_pf_window < self.risk.rolling_pf_min_trades
+            || self.risk.rolling_pf_min_trades < 3
+            || !(0.0..=2.0).contains(&self.risk.rolling_pf_floor)
+        {
+            return Err(
+                "rolling PF gate requires window >= min_trades >= 3 and floor in [0, 2]".into(),
+            );
         }
         Ok(())
     }

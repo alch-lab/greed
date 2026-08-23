@@ -48,6 +48,7 @@ struct ResultRow {
     profit_factor: Option<f64>,
     fees_usd: f64,
     pnl_by_recipe: BTreeMap<String, f64>,
+    pnl_by_recipe_and_side: BTreeMap<String, f64>,
     entries_by_recipe: BTreeMap<String, u64>,
 }
 
@@ -58,6 +59,7 @@ pub struct BacktestReport {
     training: Vec<ResultRow>,
     selected_profile: String,
     validation: ResultRow,
+    validation_profiles: Vec<ResultRow>,
     recommended_parameters: StrategyConfig,
 }
 
@@ -65,6 +67,7 @@ pub struct BacktestReport {
 struct Ledger {
     entry_fees: BTreeMap<String, f64>,
     recipe_by_candidate: BTreeMap<String, String>,
+    side_by_candidate: BTreeMap<String, String>,
     trade_pnl: BTreeMap<String, f64>,
     fees: f64,
     entries_by_recipe: BTreeMap<String, u64>,
@@ -126,7 +129,11 @@ pub async fn run(
                 .unwrap_or(0)
         });
     let (selected_name, selected_strategy) = &profiles[selected];
-    let validation = simulate(selected_name, selected_strategy, &config, &data, split, to)?;
+    let mut validation_profiles = Vec::new();
+    for (name, strategy) in &profiles {
+        validation_profiles.push(simulate(name, strategy, &config, &data, split, to)?);
+    }
+    let validation = validation_profiles[selected].clone();
     Ok(BacktestReport {
         source: "Binance public data archive (data.binance.vision)",
         data_limitations: vec![
@@ -138,6 +145,7 @@ pub async fn run(
         training,
         selected_profile: selected_name.clone(),
         validation,
+        validation_profiles,
         recommended_parameters: selected_strategy.clone(),
     })
 }
@@ -148,8 +156,15 @@ fn score(row: &ResultRow) -> f64 {
 }
 
 fn profiles(base: &StrategyConfig) -> Vec<(String, StrategyConfig)> {
-    let balanced = base.clone();
+    let mut legacy = base.clone();
+    legacy.recipes.cross_opportunity_driven = false;
+    legacy.recipes.alt_neutral_anchor_allowed = false;
+    let mut balanced = base.clone();
+    balanced.recipes.cross_opportunity_driven = true;
+    balanced.recipes.alt_neutral_anchor_allowed = true;
     let mut responsive = base.clone();
+    responsive.recipes.cross_opportunity_driven = true;
+    responsive.recipes.alt_neutral_anchor_allowed = true;
     responsive.primitives.trend_min_return_pct = 0.0045;
     responsive.primitives.breadth_threshold = 0.006;
     responsive.primitives.breadth_horizon_bars = 48;
@@ -164,6 +179,8 @@ fn profiles(base: &StrategyConfig) -> Vec<(String, StrategyConfig)> {
     responsive.risk.alt_cross_take_profit_pct = 0.020;
     responsive.risk.alt_cross_max_hold_minutes = 480;
     let mut selective = base.clone();
+    selective.recipes.cross_opportunity_driven = true;
+    selective.recipes.alt_neutral_anchor_allowed = false;
     selective.primitives.trend_min_return_pct = 0.008;
     selective.primitives.trend_horizon_bars = 96;
     selective.primitives.trend_min_efficiency = 0.20;
@@ -181,9 +198,10 @@ fn profiles(base: &StrategyConfig) -> Vec<(String, StrategyConfig)> {
     selective.risk.alt_cross_take_profit_pct = 0.03;
     selective.risk.alt_cross_max_hold_minutes = 960;
     vec![
-        ("balanced".into(), balanced),
-        ("responsive".into(), responsive),
-        ("selective".into(), selective),
+        ("legacy_fixed_strict".into(), legacy),
+        ("opportunity_balanced".into(), balanced),
+        ("opportunity_responsive".into(), responsive),
+        ("opportunity_selective".into(), selective),
     ]
 }
 
@@ -208,7 +226,7 @@ fn simulate(
         );
     }
     let mut graph = build_graph(strategy)?;
-    let mut broker = PaperBroker::new(app.paper.clone());
+    let mut broker = PaperBroker::with_risk(app.paper.clone(), strategy.risk.clone());
     let mut ledger = Ledger::default();
     let mut peak = app.paper.initial_cash_usd;
     let mut max_drawdown: f64 = 0.0;
@@ -245,9 +263,18 @@ fn simulate(
     let profit: f64 = completed.iter().filter(|v| **v > 0.0).sum();
     let loss: f64 = -completed.iter().filter(|v| **v < 0.0).sum::<f64>();
     let mut pnl_by_recipe = BTreeMap::new();
+    let mut pnl_by_recipe_and_side = BTreeMap::new();
     for (candidate, pnl) in &ledger.trade_pnl {
         if let Some(recipe) = ledger.recipe_by_candidate.get(candidate) {
             *pnl_by_recipe.entry(recipe.clone()).or_default() += pnl;
+            let side = ledger
+                .side_by_candidate
+                .get(candidate)
+                .map(String::as_str)
+                .unwrap_or("unknown");
+            *pnl_by_recipe_and_side
+                .entry(format!("{recipe}:{side}"))
+                .or_default() += pnl;
         }
     }
     Ok(ResultRow {
@@ -265,6 +292,7 @@ fn simulate(
         profit_factor: (loss > 0.0).then_some(profit / loss),
         fees_usd: ledger.fees,
         pnl_by_recipe,
+        pnl_by_recipe_and_side,
         entries_by_recipe: ledger.entries_by_recipe,
     })
 }
@@ -279,6 +307,10 @@ impl Ledger {
                 self.entry_fees.insert(id.clone(), fee);
                 let recipe = candidate_recipe(&id);
                 self.recipe_by_candidate.insert(id, recipe.clone());
+                self.side_by_candidate.insert(
+                    payload["candidate_id"].as_str().unwrap_or("").into(),
+                    payload["side"].as_str().unwrap_or("unknown").into(),
+                );
                 *self.entries_by_recipe.entry(recipe).or_default() += 1;
             }
             "paper_partial_exit" | "paper_exit" => {

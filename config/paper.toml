@@ -13,13 +13,32 @@ altcoins = [
 ]
 
 [strategy.primitives]
+trend_horizon_bars = 96
+trend_min_return_pct = 0.008
+trend_min_efficiency = 0.20
 breadth_horizon_bars = 96
+breadth_threshold = 0.012
+breadth_min_participation = 0.65
 
 [strategy.recipes]
 cross_names = 2
-cross_rebalance_bars = 24
+cross_rebalance_bars = 32
+cross_opportunity_driven = true
+alt_neutral_anchor_allowed = false
+pullback_min_pct = 0.003
+exhaustion_move_pct = 0.024
+shock_min_return_pct = 0.060
+shock_min_reversal_pct = 0.008
+shock_min_volume_ratio = 3.0
 
 [strategy.risk]
 # 3000 USDT: majors 1500 + altcoins 1500. Other risk values use defaults.
 major_max_gross = 0.50
 alt_max_gross = 0.50
+alt_cross_stop_pct = 0.018
+alt_cross_take_profit_pct = 0.030
+alt_cross_max_hold_minutes = 960
+rolling_pf_window = 10
+rolling_pf_min_trades = 5
+rolling_pf_floor = 0.80
+rolling_pf_cooldown_minutes = 480

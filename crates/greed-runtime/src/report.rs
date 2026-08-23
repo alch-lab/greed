@@ -64,6 +64,7 @@ impl Performance {
 struct OpenTrade {
     sleeve: String,
     recipe: String,
+    side: String,
     entry_ms: i64,
     net_pnl_usd: f64,
 }
@@ -76,6 +77,7 @@ struct FunnelStats {
     block: u64,
     plans: u64,
     entries: u64,
+    plan_rejections: u64,
     blockers: BTreeMap<String, u64>,
     stopped_stages: BTreeMap<String, u64>,
 }
@@ -218,8 +220,12 @@ pub fn build(path: &str) -> Result<Value> {
     let mut total = Performance::default();
     let mut sleeves: BTreeMap<String, Performance> = BTreeMap::new();
     let mut recipes: BTreeMap<String, Performance> = BTreeMap::new();
+    let mut sides: BTreeMap<String, Performance> = BTreeMap::new();
+    let mut recipe_sides: BTreeMap<String, Performance> = BTreeMap::new();
     let mut sleeve_funnels: BTreeMap<String, FunnelStats> = BTreeMap::new();
     let mut recipe_funnels: BTreeMap<String, FunnelStats> = BTreeMap::new();
+    let mut diagnostic_states: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
+    let mut diagnostic_reasons: BTreeMap<String, BTreeMap<String, u64>> = BTreeMap::new();
     let mut open_trades: BTreeMap<String, OpenTrade> = BTreeMap::new();
     let mut first_ms = None;
     let mut last_ms = None;
@@ -287,6 +293,7 @@ pub fn build(path: &str) -> Result<Value> {
                     &mut recipe_funnels,
                 );
                 record_plans(payload, &mut sleeve_funnels, &mut recipe_funnels);
+                record_diagnostics(payload, &mut diagnostic_states, &mut diagnostic_reasons);
             }
             "paper_entry" => {
                 record_daily(payload, true, &mut daily);
@@ -295,6 +302,8 @@ pub fn build(path: &str) -> Result<Value> {
                     &mut total,
                     &mut sleeves,
                     &mut recipes,
+                    &mut sides,
+                    &mut recipe_sides,
                     &mut sleeve_funnels,
                     &mut recipe_funnels,
                     &mut open_trades,
@@ -308,8 +317,21 @@ pub fn build(path: &str) -> Result<Value> {
                     &mut total,
                     &mut sleeves,
                     &mut recipes,
+                    &mut sides,
+                    &mut recipe_sides,
                     &mut open_trades,
                 );
+            }
+            "paper_plan_rejected" => {
+                let (sleeve, recipe) = classify(payload);
+                for stats in [
+                    sleeve_funnels.entry(sleeve).or_default(),
+                    recipe_funnels.entry(recipe).or_default(),
+                ] {
+                    stats.plan_rejections += 1;
+                    let reason = payload["reason"].as_str().unwrap_or("unknown");
+                    *stats.blockers.entry(reason.into()).or_default() += 1;
+                }
             }
             "paper_equity" => {
                 latest_sleeves = payload["sleeves"].clone();
@@ -341,6 +363,14 @@ pub fn build(path: &str) -> Result<Value> {
         .iter()
         .map(|(key, value)| (key, value.value()))
         .collect();
+    let side_values: BTreeMap<_, _> = sides
+        .iter()
+        .map(|(key, value)| (key, value.value()))
+        .collect();
+    let recipe_side_values: BTreeMap<_, _> = recipe_sides
+        .iter()
+        .map(|(key, value)| (key, value.value()))
+        .collect();
     let observed_frames = successful_frames + frame_errors;
     Ok(serde_json::json!({
         "journal":path,
@@ -360,16 +390,56 @@ pub fn build(path: &str) -> Result<Value> {
         "portfolio_performance":total.value(),
         "performance_by_sleeve":sleeve_values,
         "performance_by_recipe":recipe_values,
+        "performance_by_side":side_values,
+        "performance_by_recipe_and_side":recipe_side_values,
         "daily_performance":daily,
         "portfolio_risk":portfolio_risk,
         "risk_by_sleeve":sleeve_risk,
         "funnel_by_sleeve":sleeve_funnels,
         "funnel_by_recipe":recipe_funnels,
+        "diagnostic_state_counts":diagnostic_states,
+        "diagnostic_reason_counts":diagnostic_reasons,
         "latest_sleeve_equity":latest_sleeves,
         "open_trade_count_at_report":open_trades.len(),
         "api_telemetry":telemetry,
         "api_average_latency_ms":(telemetry.requests>0).then_some(telemetry.total_latency_ms as f64/telemetry.requests as f64),
     }))
+}
+
+fn record_diagnostics(
+    payload: &Value,
+    states: &mut BTreeMap<String, BTreeMap<String, u64>>,
+    reasons: &mut BTreeMap<String, BTreeMap<String, u64>>,
+) {
+    let Some(artifacts) = payload["artifacts"].as_object() else {
+        return;
+    };
+    for key in ["alt.cross_section", "alt.shock_reversal", "portfolio.risk"] {
+        let Some(value) = artifacts
+            .get(key)
+            .and_then(|record| record["artifact"]["value"].as_object())
+        else {
+            continue;
+        };
+        let state = value
+            .get("state")
+            .and_then(Value::as_str)
+            .unwrap_or("unknown");
+        *states
+            .entry(key.into())
+            .or_default()
+            .entry(state.into())
+            .or_default() += 1;
+        if let Some(values) = value.get("reasons").and_then(Value::as_array) {
+            for reason in values.iter().filter_map(Value::as_str) {
+                *reasons
+                    .entry(key.into())
+                    .or_default()
+                    .entry(reason.into())
+                    .or_default() += 1;
+            }
+        }
+    }
 }
 
 fn record_daily(payload: &Value, entry: bool, daily: &mut BTreeMap<String, DailyPerformance>) {
@@ -494,20 +564,29 @@ fn record_plans(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_entry(
     payload: &Value,
     total: &mut Performance,
     sleeves: &mut BTreeMap<String, Performance>,
     recipes: &mut BTreeMap<String, Performance>,
+    sides: &mut BTreeMap<String, Performance>,
+    recipe_sides: &mut BTreeMap<String, Performance>,
     sleeve_funnels: &mut BTreeMap<String, FunnelStats>,
     recipe_funnels: &mut BTreeMap<String, FunnelStats>,
     trades: &mut BTreeMap<String, OpenTrade>,
 ) {
     let (sleeve, recipe) = classify(payload);
     let fee = payload["fee_usd"].as_f64().unwrap_or(0.0);
+    let side = payload["side"].as_str().unwrap_or("unknown").to_owned();
     total.entry(fee);
     sleeves.entry(sleeve.clone()).or_default().entry(fee);
     recipes.entry(recipe.clone()).or_default().entry(fee);
+    sides.entry(side.clone()).or_default().entry(fee);
+    recipe_sides
+        .entry(format!("{recipe}:{side}"))
+        .or_default()
+        .entry(fee);
     sleeve_funnels.entry(sleeve.clone()).or_default().entries += 1;
     recipe_funnels.entry(recipe.clone()).or_default().entries += 1;
     trades.insert(
@@ -515,18 +594,22 @@ fn record_entry(
         OpenTrade {
             sleeve,
             recipe,
+            side,
             entry_ms: payload["ts_ms"].as_i64().unwrap_or(0),
             net_pnl_usd: -fee,
         },
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn record_exit(
     payload: &Value,
     partial: bool,
     total: &mut Performance,
     sleeves: &mut BTreeMap<String, Performance>,
     recipes: &mut BTreeMap<String, Performance>,
+    sides: &mut BTreeMap<String, Performance>,
+    recipe_sides: &mut BTreeMap<String, Performance>,
     trades: &mut BTreeMap<String, OpenTrade>,
 ) {
     let id = payload["candidate_id"].as_str().unwrap_or("").to_owned();
@@ -536,6 +619,7 @@ fn record_exit(
     let trade = trades.entry(id.clone()).or_insert(OpenTrade {
         sleeve: fallback_sleeve,
         recipe: fallback_recipe,
+        side: payload["side"].as_str().unwrap_or("unknown").into(),
         entry_ms: payload["ts_ms"].as_i64().unwrap_or(0),
         net_pnl_usd: 0.0,
     });
@@ -549,9 +633,18 @@ fn record_exit(
         .entry(trade.recipe.clone())
         .or_default()
         .exit_leg(pnl, fee, partial);
+    sides
+        .entry(trade.side.clone())
+        .or_default()
+        .exit_leg(pnl, fee, partial);
+    recipe_sides
+        .entry(format!("{}:{}", trade.recipe, trade.side))
+        .or_default()
+        .exit_leg(pnl, fee, partial);
     if !partial {
         let trade = trades.remove(&id).expect("trade inserted above");
         let hold = payload["ts_ms"].as_i64().unwrap_or(0) - trade.entry_ms;
+        let recipe_side = format!("{}:{}", trade.recipe, trade.side);
         total.complete(trade.net_pnl_usd, hold);
         sleeves
             .entry(trade.sleeve)
@@ -559,6 +652,14 @@ fn record_exit(
             .complete(trade.net_pnl_usd, hold);
         recipes
             .entry(trade.recipe)
+            .or_default()
+            .complete(trade.net_pnl_usd, hold);
+        sides
+            .entry(trade.side.clone())
+            .or_default()
+            .complete(trade.net_pnl_usd, hold);
+        recipe_sides
+            .entry(recipe_side)
             .or_default()
             .complete(trade.net_pnl_usd, hold);
     }
@@ -574,8 +675,9 @@ mod tests {
         let lines = [
             serde_json::json!({"recorded_ms":1,"kind":"runner_start","payload":{"runtime":{"git_commit":"abc","config_hash":"cfg"}}}),
             serde_json::json!({"recorded_ms":2,"kind":"data_health","payload":{"telemetry":{"requests":10,"successes":9,"failures":1,"rate_limits":1,"retries":1,"frames_requested":1,"frames_succeeded":1}}}),
-            serde_json::json!({"recorded_ms":3,"kind":"paper_entry","payload":{"ts_ms":3,"candidate_id":"BTCUSDT.recipe.trend_pullback:BTCUSDT:3","recipe":"major_trend_pullback","asset_class":"major","symbol":"BTCUSDT","fee_usd":0.2}}),
-            serde_json::json!({"recorded_ms":4,"kind":"paper_exit","payload":{"ts_ms":64_000,"candidate_id":"BTCUSDT.recipe.trend_pullback:BTCUSDT:3","recipe":"major_trend_pullback","asset_class":"major","symbol":"BTCUSDT","fee_usd":0.2,"pnl_usd":5.0}}),
+            serde_json::json!({"recorded_ms":3,"kind":"paper_entry","payload":{"ts_ms":3,"candidate_id":"BTCUSDT.recipe.trend_pullback:BTCUSDT:3","recipe":"major_trend_pullback","asset_class":"major","symbol":"BTCUSDT","side":"buy","fee_usd":0.2}}),
+            serde_json::json!({"recorded_ms":4,"kind":"paper_exit","payload":{"ts_ms":64_000,"candidate_id":"BTCUSDT.recipe.trend_pullback:BTCUSDT:3","recipe":"major_trend_pullback","asset_class":"major","symbol":"BTCUSDT","side":"buy","fee_usd":0.2,"pnl_usd":5.0}}),
+            serde_json::json!({"recorded_ms":5,"kind":"paper_plan_rejected","payload":{"ts_ms":65_000,"candidate_id":"alt.recipe.cross_section:SOLUSDT:cycle-1","recipe":"alt_cross_section_momentum","asset_class":"altcoin","symbol":"SOLUSDT","side":"buy","reason":"rolling_profit_factor_gate"}}),
         ];
         std::fs::write(
             &path,
@@ -596,6 +698,14 @@ mod tests {
             1
         );
         assert_eq!(value["api_telemetry"]["rate_limits"], 1);
+        assert_eq!(
+            value["performance_by_recipe_and_side"]["major_trend_pullback:buy"]["completed_trades"],
+            1
+        );
+        assert_eq!(
+            value["funnel_by_recipe"]["alt_cross_section_momentum"]["plan_rejections"],
+            1
+        );
         std::fs::remove_file(path).unwrap();
     }
 }

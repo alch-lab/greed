@@ -99,6 +99,8 @@ pub fn build_graph(config: &StrategyConfig) -> Result<StrategyGraph, GraphError>
                 r.cross_names,
                 p.breadth_horizon_bars,
                 r.cross_rebalance_bars,
+                r.cross_opportunity_driven,
+                r.alt_neutral_anchor_allowed,
                 anchor,
                 &config.altcoins,
             )));
@@ -109,6 +111,7 @@ pub fn build_graph(config: &StrategyConfig) -> Result<StrategyGraph, GraphError>
                 r.shock_min_return_pct,
                 r.shock_min_reversal_pct,
                 r.shock_min_volume_ratio,
+                r.alt_neutral_anchor_allowed,
                 anchor,
                 &config.altcoins,
             )));

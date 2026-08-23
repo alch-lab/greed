@@ -2,6 +2,7 @@ use crate::config::PaperConfig;
 use greed_kernel::{
     AccountFrame, Artifact, AssetClass, GraphEvaluation, MarketFrame, PositionPlan, Side,
 };
+use greed_strategy::RiskConfig;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
@@ -96,8 +97,30 @@ pub struct BrokerEvent {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct RecipeOutcome {
+    exit_ms: i64,
+    pnl_usd: f64,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RecipePerformance {
+    outcomes: Vec<RecipeOutcome>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecipeGateStatus {
+    pub allowed: bool,
+    pub completed_trades: usize,
+    pub rolling_profit_factor: Option<f64>,
+    pub rolling_net_pnl_usd: f64,
+    pub next_probe_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PaperBroker {
     config: PaperConfig,
+    #[serde(skip)]
+    risk: RiskConfig,
     cash: f64,
     realized: f64,
     peak_equity: f64,
@@ -107,12 +130,15 @@ pub struct PaperBroker {
     seen: BTreeSet<String>,
     #[serde(default)]
     sleeves: Option<SleeveLedgers>,
+    #[serde(default)]
+    recipe_performance: BTreeMap<String, RecipePerformance>,
 }
 impl PaperBroker {
-    pub fn new(config: PaperConfig) -> Self {
+    pub fn with_risk(config: PaperConfig, risk: RiskConfig) -> Self {
         let cash = config.initial_cash_usd;
         Self {
             config,
+            risk,
             cash,
             realized: 0.0,
             peak_equity: cash,
@@ -121,6 +147,7 @@ impl PaperBroker {
             positions: BTreeMap::new(),
             seen: BTreeSet::new(),
             sleeves: Some(Self::new_sleeves(cash)),
+            recipe_performance: BTreeMap::new(),
         }
     }
     fn new_sleeves(total: f64) -> SleeveLedgers {
@@ -133,6 +160,7 @@ impl PaperBroker {
     }
     pub fn load_or_new(
         config: PaperConfig,
+        risk: RiskConfig,
         path: &str,
         major_symbols: &[String],
     ) -> anyhow::Result<Self> {
@@ -143,6 +171,7 @@ impl PaperBroker {
                 // are durable state.  A deliberate config change takes effect
                 // after restart without rewriting historical positions.
                 broker.config = config;
+                broker.risk = risk;
                 for position in broker.positions.values_mut() {
                     position.asset_class = if major_symbols.contains(&position.symbol) {
                         AssetClass::Major
@@ -172,7 +201,9 @@ impl PaperBroker {
                 }
                 Ok(broker)
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(Self::new(config)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Ok(Self::with_risk(config, risk))
+            }
             Err(error) => Err(error.into()),
         }
     }
@@ -278,6 +309,54 @@ impl PaperBroker {
     }
     pub fn positions(&self) -> &BTreeMap<String, PaperPosition> {
         &self.positions
+    }
+    pub fn has_seen(&self, candidate_id: &str) -> bool {
+        self.seen.contains(candidate_id)
+    }
+    pub fn recipe_gate_status(&self, recipe: &str, now_ms: i64) -> RecipeGateStatus {
+        let outcomes = self
+            .recipe_performance
+            .get(recipe)
+            .map(|performance| performance.outcomes.as_slice())
+            .unwrap_or_default();
+        let start = outcomes.len().saturating_sub(self.risk.rolling_pf_window);
+        let window = &outcomes[start..];
+        let profit: f64 = window
+            .iter()
+            .filter(|outcome| outcome.pnl_usd > 0.0)
+            .map(|outcome| outcome.pnl_usd)
+            .sum();
+        let loss: f64 = -window
+            .iter()
+            .filter(|outcome| outcome.pnl_usd < 0.0)
+            .map(|outcome| outcome.pnl_usd)
+            .sum::<f64>();
+        let rolling_profit_factor = (loss > f64::EPSILON).then_some(profit / loss);
+        let gate_failed = window.len() >= self.risk.rolling_pf_min_trades
+            && loss > f64::EPSILON
+            && rolling_profit_factor.unwrap_or(0.0) < self.risk.rolling_pf_floor;
+        let next_probe_ms = gate_failed.then(|| {
+            window.last().map(|outcome| outcome.exit_ms).unwrap_or(0)
+                + i64::from(self.risk.rolling_pf_cooldown_minutes) * 60_000
+        });
+        RecipeGateStatus {
+            allowed: !gate_failed || next_probe_ms.is_some_and(|probe| now_ms >= probe),
+            completed_trades: window.len(),
+            rolling_profit_factor,
+            rolling_net_pnl_usd: window.iter().map(|outcome| outcome.pnl_usd).sum(),
+            next_probe_ms,
+        }
+    }
+    pub fn recipe_gate_snapshots(&self, now_ms: i64) -> BTreeMap<String, RecipeGateStatus> {
+        [
+            "major_trend_pullback",
+            "major_exhaustion_reversal",
+            "alt_cross_section_momentum",
+            "alt_shock_reversal",
+        ]
+        .into_iter()
+        .map(|recipe| (recipe.into(), self.recipe_gate_status(recipe, now_ms)))
+        .collect()
     }
     pub fn account_frame(&self) -> AccountFrame {
         AccountFrame {
@@ -507,11 +586,25 @@ impl PaperBroker {
         ledger.fees_usd += exit_fee;
         position.realized_pnl_usd += pnl;
         position.remaining_quantity = (position.remaining_quantity - quantity).max(0.0);
+        let complete = position.remaining_quantity <= f64::EPSILON;
+        if complete {
+            let performance = self
+                .recipe_performance
+                .entry(position.recipe.clone())
+                .or_default();
+            performance.outcomes.push(RecipeOutcome {
+                exit_ms: ts_ms,
+                pnl_usd: position.realized_pnl_usd,
+            });
+            if performance.outcomes.len() > 100 {
+                performance.outcomes.remove(0);
+            }
+        }
         BrokerEvent {
-            kind: if position.remaining_quantity > f64::EPSILON {
-                "paper_partial_exit".into()
-            } else {
+            kind: if complete {
                 "paper_exit".into()
+            } else {
+                "paper_partial_exit".into()
             },
             payload: serde_json::json!({"ts_ms":ts_ms,"candidate_id":position.candidate_id,"recipe":position.recipe,"asset_class":position.asset_class,"symbol":position.symbol,"side":position.side,"entry_price":position.entry_price,"exit_price":exit,"quantity":quantity,"remaining_quantity":position.remaining_quantity,"gross_pnl_usd":gross,"fee_usd":exit_fee,"pnl_usd":pnl,"reason":reason}),
         }
@@ -539,6 +632,31 @@ impl PaperBroker {
                 .find(|candidate| candidate.id == plan.candidate_id)
                 .map(|candidate| candidate.recipe.as_str())
                 .unwrap_or_else(|| recipe_from_candidate(&plan.candidate_id));
+            let gate = self.recipe_gate_status(recipe, frame.as_of_ms);
+            if !gate.allowed {
+                self.seen.insert(plan.candidate_id.clone());
+                let asset_class = frame
+                    .instrument(&plan.symbol)
+                    .map(|instrument| instrument.asset_class);
+                events.push(BrokerEvent {
+                    kind: "paper_plan_rejected".into(),
+                    payload: serde_json::json!({
+                        "ts_ms":frame.as_of_ms,
+                        "candidate_id":plan.candidate_id,
+                        "recipe":recipe,
+                        "asset_class":asset_class,
+                        "symbol":plan.symbol,
+                        "side":plan.side,
+                        "reason":"rolling_profit_factor_gate",
+                        "rolling_profit_factor":gate.rolling_profit_factor,
+                        "rolling_net_pnl_usd":gate.rolling_net_pnl_usd,
+                        "completed_trades":gate.completed_trades,
+                        "next_probe_ms":gate.next_probe_ms,
+                        "paper_only":true,
+                    }),
+                });
+                continue;
+            }
             if let Some(event) = self.open(frame, plan, recipe) {
                 events.push(event);
             }
@@ -719,11 +837,14 @@ mod tests {
 
     #[test]
     fn existing_stop_wins_over_same_bar_take_profit() {
-        let mut broker = PaperBroker::new(PaperConfig {
-            fee_bps_per_side: 0.0,
-            slippage_bps_per_side: 0.0,
-            ..PaperConfig::default()
-        });
+        let mut broker = PaperBroker::with_risk(
+            PaperConfig {
+                fee_bps_per_side: 0.0,
+                slippage_bps_per_side: 0.0,
+                ..PaperConfig::default()
+            },
+            RiskConfig::default(),
+        );
         assert_eq!(
             broker
                 .apply_plans(&frame(1_000_000, 100.0, 100.0, 100.0), &evaluation())
@@ -738,11 +859,14 @@ mod tests {
 
     #[test]
     fn partial_take_profit_preserves_a_protected_runner() {
-        let mut broker = PaperBroker::new(PaperConfig {
-            fee_bps_per_side: 0.0,
-            slippage_bps_per_side: 0.0,
-            ..PaperConfig::default()
-        });
+        let mut broker = PaperBroker::with_risk(
+            PaperConfig {
+                fee_bps_per_side: 0.0,
+                slippage_bps_per_side: 0.0,
+                ..PaperConfig::default()
+            },
+            RiskConfig::default(),
+        );
         broker.apply_plans(&frame(1_000_000, 100.0, 100.0, 100.0), &evaluation());
         let events = broker.mark_to_market(&frame(1_900_000, 102.0, 100.0, 103.0));
         assert_eq!(events.len(), 1);
@@ -754,12 +878,13 @@ mod tests {
 
     #[test]
     fn state_roundtrip_keeps_positions_and_seen_candidates() {
-        let mut broker = PaperBroker::new(PaperConfig::default());
+        let mut broker = PaperBroker::with_risk(PaperConfig::default(), RiskConfig::default());
         broker.apply_plans(&frame(1_000_000, 100.0, 100.0, 100.0), &evaluation());
         let path = std::env::temp_dir().join(format!("greed-paper-{}.json", std::process::id()));
         broker.save(path.to_str().unwrap()).unwrap();
         let restored = PaperBroker::load_or_new(
             PaperConfig::default(),
+            RiskConfig::default(),
             path.to_str().unwrap(),
             &["BTCUSDT".into()],
         )
@@ -771,7 +896,7 @@ mod tests {
 
     #[test]
     fn sleeve_ledger_attributes_fees_and_pnl_to_major() {
-        let mut broker = PaperBroker::new(PaperConfig::default());
+        let mut broker = PaperBroker::with_risk(PaperConfig::default(), RiskConfig::default());
         let entry_frame = frame(1_000_000, 100.0, 100.0, 100.0);
         let events = broker.apply_plans(&entry_frame, &evaluation());
         assert_eq!(events[0].payload["asset_class"], "major");
@@ -785,5 +910,42 @@ mod tests {
         let after_exit = broker.sleeve_snapshots(&exit_frame);
         assert!(after_exit.major.realized_pnl_usd > 0.0);
         assert_eq!(after_exit.altcoin.realized_pnl_usd, 0.0);
+    }
+
+    #[test]
+    fn rolling_pf_gate_halts_then_allows_a_timed_probe() {
+        let risk = RiskConfig {
+            rolling_pf_window: 5,
+            rolling_pf_min_trades: 3,
+            rolling_pf_floor: 0.8,
+            rolling_pf_cooldown_minutes: 60,
+            ..RiskConfig::default()
+        };
+        let mut broker = PaperBroker::with_risk(PaperConfig::default(), risk);
+        broker.recipe_performance.insert(
+            "alt_cross_section_momentum".into(),
+            RecipePerformance {
+                outcomes: vec![
+                    RecipeOutcome {
+                        exit_ms: 1_000_000,
+                        pnl_usd: -2.0,
+                    },
+                    RecipeOutcome {
+                        exit_ms: 2_000_000,
+                        pnl_usd: 1.0,
+                    },
+                    RecipeOutcome {
+                        exit_ms: 3_000_000,
+                        pnl_usd: -2.0,
+                    },
+                ],
+            },
+        );
+        let halted = broker.recipe_gate_status("alt_cross_section_momentum", 3_000_001);
+        assert!(!halted.allowed);
+        assert_eq!(halted.rolling_profit_factor, Some(0.25));
+        let probe =
+            broker.recipe_gate_status("alt_cross_section_momentum", 3_000_000 + 60 * 60_000);
+        assert!(probe.allowed);
     }
 }
