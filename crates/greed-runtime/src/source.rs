@@ -272,6 +272,15 @@ impl BinanceMarketSource {
         {
             selected.insert(symbol.clone());
         }
+        // Liquidity and mover rankings overlap heavily in trending markets.
+        // Fill the remainder from executable, liquid contracts so max_symbols
+        // is the active target rather than an accidental upper bound.
+        for (symbol, _, _, _, _, _, _) in &by_liquidity {
+            if selected.len() >= strategy.universe.max_symbols {
+                break;
+            }
+            selected.insert(symbol.clone());
+        }
         let selected_scores: BTreeMap<_, _> = rows
             .iter()
             .map(|row| (&row.0, anomaly_score(row) + row.1.ln_1p() * 1e-6))

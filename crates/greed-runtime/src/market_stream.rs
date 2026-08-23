@@ -206,7 +206,7 @@ async fn run_supervisor(
     mut symbols: watch::Receiver<Vec<String>>,
 ) {
     let radar_url = format!(
-        "{}/stream?streams=!ticker@arr",
+        "{}/market/stream?streams=!ticker@arr",
         base_url.trim_end_matches('/')
     );
     tokio::spawn(run_connection(
@@ -331,7 +331,7 @@ fn market_url(base: &str, symbols: &[String]) -> String {
         streams.push(format!("{symbol}@forceOrder"));
     }
     format!(
-        "{}/stream?streams={}",
+        "{}/market/stream?streams={}",
         base.trim_end_matches('/'),
         streams.join("/")
     )
@@ -343,7 +343,10 @@ fn public_url(base: &str, symbols: &[String]) -> String {
         .map(|symbol| format!("{}@depth20@1000ms", symbol.to_lowercase()))
         .collect::<Vec<_>>()
         .join("/");
-    format!("{}/stream?streams={streams}", base.trim_end_matches('/'))
+    format!(
+        "{}/market/stream?streams={streams}",
+        base.trim_end_matches('/')
+    )
 }
 
 fn handle_payload(
@@ -733,13 +736,13 @@ mod tests {
         let market = market_url("wss://fstream.binance.com", &symbols);
         let public = public_url("wss://fstream.binance.com", &symbols);
         assert!(!market.contains("!ticker@arr"));
-        assert!(market.contains("/stream?streams="));
+        assert!(market.contains("/market/stream?streams="));
         assert!(market.contains("ybusdt@kline_5m"));
         assert!(market.contains("ybusdt@kline_1m"));
         assert!(market.contains("btcusdt@kline_5m"));
         assert!(market.contains("btcusdt@aggTrade"));
         assert!(market.contains("btcusdt@forceOrder"));
-        assert!(public.contains("/stream?streams="));
+        assert!(public.contains("/market/stream?streams="));
     }
 
     #[test]
