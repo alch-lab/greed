@@ -19,6 +19,9 @@ pub struct BacktestPosition {
     pub remaining_quantity: f64,
     pub stop_price: f64,
     pub take_profit_prices: Vec<(f64, f64)>,
+    pub break_even_after_fraction: Option<f64>,
+    pub break_even_buffer_pct: f64,
+    pub break_even_armed: bool,
     pub trailing_activation_pct: Option<f64>,
     pub trailing_distance_pct: Option<f64>,
     pub max_hold_ms: i64,
@@ -353,6 +356,17 @@ impl BacktestBroker {
                             "partial_take_profit",
                             frame.as_of_ms,
                         ));
+                        let closed_fraction =
+                            1.0 - position.remaining_quantity / position.quantity.max(f64::EPSILON);
+                        if !position.break_even_armed
+                            && position
+                                .break_even_after_fraction
+                                .is_some_and(|threshold| closed_fraction + 1e-9 >= threshold)
+                        {
+                            position.stop_price = position.entry_price
+                                * (1.0 + position.side.sign() * position.break_even_buffer_pct);
+                            position.break_even_armed = true;
+                        }
                     }
                 } else {
                     remaining_targets.push((target, fraction));
@@ -447,7 +461,7 @@ impl BacktestBroker {
         if complete {
             let performance = self
                 .recipe_performance
-                .entry(position.recipe.clone())
+                .entry(gate_key(&position.recipe, position.side))
                 .or_default();
             performance.outcomes.push(RecipeOutcome {
                 exit_ms: ts_ms,
@@ -489,7 +503,8 @@ impl BacktestBroker {
                 .find(|candidate| candidate.id == plan.candidate_id)
                 .map(|candidate| candidate.recipe.as_str())
                 .unwrap_or_else(|| recipe_from_candidate(&plan.candidate_id));
-            let gate = self.recipe_gate_status(recipe, frame.as_of_ms);
+            let performance_key = gate_key(recipe, plan.side);
+            let gate = self.recipe_gate_status(&performance_key, frame.as_of_ms);
             if !gate.allowed {
                 self.seen.insert(plan.candidate_id.clone());
                 let asset_class = frame
@@ -501,6 +516,7 @@ impl BacktestBroker {
                         "ts_ms":frame.as_of_ms,
                         "candidate_id":plan.candidate_id,
                         "recipe":recipe,
+                        "performance_key":performance_key,
                         "asset_class":asset_class,
                         "symbol":plan.symbol,
                         "side":plan.side,
@@ -566,6 +582,9 @@ impl BacktestBroker {
                 remaining_quantity: quantity,
                 stop_price: rebased_stop,
                 take_profit_prices: rebased_targets,
+                break_even_after_fraction: plan.break_even_after_fraction,
+                break_even_buffer_pct: plan.break_even_buffer_pct,
+                break_even_armed: false,
                 trailing_activation_pct: plan.trailing_activation_pct,
                 trailing_distance_pct: plan.trailing_distance_pct,
                 max_hold_ms: plan.max_hold_ms,
@@ -595,11 +614,23 @@ fn recipe_from_candidate(candidate_id: &str) -> &'static str {
     } else if candidate_id.contains("outlier_momentum") || candidate_id.contains("outlier-momentum")
     {
         "alt_outlier_continuation"
+    } else if candidate_id.contains("early_impulse") || candidate_id.contains("early-impulse") {
+        "alt_early_impulse"
     } else if candidate_id.contains("shock_reversal") || candidate_id.contains("shock-reversal") {
         "alt_shock_reversal"
     } else {
         "unknown"
     }
+}
+
+fn gate_key(recipe: &str, side: Side) -> String {
+    format!(
+        "{recipe}:{}",
+        match side {
+            Side::Buy => "buy",
+            Side::Sell => "sell",
+        }
+    )
 }
 
 #[cfg(test)]
@@ -683,6 +714,8 @@ mod tests {
             entry_limit: None,
             stop_price: 99.0,
             take_profit_prices: vec![(102.0, 0.5)],
+            break_even_after_fraction: Some(0.25),
+            break_even_buffer_pct: 0.0015,
             trailing_activation_pct: Some(0.012),
             trailing_distance_pct: Some(0.006),
             max_hold_ms: 3_600_000,
@@ -797,5 +830,46 @@ mod tests {
         let probe =
             broker.recipe_gate_status("alt_cross_section_momentum", 3_000_000 + 60 * 60_000);
         assert!(probe.allowed);
+    }
+
+    #[test]
+    fn rolling_pf_gate_is_independent_by_side() {
+        let risk = RiskConfig {
+            rolling_pf_window: 5,
+            rolling_pf_min_trades: 3,
+            rolling_pf_floor: 1.0,
+            ..RiskConfig::default()
+        };
+        let mut broker =
+            BacktestBroker::with_risk(PortfolioConfig::default(), BacktestConfig::default(), risk);
+        broker.recipe_performance.insert(
+            "alt_early_impulse:buy".into(),
+            RecipePerformance {
+                outcomes: vec![
+                    RecipeOutcome {
+                        exit_ms: 1,
+                        pnl_usd: -2.0,
+                    },
+                    RecipeOutcome {
+                        exit_ms: 2,
+                        pnl_usd: 0.5,
+                    },
+                    RecipeOutcome {
+                        exit_ms: 3,
+                        pnl_usd: -2.0,
+                    },
+                ],
+            },
+        );
+        assert!(
+            !broker
+                .recipe_gate_status("alt_early_impulse:buy", 4)
+                .allowed
+        );
+        assert!(
+            broker
+                .recipe_gate_status("alt_early_impulse:sell", 4)
+                .allowed
+        );
     }
 }

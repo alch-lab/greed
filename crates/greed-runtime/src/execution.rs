@@ -45,8 +45,33 @@ struct ExecutionMeta {
     asset_class: AssetClass,
     side: Side,
     entry_ms: i64,
+    #[serde(default)]
+    entry_price: f64,
+    #[serde(default)]
+    initial_quantity: f64,
+    #[serde(default)]
+    last_observed_quantity: f64,
+    #[serde(default)]
+    cumulative_reported_fee_usd: f64,
+    #[serde(default)]
+    cumulative_reported_pnl_usd: f64,
     stop_price: f64,
+    #[serde(default)]
     take_profit_price: f64,
+    #[serde(default)]
+    take_profit_prices: Vec<(f64, f64)>,
+    #[serde(default)]
+    break_even_after_fraction: Option<f64>,
+    #[serde(default)]
+    break_even_buffer_pct: f64,
+    #[serde(default)]
+    break_even_armed: bool,
+    #[serde(default)]
+    extreme_price: f64,
+    #[serde(default)]
+    trailing_activation_pct: Option<f64>,
+    #[serde(default)]
+    trailing_distance_pct: Option<f64>,
     max_hold_ms: i64,
     #[serde(default)]
     exit_requested: bool,
@@ -279,6 +304,7 @@ impl BinanceDemoExecution {
                     .collect();
                 let mut events = Vec::new();
                 let mut protected: BTreeMap<String, (bool, bool)> = BTreeMap::new();
+                let mut stop_orders: BTreeMap<String, i64> = BTreeMap::new();
                 for symbol in account.positions.keys() {
                     let open_orders = self
                         .signed(
@@ -293,9 +319,201 @@ impl BinanceDemoExecution {
                     {
                         let entry = protected.entry(symbol.clone()).or_insert((false, false));
                         match order["type"].as_str().unwrap_or_default() {
-                            "STOP_MARKET" => entry.0 = true,
+                            "STOP_MARKET" => {
+                                entry.0 = true;
+                                if let Some(order_id) = order["orderId"].as_i64() {
+                                    stop_orders.insert(symbol.clone(), order_id);
+                                }
+                            }
                             "TAKE_PROFIT_MARKET" => entry.1 = true,
                             _ => {}
+                        }
+                    }
+                }
+                let mut protection_updates = Vec::new();
+                let partial_exits: Vec<_> = account
+                    .positions
+                    .iter()
+                    .filter_map(|(symbol, position)| {
+                        let meta = self.state.positions.get(symbol)?;
+                        let previous = if meta.last_observed_quantity > 0.0 {
+                            meta.last_observed_quantity
+                        } else {
+                            meta.initial_quantity
+                        };
+                        (previous > position.quantity.abs() + f64::EPSILON).then_some((
+                            symbol.clone(),
+                            previous - position.quantity.abs(),
+                            position.quantity.abs(),
+                            meta.entry_ms,
+                            meta.candidate_id.clone(),
+                            meta.recipe.clone(),
+                            meta.asset_class,
+                            meta.side,
+                        ))
+                    })
+                    .collect();
+                for (
+                    symbol,
+                    closed_quantity,
+                    remaining_quantity,
+                    entry_ms,
+                    candidate_id,
+                    recipe,
+                    asset_class,
+                    side,
+                ) in partial_exits
+                {
+                    let summary = self.trade_summary(&symbol, entry_ms).await.ok();
+                    let (fee_delta, pnl_delta) = if let Some((_, _, fee, pnl)) = summary.as_ref() {
+                        let meta = self.state.positions.get(&symbol);
+                        (
+                            fee - meta
+                                .map(|value| value.cumulative_reported_fee_usd)
+                                .unwrap_or(0.0),
+                            pnl - meta
+                                .map(|value| value.cumulative_reported_pnl_usd)
+                                .unwrap_or(0.0),
+                        )
+                    } else {
+                        (0.0, 0.0)
+                    };
+                    events.push(ExchangeEvent {
+                        kind: "exchange_partial_exit".into(),
+                        payload: serde_json::json!({
+                            "ts_ms":now_ms,
+                            "candidate_id":candidate_id,
+                            "recipe":recipe,
+                            "asset_class":asset_class,
+                            "symbol":symbol,
+                            "side":side,
+                            "reason":"staged_take_profit",
+                            "closed_quantity":closed_quantity,
+                            "remaining_quantity":remaining_quantity,
+                            "fee_usd":fee_delta,
+                            "pnl_usd":pnl_delta,
+                            "cumulative_fee_usd":summary.as_ref().map(|value| value.2),
+                            "cumulative_net_pnl_usd":summary.as_ref().map(|value| value.3),
+                            "venue":"binance_demo"
+                        }),
+                    });
+                    if let Some(meta) = self.state.positions.get_mut(&symbol) {
+                        meta.last_observed_quantity = remaining_quantity;
+                        if let Some((_, _, fee, pnl)) = summary {
+                            meta.cumulative_reported_fee_usd = fee;
+                            meta.cumulative_reported_pnl_usd = pnl;
+                        }
+                    }
+                }
+                for (symbol, position) in &account.positions {
+                    let Some(meta) = self.state.positions.get_mut(symbol) else {
+                        continue;
+                    };
+                    meta.extreme_price = if meta.extreme_price <= 0.0 {
+                        position.mark_price
+                    } else {
+                        match meta.side {
+                            Side::Buy => meta.extreme_price.max(position.mark_price),
+                            Side::Sell => meta.extreme_price.min(position.mark_price),
+                        }
+                    };
+                    let initial_quantity = meta.initial_quantity.max(position.quantity.abs());
+                    let closed_fraction =
+                        1.0 - position.quantity.abs() / initial_quantity.max(f64::EPSILON);
+                    let shield_hit = meta
+                        .break_even_after_fraction
+                        .is_some_and(|threshold| closed_fraction + 1e-6 >= threshold);
+                    let mut desired_stop = None;
+                    let mut reason = "risk_shield";
+                    if shield_hit && !meta.break_even_armed && meta.entry_price > 0.0 {
+                        desired_stop = Some(
+                            meta.entry_price
+                                * (1.0 + meta.side.sign() * meta.break_even_buffer_pct),
+                        );
+                    }
+                    let favorable = meta.side.sign()
+                        * (meta.extreme_price / meta.entry_price.max(f64::EPSILON) - 1.0);
+                    if shield_hit
+                        && meta
+                            .trailing_activation_pct
+                            .is_some_and(|activation| favorable >= activation)
+                    {
+                        if let Some(distance) = meta.trailing_distance_pct {
+                            let trailing = meta.extreme_price * (1.0 - meta.side.sign() * distance);
+                            desired_stop = Some(match (meta.side, desired_stop) {
+                                (Side::Buy, Some(current)) => current.max(trailing),
+                                (Side::Sell, Some(current)) => current.min(trailing),
+                                (_, None) => trailing,
+                            });
+                            reason = "trailing_protection";
+                        }
+                    }
+                    if let Some(desired) = desired_stop {
+                        let tighter = match meta.side {
+                            Side::Buy => desired / meta.stop_price.max(f64::EPSILON) - 1.0 >= 0.001,
+                            Side::Sell => {
+                                meta.stop_price / desired.max(f64::EPSILON) - 1.0 >= 0.001
+                            }
+                        };
+                        if tighter {
+                            protection_updates.push((
+                                symbol.clone(),
+                                desired,
+                                reason,
+                                position.clone(),
+                                stop_orders.get(symbol).copied(),
+                            ));
+                        }
+                    }
+                }
+                for (symbol, desired, reason, position, stop_order_id) in protection_updates {
+                    let rules = self
+                        .rules
+                        .get(&symbol)
+                        .cloned()
+                        .ok_or_else(|| anyhow!("missing exchange rules for {symbol}"))?;
+                    let replacement = async {
+                        if let Some(order_id) = stop_order_id {
+                            self.cancel_order(&symbol, order_id).await?;
+                        }
+                        self.place_close_all_trigger(
+                            &symbol,
+                            position.side.opposite(),
+                            "STOP_MARKET",
+                            desired,
+                            &rules,
+                            client_order_id(
+                                "protect",
+                                &format!("{symbol}:{desired:.10}:{}", now_ms / 60_000),
+                            ),
+                        )
+                        .await
+                    }
+                    .await;
+                    match replacement {
+                        Ok(()) => {
+                            if let Some(meta) = self.state.positions.get_mut(&symbol) {
+                                meta.stop_price = desired;
+                                meta.break_even_armed = true;
+                            }
+                            events.push(ExchangeEvent {
+                                kind: "exchange_protection_updated".into(),
+                                payload: serde_json::json!({"ts_ms":now_ms,"symbol":symbol,"stop_price":desired,"reason":reason,"venue":"binance_demo"}),
+                            });
+                        }
+                        Err(error) => {
+                            self.close_market(&position).await.with_context(|| {
+                                format!(
+                                    "protection update failed ({error}); emergency close failed"
+                                )
+                            })?;
+                            if let Some(meta) = self.state.positions.get_mut(&symbol) {
+                                meta.exit_requested = true;
+                            }
+                            events.push(ExchangeEvent {
+                                kind: "exchange_exit_requested".into(),
+                                payload: serde_json::json!({"ts_ms":now_ms,"symbol":symbol,"reason":"protection_update_failed","detail":error.to_string(),"venue":"binance_demo"}),
+                            });
                         }
                     }
                 }
@@ -359,7 +577,7 @@ impl BinanceDemoExecution {
                         if let Some((_, _, _, pnl)) = summary.as_ref() {
                             self.state
                                 .recipe_outcomes
-                                .entry(meta.recipe.clone())
+                                .entry(gate_key(&meta.recipe, meta.side))
                                 .or_default()
                                 .push(ExecutionOutcome {
                                     exit_ms: now_ms,
@@ -377,8 +595,9 @@ impl BinanceDemoExecution {
                                 "side": meta.side,
                                 "exit_price": summary.as_ref().map(|value| value.0),
                                 "quantity": summary.as_ref().map(|value| value.1),
-                                "fee_usd": summary.as_ref().map(|value| value.2),
-                                "pnl_usd": summary.as_ref().map(|value| value.3),
+                                "fee_usd": summary.as_ref().map(|value| value.2 - meta.cumulative_reported_fee_usd),
+                                "pnl_usd": summary.as_ref().map(|value| value.3 - meta.cumulative_reported_pnl_usd),
+                                "trade_net_pnl_usd": summary.as_ref().map(|value| value.3),
                                 "reason": "exchange_position_reconciled",
                                 "venue": "binance_demo"
                             }),
@@ -482,16 +701,29 @@ impl BinanceDemoExecution {
         }
     }
 
+    pub fn candidate_gate_status(&self, recipe: &str, side: Side, now_ms: i64) -> RecipeGateStatus {
+        self.recipe_gate_status(&gate_key(recipe, side), now_ms)
+    }
+
     pub fn recipe_gate_snapshots(&self, now_ms: i64) -> BTreeMap<String, RecipeGateStatus> {
         [
             "major_trend_pullback",
             "major_exhaustion_reversal",
             "alt_outlier_continuation",
             "alt_outlier_pullback_reclaim",
+            "alt_early_impulse",
+            "alt_cross_section_momentum",
+            "alt_cross_section_probe",
             "alt_shock_reversal",
         ]
         .into_iter()
-        .map(|recipe| (recipe.into(), self.recipe_gate_status(recipe, now_ms)))
+        .flat_map(|recipe| {
+            [Side::Buy, Side::Sell].into_iter().map(move |side| {
+                let key = gate_key(recipe, side);
+                let status = self.recipe_gate_status(&key, now_ms);
+                (key, status)
+            })
+        })
         .collect()
     }
 
@@ -538,7 +770,13 @@ impl BinanceDemoExecution {
                         remaining_quantity: position.quantity.abs(),
                         stop_price: meta.map(|value| value.stop_price).unwrap_or_default(),
                         take_profit_prices: meta
-                            .map(|value| vec![(value.take_profit_price, 1.0)])
+                            .map(|value| {
+                                if value.take_profit_prices.is_empty() {
+                                    vec![(value.take_profit_price, 1.0)]
+                                } else {
+                                    value.take_profit_prices.clone()
+                                }
+                            })
                             .unwrap_or_default(),
                         max_hold_ms: meta.map(|value| value.max_hold_ms).unwrap_or_default(),
                         current_price: Some(position.mark_price),
@@ -586,11 +824,15 @@ impl BinanceDemoExecution {
             let recipe = candidate
                 .map(|value| value.recipe.clone())
                 .unwrap_or_else(|| "unknown".into());
-            if !self.recipe_gate_status(&recipe, frame.as_of_ms).allowed {
+            let performance_key = gate_key(&recipe, plan.side);
+            if !self
+                .recipe_gate_status(&performance_key, frame.as_of_ms)
+                .allowed
+            {
                 self.state.seen.insert(plan.candidate_id.clone());
                 events.push(ExchangeEvent {
                     kind: "exchange_plan_rejected".into(),
-                    payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"symbol":plan.symbol,"side":plan.side,"reason":"rolling_profit_factor_gate","venue":"binance_demo","paper_only":true}),
+                    payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"performance_key":performance_key,"symbol":plan.symbol,"side":plan.side,"reason":"rolling_profit_factor_gate","venue":"binance_demo","paper_only":true}),
                 });
                 continue;
             }
@@ -609,8 +851,28 @@ impl BinanceDemoExecution {
                             asset_class,
                             side: plan.side,
                             entry_ms: frame.as_of_ms,
+                            entry_price,
+                            initial_quantity: quantity,
+                            last_observed_quantity: quantity,
+                            cumulative_reported_fee_usd: 0.0,
+                            cumulative_reported_pnl_usd: 0.0,
                             stop_price: plan.stop_price,
-                            take_profit_price: plan.take_profit_prices.first().map(|value| value.0).unwrap_or_default(),
+                            take_profit_price: plan.take_profit_prices.last().map(|value| value.0).unwrap_or_default(),
+                            take_profit_prices: plan.take_profit_prices.clone(),
+                            break_even_after_fraction: plan.break_even_after_fraction.map(|fraction| {
+                                self.rules
+                                    .get(&plan.symbol)
+                                    .map(|rules| {
+                                        floor_step(quantity * fraction, rules.quantity_step)
+                                            / quantity.max(f64::EPSILON)
+                                    })
+                                    .unwrap_or(fraction)
+                            }),
+                            break_even_buffer_pct: plan.break_even_buffer_pct,
+                            break_even_armed: false,
+                            extreme_price: entry_price,
+                            trailing_activation_pct: plan.trailing_activation_pct,
+                            trailing_distance_pct: plan.trailing_distance_pct,
                             max_hold_ms: plan.max_hold_ms,
                             exit_requested: false,
                         },
@@ -644,6 +906,21 @@ impl BinanceDemoExecution {
                 "order is below Binance quantity or notional minimum"
             ));
         }
+        if plan.take_profit_prices.len() < 2 {
+            return Err(anyhow!("position plan requires staged take profits"));
+        }
+        for (_, fraction) in plan
+            .take_profit_prices
+            .iter()
+            .take(plan.take_profit_prices.len() - 1)
+        {
+            let partial = floor_step(quantity * fraction, rules.quantity_step);
+            if partial < rules.min_quantity || partial * plan.reference_price < rules.min_notional {
+                return Err(anyhow!(
+                    "staged take profit is below Binance quantity or notional minimum"
+                ));
+            }
+        }
         let client_id = client_order_id("entry", &plan.candidate_id);
         let entry = self
             .submit_or_lookup(
@@ -674,20 +951,30 @@ impl BinanceDemoExecution {
                 client_order_id("stop", &plan.candidate_id),
             )
             .await?;
-            let take_profit = plan
-                .take_profit_prices
-                .first()
-                .map(|value| value.0)
-                .ok_or_else(|| anyhow!("position plan has no take profit"))?;
-            self.place_close_all_trigger(
-                &plan.symbol,
-                plan.side.opposite(),
-                "TAKE_PROFIT_MARKET",
-                take_profit,
-                rules,
-                client_order_id("take", &plan.candidate_id),
-            )
-            .await?;
+            for (index, (take_profit, fraction)) in plan.take_profit_prices.iter().enumerate() {
+                let last = index + 1 == plan.take_profit_prices.len();
+                if last {
+                    self.place_close_all_trigger(
+                        &plan.symbol,
+                        plan.side.opposite(),
+                        "TAKE_PROFIT_MARKET",
+                        *take_profit,
+                        rules,
+                        client_order_id("runner", &plan.candidate_id),
+                    )
+                    .await?;
+                } else {
+                    self.place_partial_trigger(
+                        &plan.symbol,
+                        plan.side.opposite(),
+                        *take_profit,
+                        floor_step(executed * fraction, rules.quantity_step),
+                        rules,
+                        client_order_id(&format!("take{index}"), &plan.candidate_id),
+                    )
+                    .await?;
+                }
+            }
             Result::<()>::Ok(())
         }
         .await;
@@ -745,6 +1032,37 @@ impl BinanceDemoExecution {
         Ok(())
     }
 
+    async fn place_partial_trigger(
+        &self,
+        symbol: &str,
+        side: Side,
+        trigger: f64,
+        quantity: f64,
+        rules: &SymbolRules,
+        client_id: String,
+    ) -> Result<()> {
+        self.submit_or_lookup(
+            symbol,
+            &client_id,
+            vec![
+                ("symbol".into(), symbol.into()),
+                ("side".into(), side_name(side).into()),
+                ("type".into(), "TAKE_PROFIT_MARKET".into()),
+                (
+                    "stopPrice".into(),
+                    decimal(round_step(trigger, rules.price_tick), rules.price_tick),
+                ),
+                ("quantity".into(), decimal(quantity, rules.quantity_step)),
+                ("reduceOnly".into(), "true".into()),
+                ("workingType".into(), "MARK_PRICE".into()),
+                ("priceProtect".into(), "true".into()),
+                ("newClientOrderId".into(), client_id.clone()),
+            ],
+        )
+        .await?;
+        Ok(())
+    }
+
     async fn submit_or_lookup(
         &self,
         symbol: &str,
@@ -791,6 +1109,19 @@ impl BinanceDemoExecution {
             Method::DELETE,
             "/fapi/v1/allOpenOrders",
             vec![("symbol".into(), symbol.into())],
+        )
+        .await?;
+        Ok(())
+    }
+
+    async fn cancel_order(&self, symbol: &str, order_id: i64) -> Result<()> {
+        self.signed(
+            Method::DELETE,
+            "/fapi/v1/order",
+            vec![
+                ("symbol".into(), symbol.into()),
+                ("orderId".into(), order_id.to_string()),
+            ],
         )
         .await?;
         Ok(())
@@ -964,6 +1295,15 @@ fn side_name(side: Side) -> &'static str {
         Side::Buy => "BUY",
         Side::Sell => "SELL",
     }
+}
+fn gate_key(recipe: &str, side: Side) -> String {
+    format!(
+        "{recipe}:{}",
+        match side {
+            Side::Buy => "buy",
+            Side::Sell => "sell",
+        }
+    )
 }
 fn floor_step(value: f64, step: f64) -> f64 {
     (value / step).floor() * step

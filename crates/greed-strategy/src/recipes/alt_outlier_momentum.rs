@@ -385,6 +385,7 @@ impl StrategyNode for AltOutlierMomentumNode {
                 } else {
                     "neutral"
                 };
+            let context_confirmed = anchor_context == "confirmed" || breadth_context == "confirmed";
             let signal_ms = setup
                 .instrument
                 .fast_perpetual
@@ -410,8 +411,16 @@ impl StrategyNode for AltOutlierMomentumNode {
                     * (setup.volume_ratio / self.min_volume_ratio).min(1.5)
                     / 1.5)
                     .clamp(0.35, 1.0),
-                verdict: Verdict::Pass,
-                blockers: vec![],
+                verdict: if context_confirmed {
+                    Verdict::Pass
+                } else {
+                    Verdict::Block
+                },
+                blockers: if context_confirmed {
+                    vec![]
+                } else {
+                    vec!["outlier needs BTC trend or alt breadth confirmation".into()]
+                },
                 evidence: vec![
                     format!("{}.outlier_return", setup.instrument.symbol),
                     format!("{}.volume_expansion", setup.instrument.symbol),

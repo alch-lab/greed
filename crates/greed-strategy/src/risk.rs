@@ -21,7 +21,10 @@ impl PositionPlannerNode {
 }
 
 fn candidate_size_multiplier(config: &RiskConfig, tags: &BTreeMap<String, String>) -> f64 {
-    if tags.get("stop_profile").map(String::as_str) == Some("alt_outlier") {
+    if matches!(
+        tags.get("stop_profile").map(String::as_str),
+        Some("alt_outlier" | "alt_intraday")
+    ) {
         let anchor = match tags.get("anchor_context").map(String::as_str) {
             Some("opposed") => config.alt_outlier_opposed_size_multiplier,
             Some("neutral") => config.alt_outlier_neutral_size_multiplier,
@@ -95,7 +98,7 @@ impl StrategyNode for PositionPlannerNode {
                     90_000,
                     DataQuality::Complete,
                     1.0,
-                    vec!["paper_account".into()],
+                    vec!["binance_demo_account".into()],
                 ),
             }),
         }];
@@ -118,6 +121,9 @@ impl StrategyNode for PositionPlannerNode {
             };
             let base_per_trade = if instrument.asset_class == AssetClass::Major {
                 self.config.major_gross_per_trade
+            } else if candidate.tags.get("stop_profile").map(String::as_str) == Some("alt_intraday")
+            {
+                self.config.alt_intraday_gross_per_trade
             } else if candidate.tags.get("stop_profile").map(String::as_str) == Some("alt_outlier")
             {
                 self.config.alt_outlier_gross_per_trade
@@ -153,11 +159,12 @@ impl StrategyNode for PositionPlannerNode {
                     Some("exhaustion") => self.config.initial_stop_pct * 0.75,
                     Some("alt_shock") => self.config.initial_stop_pct * 1.5,
                     Some("alt_outlier") => self.config.alt_outlier_stop_pct,
+                    Some("alt_intraday") => self.config.alt_intraday_stop_pct,
                     Some("alt_cross") => self.config.alt_cross_stop_pct,
                     _ => self.config.initial_stop_pct,
                 }
             };
-            let take_profit_pct = if neutral_anchor {
+            let legacy_take_profit_pct = if neutral_anchor {
                 self.config.alt_neutral_anchor_take_profit_pct
             } else {
                 match candidate.tags.get("stop_profile").map(String::as_str) {
@@ -167,12 +174,42 @@ impl StrategyNode for PositionPlannerNode {
                 }
             };
             let stop_price = candidate.reference_price * (1.0 - candidate.side.sign() * stop_pct);
-            let tp = candidate.reference_price * (1.0 + candidate.side.sign() * take_profit_pct);
+            let risk_distance = stop_pct;
+            let target = |r_multiple: f64| {
+                candidate.reference_price
+                    * (1.0 + candidate.side.sign() * risk_distance * r_multiple)
+            };
+            let runner_fraction =
+                (1.0 - self.config.risk_shield_fraction - self.config.second_take_profit_fraction)
+                    .max(0.0);
+            let take_profit_prices = if runner_fraction > f64::EPSILON {
+                vec![
+                    (
+                        target(self.config.risk_shield_r_multiple),
+                        self.config.risk_shield_fraction,
+                    ),
+                    (
+                        target(self.config.second_take_profit_r_multiple),
+                        self.config.second_take_profit_fraction,
+                    ),
+                    (
+                        target(self.config.runner_take_profit_r_multiple),
+                        runner_fraction,
+                    ),
+                ]
+            } else {
+                vec![(
+                    candidate.reference_price
+                        * (1.0 + candidate.side.sign() * legacy_take_profit_pct),
+                    1.0,
+                )]
+            };
             let max_hold_minutes = if neutral_anchor {
                 self.config.alt_neutral_anchor_max_hold_minutes
             } else {
                 match candidate.tags.get("hold_profile").map(String::as_str) {
                     Some("alt_outlier") => self.config.alt_outlier_max_hold_minutes,
+                    Some("alt_intraday") => self.config.alt_intraday_max_hold_minutes,
                     Some("alt_cross") => self.config.alt_cross_max_hold_minutes,
                     _ => self.config.max_hold_minutes,
                 }
@@ -185,7 +222,9 @@ impl StrategyNode for PositionPlannerNode {
                 notional_usd: ctx.frame.account.equity_usd * per_trade,
                 entry_limit: None,
                 stop_price,
-                take_profit_prices: vec![(tp, self.config.first_take_profit_fraction)],
+                take_profit_prices,
+                break_even_after_fraction: Some(self.config.risk_shield_fraction),
+                break_even_buffer_pct: self.config.break_even_cost_buffer_pct,
                 trailing_activation_pct: Some(self.config.trailing_activation_pct),
                 trailing_distance_pct: Some(self.config.trailing_distance_pct),
                 max_hold_ms: max_hold_minutes as i64 * 60_000,

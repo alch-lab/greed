@@ -9,9 +9,9 @@ use crate::{
         price::TrendRegimeNode,
     },
     recipes::{
-        alt_cross_section::AltCrossSectionNode, alt_outlier_momentum::AltOutlierMomentumNode,
-        alt_shock_reversal::AltShockReversalNode, major_exhaustion::MajorExhaustionNode,
-        major_trend_pullback::MajorTrendPullbackNode,
+        alt_cross_section::AltCrossSectionNode, alt_early_impulse::AltEarlyImpulseNode,
+        alt_outlier_momentum::AltOutlierMomentumNode, alt_shock_reversal::AltShockReversalNode,
+        major_exhaustion::MajorExhaustionNode, major_trend_pullback::MajorTrendPullbackNode,
     },
     risk::PositionPlannerNode,
     StrategyConfig,
@@ -125,6 +125,20 @@ pub fn build_graph(config: &StrategyConfig) -> Result<StrategyGraph, GraphError>
                 &config.altcoins,
             )));
             recipe_ids.push("alt.recipe.outlier_momentum".into());
+        }
+        if r.alt_early_impulse_enabled {
+            nodes.push(Box::new(AltEarlyImpulseNode::new(
+                r.impulse_names,
+                r.impulse_min_15m_pct,
+                r.impulse_max_15m_pct,
+                r.impulse_min_volume_ratio,
+                r.impulse_max_1h_pct,
+                r.outlier_max_directional_wick_ratio,
+                r.outlier_max_climax_range_ratio,
+                anchor,
+                &config.altcoins,
+            )));
+            recipe_ids.push("alt.recipe.early_impulse".into());
         }
         if r.alt_shock_reversal_enabled {
             nodes.push(Box::new(AltShockReversalNode::new(

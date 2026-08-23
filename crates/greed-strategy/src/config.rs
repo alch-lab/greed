@@ -100,6 +100,7 @@ pub struct RecipeConfig {
     pub require_coinbase_premium: bool,
     pub alt_cross_section_enabled: bool,
     pub alt_outlier_momentum_enabled: bool,
+    pub alt_early_impulse_enabled: bool,
     pub alt_shock_reversal_enabled: bool,
     pub pullback_min_pct: f64,
     pub exhaustion_move_pct: f64,
@@ -120,6 +121,11 @@ pub struct RecipeConfig {
     pub outlier_pullback_min_pct: f64,
     pub outlier_pullback_max_pct: f64,
     pub outlier_candidate_expiry_minutes: u32,
+    pub impulse_names: usize,
+    pub impulse_min_15m_pct: f64,
+    pub impulse_max_15m_pct: f64,
+    pub impulse_min_volume_ratio: f64,
+    pub impulse_max_1h_pct: f64,
     pub shock_min_return_pct: f64,
     pub shock_min_reversal_pct: f64,
     pub shock_min_volume_ratio: f64,
@@ -133,6 +139,7 @@ impl Default for RecipeConfig {
             require_coinbase_premium: false,
             alt_cross_section_enabled: true,
             alt_outlier_momentum_enabled: true,
+            alt_early_impulse_enabled: true,
             alt_shock_reversal_enabled: true,
             pullback_min_pct: 0.002,
             exhaustion_move_pct: 0.018,
@@ -153,6 +160,11 @@ impl Default for RecipeConfig {
             outlier_pullback_min_pct: 0.004,
             outlier_pullback_max_pct: 0.015,
             outlier_candidate_expiry_minutes: 10,
+            impulse_names: 2,
+            impulse_min_15m_pct: 0.006,
+            impulse_max_15m_pct: 0.025,
+            impulse_min_volume_ratio: 1.60,
+            impulse_max_1h_pct: 0.040,
             shock_min_return_pct: 0.045,
             shock_min_reversal_pct: 0.006,
             shock_min_volume_ratio: 2.5,
@@ -177,6 +189,9 @@ pub struct RiskConfig {
     pub alt_outlier_stop_pct: f64,
     pub alt_outlier_take_profit_pct: f64,
     pub alt_outlier_max_hold_minutes: u32,
+    pub alt_intraday_gross_per_trade: f64,
+    pub alt_intraday_stop_pct: f64,
+    pub alt_intraday_max_hold_minutes: u32,
     pub major_max_gross: f64,
     pub alt_max_gross: f64,
     pub max_total_gross: f64,
@@ -186,6 +201,12 @@ pub struct RiskConfig {
     pub alt_cross_take_profit_pct: f64,
     pub alt_cross_max_hold_minutes: u32,
     pub first_take_profit_fraction: f64,
+    pub risk_shield_r_multiple: f64,
+    pub risk_shield_fraction: f64,
+    pub second_take_profit_r_multiple: f64,
+    pub second_take_profit_fraction: f64,
+    pub runner_take_profit_r_multiple: f64,
+    pub break_even_cost_buffer_pct: f64,
     pub trailing_activation_pct: f64,
     pub trailing_distance_pct: f64,
     pub max_hold_minutes: u32,
@@ -214,6 +235,9 @@ impl Default for RiskConfig {
             alt_outlier_stop_pct: 0.012,
             alt_outlier_take_profit_pct: 0.020,
             alt_outlier_max_hold_minutes: 180,
+            alt_intraday_gross_per_trade: 0.08,
+            alt_intraday_stop_pct: 0.009,
+            alt_intraday_max_hold_minutes: 90,
             major_max_gross: 0.50,
             alt_max_gross: 0.50,
             max_total_gross: 1.0,
@@ -223,6 +247,12 @@ impl Default for RiskConfig {
             alt_cross_take_profit_pct: 0.025,
             alt_cross_max_hold_minutes: 720,
             first_take_profit_fraction: 0.50,
+            risk_shield_r_multiple: 0.75,
+            risk_shield_fraction: 0.25,
+            second_take_profit_r_multiple: 1.0,
+            second_take_profit_fraction: 0.30,
+            runner_take_profit_r_multiple: 2.5,
+            break_even_cost_buffer_pct: 0.0015,
             trailing_activation_pct: 0.012,
             trailing_distance_pct: 0.006,
             max_hold_minutes: 240,
@@ -275,7 +305,16 @@ impl StrategyConfig {
             || self.recipes.outlier_pullback_max_pct > 0.05
             || !(3..=30).contains(&self.recipes.outlier_candidate_expiry_minutes)
         {
-            return Err("outlier recipe parameters are outside safe paper ranges".into());
+            return Err("outlier recipe parameters are outside safe demo ranges".into());
+        }
+        if !(1..=5).contains(&self.recipes.impulse_names)
+            || !(0.002..=0.03).contains(&self.recipes.impulse_min_15m_pct)
+            || self.recipes.impulse_min_15m_pct >= self.recipes.impulse_max_15m_pct
+            || self.recipes.impulse_max_15m_pct > 0.05
+            || !(1.0..=5.0).contains(&self.recipes.impulse_min_volume_ratio)
+            || self.recipes.impulse_max_1h_pct <= self.recipes.impulse_max_15m_pct
+        {
+            return Err("early impulse parameters are outside safe demo ranges".into());
         }
         if !(4..=96).contains(&self.recipes.cross_rebalance_bars) {
             return Err("cross_rebalance_bars must be between 4 and 96".into());
@@ -289,12 +328,13 @@ impl StrategyConfig {
             || self.risk.alt_max_gross > 0.5
         {
             return Err(
-                "paper gross caps may not exceed 100% total or 50% per capital bucket".into(),
+                "demo gross caps may not exceed 100% total or 50% per capital bucket".into(),
             );
         }
         if self.risk.major_gross_per_trade > self.risk.major_max_gross
             || self.risk.alt_gross_per_trade > self.risk.alt_max_gross
             || self.risk.alt_outlier_gross_per_trade > self.risk.alt_max_gross
+            || self.risk.alt_intraday_gross_per_trade > self.risk.alt_max_gross
         {
             return Err("per-trade gross may not exceed its capital bucket".into());
         }
@@ -312,7 +352,19 @@ impl StrategyConfig {
             || self.risk.alt_outlier_take_profit_pct == 0.0
             || self.risk.alt_outlier_max_hold_minutes == 0
         {
-            return Err("outlier risk parameters are outside safe paper ranges".into());
+            return Err("outlier risk parameters are outside safe demo ranges".into());
+        }
+        let staged_fraction =
+            self.risk.risk_shield_fraction + self.risk.second_take_profit_fraction;
+        if !(0.25..1.0).contains(&staged_fraction)
+            || !(0.25..=1.5).contains(&self.risk.risk_shield_r_multiple)
+            || self.risk.second_take_profit_r_multiple <= self.risk.risk_shield_r_multiple
+            || self.risk.runner_take_profit_r_multiple <= self.risk.second_take_profit_r_multiple
+            || !(0.0..=0.005).contains(&self.risk.break_even_cost_buffer_pct)
+            || self.risk.alt_intraday_stop_pct <= 0.0
+            || self.risk.alt_intraday_max_hold_minutes == 0
+        {
+            return Err("staged exit or intraday risk parameters are invalid".into());
         }
         if !(0.0..=1.0).contains(&self.risk.alt_neutral_anchor_size_multiplier)
             || self.risk.alt_neutral_anchor_size_multiplier == 0.0

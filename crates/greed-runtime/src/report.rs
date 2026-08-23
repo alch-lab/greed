@@ -307,11 +307,11 @@ pub fn build(path: &str) -> Result<Value> {
                     &mut open_trades,
                 );
             }
-            "exchange_exit" => {
+            "exchange_partial_exit" | "exchange_exit" => {
                 record_daily(payload, false, &mut daily);
                 record_exit(
                     payload,
-                    false,
+                    kind == "exchange_partial_exit",
                     &mut total,
                     &mut sleeves,
                     &mut recipes,

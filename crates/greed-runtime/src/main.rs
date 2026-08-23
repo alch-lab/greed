@@ -131,8 +131,9 @@ fn strategy_funnels_demo(
             .filter(|candidate| {
                 candidate.verdict == Verdict::Pass
                     && !execution
-                        .recipe_gate_status(
+                        .candidate_gate_status(
                             &candidate.recipe,
+                            candidate.side,
                             chrono::Utc::now().timestamp_millis(),
                         )
                         .allowed
@@ -152,8 +153,9 @@ fn strategy_funnels_demo(
                             .find(|candidate| candidate.id == value.candidate_id)
                             .is_some_and(|candidate| {
                                 execution
-                                    .recipe_gate_status(
+                                    .candidate_gate_status(
                                         &candidate.recipe,
+                                        candidate.side,
                                         chrono::Utc::now().timestamp_millis(),
                                     )
                                     .allowed

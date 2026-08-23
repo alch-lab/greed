@@ -138,7 +138,7 @@ pub async fn run(
     Ok(BacktestReport {
         source: "Binance public data archive (data.binance.vision)",
         data_limitations: vec![
-            "15m OHLC cannot reveal intrabar path; stop is conservatively evaluated before take-profit",
+            "15m/5m OHLC cannot reveal intrabar path; stop is conservatively evaluated before staged take-profit",
             "historical depth is percentage-band depth, not a reconstructable level-2 book",
             "Coinbase premium, ETF flow and liquidation websocket are observation-only because no reliable archive is available",
             "dynamic live-universe discovery is evaluated on the configured historical symbols only; it is not a survivorship-bias-free all-contract backtest",
