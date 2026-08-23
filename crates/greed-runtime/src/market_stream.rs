@@ -340,11 +340,11 @@ fn market_url(base: &str, symbols: &[String]) -> String {
 fn public_url(base: &str, symbols: &[String]) -> String {
     let streams = symbols
         .iter()
-        .map(|symbol| format!("{}@depth20@1000ms", symbol.to_lowercase()))
+        .map(|symbol| format!("{}@depth20@500ms", symbol.to_lowercase()))
         .collect::<Vec<_>>()
         .join("/");
     format!(
-        "{}/market/stream?streams={streams}",
+        "{}/public/stream?streams={streams}",
         base.trim_end_matches('/')
     )
 }
@@ -742,7 +742,8 @@ mod tests {
         assert!(market.contains("btcusdt@kline_5m"));
         assert!(market.contains("btcusdt@aggTrade"));
         assert!(market.contains("btcusdt@forceOrder"));
-        assert!(public.contains("/market/stream?streams="));
+        assert!(public.contains("/public/stream?streams="));
+        assert!(public.contains("btcusdt@depth20@500ms"));
     }
 
     #[test]
