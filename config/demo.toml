@@ -91,15 +91,19 @@ shock_min_volume_ratio = 3.0
 
 [strategy.risk]
 # 3000 USDT: majors 1500 + altcoins 1500. The attack sleeve values below are explicit.
+# At 3000 equity: major long 1050, major short 367.50; early impulse 900;
+# outlier/shock 600. Unproven alt recipes start at 90% of those notionals.
+major_gross_per_trade = 0.35
 major_short_size_multiplier = 0.35
 major_max_gross = 0.50
 alt_max_gross = 0.50
+alt_gross_per_trade = 0.20
 alt_neutral_anchor_size_multiplier = 0.30
 alt_neutral_anchor_stop_pct = 0.012
 alt_neutral_anchor_take_profit_pct = 0.018
 alt_neutral_anchor_max_hold_minutes = 240
-alt_outlier_gross_per_trade = 0.02
-alt_intraday_gross_per_trade = 0.08
+alt_outlier_gross_per_trade = 0.20
+alt_intraday_gross_per_trade = 0.30
 alt_intraday_stop_pct = 0.009
 alt_intraday_max_hold_minutes = 90
 alt_outlier_opposed_size_multiplier = 0.50
@@ -123,5 +127,5 @@ rolling_pf_window = 10
 rolling_pf_min_trades = 3
 rolling_pf_floor = 1.00
 rolling_pf_cooldown_minutes = 720
-rolling_pf_probe_size_multiplier = 0.70
-rolling_pf_epoch = 2
+rolling_pf_probe_size_multiplier = 0.90
+rolling_pf_epoch = 3
