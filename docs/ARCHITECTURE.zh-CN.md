@@ -37,7 +37,7 @@ MarketFrame → Primitive DAG → State DAG → Recipe → PositionPlanner
 - 风控：北京时间风险日、日亏损熔断、峰值回撤熔断、已有仓位总敞口上限。
 
 模拟资金为 3000 USDT，并硬分成主流币、山寨币各 1500 USDT 的独立资金桶。当前主流币
-单笔名义仓位 600 USDT，山寨币单笔 300 USDT；任何一类都不能借用另一类未使用的预算，
+单笔名义仓位 600 USDT，妖币动量基础单笔 150 USDT；任何一类都不能借用另一类未使用的预算，
 组合也不允许超过 3000 USDT 名义敞口。
 
 尚未接入但合同已预留的数据包括逐笔成交 POC、强平 WebSocket、ETF 自动抓取、CME
@@ -48,14 +48,16 @@ MarketFrame → Primitive DAG → State DAG → Recipe → PositionPlanner
 - `major_trend_pullback`：BTC/ETH 趋势、现货/永续 CVD、OI 新仓、流动性、Coinbase
   true premium、回踩和收回。
 - `major_exhaustion_reversal`：大幅移动、跨市场 CVD 反转、去杠杆完成和流动性确认。
-- `alt_cross_section_momentum`：全市场广度确认后交易最强/最弱的合格标的。
+- `alt_outlier_momentum`：独立检测单币 1h/4h 加速、量能扩张、路径效率和阶段突破；BTC
+  与市场广度只调整仓位，不否决个币方向。
+- `alt_cross_section_momentum`：保留作研究分支，生产配置暂时关闭。
 - `alt_shock_reversal`：一小时冲击、15m 强反转、量能异常和全市场方向锚。
 
 当前职责刻意不对称：Major 使用 24 小时趋势窗口、更高趋势效率和回踩/订单流确认，作为
-低频压仓石；Altcoin 是受控进攻桶。横截面不再只在固定钟点检查，而是在 BTC 与市场广度
-同向后立即触发，同一标的用确定性的 8 小时 cycle ID 去重。BTC 明确反向或震荡仍会拦截
-生产配置，避免把“进攻”变成无方向高频。冲击反转每帧记录距离移动、反转和量能门槛的
-差距，不再静默返回。
+低频压仓石；Altcoin 是受控进攻桶。运行时每 15 分钟从全部可交易 USDT 永续中组合高流动性
+合约和涨跌异动合约，最多保留 30 个进入完整 K 线、盘口和 OI 评估。妖币动量同一标的按
+1 小时 cycle 去重，最长持仓 3 小时；BTC 同向使用标准仓位，中性或反向只缩仓。冲击反转
+每帧记录距离移动、反转和量能门槛的差距，不再静默返回。
 
 所有 recipe 都生成带 blocker、证据 lineage 和过期时间的候选。只有 `Pass` 候选才会进入
 paper position planner；`Block/Unknown` 仍写 journal，用来研究漏斗和数据缺口。

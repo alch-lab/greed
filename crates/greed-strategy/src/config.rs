@@ -5,6 +5,7 @@ use serde::{Deserialize, Serialize};
 pub struct StrategyConfig {
     pub majors: Vec<String>,
     pub altcoins: Vec<String>,
+    pub universe: UniverseConfig,
     pub primitives: PrimitiveConfig,
     pub recipes: RecipeConfig,
     pub risk: RiskConfig,
@@ -15,9 +16,34 @@ impl Default for StrategyConfig {
         Self {
             majors: vec!["BTCUSDT".into(), "ETHUSDT".into()],
             altcoins: vec![],
+            universe: UniverseConfig::default(),
             primitives: PrimitiveConfig::default(),
             recipes: RecipeConfig::default(),
             risk: RiskConfig::default(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct UniverseConfig {
+    pub dynamic_enabled: bool,
+    pub max_altcoins: usize,
+    pub top_liquidity_names: usize,
+    pub top_mover_names: usize,
+    pub min_24h_quote_volume_usd: f64,
+    pub refresh_minutes: u32,
+}
+
+impl Default for UniverseConfig {
+    fn default() -> Self {
+        Self {
+            dynamic_enabled: false,
+            max_altcoins: 30,
+            top_liquidity_names: 12,
+            top_mover_names: 18,
+            min_24h_quote_volume_usd: 25_000_000.0,
+            refresh_minutes: 15,
         }
     }
 }
@@ -73,6 +99,7 @@ pub struct RecipeConfig {
     pub major_exhaustion_enabled: bool,
     pub require_coinbase_premium: bool,
     pub alt_cross_section_enabled: bool,
+    pub alt_outlier_momentum_enabled: bool,
     pub alt_shock_reversal_enabled: bool,
     pub pullback_min_pct: f64,
     pub exhaustion_move_pct: f64,
@@ -81,6 +108,11 @@ pub struct RecipeConfig {
     pub cross_opportunity_driven: bool,
     pub alt_neutral_anchor_allowed: bool,
     pub alt_shock_neutral_anchor_allowed: bool,
+    pub outlier_names: usize,
+    pub outlier_min_return_1h_pct: f64,
+    pub outlier_min_return_4h_pct: f64,
+    pub outlier_min_volume_ratio: f64,
+    pub outlier_min_efficiency: f64,
     pub shock_min_return_pct: f64,
     pub shock_min_reversal_pct: f64,
     pub shock_min_volume_ratio: f64,
@@ -93,6 +125,7 @@ impl Default for RecipeConfig {
             major_exhaustion_enabled: true,
             require_coinbase_premium: false,
             alt_cross_section_enabled: true,
+            alt_outlier_momentum_enabled: true,
             alt_shock_reversal_enabled: true,
             pullback_min_pct: 0.002,
             exhaustion_move_pct: 0.018,
@@ -101,6 +134,11 @@ impl Default for RecipeConfig {
             cross_opportunity_driven: true,
             alt_neutral_anchor_allowed: false,
             alt_shock_neutral_anchor_allowed: false,
+            outlier_names: 2,
+            outlier_min_return_1h_pct: 0.025,
+            outlier_min_return_4h_pct: 0.05,
+            outlier_min_volume_ratio: 1.50,
+            outlier_min_efficiency: 0.45,
             shock_min_return_pct: 0.045,
             shock_min_reversal_pct: 0.006,
             shock_min_volume_ratio: 2.5,
@@ -117,6 +155,12 @@ pub struct RiskConfig {
     pub alt_neutral_anchor_stop_pct: f64,
     pub alt_neutral_anchor_take_profit_pct: f64,
     pub alt_neutral_anchor_max_hold_minutes: u32,
+    pub alt_outlier_gross_per_trade: f64,
+    pub alt_outlier_opposed_size_multiplier: f64,
+    pub alt_outlier_neutral_size_multiplier: f64,
+    pub alt_outlier_stop_pct: f64,
+    pub alt_outlier_take_profit_pct: f64,
+    pub alt_outlier_max_hold_minutes: u32,
     pub major_max_gross: f64,
     pub alt_max_gross: f64,
     pub max_total_gross: f64,
@@ -146,6 +190,12 @@ impl Default for RiskConfig {
             alt_neutral_anchor_stop_pct: 0.012,
             alt_neutral_anchor_take_profit_pct: 0.018,
             alt_neutral_anchor_max_hold_minutes: 240,
+            alt_outlier_gross_per_trade: 0.05,
+            alt_outlier_opposed_size_multiplier: 0.50,
+            alt_outlier_neutral_size_multiplier: 0.75,
+            alt_outlier_stop_pct: 0.012,
+            alt_outlier_take_profit_pct: 0.020,
+            alt_outlier_max_hold_minutes: 180,
             major_max_gross: 0.50,
             alt_max_gross: 0.50,
             max_total_gross: 1.0,
@@ -173,6 +223,15 @@ impl StrategyConfig {
         if self.majors.is_empty() {
             return Err("at least one major symbol is required".into());
         }
+        if self.universe.max_altcoins < 5
+            || self.universe.max_altcoins > 50
+            || self.universe.top_liquidity_names + self.universe.top_mover_names
+                < self.universe.max_altcoins
+            || self.universe.min_24h_quote_volume_usd <= 0.0
+            || !(5..=60).contains(&self.universe.refresh_minutes)
+        {
+            return Err("dynamic universe parameters are outside safe API ranges".into());
+        }
         if !(4..=96).contains(&self.primitives.trend_horizon_bars) {
             return Err("trend_horizon_bars must be between 4 and 96".into());
         }
@@ -181,6 +240,14 @@ impl StrategyConfig {
         }
         if !(1..=10).contains(&self.recipes.cross_names) {
             return Err("cross_names must be between 1 and 10".into());
+        }
+        if !(1..=5).contains(&self.recipes.outlier_names)
+            || !(0.005..=0.15).contains(&self.recipes.outlier_min_return_1h_pct)
+            || !(0.01..=0.30).contains(&self.recipes.outlier_min_return_4h_pct)
+            || !(1.0..=10.0).contains(&self.recipes.outlier_min_volume_ratio)
+            || !(0.10..=0.95).contains(&self.recipes.outlier_min_efficiency)
+        {
+            return Err("outlier recipe parameters are outside safe paper ranges".into());
         }
         if !(4..=96).contains(&self.recipes.cross_rebalance_bars) {
             return Err("cross_rebalance_bars must be between 4 and 96".into());
@@ -199,8 +266,21 @@ impl StrategyConfig {
         }
         if self.risk.major_gross_per_trade > self.risk.major_max_gross
             || self.risk.alt_gross_per_trade > self.risk.alt_max_gross
+            || self.risk.alt_outlier_gross_per_trade > self.risk.alt_max_gross
         {
             return Err("per-trade gross may not exceed its capital bucket".into());
+        }
+        if !(0.0..=1.0).contains(&self.risk.alt_outlier_opposed_size_multiplier)
+            || self.risk.alt_outlier_opposed_size_multiplier == 0.0
+            || !(0.0..=1.0).contains(&self.risk.alt_outlier_neutral_size_multiplier)
+            || self.risk.alt_outlier_neutral_size_multiplier == 0.0
+            || !(0.0..=0.03).contains(&self.risk.alt_outlier_stop_pct)
+            || self.risk.alt_outlier_stop_pct == 0.0
+            || !(0.0..=0.06).contains(&self.risk.alt_outlier_take_profit_pct)
+            || self.risk.alt_outlier_take_profit_pct == 0.0
+            || self.risk.alt_outlier_max_hold_minutes == 0
+        {
+            return Err("outlier risk parameters are outside safe paper ranges".into());
         }
         if !(0.0..=1.0).contains(&self.risk.alt_neutral_anchor_size_multiplier)
             || self.risk.alt_neutral_anchor_size_multiplier == 0.0

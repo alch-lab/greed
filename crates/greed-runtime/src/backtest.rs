@@ -140,6 +140,7 @@ pub async fn run(
             "15m OHLC cannot reveal intrabar path; stop is conservatively evaluated before take-profit",
             "historical depth is percentage-band depth, not a reconstructable level-2 book",
             "Coinbase premium, ETF flow and liquidation websocket are observation-only because no reliable archive is available",
+            "dynamic live-universe discovery is evaluated on the configured historical symbols only; it is not a survivorship-bias-free all-contract backtest",
             "a limited date range is a parameter smoke test, not evidence of durable alpha",
         ],
         training,
@@ -156,67 +157,37 @@ fn score(row: &ResultRow) -> f64 {
 }
 
 fn profiles(base: &StrategyConfig) -> Vec<(String, StrategyConfig)> {
-    let mut legacy = base.clone();
-    legacy.recipes.cross_opportunity_driven = false;
-    legacy.recipes.alt_neutral_anchor_allowed = false;
-    let mut balanced = base.clone();
-    balanced.recipes.cross_opportunity_driven = true;
-    balanced.recipes.alt_neutral_anchor_allowed = true;
     let mut responsive = base.clone();
-    responsive.recipes.cross_opportunity_driven = true;
-    responsive.recipes.alt_neutral_anchor_allowed = true;
-    responsive.recipes.alt_shock_neutral_anchor_allowed = true;
-    responsive.primitives.trend_min_return_pct = 0.0045;
-    responsive.primitives.breadth_threshold = 0.006;
-    responsive.primitives.breadth_horizon_bars = 48;
-    responsive.primitives.breadth_min_participation = 0.55;
-    responsive.recipes.pullback_min_pct = 0.0015;
-    responsive.recipes.exhaustion_move_pct = 0.014;
-    responsive.recipes.shock_min_return_pct = 0.035;
-    responsive.recipes.shock_min_reversal_pct = 0.004;
-    responsive.recipes.shock_min_volume_ratio = 1.8;
-    responsive.recipes.cross_rebalance_bars = 16;
-    responsive.risk.alt_cross_stop_pct = 0.012;
-    responsive.risk.alt_cross_take_profit_pct = 0.020;
-    responsive.risk.alt_cross_max_hold_minutes = 480;
+    responsive.recipes.outlier_min_return_1h_pct = 0.015;
+    responsive.recipes.outlier_min_return_4h_pct = 0.035;
+    responsive.recipes.outlier_min_volume_ratio = 1.20;
+    responsive.recipes.outlier_min_efficiency = 0.35;
+    let mut balanced = base.clone();
+    balanced.recipes.outlier_min_return_1h_pct = 0.020;
+    balanced.recipes.outlier_min_return_4h_pct = 0.045;
+    balanced.recipes.outlier_min_volume_ratio = 1.40;
+    balanced.recipes.outlier_min_efficiency = 0.40;
     let mut selective = base.clone();
-    selective.recipes.cross_opportunity_driven = true;
-    selective.recipes.alt_neutral_anchor_allowed = false;
-    selective.primitives.trend_min_return_pct = 0.008;
-    selective.primitives.trend_horizon_bars = 96;
-    selective.primitives.trend_min_efficiency = 0.20;
-    selective.primitives.breadth_threshold = 0.012;
-    selective.primitives.breadth_horizon_bars = 96;
-    selective.primitives.breadth_min_participation = 0.65;
-    selective.recipes.pullback_min_pct = 0.003;
-    selective.recipes.exhaustion_move_pct = 0.024;
-    selective.recipes.shock_min_return_pct = 0.06;
-    selective.recipes.shock_min_reversal_pct = 0.008;
-    selective.recipes.shock_min_volume_ratio = 3.0;
-    selective.recipes.cross_names = 2;
-    selective.recipes.cross_rebalance_bars = 32;
-    selective.risk.alt_cross_stop_pct = 0.018;
-    selective.risk.alt_cross_take_profit_pct = 0.03;
-    selective.risk.alt_cross_max_hold_minutes = 960;
-    let mut profiles = vec![
-        ("legacy_fixed_strict".into(), legacy),
-        ("opportunity_balanced".into(), balanced),
-        ("opportunity_responsive".into(), responsive),
-        ("opportunity_selective".into(), selective),
-    ];
-    for multiplier in [0.30, 0.45, 0.60] {
-        let mut neutral = base.clone();
-        neutral.recipes.alt_neutral_anchor_allowed = true;
-        neutral.risk.alt_neutral_anchor_size_multiplier = multiplier;
-        profiles.push((
-            format!(
-                "opportunity_selective_neutral_{}pct",
-                (multiplier * 100.0) as u32
-            ),
-            neutral,
-        ));
-    }
-    profiles
+    selective.recipes.outlier_min_return_1h_pct = 0.025;
+    selective.recipes.outlier_min_return_4h_pct = 0.055;
+    selective.recipes.outlier_min_volume_ratio = 1.60;
+    selective.recipes.outlier_min_efficiency = 0.50;
+    let mut extreme = base.clone();
+    extreme.recipes.outlier_min_return_1h_pct = 0.035;
+    extreme.recipes.outlier_min_return_4h_pct = 0.070;
+    extreme.recipes.outlier_min_volume_ratio = 1.80;
+    extreme.recipes.outlier_min_efficiency = 0.55;
+    let mut tight_exit = balanced.clone();
+    tight_exit.risk.alt_outlier_stop_pct = 0.010;
+    tight_exit.risk.alt_outlier_take_profit_pct = 0.016;
+    tight_exit.risk.alt_outlier_max_hold_minutes = 120;
+    vec![
+        ("outlier_responsive".into(), responsive),
+        ("outlier_balanced".into(), balanced),
+        ("outlier_selective".into(), selective),
+        ("outlier_extreme".into(), extreme),
+        ("outlier_tight_exit".into(), tight_exit),
+    ]
 }
 
 fn simulate(
@@ -352,6 +323,8 @@ fn candidate_recipe(id: &str) -> String {
         "alt_cross_section_probe"
     } else if id.contains("cross_section") {
         "alt_cross_section_momentum"
+    } else if id.contains("outlier_momentum") {
+        "alt_outlier_momentum"
     } else if id.contains("shock_reversal") {
         "alt_shock_reversal"
     } else {

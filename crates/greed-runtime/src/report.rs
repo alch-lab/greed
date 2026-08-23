@@ -414,7 +414,12 @@ fn record_diagnostics(
     let Some(artifacts) = payload["artifacts"].as_object() else {
         return;
     };
-    for key in ["alt.cross_section", "alt.shock_reversal", "portfolio.risk"] {
+    for key in [
+        "alt.cross_section",
+        "alt.outlier_momentum",
+        "alt.shock_reversal",
+        "portfolio.risk",
+    ] {
         let Some(value) = artifacts
             .get(key)
             .and_then(|record| record["artifact"]["value"].as_object())
@@ -494,6 +499,8 @@ fn recipe_from_id(id: &str) -> &'static str {
         "alt_cross_section_probe"
     } else if id.contains("cross_section") || id.contains("cross-section") {
         "alt_cross_section_momentum"
+    } else if id.contains("outlier_momentum") || id.contains("outlier-momentum") {
+        "alt_outlier_momentum"
     } else if id.contains("shock_reversal") || id.contains("shock-reversal") {
         "alt_shock_reversal"
     } else {

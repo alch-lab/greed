@@ -12,6 +12,14 @@ altcoins = [
   "AVAXUSDT", "SUIUSDT", "LTCUSDT", "BCHUSDT", "TRXUSDT", "DOTUSDT",
 ]
 
+[strategy.universe]
+dynamic_enabled = true
+max_altcoins = 30
+top_liquidity_names = 12
+top_mover_names = 18
+min_24h_quote_volume_usd = 25000000.0
+refresh_minutes = 15
+
 [strategy.primitives]
 trend_horizon_bars = 96
 trend_min_return_pct = 0.008
@@ -21,11 +29,19 @@ breadth_threshold = 0.012
 breadth_min_participation = 0.65
 
 [strategy.recipes]
+alt_cross_section_enabled = false
+alt_outlier_momentum_enabled = true
+alt_shock_reversal_enabled = true
 cross_names = 2
 cross_rebalance_bars = 32
 cross_opportunity_driven = true
 alt_neutral_anchor_allowed = true
 alt_shock_neutral_anchor_allowed = false
+outlier_names = 3
+outlier_min_return_1h_pct = 0.025
+outlier_min_return_4h_pct = 0.055
+outlier_min_volume_ratio = 1.60
+outlier_min_efficiency = 0.50
 pullback_min_pct = 0.003
 exhaustion_move_pct = 0.024
 shock_min_return_pct = 0.060
@@ -40,6 +56,12 @@ alt_neutral_anchor_size_multiplier = 0.30
 alt_neutral_anchor_stop_pct = 0.012
 alt_neutral_anchor_take_profit_pct = 0.018
 alt_neutral_anchor_max_hold_minutes = 240
+alt_outlier_gross_per_trade = 0.05
+alt_outlier_opposed_size_multiplier = 0.50
+alt_outlier_neutral_size_multiplier = 0.75
+alt_outlier_stop_pct = 0.012
+alt_outlier_take_profit_pct = 0.020
+alt_outlier_max_hold_minutes = 180
 alt_cross_stop_pct = 0.018
 alt_cross_take_profit_pct = 0.030
 alt_cross_max_hold_minutes = 960

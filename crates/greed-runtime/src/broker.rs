@@ -395,6 +395,7 @@ impl PaperBroker {
             "major_exhaustion_reversal",
             "alt_cross_section_momentum",
             "alt_cross_section_probe",
+            "alt_outlier_momentum",
             "alt_shock_reversal",
         ]
         .into_iter()
@@ -778,6 +779,9 @@ fn recipe_from_candidate(candidate_id: &str) -> &'static str {
         "alt_cross_section_probe"
     } else if candidate_id.contains("cross_section") || candidate_id.contains("cross-section") {
         "alt_cross_section_momentum"
+    } else if candidate_id.contains("outlier_momentum") || candidate_id.contains("outlier-momentum")
+    {
+        "alt_outlier_momentum"
     } else if candidate_id.contains("shock_reversal") || candidate_id.contains("shock-reversal") {
         "alt_shock_reversal"
     } else {

@@ -247,11 +247,20 @@ async fn one_frame(
     source: &mut BinancePaperSource,
     broker: &PaperBroker,
 ) -> Result<(greed_kernel::MarketFrame, GraphEvaluation)> {
+    let mut strategy = config.strategy.clone();
+    if strategy.universe.dynamic_enabled {
+        let discovery = source
+            .discover_altcoins(&strategy, chrono::Utc::now().timestamp_millis())
+            .await?;
+        if !discovery.symbols.is_empty() {
+            strategy.altcoins = discovery.symbols;
+        }
+    }
     let mut frame = source
-        .fetch_frame(&config.strategy, broker.account_frame())
+        .fetch_frame(&strategy, broker.account_frame())
         .await?;
     frame.account = broker.marked_account(&frame);
-    let mut graph = build_graph(&config.strategy)?;
+    let mut graph = build_graph(&strategy)?;
     let evaluation = graph.evaluate(&frame)?;
     Ok((frame, evaluation))
 }
@@ -331,12 +340,53 @@ async fn run_paper(config: AppConfig, iterations: u64) -> Result<()> {
     let start_payload = serde_json::json!({"paper_only":true,"config":config,"runtime":identity});
     journal.append("runner_start", start_payload.clone())?;
     history.append("runner_start", start_payload)?;
-    let mut graph = build_graph(&config.strategy)?;
+    let mut active_strategy = config.strategy.clone();
+    let mut graph = build_graph(&active_strategy)?;
+    let mut last_universe_refresh_ms = 0i64;
+    let mut universe_status = serde_json::json!({
+        "as_of_ms": started_ms,
+        "symbols": active_strategy.altcoins.clone(),
+        "dynamic": active_strategy.universe.dynamic_enabled,
+    });
     let mut samples = SampleRecorder::default();
     let mut completed = 0u64;
     loop {
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        let refresh_ms = i64::from(config.strategy.universe.refresh_minutes) * 60_000;
+        if config.strategy.universe.dynamic_enabled
+            && now_ms - last_universe_refresh_ms >= refresh_ms
+        {
+            last_universe_refresh_ms = now_ms;
+            match source.discover_altcoins(&config.strategy, now_ms).await {
+                Ok(mut discovery) => {
+                    for symbol in broker.positions().keys() {
+                        if !config.strategy.majors.contains(symbol)
+                            && !discovery.symbols.contains(symbol)
+                        {
+                            discovery.symbols.push(symbol.clone());
+                        }
+                    }
+                    discovery.symbols.sort();
+                    if !discovery.symbols.is_empty()
+                        && discovery.symbols != active_strategy.altcoins
+                    {
+                        active_strategy.altcoins.clone_from(&discovery.symbols);
+                        graph = build_graph(&active_strategy)?;
+                    }
+                    universe_status = serde_json::to_value(&discovery)?;
+                    journal.append("universe_refresh", universe_status.clone())?;
+                }
+                Err(error) => {
+                    warn!(error=%error,"dynamic universe refresh failed; keeping previous symbols");
+                    journal.append(
+                        "universe_refresh_error",
+                        serde_json::json!({"ts_ms":now_ms,"error":error.to_string()}),
+                    )?;
+                }
+            }
+        }
         match source
-            .fetch_frame(&config.strategy, broker.account_frame())
+            .fetch_frame(&active_strategy, broker.account_frame())
             .await
         {
             Ok(mut frame) => {
@@ -360,7 +410,7 @@ async fn run_paper(config: AppConfig, iterations: u64) -> Result<()> {
                 let account = broker.marked_account(&frame);
                 let sleeves = broker.sleeve_snapshots(&frame);
                 let funnels =
-                    strategy_funnels(&config.strategy, &evaluation, &broker, frame.as_of_ms);
+                    strategy_funnels(&active_strategy, &evaluation, &broker, frame.as_of_ms);
                 let recipe_gates = broker.recipe_gate_snapshots(frame.as_of_ms);
                 let observation = serde_json::json!({
                     "ts_ms": frame.as_of_ms,
@@ -378,7 +428,7 @@ async fn run_paper(config: AppConfig, iterations: u64) -> Result<()> {
                 });
                 history.append("paper_equity", observation.clone())?;
                 journal.append("paper_equity", observation)?;
-                status.write(&serde_json::json!({"as_of_ms":frame.as_of_ms,"paper_only":true,"account":account,"sleeves":sleeves,"funnels":funnels,"recipe_gates":recipe_gates,"positions":broker.position_snapshots(&frame),"graph":summarize(&evaluation),"artifacts":evaluation.artifacts,"data_health":data_health,"runtime":identity}))?;
+                status.write(&serde_json::json!({"as_of_ms":frame.as_of_ms,"paper_only":true,"account":account,"sleeves":sleeves,"funnels":funnels,"recipe_gates":recipe_gates,"positions":broker.position_snapshots(&frame),"graph":summarize(&evaluation),"artifacts":evaluation.artifacts,"universe":universe_status,"data_health":data_health,"runtime":identity}))?;
                 completed += 1;
                 info!(
                     iteration = completed,

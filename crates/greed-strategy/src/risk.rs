@@ -21,7 +21,13 @@ impl PositionPlannerNode {
 }
 
 fn candidate_size_multiplier(config: &RiskConfig, tags: &BTreeMap<String, String>) -> f64 {
-    if tags.get("anchor_confirmation").map(String::as_str) == Some("neutral") {
+    if tags.get("stop_profile").map(String::as_str) == Some("alt_outlier") {
+        match tags.get("anchor_context").map(String::as_str) {
+            Some("opposed") => config.alt_outlier_opposed_size_multiplier,
+            Some("neutral") => config.alt_outlier_neutral_size_multiplier,
+            _ => 1.0,
+        }
+    } else if tags.get("anchor_confirmation").map(String::as_str) == Some("neutral") {
         config.alt_neutral_anchor_size_multiplier
     } else {
         1.0
@@ -106,6 +112,9 @@ impl StrategyNode for PositionPlannerNode {
             };
             let base_per_trade = if instrument.asset_class == AssetClass::Major {
                 self.config.major_gross_per_trade
+            } else if candidate.tags.get("stop_profile").map(String::as_str) == Some("alt_outlier")
+            {
+                self.config.alt_outlier_gross_per_trade
             } else {
                 self.config.alt_gross_per_trade
             };
@@ -137,6 +146,7 @@ impl StrategyNode for PositionPlannerNode {
                 match candidate.tags.get("stop_profile").map(String::as_str) {
                     Some("exhaustion") => self.config.initial_stop_pct * 0.75,
                     Some("alt_shock") => self.config.initial_stop_pct * 1.5,
+                    Some("alt_outlier") => self.config.alt_outlier_stop_pct,
                     Some("alt_cross") => self.config.alt_cross_stop_pct,
                     _ => self.config.initial_stop_pct,
                 }
@@ -145,6 +155,7 @@ impl StrategyNode for PositionPlannerNode {
                 self.config.alt_neutral_anchor_take_profit_pct
             } else {
                 match candidate.tags.get("stop_profile").map(String::as_str) {
+                    Some("alt_outlier") => self.config.alt_outlier_take_profit_pct,
                     Some("alt_cross") => self.config.alt_cross_take_profit_pct,
                     _ => self.config.first_take_profit_pct,
                 }
@@ -155,6 +166,7 @@ impl StrategyNode for PositionPlannerNode {
                 self.config.alt_neutral_anchor_max_hold_minutes
             } else {
                 match candidate.tags.get("hold_profile").map(String::as_str) {
+                    Some("alt_outlier") => self.config.alt_outlier_max_hold_minutes,
                     Some("alt_cross") => self.config.alt_cross_max_hold_minutes,
                     _ => self.config.max_hold_minutes,
                 }
@@ -194,5 +206,20 @@ mod tests {
 
         assert_eq!(candidate_size_multiplier(&config, &neutral), 0.60);
         assert_eq!(candidate_size_multiplier(&config, &confirmed), 1.0);
+    }
+
+    #[test]
+    fn outlier_candidate_uses_market_context_only_as_a_size_modifier() {
+        let config = RiskConfig::default();
+        let opposed = BTreeMap::from([
+            ("stop_profile".into(), "alt_outlier".into()),
+            ("anchor_context".into(), "opposed".into()),
+        ]);
+        let neutral = BTreeMap::from([
+            ("stop_profile".into(), "alt_outlier".into()),
+            ("anchor_context".into(), "neutral".into()),
+        ]);
+        assert_eq!(candidate_size_multiplier(&config, &opposed), 0.50);
+        assert_eq!(candidate_size_multiplier(&config, &neutral), 0.75);
     }
 }

@@ -1,4 +1,5 @@
 pub mod alt_cross_section;
+pub mod alt_outlier_momentum;
 pub mod alt_shock_reversal;
 pub mod major_exhaustion;
 pub mod major_trend_pullback;

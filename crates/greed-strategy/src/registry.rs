@@ -9,8 +9,9 @@ use crate::{
         price::TrendRegimeNode,
     },
     recipes::{
-        alt_cross_section::AltCrossSectionNode, alt_shock_reversal::AltShockReversalNode,
-        major_exhaustion::MajorExhaustionNode, major_trend_pullback::MajorTrendPullbackNode,
+        alt_cross_section::AltCrossSectionNode, alt_outlier_momentum::AltOutlierMomentumNode,
+        alt_shock_reversal::AltShockReversalNode, major_exhaustion::MajorExhaustionNode,
+        major_trend_pullback::MajorTrendPullbackNode,
     },
     risk::PositionPlannerNode,
     StrategyConfig,
@@ -105,6 +106,18 @@ pub fn build_graph(config: &StrategyConfig) -> Result<StrategyGraph, GraphError>
                 &config.altcoins,
             )));
             recipe_ids.push("alt.recipe.cross_section".into());
+        }
+        if r.alt_outlier_momentum_enabled {
+            nodes.push(Box::new(AltOutlierMomentumNode::new(
+                r.outlier_names,
+                r.outlier_min_return_1h_pct,
+                r.outlier_min_return_4h_pct,
+                r.outlier_min_volume_ratio,
+                r.outlier_min_efficiency,
+                anchor,
+                &config.altcoins,
+            )));
+            recipe_ids.push("alt.recipe.outlier_momentum".into());
         }
         if r.alt_shock_reversal_enabled {
             nodes.push(Box::new(AltShockReversalNode::new(

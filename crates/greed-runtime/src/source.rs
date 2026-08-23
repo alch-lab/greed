@@ -8,7 +8,7 @@ use greed_strategy::StrategyConfig;
 use reqwest::{Client, StatusCode};
 use serde_json::Value;
 use std::{
-    collections::{BTreeMap, VecDeque},
+    collections::{BTreeMap, BTreeSet, VecDeque},
     sync::Mutex,
     time::{Duration, Instant},
 };
@@ -47,6 +47,25 @@ pub struct BinancePaperSource {
     last_success_ms: Option<i64>,
     last_error: Option<String>,
     telemetry: Mutex<ApiTelemetry>,
+    discovery_prices: BTreeMap<String, VecDeque<(i64, f64)>>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UniverseDiscovery {
+    pub as_of_ms: i64,
+    pub symbols: Vec<String>,
+    pub eligible_contracts: usize,
+    pub liquid_contracts: usize,
+    pub rolling_history_ready: usize,
+    pub leaders: Vec<UniverseLeader>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct UniverseLeader {
+    pub symbol: String,
+    pub quote_volume_24h_usd: f64,
+    pub change_24h_pct: f64,
+    pub return_1h_pct: Option<f64>,
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -78,6 +97,160 @@ impl BinancePaperSource {
             last_success_ms: None,
             last_error: None,
             telemetry: Mutex::new(ApiTelemetry::default()),
+            discovery_prices: BTreeMap::new(),
+        })
+    }
+    pub async fn discover_altcoins(
+        &mut self,
+        strategy: &StrategyConfig,
+        now_ms: i64,
+    ) -> Result<UniverseDiscovery> {
+        if !strategy.universe.dynamic_enabled {
+            return Ok(UniverseDiscovery {
+                as_of_ms: now_ms,
+                symbols: strategy.altcoins.clone(),
+                eligible_contracts: strategy.altcoins.len(),
+                liquid_contracts: strategy.altcoins.len(),
+                rolling_history_ready: 0,
+                leaders: Vec::new(),
+            });
+        }
+        let bases = self.futures_bases();
+        let (exchange, tickers) = tokio::try_join!(
+            self.get_from_bases(&bases, "/fapi/v1/exchangeInfo"),
+            self.get_from_bases(&bases, "/fapi/v1/ticker/24hr")
+        )?;
+        let eligible: BTreeSet<String> = exchange["symbols"]
+            .as_array()
+            .ok_or_else(|| anyhow!("exchangeInfo symbols is not an array"))?
+            .iter()
+            .filter(|value| {
+                value["status"] == "TRADING"
+                    && value["contractType"] == "PERPETUAL"
+                    && value["quoteAsset"] == "USDT"
+                    && value
+                        .get("underlyingType")
+                        .and_then(Value::as_str)
+                        .is_none_or(|kind| kind == "COIN")
+            })
+            .filter_map(|value| value["symbol"].as_str().map(str::to_owned))
+            .filter(|symbol| !strategy.majors.contains(symbol))
+            .collect();
+        let mut rows = Vec::new();
+        for ticker in tickers
+            .as_array()
+            .ok_or_else(|| anyhow!("24hr ticker response is not an array"))?
+        {
+            let Some(symbol) = ticker["symbol"].as_str() else {
+                continue;
+            };
+            if !eligible.contains(symbol) {
+                continue;
+            }
+            let parse = |key: &str| {
+                ticker[key]
+                    .as_str()
+                    .and_then(|value| value.parse::<f64>().ok())
+            };
+            let (Some(price), Some(quote_volume), Some(change_24h_pct)) = (
+                parse("lastPrice"),
+                parse("quoteVolume"),
+                parse("priceChangePercent"),
+            ) else {
+                continue;
+            };
+            if price <= 0.0 || quote_volume < strategy.universe.min_24h_quote_volume_usd {
+                continue;
+            }
+            let history = self.discovery_prices.entry(symbol.into()).or_default();
+            history.push_back((now_ms, price));
+            while history
+                .front()
+                .is_some_and(|(ts, _)| *ts < now_ms - 2 * 3_600_000)
+            {
+                history.pop_front();
+            }
+            let return_1h = history
+                .iter()
+                .rev()
+                .find(|(ts, _)| *ts <= now_ms - 45 * 60_000)
+                .map(|(_, prior)| price / prior - 1.0);
+            rows.push((
+                symbol.to_owned(),
+                quote_volume,
+                change_24h_pct / 100.0,
+                return_1h,
+            ));
+        }
+        let rolling_history_ready = rows
+            .iter()
+            .filter(|(_, _, _, return_1h)| return_1h.is_some())
+            .count();
+        let mut selected: BTreeSet<String> = strategy
+            .altcoins
+            .iter()
+            .filter(|symbol| eligible.contains(*symbol))
+            .cloned()
+            .collect();
+        let mut by_liquidity = rows.clone();
+        by_liquidity.sort_by(|a, b| b.1.total_cmp(&a.1));
+        for (symbol, _, _, _) in by_liquidity
+            .iter()
+            .take(strategy.universe.top_liquidity_names)
+        {
+            selected.insert(symbol.clone());
+        }
+        let mut by_movement = rows.clone();
+        by_movement.sort_by(|a, b| {
+            let score = |row: &(String, f64, f64, Option<f64>)| {
+                row.3.unwrap_or(row.2).abs().max(row.2.abs() * 0.35)
+            };
+            score(b).total_cmp(&score(a))
+        });
+        for (symbol, _, _, _) in by_movement.iter().take(strategy.universe.top_mover_names) {
+            selected.insert(symbol.clone());
+        }
+        let selected_scores: BTreeMap<_, _> = rows
+            .iter()
+            .map(|(symbol, volume, change, rolling)| {
+                (
+                    symbol,
+                    rolling.unwrap_or(*change).abs().max(change.abs() * 0.35)
+                        + volume.ln_1p() * 1e-6,
+                )
+            })
+            .collect();
+        let mut symbols: Vec<_> = selected.into_iter().collect();
+        symbols.sort_by(|a, b| {
+            selected_scores
+                .get(b)
+                .copied()
+                .unwrap_or(0.0)
+                .total_cmp(&selected_scores.get(a).copied().unwrap_or(0.0))
+        });
+        symbols.truncate(strategy.universe.max_altcoins);
+        symbols.sort();
+        let selected_symbols: BTreeSet<_> = symbols.iter().map(String::as_str).collect();
+        let leaders = by_movement
+            .into_iter()
+            .filter(|(symbol, _, _, _)| selected_symbols.contains(symbol.as_str()))
+            .take(20)
+            .map(
+                |(symbol, quote_volume, change_24h, return_1h)| UniverseLeader {
+                    symbol,
+                    quote_volume_24h_usd: quote_volume,
+                    change_24h_pct: change_24h * 100.0,
+                    return_1h_pct: return_1h.map(|value| value * 100.0),
+                },
+            )
+            .collect();
+        Ok(UniverseDiscovery {
+            as_of_ms: now_ms,
+            symbols,
+            eligible_contracts: eligible.len(),
+            liquid_contracts: rows.len(),
+            rolling_history_ready,
+            leaders,
         })
     }
     pub fn health(&self) -> Value {
