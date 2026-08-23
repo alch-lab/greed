@@ -121,6 +121,7 @@ pub fn build_graph(config: &StrategyConfig) -> Result<StrategyGraph, GraphError>
                 r.outlier_pullback_min_pct,
                 r.outlier_pullback_max_pct,
                 r.outlier_candidate_expiry_minutes,
+                r.outlier_short_threshold_multiplier,
                 anchor,
                 &config.altcoins,
             )));
@@ -133,6 +134,10 @@ pub fn build_graph(config: &StrategyConfig) -> Result<StrategyGraph, GraphError>
                 r.impulse_max_15m_pct,
                 r.impulse_min_volume_ratio,
                 r.impulse_max_1h_pct,
+                r.impulse_min_return_z,
+                r.impulse_pullback_min_fraction,
+                r.impulse_pullback_max_fraction,
+                r.impulse_short_threshold_multiplier,
                 r.outlier_max_directional_wick_ratio,
                 r.outlier_max_climax_range_ratio,
                 anchor,

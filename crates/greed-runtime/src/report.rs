@@ -280,7 +280,8 @@ pub fn build(path: &str) -> Result<Value> {
                 current_run_telemetry = TelemetryTotals::from_value(&payload["telemetry"]);
                 if let Some(stream) = payload.get("stream").filter(|value| value.is_object()) {
                     stream_observations += 1;
-                    if !stream["market_connected"].as_bool().unwrap_or(false)
+                    if !stream["radar_connected"].as_bool().unwrap_or(false)
+                        || !stream["market_connected"].as_bool().unwrap_or(false)
                         || !stream["public_connected"].as_bool().unwrap_or(false)
                     {
                         stream_offline_observations += 1;
@@ -290,7 +291,11 @@ pub fn build(path: &str) -> Result<Value> {
                     stream_max_parse_errors = stream_max_parse_errors
                         .max(stream["parse_errors"].as_u64().unwrap_or_default());
                     if let Some(now) = recorded_ms {
-                        for key in ["last_market_message_ms", "last_public_message_ms"] {
+                        for key in [
+                            "last_radar_message_ms",
+                            "last_market_message_ms",
+                            "last_public_message_ms",
+                        ] {
                             if let Some(message_ms) = stream[key].as_i64() {
                                 max_stream_message_gap_ms =
                                     max_stream_message_gap_ms.max(now - message_ms);

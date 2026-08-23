@@ -12,6 +12,10 @@ pub struct AltEarlyImpulseNode {
     max_15m: f64,
     min_volume_ratio: f64,
     max_1h: f64,
+    min_return_z: f64,
+    pullback_min_fraction: f64,
+    pullback_max_fraction: f64,
+    short_threshold_multiplier: f64,
     max_wick_ratio: f64,
     max_range_ratio: f64,
     anchor_symbol: String,
@@ -26,6 +30,10 @@ impl AltEarlyImpulseNode {
         max_15m: f64,
         min_volume_ratio: f64,
         max_1h: f64,
+        min_return_z: f64,
+        pullback_min_fraction: f64,
+        pullback_max_fraction: f64,
+        short_threshold_multiplier: f64,
         max_wick_ratio: f64,
         max_range_ratio: f64,
         anchor_symbol: &str,
@@ -38,6 +46,10 @@ impl AltEarlyImpulseNode {
             max_15m,
             min_volume_ratio,
             max_1h,
+            min_return_z,
+            pullback_min_fraction,
+            pullback_max_fraction,
+            short_threshold_multiplier,
             max_wick_ratio,
             max_range_ratio,
             anchor_symbol: anchor_symbol.into(),
@@ -59,7 +71,27 @@ struct Setup<'a> {
     move_15m: f64,
     move_1h: f64,
     volume_ratio: f64,
+    return_z: f64,
+    pullback_fraction: f64,
+    discovery_latency_ms: i64,
     score: f64,
+}
+
+fn return_sigma(bars: &[&greed_kernel::Candle]) -> f64 {
+    let returns: Vec<_> = bars
+        .windows(2)
+        .map(|pair| pair[1].close / pair[0].close.max(f64::EPSILON) - 1.0)
+        .collect();
+    if returns.len() < 2 {
+        return 0.0;
+    }
+    let mean = returns.iter().sum::<f64>() / returns.len() as f64;
+    (returns
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / (returns.len() - 1) as f64)
+        .sqrt()
 }
 
 fn directional_wick(bar: &greed_kernel::Candle, side: Side) -> f64 {
@@ -93,7 +125,8 @@ impl StrategyNode for AltEarlyImpulseNode {
         let mut missing_fast = 0u64;
         let mut impulse_hits = 0u64;
         let mut volume_hits = 0u64;
-        let mut structure_hits = 0u64;
+        let mut pullback_hits = 0u64;
+        let mut reclaim_hits = 0u64;
         let mut climax_blocks = 0u64;
         let mut best_move: f64 = 0.0;
         let mut best_volume: f64 = 0.0;
@@ -119,46 +152,119 @@ impl StrategyNode for AltEarlyImpulseNode {
                 continue;
             };
             let fast = closed_bars(fast_series);
-            if slow.len() < 5 || fast.len() < 24 {
+            if slow.len() < 5 || fast.len() < 40 {
                 missing_fast += 1;
                 continue;
             }
             let f = fast.len() - 1;
-            let move_15m = fast[f].close / fast[f - 3].close - 1.0;
             let move_1h = fast[f].close / fast[f - 12].close - 1.0;
-            best_move = best_move.max(move_15m.abs());
-            if move_15m.abs() < self.min_15m
-                || move_15m.abs() > self.max_15m
-                || move_1h.abs() > self.max_1h
-                || move_15m.signum() != move_1h.signum()
-            {
-                continue;
+            let sigma_5m = return_sigma(&fast[f - 36..f]);
+            let mut detected = None;
+            for impulse_index in (f.saturating_sub(4)..f).rev() {
+                if impulse_index < 27 {
+                    continue;
+                }
+                let move_15m = fast[impulse_index].close / fast[impulse_index - 3].close - 1.0;
+                let side = if move_15m > 0.0 {
+                    Side::Buy
+                } else {
+                    Side::Sell
+                };
+                let multiplier = if side == Side::Sell {
+                    self.short_threshold_multiplier
+                } else {
+                    1.0
+                };
+                let expected_sigma = sigma_5m.max(0.000_1) * 3.0_f64.sqrt();
+                let return_z = move_15m.abs() / expected_sigma;
+                let effective_min =
+                    self.min_15m.max(self.min_return_z * expected_sigma) * multiplier;
+                best_move = best_move.max(move_15m.abs());
+                if move_15m.abs() < effective_min
+                    || move_15m.abs() > self.max_15m
+                    || move_1h.abs() > self.max_1h
+                    || move_15m.signum() != move_1h.signum()
+                {
+                    continue;
+                }
+                impulse_hits += 1;
+                let baseline_volume = fast[impulse_index - 24..impulse_index]
+                    .iter()
+                    .map(|bar| bar.quote_volume)
+                    .sum::<f64>()
+                    / 24.0;
+                let volume_ratio = fast[impulse_index].quote_volume / baseline_volume.max(1.0);
+                best_volume = best_volume.max(volume_ratio);
+                if volume_ratio < self.min_volume_ratio * multiplier
+                    || fast[f].quote_volume < baseline_volume * 0.90
+                {
+                    continue;
+                }
+                volume_hits += 1;
+                let origin = fast[impulse_index - 3].close;
+                let impulse_size = (fast[impulse_index].close - origin).abs().max(f64::EPSILON);
+                let pullback_fraction = match side {
+                    Side::Buy => {
+                        let peak = fast[impulse_index..f]
+                            .iter()
+                            .map(|bar| bar.high)
+                            .fold(0.0, f64::max);
+                        let low = fast[impulse_index + 1..=f]
+                            .iter()
+                            .map(|bar| bar.low)
+                            .fold(f64::INFINITY, f64::min);
+                        (peak - low) / impulse_size
+                    }
+                    Side::Sell => {
+                        let low = fast[impulse_index..f]
+                            .iter()
+                            .map(|bar| bar.low)
+                            .fold(f64::INFINITY, f64::min);
+                        let high = fast[impulse_index + 1..=f]
+                            .iter()
+                            .map(|bar| bar.high)
+                            .fold(0.0, f64::max);
+                        (high - low) / impulse_size
+                    }
+                };
+                let held_origin = match side {
+                    Side::Buy => fast[impulse_index + 1..=f]
+                        .iter()
+                        .all(|bar| bar.low > origin),
+                    Side::Sell => fast[impulse_index + 1..=f]
+                        .iter()
+                        .all(|bar| bar.high < origin),
+                };
+                if !held_origin
+                    || pullback_fraction < self.pullback_min_fraction
+                    || pullback_fraction > self.pullback_max_fraction
+                {
+                    continue;
+                }
+                pullback_hits += 1;
+                let reclaimed = match side {
+                    Side::Buy => fast[f].close > fast[f - 1].high,
+                    Side::Sell => fast[f].close < fast[f - 1].low,
+                };
+                if !reclaimed {
+                    continue;
+                }
+                reclaim_hits += 1;
+                detected = Some((
+                    move_15m,
+                    side,
+                    volume_ratio,
+                    return_z,
+                    pullback_fraction,
+                    impulse_index,
+                ));
+                break;
             }
-            impulse_hits += 1;
-            let side = if move_15m > 0.0 {
-                Side::Buy
-            } else {
-                Side::Sell
+            let Some((move_15m, side, volume_ratio, return_z, pullback_fraction, impulse_index)) =
+                detected
+            else {
+                continue;
             };
-            let baseline_volume = fast[f - 20..f]
-                .iter()
-                .map(|bar| bar.quote_volume)
-                .sum::<f64>()
-                / 20.0;
-            let volume_ratio = fast[f].quote_volume / baseline_volume.max(1.0);
-            best_volume = best_volume.max(volume_ratio);
-            if volume_ratio < self.min_volume_ratio {
-                continue;
-            }
-            volume_hits += 1;
-            let higher_structure = match side {
-                Side::Buy => fast[f].close > fast[f - 1].high && fast[f].low > fast[f - 2].low,
-                Side::Sell => fast[f].close < fast[f - 1].low && fast[f].high < fast[f - 2].high,
-            };
-            if !higher_structure {
-                continue;
-            }
-            structure_hits += 1;
             let average_range = fast[f - 20..f]
                 .iter()
                 .map(|bar| (bar.high - bar.low) / bar.close.max(f64::EPSILON))
@@ -177,7 +283,10 @@ impl StrategyNode for AltEarlyImpulseNode {
                 move_15m,
                 move_1h,
                 volume_ratio,
-                score: move_15m.abs() * 3.0 + move_1h.abs() + volume_ratio.ln_1p() * 0.01,
+                return_z,
+                pullback_fraction,
+                discovery_latency_ms: (ctx.frame.as_of_ms - fast[impulse_index].close_ms).max(0),
+                score: return_z * 0.02 + move_1h.abs() + volume_ratio.ln_1p() * 0.01,
             });
         }
         setups.sort_by(|a, b| b.score.total_cmp(&a.score));
@@ -187,7 +296,8 @@ impl StrategyNode for AltEarlyImpulseNode {
             ("missing_fast_data".into(), missing_fast as f64),
             ("impulse_hits".into(), impulse_hits as f64),
             ("volume_hits".into(), volume_hits as f64),
-            ("structure_hits".into(), structure_hits as f64),
+            ("pullback_hits".into(), pullback_hits as f64),
+            ("reclaim_hits".into(), reclaim_hits as f64),
             ("climax_blocks".into(), climax_blocks as f64),
             ("selected_symbols".into(), selected as f64),
             ("best_move_15m".into(), best_move),
@@ -218,7 +328,7 @@ impl StrategyNode for AltEarlyImpulseNode {
                     vec![]
                 } else {
                     vec![format!(
-                        "no safe early impulse: impulse={impulse_hits}, volume={volume_hits}, structure={structure_hits}, climax={climax_blocks}, missing_fast={missing_fast}"
+                        "no staged early impulse: impulse={impulse_hits}, volume={volume_hits}, pullback={pullback_hits}, reclaim={reclaim_hits}, climax={climax_blocks}, missing_fast={missing_fast}"
                     )]
                 },
                 metrics,
@@ -254,7 +364,13 @@ impl StrategyNode for AltEarlyImpulseNode {
                 .unwrap_or(ctx.frame.as_of_ms);
             let anchor_context = context(anchor);
             let breadth_context = context(breadth);
-            let context_confirmed = anchor_context == "confirmed" || breadth_context == "confirmed";
+            let context_confirmed = match setup.side {
+                Side::Buy => anchor_context == "confirmed" || breadth_context == "confirmed",
+                Side::Sell => {
+                    anchor_context != "opposed"
+                        && (anchor_context == "confirmed" || breadth_context == "confirmed")
+                }
+            };
             let candidate = TradeCandidate {
                 id: format!("{}:{}:{}", self.id, setup.instrument.symbol, signal_ms),
                 recipe: "alt_early_impulse".into(),
@@ -285,6 +401,16 @@ impl StrategyNode for AltEarlyImpulseNode {
                     ("move_15m".into(), format!("{:.8}", setup.move_15m)),
                     ("move_1h".into(), format!("{:.8}", setup.move_1h)),
                     ("volume_ratio".into(), format!("{:.4}", setup.volume_ratio)),
+                    ("return_z".into(), format!("{:.4}", setup.return_z)),
+                    (
+                        "pullback_fraction".into(),
+                        format!("{:.4}", setup.pullback_fraction),
+                    ),
+                    (
+                        "discovery_latency_ms".into(),
+                        setup.discovery_latency_ms.to_string(),
+                    ),
+                    ("entry_pattern".into(), "impulse_pullback_reclaim".into()),
                     ("stop_profile".into(), "alt_intraday".into()),
                     ("hold_profile".into(), "alt_intraday".into()),
                     ("anchor_context".into(), anchor_context.into()),

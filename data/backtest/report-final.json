@@ -1,106 +1,379 @@
 {
   "source": "Binance public data archive (data.binance.vision)",
   "data_limitations": [
-    "15m OHLC cannot reveal intrabar path; stop is conservatively evaluated before take-profit",
+    "15m/5m OHLC cannot reveal intrabar path; stop is conservatively evaluated before staged take-profit",
     "historical depth is percentage-band depth, not a reconstructable level-2 book",
     "Coinbase premium, ETF flow and liquidation websocket are observation-only because no reliable archive is available",
-    "two weeks is a parameter smoke test, not evidence of durable alpha"
+    "dynamic live-universe discovery is evaluated on the configured historical symbols only; it is not a survivorship-bias-free all-contract backtest",
+    "a limited date range is a parameter smoke test, not evidence of durable alpha"
   ],
   "training": [
     {
-      "profile": "balanced",
+      "profile": "outlier_responsive",
       "from": "2026-08-08",
       "to": "2026-08-14",
       "starting_equity_usd": 3000.0,
-      "ending_equity_usd": 2986.0513525881565,
-      "net_pnl_usd": -13.948647411843467,
-      "return_pct": -0.004649549137281106,
-      "max_drawdown_pct": 0.004806038372304707,
-      "entries": 6,
-      "completed_trades": 6,
-      "win_rate": 0.16666666666666666,
-      "profit_factor": 0.1261552284861029,
-      "fees_usd": 2.39842189940047,
-      "pnl_by_recipe": {
-        "alt_cross_section_momentum": -4.687623262605109,
-        "major_trend_pullback": -9.261024149238931
-      },
-      "entries_by_recipe": {
-        "alt_cross_section_momentum": 4,
-        "major_trend_pullback": 2
-      }
-    },
-    {
-      "profile": "responsive",
-      "from": "2026-08-08",
-      "to": "2026-08-14",
-      "starting_equity_usd": 3000.0,
-      "ending_equity_usd": 2961.1922771896047,
-      "net_pnl_usd": -38.80772281039526,
-      "return_pct": -0.01293590760346508,
-      "max_drawdown_pct": 0.01350315175963661,
-      "entries": 22,
-      "completed_trades": 22,
-      "win_rate": 0.22727272727272727,
-      "profit_factor": 0.2896245876362281,
-      "fees_usd": 7.439200914247527,
-      "pnl_by_recipe": {
-        "alt_cross_section_momentum": -29.274580307125948,
-        "major_trend_pullback": -9.53314250326891
-      },
-      "entries_by_recipe": {
-        "alt_cross_section_momentum": 19,
-        "major_trend_pullback": 3
-      }
-    },
-    {
-      "profile": "selective",
-      "from": "2026-08-08",
-      "to": "2026-08-14",
-      "starting_equity_usd": 3000.0,
-      "ending_equity_usd": 2997.024074833153,
-      "net_pnl_usd": -2.9759251668469915,
-      "return_pct": -0.000991975055615657,
-      "max_drawdown_pct": 0.00125537834245506,
-      "entries": 1,
-      "completed_trades": 1,
+      "ending_equity_usd": 2995.4566862690494,
+      "net_pnl_usd": -4.543313730950558,
+      "return_pct": -0.0015144379103168015,
+      "max_drawdown_pct": 0.0016019948012380946,
+      "entries": 7,
+      "completed_trades": 7,
       "win_rate": 0.0,
       "profit_factor": -0.0,
-      "fees_usd": 0.601187368898974,
+      "fees_usd": 0.8395472672492553,
       "pnl_by_recipe": {
-        "major_trend_pullback": -2.975925166846875
+        "alt_early_impulse": -2.1524169375737205,
+        "alt_outlier_continuation": -0.6737408994180338,
+        "alt_outlier_pullback_reclaim": -0.230513086936973,
+        "major_trend_pullback": -1.4866428070223763
+      },
+      "pnl_by_recipe_and_side": {
+        "alt_early_impulse:buy": -2.1524169375737205,
+        "alt_outlier_continuation:sell": -0.6737408994180338,
+        "alt_outlier_pullback_reclaim:sell": -0.230513086936973,
+        "major_trend_pullback:sell": -1.4866428070223763
       },
       "entries_by_recipe": {
+        "alt_early_impulse": 2,
+        "alt_outlier_continuation": 3,
+        "alt_outlier_pullback_reclaim": 1,
+        "major_trend_pullback": 1
+      }
+    },
+    {
+      "profile": "outlier_balanced",
+      "from": "2026-08-08",
+      "to": "2026-08-14",
+      "starting_equity_usd": 3000.0,
+      "ending_equity_usd": 2996.054344217211,
+      "net_pnl_usd": -3.94565578278889,
+      "return_pct": -0.001315218594262979,
+      "max_drawdown_pct": 0.001499214009292705,
+      "entries": 4,
+      "completed_trades": 4,
+      "win_rate": 0.0,
+      "profit_factor": -0.0,
+      "fees_usd": 0.7044963335333354,
+      "pnl_by_recipe": {
+        "alt_early_impulse": -2.1524169375737205,
+        "alt_outlier_continuation": -0.30649585186785255,
+        "major_trend_pullback": -1.486742993347908
+      },
+      "pnl_by_recipe_and_side": {
+        "alt_early_impulse:buy": -2.1524169375737205,
+        "alt_outlier_continuation:sell": -0.30649585186785255,
+        "major_trend_pullback:sell": -1.486742993347908
+      },
+      "entries_by_recipe": {
+        "alt_early_impulse": 2,
+        "alt_outlier_continuation": 1,
+        "major_trend_pullback": 1
+      }
+    },
+    {
+      "profile": "outlier_selective",
+      "from": "2026-08-08",
+      "to": "2026-08-14",
+      "starting_equity_usd": 3000.0,
+      "ending_equity_usd": 2996.3606880509587,
+      "net_pnl_usd": -3.6393119490412573,
+      "return_pct": -0.0012131039830137746,
+      "max_drawdown_pct": 0.0013971182114076107,
+      "entries": 3,
+      "completed_trades": 3,
+      "win_rate": 0.0,
+      "profit_factor": -0.0,
+      "fees_usd": 0.659428631306825,
+      "pnl_by_recipe": {
+        "alt_early_impulse": -2.1524169375737205,
+        "major_trend_pullback": -1.4868950114677593
+      },
+      "pnl_by_recipe_and_side": {
+        "alt_early_impulse:buy": -2.1524169375737205,
+        "major_trend_pullback:sell": -1.4868950114677593
+      },
+      "entries_by_recipe": {
+        "alt_early_impulse": 2,
+        "major_trend_pullback": 1
+      }
+    },
+    {
+      "profile": "outlier_anti_climax",
+      "from": "2026-08-08",
+      "to": "2026-08-14",
+      "starting_equity_usd": 3000.0,
+      "ending_equity_usd": 2996.3606880509587,
+      "net_pnl_usd": -3.6393119490412573,
+      "return_pct": -0.0012131039830137746,
+      "max_drawdown_pct": 0.0013971182114076107,
+      "entries": 3,
+      "completed_trades": 3,
+      "win_rate": 0.0,
+      "profit_factor": -0.0,
+      "fees_usd": 0.659428631306825,
+      "pnl_by_recipe": {
+        "alt_early_impulse": -2.1524169375737205,
+        "major_trend_pullback": -1.4868950114677593
+      },
+      "pnl_by_recipe_and_side": {
+        "alt_early_impulse:buy": -2.1524169375737205,
+        "major_trend_pullback:sell": -1.4868950114677593
+      },
+      "entries_by_recipe": {
+        "alt_early_impulse": 2,
+        "major_trend_pullback": 1
+      }
+    },
+    {
+      "profile": "outlier_tight_exit",
+      "from": "2026-08-08",
+      "to": "2026-08-14",
+      "starting_equity_usd": 3000.0,
+      "ending_equity_usd": 2996.0805754954185,
+      "net_pnl_usd": -3.919424504581457,
+      "return_pct": -0.0013064748348604605,
+      "max_drawdown_pct": 0.0014904718608207599,
+      "entries": 4,
+      "completed_trades": 4,
+      "win_rate": 0.0,
+      "profit_factor": -0.0,
+      "fees_usd": 0.7044858475667201,
+      "pnl_by_recipe": {
+        "alt_early_impulse": -2.1524169375737205,
+        "alt_outlier_continuation": -0.28025155681729325,
+        "major_trend_pullback": -1.4867560101909292
+      },
+      "pnl_by_recipe_and_side": {
+        "alt_early_impulse:buy": -2.1524169375737205,
+        "alt_outlier_continuation:sell": -0.28025155681729325,
+        "major_trend_pullback:sell": -1.4867560101909292
+      },
+      "entries_by_recipe": {
+        "alt_early_impulse": 2,
+        "alt_outlier_continuation": 1,
         "major_trend_pullback": 1
       }
     }
   ],
-  "selected_profile": "balanced",
+  "selected_profile": "outlier_responsive",
   "validation": {
-    "profile": "balanced",
+    "profile": "outlier_responsive",
     "from": "2026-08-15",
     "to": "2026-08-21",
     "starting_equity_usd": 3000.0,
-    "ending_equity_usd": 3026.808962508268,
-    "net_pnl_usd": 26.808962508267996,
-    "return_pct": 0.008936320836089306,
-    "max_drawdown_pct": 0.01078336280196599,
-    "entries": 32,
-    "completed_trades": 32,
-    "win_rate": 0.4375,
-    "profit_factor": 1.3658138883147557,
-    "fees_usd": 14.547121620407701,
+    "ending_equity_usd": 3006.4169834244817,
+    "net_pnl_usd": 6.416983424481714,
+    "return_pct": 0.0021389944748271272,
+    "max_drawdown_pct": 0.0036297125450920585,
+    "entries": 51,
+    "completed_trades": 51,
+    "win_rate": 0.6470588235294118,
+    "profit_factor": 1.233015610884042,
+    "fees_usd": 10.353159879331939,
     "pnl_by_recipe": {
-      "alt_cross_section_momentum": 10.69346624369668,
-      "major_exhaustion_reversal": -9.103823583002182,
-      "major_trend_pullback": 25.219319847572404
+      "alt_early_impulse": 2.296971860472766,
+      "alt_outlier_continuation": -2.0139921315516514,
+      "alt_outlier_pullback_reclaim": -0.023371920311764216,
+      "major_exhaustion_reversal": 0.8565691125377064,
+      "major_trend_pullback": 5.300806503334586
+    },
+    "pnl_by_recipe_and_side": {
+      "alt_early_impulse:buy": 2.296971860472766,
+      "alt_outlier_continuation:buy": -0.9405967115326445,
+      "alt_outlier_continuation:sell": -1.0733954200190068,
+      "alt_outlier_pullback_reclaim:buy": -0.023371920311764216,
+      "major_exhaustion_reversal:sell": 0.8565691125377064,
+      "major_trend_pullback:buy": 5.300806503334586
     },
     "entries_by_recipe": {
-      "alt_cross_section_momentum": 16,
+      "alt_early_impulse": 14,
+      "alt_outlier_continuation": 23,
+      "alt_outlier_pullback_reclaim": 4,
       "major_exhaustion_reversal": 2,
-      "major_trend_pullback": 14
+      "major_trend_pullback": 8
     }
   },
+  "validation_profiles": [
+    {
+      "profile": "outlier_responsive",
+      "from": "2026-08-15",
+      "to": "2026-08-21",
+      "starting_equity_usd": 3000.0,
+      "ending_equity_usd": 3006.4169834244817,
+      "net_pnl_usd": 6.416983424481714,
+      "return_pct": 0.0021389944748271272,
+      "max_drawdown_pct": 0.0036297125450920585,
+      "entries": 51,
+      "completed_trades": 51,
+      "win_rate": 0.6470588235294118,
+      "profit_factor": 1.233015610884042,
+      "fees_usd": 10.353159879331939,
+      "pnl_by_recipe": {
+        "alt_early_impulse": 2.296971860472766,
+        "alt_outlier_continuation": -2.0139921315516514,
+        "alt_outlier_pullback_reclaim": -0.023371920311764216,
+        "major_exhaustion_reversal": 0.8565691125377064,
+        "major_trend_pullback": 5.300806503334586
+      },
+      "pnl_by_recipe_and_side": {
+        "alt_early_impulse:buy": 2.296971860472766,
+        "alt_outlier_continuation:buy": -0.9405967115326445,
+        "alt_outlier_continuation:sell": -1.0733954200190068,
+        "alt_outlier_pullback_reclaim:buy": -0.023371920311764216,
+        "major_exhaustion_reversal:sell": 0.8565691125377064,
+        "major_trend_pullback:buy": 5.300806503334586
+      },
+      "entries_by_recipe": {
+        "alt_early_impulse": 14,
+        "alt_outlier_continuation": 23,
+        "alt_outlier_pullback_reclaim": 4,
+        "major_exhaustion_reversal": 2,
+        "major_trend_pullback": 8
+      }
+    },
+    {
+      "profile": "outlier_balanced",
+      "from": "2026-08-15",
+      "to": "2026-08-21",
+      "starting_equity_usd": 3000.0,
+      "ending_equity_usd": 3005.9172146879055,
+      "net_pnl_usd": 5.917214687905471,
+      "return_pct": 0.0019724048959683937,
+      "max_drawdown_pct": 0.0035626324540459883,
+      "entries": 44,
+      "completed_trades": 44,
+      "win_rate": 0.6590909090909091,
+      "profit_factor": 1.224222261783826,
+      "fees_usd": 9.984210378568717,
+      "pnl_by_recipe": {
+        "alt_early_impulse": 2.298803430689377,
+        "alt_outlier_continuation": -1.9050057946737913,
+        "alt_outlier_pullback_reclaim": -0.6322580162867264,
+        "major_exhaustion_reversal": 0.8567597536457622,
+        "major_trend_pullback": 5.29891531453251
+      },
+      "pnl_by_recipe_and_side": {
+        "alt_early_impulse:buy": 2.298803430689377,
+        "alt_outlier_continuation:buy": -1.9050057946737913,
+        "alt_outlier_pullback_reclaim:buy": -0.6322580162867264,
+        "major_exhaustion_reversal:sell": 0.8567597536457622,
+        "major_trend_pullback:buy": 5.29891531453251
+      },
+      "entries_by_recipe": {
+        "alt_early_impulse": 14,
+        "alt_outlier_continuation": 15,
+        "alt_outlier_pullback_reclaim": 5,
+        "major_exhaustion_reversal": 2,
+        "major_trend_pullback": 8
+      }
+    },
+    {
+      "profile": "outlier_selective",
+      "from": "2026-08-15",
+      "to": "2026-08-21",
+      "starting_equity_usd": 3000.0,
+      "ending_equity_usd": 3015.9270229649655,
+      "net_pnl_usd": 15.927022964965545,
+      "return_pct": 0.005309007654988429,
+      "max_drawdown_pct": 0.0034438277020970376,
+      "entries": 45,
+      "completed_trades": 45,
+      "win_rate": 0.7111111111111111,
+      "profit_factor": 1.635746536443617,
+      "fees_usd": 11.232600024733628,
+      "pnl_by_recipe": {
+        "alt_early_impulse": 10.056454361516165,
+        "alt_outlier_continuation": -0.4544890553591719,
+        "alt_outlier_pullback_reclaim": 0.18058585957247522,
+        "major_exhaustion_reversal": 0.8566773043287952,
+        "major_trend_pullback": 5.287794494907848
+      },
+      "pnl_by_recipe_and_side": {
+        "alt_early_impulse:buy": 10.056454361516165,
+        "alt_outlier_continuation:buy": -0.4544890553591719,
+        "alt_outlier_pullback_reclaim:buy": 0.18058585957247522,
+        "major_exhaustion_reversal:sell": 0.8566773043287952,
+        "major_trend_pullback:buy": 5.287794494907848
+      },
+      "entries_by_recipe": {
+        "alt_early_impulse": 21,
+        "alt_outlier_continuation": 10,
+        "alt_outlier_pullback_reclaim": 4,
+        "major_exhaustion_reversal": 2,
+        "major_trend_pullback": 8
+      }
+    },
+    {
+      "profile": "outlier_anti_climax",
+      "from": "2026-08-15",
+      "to": "2026-08-21",
+      "starting_equity_usd": 3000.0,
+      "ending_equity_usd": 3002.9401105387515,
+      "net_pnl_usd": 2.940110538751469,
+      "return_pct": 0.000980036846250476,
+      "max_drawdown_pct": 0.0030091451470179473,
+      "entries": 28,
+      "completed_trades": 28,
+      "win_rate": 0.6785714285714286,
+      "profit_factor": 1.132368697730174,
+      "fees_usd": 8.085856091398943,
+      "pnl_by_recipe": {
+        "alt_early_impulse": -2.0732892589167786,
+        "alt_outlier_continuation": -1.1334099858718862,
+        "major_exhaustion_reversal": 0.855730535490151,
+        "major_trend_pullback": 5.291079248050707
+      },
+      "pnl_by_recipe_and_side": {
+        "alt_early_impulse:buy": -2.0732892589167786,
+        "alt_outlier_continuation:buy": -1.1334099858718862,
+        "major_exhaustion_reversal:sell": 0.855730535490151,
+        "major_trend_pullback:buy": 5.291079248050707
+      },
+      "entries_by_recipe": {
+        "alt_early_impulse": 9,
+        "alt_outlier_continuation": 9,
+        "major_exhaustion_reversal": 2,
+        "major_trend_pullback": 8
+      }
+    },
+    {
+      "profile": "outlier_tight_exit",
+      "from": "2026-08-15",
+      "to": "2026-08-21",
+      "starting_equity_usd": 3000.0,
+      "ending_equity_usd": 3006.929804170805,
+      "net_pnl_usd": 6.9298041708048,
+      "return_pct": 0.0023099347236015255,
+      "max_drawdown_pct": 0.003148001414163822,
+      "entries": 44,
+      "completed_trades": 44,
+      "win_rate": 0.6818181818181818,
+      "profit_factor": 1.2783929397874243,
+      "fees_usd": 9.963751137858422,
+      "pnl_by_recipe": {
+        "alt_early_impulse": 2.3006082889263477,
+        "alt_outlier_continuation": -1.184245470445,
+        "alt_outlier_pullback_reclaim": -0.3421366614767576,
+        "major_exhaustion_reversal": 0.8567781738597696,
+        "major_trend_pullback": 5.298799839938541
+      },
+      "pnl_by_recipe_and_side": {
+        "alt_early_impulse:buy": 2.3006082889263477,
+        "alt_outlier_continuation:buy": -1.184245470445,
+        "alt_outlier_pullback_reclaim:buy": -0.3421366614767576,
+        "major_exhaustion_reversal:sell": 0.8567781738597696,
+        "major_trend_pullback:buy": 5.298799839938541
+      },
+      "entries_by_recipe": {
+        "alt_early_impulse": 14,
+        "alt_outlier_continuation": 15,
+        "alt_outlier_pullback_reclaim": 5,
+        "major_exhaustion_reversal": 2,
+        "major_trend_pullback": 8
+      }
+    }
+  ],
   "recommended_parameters": {
     "majors": [
       "BTCUSDT",
@@ -120,18 +393,27 @@
       "TRXUSDT",
       "DOTUSDT"
     ],
+    "universe": {
+      "dynamic_enabled": true,
+      "max_altcoins": 30,
+      "top_liquidity_names": 12,
+      "top_mover_names": 18,
+      "min_24h_quote_volume_usd": 25000000.0,
+      "refresh_minutes": 1,
+      "anomaly_scan_seconds": 15
+    },
     "primitives": {
-      "trend_horizon_bars": 24,
-      "trend_min_return_pct": 0.006,
-      "trend_min_efficiency": 0.1,
+      "trend_horizon_bars": 96,
+      "trend_min_return_pct": 0.008,
+      "trend_min_efficiency": 0.2,
       "flow_window_bars": 4,
       "min_spot_delta_share": 0.01,
       "min_spot_directional_share": 0.15,
       "max_spread_bps": 8.0,
       "min_depth_usd": 100000.0,
-      "breadth_horizon_bars": 96,
-      "breadth_threshold": 0.01,
-      "breadth_min_participation": 0.55,
+      "breadth_horizon_bars": 32,
+      "breadth_threshold": 0.008,
+      "breadth_min_participation": 0.6,
       "alt_min_24h_volume_usd": 25000000.0,
       "alt_min_open_interest_usd": 5000000.0,
       "volume_profile_bars": 96,
@@ -142,33 +424,86 @@
       "major_trend_pullback_enabled": true,
       "major_exhaustion_enabled": true,
       "require_coinbase_premium": false,
-      "alt_cross_section_enabled": true,
+      "alt_cross_section_enabled": false,
+      "alt_outlier_momentum_enabled": true,
+      "alt_early_impulse_enabled": true,
       "alt_shock_reversal_enabled": true,
-      "pullback_min_pct": 0.002,
-      "exhaustion_move_pct": 0.018,
-      "cross_names": 2,
-      "cross_rebalance_bars": 24,
-      "shock_min_return_pct": 0.045,
-      "shock_min_reversal_pct": 0.006,
-      "shock_min_volume_ratio": 2.5
+      "pullback_min_pct": 0.003,
+      "exhaustion_move_pct": 0.024,
+      "cross_names": 1,
+      "cross_rebalance_bars": 4,
+      "cross_opportunity_driven": true,
+      "alt_neutral_anchor_allowed": true,
+      "alt_shock_neutral_anchor_allowed": false,
+      "outlier_names": 3,
+      "outlier_min_return_1h_pct": 0.01,
+      "outlier_min_return_4h_pct": 0.025,
+      "outlier_min_volume_ratio": 1.1,
+      "outlier_min_efficiency": 0.25,
+      "outlier_confirmation_min_5m_pct": 0.001,
+      "outlier_confirmation_max_5m_pct": 0.012,
+      "outlier_max_directional_wick_ratio": 0.35,
+      "outlier_max_climax_range_ratio": 2.8,
+      "outlier_pullback_min_pct": 0.004,
+      "outlier_pullback_max_pct": 0.015,
+      "outlier_candidate_expiry_minutes": 10,
+      "outlier_short_threshold_multiplier": 1.25,
+      "impulse_names": 2,
+      "impulse_min_15m_pct": 0.006,
+      "impulse_max_15m_pct": 0.025,
+      "impulse_min_volume_ratio": 1.6,
+      "impulse_max_1h_pct": 0.04,
+      "impulse_min_return_z": 1.8,
+      "impulse_pullback_min_fraction": 0.15,
+      "impulse_pullback_max_fraction": 0.6,
+      "impulse_short_threshold_multiplier": 1.3,
+      "shock_min_return_pct": 0.06,
+      "shock_min_reversal_pct": 0.008,
+      "shock_min_volume_ratio": 3.0
     },
     "risk": {
       "major_gross_per_trade": 0.2,
+      "major_short_size_multiplier": 0.5,
       "alt_gross_per_trade": 0.1,
+      "alt_neutral_anchor_size_multiplier": 0.3,
+      "alt_neutral_anchor_stop_pct": 0.012,
+      "alt_neutral_anchor_take_profit_pct": 0.018,
+      "alt_neutral_anchor_max_hold_minutes": 240,
+      "alt_outlier_gross_per_trade": 0.02,
+      "alt_outlier_opposed_size_multiplier": 0.5,
+      "alt_outlier_neutral_size_multiplier": 0.75,
+      "alt_outlier_breadth_opposed_size_multiplier": 0.35,
+      "alt_outlier_breadth_neutral_size_multiplier": 0.65,
+      "alt_outlier_stop_pct": 0.012,
+      "alt_outlier_take_profit_pct": 0.02,
+      "alt_outlier_max_hold_minutes": 120,
+      "alt_intraday_gross_per_trade": 0.08,
+      "alt_intraday_stop_pct": 0.009,
+      "alt_intraday_max_hold_minutes": 90,
       "major_max_gross": 0.5,
       "alt_max_gross": 0.5,
       "max_total_gross": 1.0,
       "initial_stop_pct": 0.008,
       "first_take_profit_pct": 0.012,
-      "alt_cross_stop_pct": 0.015,
+      "alt_cross_stop_pct": 0.012,
       "alt_cross_take_profit_pct": 0.025,
-      "alt_cross_max_hold_minutes": 720,
+      "alt_cross_max_hold_minutes": 180,
       "first_take_profit_fraction": 0.5,
+      "risk_shield_r_multiple": 0.75,
+      "risk_shield_fraction": 0.25,
+      "second_take_profit_r_multiple": 1.0,
+      "second_take_profit_fraction": 0.3,
+      "runner_take_profit_r_multiple": 2.5,
+      "break_even_cost_buffer_pct": 0.0015,
       "trailing_activation_pct": 0.012,
       "trailing_distance_pct": 0.006,
       "max_hold_minutes": 240,
       "daily_loss_limit_pct": 0.025,
-      "peak_drawdown_halt_pct": 0.05
+      "peak_drawdown_halt_pct": 0.05,
+      "rolling_pf_window": 10,
+      "rolling_pf_min_trades": 3,
+      "rolling_pf_floor": 1.0,
+      "rolling_pf_cooldown_minutes": 720
     }
   }
 }

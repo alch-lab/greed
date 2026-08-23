@@ -21,6 +21,7 @@ pub struct AltOutlierMomentumNode {
     pullback_min: f64,
     pullback_max: f64,
     candidate_expiry_ms: i64,
+    short_threshold_multiplier: f64,
     anchor_symbol: String,
     dependencies: Vec<String>,
 }
@@ -40,6 +41,7 @@ impl AltOutlierMomentumNode {
         pullback_min: f64,
         pullback_max: f64,
         candidate_expiry_minutes: u32,
+        short_threshold_multiplier: f64,
         anchor_symbol: &str,
         symbols: &[String],
     ) -> Self {
@@ -57,6 +59,7 @@ impl AltOutlierMomentumNode {
             pullback_min,
             pullback_max,
             candidate_expiry_ms: i64::from(candidate_expiry_minutes) * 60_000,
+            short_threshold_multiplier,
             anchor_symbol: anchor_symbol.into(),
             dependencies: std::iter::once("alt.market_breadth".into())
                 .chain(std::iter::once(format!("{anchor_symbol}.trend_regime")))
@@ -205,8 +208,19 @@ impl StrategyNode for AltOutlierMomentumNode {
             best_return_1h = best_return_1h.max(return_1h.abs());
             best_return_4h = best_return_4h.max(return_4h.abs());
             let same_direction = return_1h.signum() == return_4h.signum();
+            let side = if return_1h > 0.0 {
+                Side::Buy
+            } else {
+                Side::Sell
+            };
+            let threshold_multiplier = if side == Side::Sell {
+                self.short_threshold_multiplier
+            } else {
+                1.0
+            };
             if !same_direction
-                || (return_1h.abs() < self.min_return_1h && return_4h.abs() < self.min_return_4h)
+                || (return_1h.abs() < self.min_return_1h * threshold_multiplier
+                    && return_4h.abs() < self.min_return_4h * threshold_multiplier)
             {
                 continue;
             }
@@ -223,7 +237,7 @@ impl StrategyNode for AltOutlierMomentumNode {
                 / 92.0;
             let volume_ratio = recent_volume / baseline_volume.max(1.0);
             best_volume_ratio = best_volume_ratio.max(volume_ratio);
-            if volume_ratio < self.min_volume_ratio {
+            if volume_ratio < self.min_volume_ratio * threshold_multiplier {
                 continue;
             }
             volume_hits += 1;
@@ -232,11 +246,6 @@ impl StrategyNode for AltOutlierMomentumNode {
             if efficiency < self.min_efficiency {
                 continue;
             }
-            let side = if return_1h > 0.0 {
-                Side::Buy
-            } else {
-                Side::Sell
-            };
             let Some(fast_series) = instrument.fast_perpetual.as_ref() else {
                 fast_missing += 1;
                 continue;
@@ -385,7 +394,13 @@ impl StrategyNode for AltOutlierMomentumNode {
                 } else {
                     "neutral"
                 };
-            let context_confirmed = anchor_context == "confirmed" || breadth_context == "confirmed";
+            let context_confirmed = match setup.side {
+                Side::Buy => anchor_context == "confirmed" || breadth_context == "confirmed",
+                Side::Sell => {
+                    anchor_context != "opposed"
+                        && (anchor_context == "confirmed" || breadth_context == "confirmed")
+                }
+            };
             let signal_ms = setup
                 .instrument
                 .fast_perpetual

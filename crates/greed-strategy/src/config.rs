@@ -33,6 +33,8 @@ pub struct UniverseConfig {
     pub top_mover_names: usize,
     pub min_24h_quote_volume_usd: f64,
     pub refresh_minutes: u32,
+    /// Re-score the websocket-wide anomaly radar without issuing REST calls.
+    pub anomaly_scan_seconds: u32,
 }
 
 impl Default for UniverseConfig {
@@ -44,6 +46,7 @@ impl Default for UniverseConfig {
             top_mover_names: 18,
             min_24h_quote_volume_usd: 25_000_000.0,
             refresh_minutes: 1,
+            anomaly_scan_seconds: 15,
         }
     }
 }
@@ -121,11 +124,16 @@ pub struct RecipeConfig {
     pub outlier_pullback_min_pct: f64,
     pub outlier_pullback_max_pct: f64,
     pub outlier_candidate_expiry_minutes: u32,
+    pub outlier_short_threshold_multiplier: f64,
     pub impulse_names: usize,
     pub impulse_min_15m_pct: f64,
     pub impulse_max_15m_pct: f64,
     pub impulse_min_volume_ratio: f64,
     pub impulse_max_1h_pct: f64,
+    pub impulse_min_return_z: f64,
+    pub impulse_pullback_min_fraction: f64,
+    pub impulse_pullback_max_fraction: f64,
+    pub impulse_short_threshold_multiplier: f64,
     pub shock_min_return_pct: f64,
     pub shock_min_reversal_pct: f64,
     pub shock_min_volume_ratio: f64,
@@ -160,11 +168,16 @@ impl Default for RecipeConfig {
             outlier_pullback_min_pct: 0.004,
             outlier_pullback_max_pct: 0.015,
             outlier_candidate_expiry_minutes: 10,
+            outlier_short_threshold_multiplier: 1.25,
             impulse_names: 2,
             impulse_min_15m_pct: 0.006,
             impulse_max_15m_pct: 0.025,
             impulse_min_volume_ratio: 1.60,
             impulse_max_1h_pct: 0.040,
+            impulse_min_return_z: 1.8,
+            impulse_pullback_min_fraction: 0.15,
+            impulse_pullback_max_fraction: 0.60,
+            impulse_short_threshold_multiplier: 1.30,
             shock_min_return_pct: 0.045,
             shock_min_reversal_pct: 0.006,
             shock_min_volume_ratio: 2.5,
@@ -176,6 +189,7 @@ impl Default for RecipeConfig {
 #[serde(default)]
 pub struct RiskConfig {
     pub major_gross_per_trade: f64,
+    pub major_short_size_multiplier: f64,
     pub alt_gross_per_trade: f64,
     pub alt_neutral_anchor_size_multiplier: f64,
     pub alt_neutral_anchor_stop_pct: f64,
@@ -222,6 +236,7 @@ impl Default for RiskConfig {
     fn default() -> Self {
         Self {
             major_gross_per_trade: 0.20,
+            major_short_size_multiplier: 0.50,
             alt_gross_per_trade: 0.10,
             alt_neutral_anchor_size_multiplier: 0.60,
             alt_neutral_anchor_stop_pct: 0.012,
@@ -277,6 +292,7 @@ impl StrategyConfig {
                 < self.universe.max_altcoins
             || self.universe.min_24h_quote_volume_usd <= 0.0
             || !(1..=60).contains(&self.universe.refresh_minutes)
+            || !(5..=60).contains(&self.universe.anomaly_scan_seconds)
         {
             return Err("dynamic universe parameters are outside safe API ranges".into());
         }
@@ -304,6 +320,7 @@ impl StrategyConfig {
             || self.recipes.outlier_pullback_min_pct >= self.recipes.outlier_pullback_max_pct
             || self.recipes.outlier_pullback_max_pct > 0.05
             || !(3..=30).contains(&self.recipes.outlier_candidate_expiry_minutes)
+            || !(1.0..=2.0).contains(&self.recipes.outlier_short_threshold_multiplier)
         {
             return Err("outlier recipe parameters are outside safe demo ranges".into());
         }
@@ -313,6 +330,12 @@ impl StrategyConfig {
             || self.recipes.impulse_max_15m_pct > 0.05
             || !(1.0..=5.0).contains(&self.recipes.impulse_min_volume_ratio)
             || self.recipes.impulse_max_1h_pct <= self.recipes.impulse_max_15m_pct
+            || !(1.0..=5.0).contains(&self.recipes.impulse_min_return_z)
+            || !(0.05..=0.50).contains(&self.recipes.impulse_pullback_min_fraction)
+            || !(0.20..=0.90).contains(&self.recipes.impulse_pullback_max_fraction)
+            || self.recipes.impulse_pullback_min_fraction
+                >= self.recipes.impulse_pullback_max_fraction
+            || !(1.0..=2.0).contains(&self.recipes.impulse_short_threshold_multiplier)
         {
             return Err("early impulse parameters are outside safe demo ranges".into());
         }
@@ -337,6 +360,9 @@ impl StrategyConfig {
             || self.risk.alt_intraday_gross_per_trade > self.risk.alt_max_gross
         {
             return Err("per-trade gross may not exceed its capital bucket".into());
+        }
+        if !(0.10..=1.0).contains(&self.risk.major_short_size_multiplier) {
+            return Err("major_short_size_multiplier must be between 0.10 and 1.0".into());
         }
         if !(0.0..=1.0).contains(&self.risk.alt_outlier_opposed_size_multiplier)
             || self.risk.alt_outlier_opposed_size_multiplier == 0.0

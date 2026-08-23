@@ -69,6 +69,8 @@ struct ExecutionMeta {
     #[serde(default)]
     extreme_price: f64,
     #[serde(default)]
+    adverse_price: f64,
+    #[serde(default)]
     trailing_activation_pct: Option<f64>,
     #[serde(default)]
     trailing_distance_pct: Option<f64>,
@@ -417,6 +419,14 @@ impl BinanceDemoExecution {
                             Side::Sell => meta.extreme_price.min(position.mark_price),
                         }
                     };
+                    meta.adverse_price = if meta.adverse_price <= 0.0 {
+                        position.mark_price
+                    } else {
+                        match meta.side {
+                            Side::Buy => meta.adverse_price.min(position.mark_price),
+                            Side::Sell => meta.adverse_price.max(position.mark_price),
+                        }
+                    };
                     let initial_quantity = meta.initial_quantity.max(position.quantity.abs());
                     let closed_fraction =
                         1.0 - position.quantity.abs() / initial_quantity.max(f64::EPSILON);
@@ -584,6 +594,11 @@ impl BinanceDemoExecution {
                                     pnl_usd: *pnl,
                                 });
                         }
+                        let mfe_pct = meta.side.sign()
+                            * (meta.extreme_price / meta.entry_price.max(f64::EPSILON) - 1.0);
+                        let mae_pct = (-meta.side.sign()
+                            * (meta.adverse_price / meta.entry_price.max(f64::EPSILON) - 1.0))
+                            .max(0.0);
                         events.push(ExchangeEvent {
                             kind: "exchange_exit".into(),
                             payload: serde_json::json!({
@@ -598,6 +613,9 @@ impl BinanceDemoExecution {
                                 "fee_usd": summary.as_ref().map(|value| value.2 - meta.cumulative_reported_fee_usd),
                                 "pnl_usd": summary.as_ref().map(|value| value.3 - meta.cumulative_reported_pnl_usd),
                                 "trade_net_pnl_usd": summary.as_ref().map(|value| value.3),
+                                "mfe_pct": mfe_pct,
+                                "mae_pct": mae_pct,
+                                "hold_ms": now_ms - meta.entry_ms,
                                 "reason": "exchange_position_reconciled",
                                 "venue": "binance_demo"
                             }),
@@ -871,6 +889,7 @@ impl BinanceDemoExecution {
                             break_even_buffer_pct: plan.break_even_buffer_pct,
                             break_even_armed: false,
                             extreme_price: entry_price,
+                            adverse_price: entry_price,
                             trailing_activation_pct: plan.trailing_activation_pct,
                             trailing_distance_pct: plan.trailing_distance_pct,
                             max_hold_ms: plan.max_hold_ms,
@@ -878,9 +897,15 @@ impl BinanceDemoExecution {
                         },
                     );
                     self.save().ok();
+                    let signal_to_order_ms = candidate
+                        .map(|value| frame.as_of_ms.saturating_sub(value.signal_ms))
+                        .unwrap_or_default();
+                    let discovery_latency_ms = candidate
+                        .and_then(|value| value.tags.get("discovery_latency_ms"))
+                        .and_then(|value| value.parse::<i64>().ok());
                     events.push(ExchangeEvent {
                         kind: "exchange_entry".into(),
-                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"asset_class":asset_class,"symbol":plan.symbol,"side":plan.side,"entry_price":entry_price,"quantity":quantity,"notional_usd":plan.notional_usd,"order_id":order_id,"venue":"binance_demo","paper_only":true}),
+                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"asset_class":asset_class,"symbol":plan.symbol,"side":plan.side,"entry_price":entry_price,"quantity":quantity,"notional_usd":plan.notional_usd,"order_id":order_id,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
                     });
                 }
                 Err(error) => events.push(ExchangeEvent {

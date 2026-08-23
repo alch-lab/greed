@@ -150,8 +150,16 @@ impl StrategyNode for PositionPlannerNode {
                 .get("anchor_confirmation")
                 .map(String::as_str)
                 == Some("neutral");
-            let per_trade =
-                base_per_trade * candidate_size_multiplier(&self.config, &candidate.tags);
+            let direction_multiplier = if instrument.asset_class == AssetClass::Major
+                && candidate.side == greed_kernel::Side::Sell
+            {
+                self.config.major_short_size_multiplier
+            } else {
+                1.0
+            };
+            let per_trade = base_per_trade
+                * direction_multiplier
+                * candidate_size_multiplier(&self.config, &candidate.tags);
             let bucket_has_room = match instrument.asset_class {
                 AssetClass::Major => major_gross + per_trade <= self.config.major_max_gross,
                 AssetClass::Altcoin => alt_gross + per_trade <= self.config.alt_max_gross,

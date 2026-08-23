@@ -80,8 +80,31 @@ pub struct UniverseLeader {
     pub symbol: String,
     pub quote_volume_24h_usd: f64,
     pub change_24h_pct: f64,
+    pub return_1m_pct: Option<f64>,
+    pub return_5m_pct: Option<f64>,
     pub return_15m_pct: Option<f64>,
     pub return_1h_pct: Option<f64>,
+    pub anomaly_score: f64,
+}
+
+type DiscoveryRow = (
+    String,
+    f64,
+    f64,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+    Option<f64>,
+);
+
+fn median_abs(values: impl Iterator<Item = Option<f64>>, floor: f64) -> f64 {
+    let mut values: Vec<_> = values.flatten().map(f64::abs).collect();
+    values.sort_by(f64::total_cmp);
+    values
+        .get(values.len() / 2)
+        .copied()
+        .unwrap_or(floor)
+        .max(floor)
 }
 
 #[derive(Debug, serde::Deserialize)]
@@ -231,21 +254,24 @@ impl BinanceMarketSource {
             {
                 history.pop_front();
             }
-            let return_15m = history
-                .iter()
-                .rev()
-                .find(|(ts, _)| *ts <= now_ms - 12 * 60_000)
-                .map(|(_, prior)| price / prior - 1.0);
             let return_1h = history
                 .iter()
                 .rev()
                 .find(|(ts, _)| *ts <= now_ms - 45 * 60_000)
                 .map(|(_, prior)| price / prior - 1.0);
-            rows.push((symbol, quote_volume, change_24h, return_15m, return_1h));
+            rows.push((
+                symbol,
+                quote_volume,
+                change_24h,
+                ticker.return_1m,
+                ticker.return_5m,
+                ticker.return_15m,
+                return_1h,
+            ));
         }
         let rolling_history_ready = rows
             .iter()
-            .filter(|(_, _, _, return_15m, _)| return_15m.is_some())
+            .filter(|(_, _, _, _, return_5m, _, _)| return_5m.is_some())
             .count();
         let mut selected: BTreeSet<String> = strategy
             .altcoins
@@ -255,37 +281,30 @@ impl BinanceMarketSource {
             .collect();
         let mut by_liquidity = rows.clone();
         by_liquidity.sort_by(|a, b| b.1.total_cmp(&a.1));
-        for (symbol, _, _, _, _) in by_liquidity
+        for (symbol, _, _, _, _, _, _) in by_liquidity
             .iter()
             .take(strategy.universe.top_liquidity_names)
         {
             selected.insert(symbol.clone());
         }
         let mut by_movement = rows.clone();
-        by_movement.sort_by(|a, b| {
-            let score = |row: &(String, f64, f64, Option<f64>, Option<f64>)| {
-                row.3
-                    .unwrap_or_default()
-                    .abs()
-                    .mul_add(2.0, row.4.unwrap_or_default().abs())
-                    .max(row.2.abs() * 0.25)
-            };
-            score(b).total_cmp(&score(a))
-        });
-        for (symbol, _, _, _, _) in by_movement.iter().take(strategy.universe.top_mover_names) {
+        let scale_1m = median_abs(rows.iter().map(|row| row.3), 0.0005);
+        let scale_5m = median_abs(rows.iter().map(|row| row.4), 0.0015);
+        let scale_15m = median_abs(rows.iter().map(|row| row.5), 0.0030);
+        let anomaly_score = |row: &DiscoveryRow| {
+            row.3.unwrap_or_default().abs() / scale_1m * 0.50
+                + row.4.unwrap_or_default().abs() / scale_5m * 0.30
+                + row.5.unwrap_or_default().abs() / scale_15m * 0.15
+                + row.2.abs() * 0.05 / 0.03
+        };
+        by_movement.sort_by(|a, b| anomaly_score(b).total_cmp(&anomaly_score(a)));
+        for (symbol, _, _, _, _, _, _) in by_movement.iter().take(strategy.universe.top_mover_names)
+        {
             selected.insert(symbol.clone());
         }
         let selected_scores: BTreeMap<_, _> = rows
             .iter()
-            .map(|(symbol, volume, change, return_15m, return_1h)| {
-                (
-                    symbol,
-                    return_15m.unwrap_or_default().abs() * 2.0
-                        + return_1h.unwrap_or_default().abs()
-                        + change.abs() * 0.25
-                        + volume.ln_1p() * 1e-6,
-                )
-            })
+            .map(|row| (&row.0, anomaly_score(row) + row.1.ln_1p() * 1e-6))
             .collect();
         let mut symbols: Vec<_> = selected.into_iter().collect();
         symbols.sort_by(|a, b| {
@@ -300,17 +319,18 @@ impl BinanceMarketSource {
         let selected_symbols: BTreeSet<_> = symbols.iter().map(String::as_str).collect();
         let leaders = by_movement
             .into_iter()
-            .filter(|(symbol, _, _, _, _)| selected_symbols.contains(symbol.as_str()))
+            .filter(|(symbol, _, _, _, _, _, _)| selected_symbols.contains(symbol.as_str()))
             .take(20)
-            .map(
-                |(symbol, quote_volume, change_24h, return_15m, return_1h)| UniverseLeader {
-                    symbol,
-                    quote_volume_24h_usd: quote_volume,
-                    change_24h_pct: change_24h * 100.0,
-                    return_15m_pct: return_15m.map(|value| value * 100.0),
-                    return_1h_pct: return_1h.map(|value| value * 100.0),
-                },
-            )
+            .map(|row| UniverseLeader {
+                symbol: row.0.clone(),
+                quote_volume_24h_usd: row.1,
+                change_24h_pct: row.2 * 100.0,
+                return_1m_pct: row.3.map(|value| value * 100.0),
+                return_5m_pct: row.4.map(|value| value * 100.0),
+                return_15m_pct: row.5.map(|value| value * 100.0),
+                return_1h_pct: row.6.map(|value| value * 100.0),
+                anomaly_score: anomaly_score(&row),
+            })
             .collect();
         Ok(UniverseDiscovery {
             as_of_ms: now_ms,

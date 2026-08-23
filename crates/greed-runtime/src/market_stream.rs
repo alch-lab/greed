@@ -14,6 +14,7 @@ use tracing::warn;
 
 const STREAM_TTL_MS: i64 = 15_000;
 const CANDLE_CACHE_LIMIT: usize = 200;
+const TICKER_HISTORY_MS: i64 = 20 * 60_000;
 
 #[derive(Debug, Clone)]
 pub struct StreamTicker {
@@ -21,6 +22,9 @@ pub struct StreamTicker {
     pub price: f64,
     pub open_24h: f64,
     pub quote_volume_24h: f64,
+    pub return_1m: Option<f64>,
+    pub return_5m: Option<f64>,
+    pub return_15m: Option<f64>,
 }
 
 impl StreamTicker {
@@ -40,10 +44,13 @@ pub struct StreamMark {
 
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct StreamTelemetry {
+    pub radar_connected: bool,
     pub market_connected: bool,
     pub public_connected: bool,
+    pub last_radar_message_ms: Option<i64>,
     pub last_market_message_ms: Option<i64>,
     pub last_public_message_ms: Option<i64>,
+    pub radar_messages: u64,
     pub market_messages: u64,
     pub public_messages: u64,
     pub reconnects: u64,
@@ -55,6 +62,7 @@ pub struct StreamTelemetry {
 #[derive(Default)]
 struct StreamState {
     tickers: BTreeMap<String, StreamTicker>,
+    ticker_history: BTreeMap<String, VecDeque<(i64, f64)>>,
     candles: BTreeMap<(String, String), VecDeque<Candle>>,
     candle_update_ms: BTreeMap<(String, String), i64>,
     books: BTreeMap<String, BookState>,
@@ -144,6 +152,15 @@ async fn run_supervisor(
     state: Arc<RwLock<StreamState>>,
     mut symbols: watch::Receiver<Vec<String>>,
 ) {
+    let radar_url = format!(
+        "{}/market/stream?streams=!ticker@arr",
+        base_url.trim_end_matches('/')
+    );
+    tokio::spawn(run_connection(
+        StreamRoute::Radar,
+        radar_url,
+        Arc::clone(&state),
+    ));
     loop {
         let active = symbols.borrow().clone();
         if active.is_empty() {
@@ -190,6 +207,7 @@ async fn run_supervisor(
 
 #[derive(Clone, Copy)]
 enum StreamRoute {
+    Radar,
     Market,
     Public,
 }
@@ -240,7 +258,7 @@ async fn run_connection(route: StreamRoute, url: String, state: Arc<RwLock<Strea
 }
 
 fn market_url(base: &str, symbols: &[String]) -> String {
-    let mut streams = vec!["!ticker@arr".to_string()];
+    let mut streams = Vec::new();
     for symbol in symbols {
         let symbol = symbol.to_lowercase();
         streams.push(format!("{symbol}@kline_15m"));
@@ -318,19 +336,37 @@ fn update_ticker(state: &Arc<RwLock<StreamState>>, value: &Value, received_ms: i
     if price <= 0.0 || open <= 0.0 {
         return Err(anyhow!("invalid ticker price for {symbol}"));
     }
-    state
-        .write()
-        .expect("stream state poisoned")
-        .tickers
-        .insert(
-            symbol,
-            StreamTicker {
-                received_ms,
-                price,
-                open_24h: open,
-                quote_volume_24h: quote_volume,
-            },
-        );
+    let mut state = state.write().expect("stream state poisoned");
+    let history = state.ticker_history.entry(symbol.clone()).or_default();
+    while history
+        .front()
+        .is_some_and(|(ts, _)| *ts < received_ms - TICKER_HISTORY_MS)
+    {
+        history.pop_front();
+    }
+    let prior_return = |age_ms: i64| {
+        history
+            .iter()
+            .rev()
+            .find(|(ts, _)| *ts <= received_ms - age_ms)
+            .map(|(_, prior)| price / prior - 1.0)
+    };
+    let return_1m = prior_return(60_000);
+    let return_5m = prior_return(5 * 60_000);
+    let return_15m = prior_return(15 * 60_000);
+    history.push_back((received_ms, price));
+    state.tickers.insert(
+        symbol,
+        StreamTicker {
+            received_ms,
+            price,
+            open_24h: open,
+            quote_volume_24h: quote_volume,
+            return_1m,
+            return_5m,
+            return_15m,
+        },
+    );
     Ok(())
 }
 
@@ -454,6 +490,7 @@ fn set_connected(
 ) {
     let mut state = state.write().expect("stream state poisoned");
     match route {
+        StreamRoute::Radar => state.telemetry.radar_connected = connected,
         StreamRoute::Market => state.telemetry.market_connected = connected,
         StreamRoute::Public => state.telemetry.public_connected = connected,
     }
@@ -465,6 +502,10 @@ fn set_connected(
 fn record_message(state: &Arc<RwLock<StreamState>>, route: StreamRoute, now_ms: i64) {
     let mut state = state.write().expect("stream state poisoned");
     match route {
+        StreamRoute::Radar => {
+            state.telemetry.radar_messages += 1;
+            state.telemetry.last_radar_message_ms = Some(now_ms);
+        }
         StreamRoute::Market => {
             state.telemetry.market_messages += 1;
             state.telemetry.last_market_message_ms = Some(now_ms);
@@ -577,9 +618,30 @@ mod tests {
         let symbols = vec!["BTCUSDT".to_string(), "YBUSDT".to_string()];
         let market = market_url("wss://fstream.binance.com", &symbols);
         let public = public_url("wss://fstream.binance.com", &symbols);
-        assert!(market.contains("/market/stream?streams=!ticker@arr"));
+        assert!(!market.contains("!ticker@arr"));
+        assert!(market.contains("/market/stream?streams="));
         assert!(market.contains("ybusdt@kline_5m"));
         assert!(!market.contains("btcusdt@kline_5m"));
         assert!(public.contains("/public/stream?streams="));
+    }
+
+    #[test]
+    fn ticker_radar_keeps_short_interval_returns() {
+        let state = Arc::new(RwLock::new(StreamState::default()));
+        update_ticker(
+            &state,
+            &serde_json::json!({"s":"YBUSDT","c":"1.0","o":"0.9","q":"30000000"}),
+            1_000,
+        )
+        .unwrap();
+        update_ticker(
+            &state,
+            &serde_json::json!({"s":"YBUSDT","c":"1.1","o":"0.9","q":"31000000"}),
+            61_000,
+        )
+        .unwrap();
+        let ticker = state.read().unwrap().tickers["YBUSDT"].clone();
+        assert!((ticker.return_1m.unwrap() - 0.10).abs() < 1e-9);
+        assert!(ticker.return_5m.is_none());
     }
 }

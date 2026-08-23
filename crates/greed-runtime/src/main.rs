@@ -395,7 +395,7 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
             history.append(&event.kind, event.payload.clone())?;
             journal.append(&event.kind, event.payload)?;
         }
-        let refresh_ms = i64::from(config.strategy.universe.refresh_minutes) * 60_000;
+        let refresh_ms = i64::from(config.strategy.universe.anomaly_scan_seconds) * 1_000;
         if config.strategy.universe.dynamic_enabled
             && now_ms - last_universe_refresh_ms >= refresh_ms
         {
