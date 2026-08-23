@@ -3,8 +3,9 @@
 ## 安全边界
 
 `greed` 的 forward test 只连接 Binance Demo/Testnet，不允许配置主网交易域名。API key 和
-secret 只从环境变量读取，不写入 TOML、状态或日志。历史回测仍使用本地 broker；`paper`
-命令使用 Binance Demo 的账户、撮合、订单过滤器和保护单。程序没有主网 `live` 模式。
+secret 只从环境变量读取，不写入 TOML、状态或日志。历史回测使用仅由 `backtest` 命令调用
+的 K 线成交仿真；`paper` 命令使用 Binance Demo 的账户、撮合、订单过滤器和保护单。
+程序没有本地模拟成交模式，也没有主网 `live` 模式。
 
 旧 runner、旧插件注册表和旧账户代码已经删除。
 
@@ -12,7 +13,7 @@ secret 只从环境变量读取，不写入 TOML、状态或日志。历史回�
 
 - `greed-kernel`：无 I/O 领域合同、Artifact、DAG 拓扑和执行。
 - `greed-strategy`：特征原语、状态分类器、recipe 和组合风控。
-- `greed-runtime`：公开行情适配、Binance Demo 鉴权执行、本地回测 broker、持久化和 journal。
+- `greed-runtime`：公开行情适配、Binance Demo 鉴权执行、隔离的历史回测仿真和 journal。
 
 事件处理入口固定为：
 
@@ -60,7 +61,7 @@ MarketFrame → Primitive DAG → State DAG → Recipe → PositionPlanner
 每帧记录距离移动、反转和量能门槛的差距，不再静默返回。
 
 所有 recipe 都生成带 blocker、证据 lineage 和过期时间的候选。只有 `Pass` 候选才会进入
-paper position planner；`Block/Unknown` 仍写 journal，用来研究漏斗和数据缺口。
+Demo position planner；`Block/Unknown` 仍写 journal，用来研究漏斗和数据缺口。
 
 Demo forward test 以交易所实际成交与费用为准。订单拒绝写入 `exchange_order_rejected`；
 账户同步失败时整帧停止。入场成交后如果任一保护单失败，程序撤销残单并立即发送
@@ -70,9 +71,9 @@ reduce-only 市价平仓。每轮同步还会检查止损和止盈是否仍存�
 
 ```bash
 cargo build --release -p greed-runtime
-./target/release/greed validate --config config/paper.toml
-./target/release/greed once --config config/paper.toml
-./target/release/greed paper --config config/paper.toml
+./target/release/greed validate --config config/demo.toml
+./target/release/greed once --config config/demo.toml
+./target/release/greed paper --config config/demo.toml
 ```
 
 服务器使用 `deploy/greed-paper.service`。需要网络代理时只填写
@@ -135,7 +136,7 @@ recipe、哪一天、卡在哪一关、当时接口是否异常”。
 3. Block/Unknown 的主要原因可解释，不能出现缺数据却 Pass。
 4. 每个 recipe 的多空候选数量、成交数量、费用后 PF 分开统计；Major/Altcoin 分账检查
    最大回撤。若需要 MAE/MFE，再由全量 candle 和成交事件进行离线重放，不能用当前价近似。
-5. paper 状态跨重启连续，不能重复开同一个 candidate。
+5. Demo 交易所状态跨重启连续，不能重复开同一个 candidate。
 6. 高滑点、接口中断和同 K 止损/止盈冲突按保守路径重放。
 
 一周结果只用于修复数据和缩小策略空间，不足以证明长期 alpha，也不应直接开启真钱。
@@ -151,7 +152,7 @@ recipe、哪一天、卡在哪一关、当时接口是否异常”。
 Continuation 与 Pullback Reclaim 使用独立滚动 PF 门控，避免一个分支拖累后继续无条件试错。
 当前结论是：只允许 Binance Demo forward test，禁止主网下单；一周后依据交易所真实拒单、
 成交、费用和短周期路径决定删除或保留各分支。
-一周 paper 后只有同时满足以下条件才进入下一阶段评审：
+一周 Demo forward test 后只有同时满足以下条件才进入下一阶段评审：
 
 1. 行情与 OI 关键数据完整率至少 99%，没有连续五分钟空窗。
 2. 至少 20 个完整平仓样本，费用后 PF 至少 1.25，净收益为正。

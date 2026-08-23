@@ -1,5 +1,5 @@
 mod backtest;
-mod broker;
+mod backtest_broker;
 mod config;
 mod execution;
 mod journal;
@@ -8,14 +8,13 @@ mod report;
 mod source;
 
 use anyhow::{Context, Result};
-use broker::PaperBroker;
 use clap::{Parser, Subcommand};
 use config::AppConfig;
 use execution::BinanceDemoExecution;
-use greed_kernel::{Artifact, AssetClass, GraphEvaluation, Verdict};
+use greed_kernel::{AccountFrame, Artifact, AssetClass, GraphEvaluation, Verdict};
 use greed_strategy::{build_graph, StrategyConfig};
 use journal::{Journal, SampleRecorder, StatusWriter};
-use source::BinancePaperSource;
+use source::BinanceMarketSource;
 use std::time::Duration;
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
@@ -34,17 +33,17 @@ struct Cli {
 enum Command {
     /// Parse configuration and build the complete strategy graph without network I/O.
     Validate {
-        #[arg(long, default_value = "config/paper.toml")]
+        #[arg(long, default_value = "config/demo.toml")]
         config: String,
     },
     /// Fetch one point-in-time frame and print candidates/plans.
     Once {
-        #[arg(long, default_value = "config/paper.toml")]
+        #[arg(long, default_value = "config/demo.toml")]
         config: String,
     },
     /// Run the public-market-data paper loop. Zero iterations means run forever.
     Paper {
-        #[arg(long, default_value = "config/paper.toml")]
+        #[arg(long, default_value = "config/demo.toml")]
         config: String,
         #[arg(long, default_value_t = 0)]
         iterations: u64,
@@ -56,7 +55,7 @@ enum Command {
     },
     /// Download official archives, select parameters on train data and report untouched validation.
     Backtest {
-        #[arg(long, default_value = "config/paper.toml")]
+        #[arg(long, default_value = "config/demo.toml")]
         config: String,
         #[arg(long)]
         train_from: String,
@@ -240,8 +239,7 @@ fn git_commit() -> Option<String> {
 
 async fn one_frame(
     config: &AppConfig,
-    source: &mut BinancePaperSource,
-    broker: &PaperBroker,
+    source: &mut BinanceMarketSource,
 ) -> Result<(greed_kernel::MarketFrame, GraphEvaluation)> {
     let mut strategy = config.strategy.clone();
     if strategy.universe.dynamic_enabled {
@@ -252,10 +250,22 @@ async fn one_frame(
             strategy.altcoins = discovery.symbols;
         }
     }
-    let mut frame = source
-        .fetch_frame(&strategy, broker.account_frame())
+    let frame = source
+        .fetch_frame(
+            &strategy,
+            AccountFrame {
+                equity_usd: config.portfolio.initial_equity_usd,
+                cash_usd: config.portfolio.initial_equity_usd,
+                realized_pnl_usd: 0.0,
+                peak_equity_usd: config.portfolio.initial_equity_usd,
+                risk_day_start_equity_usd: config.portfolio.initial_equity_usd,
+                gross_exposure_usd: 0.0,
+                major_gross_exposure_usd: 0.0,
+                alt_gross_exposure_usd: 0.0,
+                open_positions: 0,
+            },
+        )
         .await?;
-    frame.account = broker.marked_account(&frame);
     let mut graph = build_graph(&strategy)?;
     let evaluation = graph.evaluate(&frame)?;
     Ok((frame, evaluation))
@@ -285,9 +295,8 @@ async fn main() -> Result<()> {
         }
         Command::Once { config } => {
             let config = load(&config)?;
-            let mut source = BinancePaperSource::new(config.runtime.clone())?;
-            let broker = PaperBroker::with_risk(config.paper.clone(), config.strategy.risk.clone());
-            let (_, evaluation) = one_frame(&config, &mut source, &broker).await?;
+            let mut source = BinanceMarketSource::new(config.runtime.clone())?;
+            let (_, evaluation) = one_frame(&config, &mut source).await?;
             println!("{}", serde_json::to_string_pretty(&summarize(&evaluation))?);
             Ok(())
         }
@@ -328,17 +337,17 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
     let started_ms = chrono::Utc::now().timestamp_millis();
     let identity = runtime_identity(&config, started_ms);
     let _monitor = monitor::start(&config.runtime).await?;
-    let mut source = BinancePaperSource::new(config.runtime.clone())?;
+    let mut source = BinanceMarketSource::new(config.runtime.clone())?;
     let mut execution = BinanceDemoExecution::connect(
         config.execution.clone(),
-        config.paper.clone(),
+        config.portfolio.clone(),
         config.strategy.risk.clone(),
         config.runtime.execution_state_path.clone(),
         &config.strategy.majors,
         config.runtime.proxy.as_deref(),
     )
     .await
-    .context("Binance demo execution initialization failed; no local-fill fallback is allowed")?;
+    .context("Binance demo execution initialization failed; trading runtime cannot start")?;
     let journal = Journal::new(&config.runtime.journal_path)?;
     let history = Journal::new(&config.runtime.history_path)?;
     let status = StatusWriter::new(&config.runtime.status_path);

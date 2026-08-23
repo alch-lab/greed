@@ -1,18 +1,15 @@
-use crate::config::PaperConfig;
+use crate::config::{BacktestConfig, PortfolioConfig};
 use greed_kernel::{
     AccountFrame, Artifact, AssetClass, GraphEvaluation, MarketFrame, PositionPlan, Side,
 };
 use greed_strategy::RiskConfig;
-use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::collections::{BTreeMap, BTreeSet};
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PaperPosition {
+#[derive(Debug, Clone)]
+pub struct BacktestPosition {
     pub candidate_id: String,
-    #[serde(default = "unknown_recipe")]
     pub recipe: String,
-    #[serde(default = "default_asset_class")]
     pub asset_class: AssetClass,
     pub symbol: String,
     pub side: Side,
@@ -30,26 +27,7 @@ pub struct PaperPosition {
     pub last_bar_ms: i64,
 }
 
-#[derive(Debug, Serialize)]
-#[cfg(test)]
-pub struct PositionSnapshot<'a> {
-    #[serde(flatten)]
-    pub position: &'a PaperPosition,
-    pub current_price: Option<f64>,
-    pub current_notional_usd: Option<f64>,
-    pub unrealized_pnl_usd: Option<f64>,
-    pub unrealized_pnl_pct: Option<f64>,
-}
-
-fn unknown_recipe() -> String {
-    "unknown".into()
-}
-
-fn default_asset_class() -> AssetClass {
-    AssetClass::Major
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SleeveLedger {
     pub initial_equity_usd: f64,
     pub realized_pnl_usd: f64,
@@ -72,54 +50,34 @@ impl SleeveLedger {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 pub struct SleeveLedgers {
     pub major: SleeveLedger,
     pub altcoin: SleeveLedger,
-    #[serde(default)]
-    pub unattributed_realized_pnl_usd: f64,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct SleeveSnapshot {
-    pub initial_equity_usd: f64,
     pub equity_usd: f64,
-    pub cash_usd: f64,
-    pub realized_pnl_usd: f64,
-    pub unrealized_pnl_usd: f64,
-    pub fees_usd: f64,
-    pub peak_equity_usd: f64,
-    pub drawdown_pct: f64,
-    pub daily_loss_pct: f64,
-    pub gross_exposure_usd: f64,
-    pub open_positions: usize,
 }
 
-#[derive(Debug, Clone, Serialize)]
-#[cfg(test)]
-pub struct SleeveSnapshots {
-    pub major: SleeveSnapshot,
-    pub altcoin: SleeveSnapshot,
-    pub unattributed_realized_pnl_usd: f64,
-}
-
-pub struct BrokerEvent {
+pub struct BacktestEvent {
     pub kind: String,
     pub payload: Value,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone)]
 struct RecipeOutcome {
     exit_ms: i64,
     pnl_usd: f64,
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default)]
 struct RecipePerformance {
     outcomes: Vec<RecipeOutcome>,
 }
 
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone)]
 pub struct RecipeGateStatus {
     pub allowed: bool,
     pub completed_trades: usize,
@@ -128,28 +86,27 @@ pub struct RecipeGateStatus {
     pub next_probe_ms: Option<i64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct PaperBroker {
-    config: PaperConfig,
-    #[serde(skip)]
+#[derive(Debug, Clone)]
+pub struct BacktestBroker {
+    portfolio: PortfolioConfig,
+    costs: BacktestConfig,
     risk: RiskConfig,
     cash: f64,
     realized: f64,
     peak_equity: f64,
     risk_day_start: f64,
     risk_day: String,
-    positions: BTreeMap<String, PaperPosition>,
+    positions: BTreeMap<String, BacktestPosition>,
     seen: BTreeSet<String>,
-    #[serde(default)]
-    sleeves: Option<SleeveLedgers>,
-    #[serde(default)]
+    sleeves: SleeveLedgers,
     recipe_performance: BTreeMap<String, RecipePerformance>,
 }
-impl PaperBroker {
-    pub fn with_risk(config: PaperConfig, risk: RiskConfig) -> Self {
-        let cash = config.initial_cash_usd;
+impl BacktestBroker {
+    pub fn with_risk(portfolio: PortfolioConfig, costs: BacktestConfig, risk: RiskConfig) -> Self {
+        let cash = portfolio.initial_equity_usd;
         Self {
-            config,
+            portfolio,
+            costs,
             risk,
             cash,
             realized: 0.0,
@@ -158,7 +115,7 @@ impl PaperBroker {
             risk_day: String::new(),
             positions: BTreeMap::new(),
             seen: BTreeSet::new(),
-            sleeves: Some(Self::new_sleeves(cash)),
+            sleeves: Self::new_sleeves(cash),
             recipe_performance: BTreeMap::new(),
         }
     }
@@ -167,98 +124,25 @@ impl PaperBroker {
         SleeveLedgers {
             major: SleeveLedger::new(major),
             altcoin: SleeveLedger::new(total - major),
-            unattributed_realized_pnl_usd: 0.0,
         }
-    }
-    #[cfg(test)]
-    pub fn load_or_new(
-        config: PaperConfig,
-        risk: RiskConfig,
-        path: &str,
-        major_symbols: &[String],
-    ) -> anyhow::Result<Self> {
-        match std::fs::read_to_string(path) {
-            Ok(text) => {
-                let mut broker: Self = serde_json::from_str(&text)?;
-                // Runtime costs are configuration, while positions/accounting
-                // are durable state.  A deliberate config change takes effect
-                // after restart without rewriting historical positions.
-                broker.config = config;
-                broker.risk = risk;
-                for position in broker.positions.values_mut() {
-                    position.asset_class = if major_symbols.contains(&position.symbol) {
-                        AssetClass::Major
-                    } else {
-                        AssetClass::Altcoin
-                    };
-                    if position.recipe == "unknown" {
-                        position.recipe = recipe_from_candidate(&position.candidate_id).into();
-                    }
-                }
-                if broker.sleeves.is_none() {
-                    let mut sleeves = Self::new_sleeves(broker.config.initial_cash_usd);
-                    let attributed: f64 = broker
-                        .positions
-                        .values()
-                        .map(|position| {
-                            let ledger = match position.asset_class {
-                                AssetClass::Major => &mut sleeves.major,
-                                AssetClass::Altcoin => &mut sleeves.altcoin,
-                            };
-                            ledger.realized_pnl_usd += position.realized_pnl_usd;
-                            position.realized_pnl_usd
-                        })
-                        .sum();
-                    sleeves.unattributed_realized_pnl_usd = broker.realized - attributed;
-                    broker.sleeves = Some(sleeves);
-                }
-                Ok(broker)
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Ok(Self::with_risk(config, risk))
-            }
-            Err(error) => Err(error.into()),
-        }
-    }
-    #[cfg(test)]
-    pub fn save(&self, path: &str) -> anyhow::Result<()> {
-        let path = std::path::Path::new(path);
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let temp = path.with_extension("tmp");
-        std::fs::write(&temp, serde_json::to_vec_pretty(self)?)?;
-        std::fs::rename(temp, path)?;
-        Ok(())
     }
     fn current_day(ms: i64) -> String {
         chrono::DateTime::from_timestamp_millis(ms + 8 * 3_600_000)
             .map(|dt| dt.format("%Y-%m-%d").to_string())
             .unwrap_or_default()
     }
-    fn ledgers(&self) -> &SleeveLedgers {
-        self.sleeves
-            .as_ref()
-            .expect("sleeve ledgers initialized by constructor or migration")
-    }
     fn ledger_mut(&mut self, asset_class: AssetClass) -> &mut SleeveLedger {
-        let sleeves = self
-            .sleeves
-            .as_mut()
-            .expect("sleeve ledgers initialized by constructor or migration");
         match asset_class {
-            AssetClass::Major => &mut sleeves.major,
-            AssetClass::Altcoin => &mut sleeves.altcoin,
+            AssetClass::Major => &mut self.sleeves.major,
+            AssetClass::Altcoin => &mut self.sleeves.altcoin,
         }
     }
     fn sleeve_snapshot(&self, frame: &MarketFrame, asset_class: AssetClass) -> SleeveSnapshot {
         let ledger = match asset_class {
-            AssetClass::Major => &self.ledgers().major,
-            AssetClass::Altcoin => &self.ledgers().altcoin,
+            AssetClass::Major => &self.sleeves.major,
+            AssetClass::Altcoin => &self.sleeves.altcoin,
         };
         let mut unrealized = 0.0;
-        let mut gross = 0.0;
-        let mut open_positions = 0;
         for position in self
             .positions
             .values()
@@ -270,35 +154,10 @@ impl PaperBroker {
             unrealized += position.side.sign()
                 * (instrument.price - position.entry_price)
                 * position.remaining_quantity;
-            gross += instrument.price * position.remaining_quantity;
-            open_positions += 1;
         }
         let cash = ledger.initial_equity_usd + ledger.realized_pnl_usd;
         let equity = cash + unrealized;
-        let peak = ledger.peak_equity_usd.max(equity);
-        SleeveSnapshot {
-            initial_equity_usd: ledger.initial_equity_usd,
-            equity_usd: equity,
-            cash_usd: cash,
-            realized_pnl_usd: ledger.realized_pnl_usd,
-            unrealized_pnl_usd: unrealized,
-            fees_usd: ledger.fees_usd,
-            peak_equity_usd: peak,
-            drawdown_pct: ((peak - equity) / peak.max(1.0)).max(0.0),
-            daily_loss_pct: ((ledger.risk_day_start_equity_usd - equity)
-                / ledger.risk_day_start_equity_usd.max(1.0))
-            .max(0.0),
-            gross_exposure_usd: gross,
-            open_positions,
-        }
-    }
-    #[cfg(test)]
-    pub fn sleeve_snapshots(&self, frame: &MarketFrame) -> SleeveSnapshots {
-        SleeveSnapshots {
-            major: self.sleeve_snapshot(frame, AssetClass::Major),
-            altcoin: self.sleeve_snapshot(frame, AssetClass::Altcoin),
-            unattributed_realized_pnl_usd: self.ledgers().unattributed_realized_pnl_usd,
-        }
+        SleeveSnapshot { equity_usd: equity }
     }
     fn roll_sleeve_day(&mut self, frame: &MarketFrame) {
         let day = Self::current_day(frame.as_of_ms);
@@ -321,43 +180,6 @@ impl PaperBroker {
             let ledger = self.ledger_mut(asset_class);
             ledger.peak_equity_usd = ledger.peak_equity_usd.max(equity);
         }
-    }
-    #[cfg(test)]
-    pub fn positions(&self) -> &BTreeMap<String, PaperPosition> {
-        &self.positions
-    }
-    #[cfg(test)]
-    pub fn position_snapshots<'a>(
-        &'a self,
-        frame: &MarketFrame,
-    ) -> BTreeMap<&'a str, PositionSnapshot<'a>> {
-        self.positions
-            .iter()
-            .map(|(symbol, position)| {
-                let current_price = frame.instrument(symbol).map(|instrument| instrument.price);
-                let current_notional_usd =
-                    current_price.map(|price| price * position.remaining_quantity);
-                let unrealized_pnl_usd = current_price.map(|price| {
-                    position.side.sign()
-                        * (price - position.entry_price)
-                        * position.remaining_quantity
-                });
-                let entry_notional_usd = position.entry_price * position.remaining_quantity;
-                let unrealized_pnl_pct = unrealized_pnl_usd
-                    .filter(|_| entry_notional_usd > f64::EPSILON)
-                    .map(|pnl| pnl / entry_notional_usd);
-                (
-                    symbol.as_str(),
-                    PositionSnapshot {
-                        position,
-                        current_price,
-                        current_notional_usd,
-                        unrealized_pnl_usd,
-                        unrealized_pnl_pct,
-                    },
-                )
-            })
-            .collect()
     }
     pub fn recipe_gate_status(&self, recipe: &str, now_ms: i64) -> RecipeGateStatus {
         let outcomes = self
@@ -463,7 +285,7 @@ impl PaperBroker {
             open_positions: self.positions.len(),
         }
     }
-    pub fn mark_to_market(&mut self, frame: &MarketFrame) -> Vec<BrokerEvent> {
+    pub fn mark_to_market(&mut self, frame: &MarketFrame) -> Vec<BacktestEvent> {
         let day = Self::current_day(frame.as_of_ms);
         if day != self.risk_day {
             self.risk_day = day;
@@ -575,7 +397,7 @@ impl PaperBroker {
         self.update_sleeve_peaks(frame);
         events
     }
-    pub fn close_all(&mut self, frame: &MarketFrame, reason: &str) -> Vec<BrokerEvent> {
+    pub fn close_all(&mut self, frame: &MarketFrame, reason: &str) -> Vec<BacktestEvent> {
         let symbols: Vec<_> = self.positions.keys().cloned().collect();
         let mut events = Vec::new();
         for symbol in symbols {
@@ -592,24 +414,24 @@ impl PaperBroker {
     }
     fn close_position(
         &mut self,
-        mut position: PaperPosition,
+        mut position: BacktestPosition,
         raw_price: f64,
         reason: &str,
         ts_ms: i64,
-    ) -> BrokerEvent {
+    ) -> BacktestEvent {
         let quantity = position.remaining_quantity;
         self.settle_leg(&mut position, raw_price, quantity, reason, ts_ms)
     }
     fn settle_leg(
         &mut self,
-        position: &mut PaperPosition,
+        position: &mut BacktestPosition,
         raw_price: f64,
         quantity: f64,
         reason: &str,
         ts_ms: i64,
-    ) -> BrokerEvent {
-        let slip = self.config.slippage_bps_per_side / 10_000.0;
-        let fee = self.config.fee_bps_per_side / 10_000.0;
+    ) -> BacktestEvent {
+        let slip = self.costs.slippage_bps_per_side / 10_000.0;
+        let fee = self.costs.fee_bps_per_side / 10_000.0;
         let exit = raw_price * (1.0 - position.side.sign() * slip);
         let gross = position.side.sign() * (exit - position.entry_price) * quantity;
         let exit_fee = exit * quantity * fee;
@@ -635,11 +457,11 @@ impl PaperBroker {
                 performance.outcomes.remove(0);
             }
         }
-        BrokerEvent {
+        BacktestEvent {
             kind: if complete {
-                "paper_exit".into()
+                "backtest_exit".into()
             } else {
-                "paper_partial_exit".into()
+                "backtest_partial_exit".into()
             },
             payload: serde_json::json!({"ts_ms":ts_ms,"candidate_id":position.candidate_id,"recipe":position.recipe,"asset_class":position.asset_class,"symbol":position.symbol,"side":position.side,"entry_price":position.entry_price,"exit_price":exit,"quantity":quantity,"remaining_quantity":position.remaining_quantity,"gross_pnl_usd":gross,"fee_usd":exit_fee,"pnl_usd":pnl,"reason":reason}),
         }
@@ -648,13 +470,13 @@ impl PaperBroker {
         &mut self,
         frame: &MarketFrame,
         evaluation: &GraphEvaluation,
-    ) -> Vec<BrokerEvent> {
+    ) -> Vec<BacktestEvent> {
         let mut events = Vec::new();
         for record in evaluation.artifacts.values() {
             let Artifact::PositionPlan(plan) = &record.artifact else {
                 continue;
             };
-            if self.positions.len() >= self.config.max_positions
+            if self.positions.len() >= self.portfolio.max_positions
                 || self.positions.contains_key(&plan.symbol)
                 || self.seen.contains(&plan.candidate_id)
             {
@@ -673,8 +495,8 @@ impl PaperBroker {
                 let asset_class = frame
                     .instrument(&plan.symbol)
                     .map(|instrument| instrument.asset_class);
-                events.push(BrokerEvent {
-                    kind: "paper_plan_rejected".into(),
+                events.push(BacktestEvent {
+                    kind: "backtest_plan_rejected".into(),
                     payload: serde_json::json!({
                         "ts_ms":frame.as_of_ms,
                         "candidate_id":plan.candidate_id,
@@ -687,7 +509,7 @@ impl PaperBroker {
                         "rolling_net_pnl_usd":gate.rolling_net_pnl_usd,
                         "completed_trades":gate.completed_trades,
                         "next_probe_ms":gate.next_probe_ms,
-                        "paper_only":true,
+                        "backtest_only":true,
                     }),
                 });
                 continue;
@@ -703,13 +525,13 @@ impl PaperBroker {
         frame: &MarketFrame,
         plan: &PositionPlan,
         recipe: &str,
-    ) -> Option<BrokerEvent> {
+    ) -> Option<BacktestEvent> {
         let instrument = frame.instrument(&plan.symbol)?;
         if instrument.price <= 0.0 || plan.reference_price <= 0.0 {
             return None;
         }
-        let slip = self.config.slippage_bps_per_side / 10_000.0;
-        let fee = self.config.fee_bps_per_side / 10_000.0;
+        let slip = self.costs.slippage_bps_per_side / 10_000.0;
+        let fee = self.costs.fee_bps_per_side / 10_000.0;
         let entry = instrument.price * (1.0 + plan.side.sign() * slip);
         let quantity = plan.notional_usd / entry;
         let reference = plan.reference_price;
@@ -732,7 +554,7 @@ impl PaperBroker {
         self.seen.insert(plan.candidate_id.clone());
         self.positions.insert(
             plan.symbol.clone(),
-            PaperPosition {
+            BacktestPosition {
                 candidate_id: plan.candidate_id.clone(),
                 recipe: recipe.into(),
                 asset_class: instrument.asset_class,
@@ -752,9 +574,9 @@ impl PaperBroker {
                 last_bar_ms: 0,
             },
         );
-        Some(BrokerEvent {
-            kind: "paper_entry".into(),
-            payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"asset_class":instrument.asset_class,"symbol":plan.symbol,"side":plan.side,"entry_price":entry,"quantity":quantity,"notional_usd":plan.notional_usd,"fee_usd":entry_fee,"stop_price":rebased_stop,"paper_only":true}),
+        Some(BacktestEvent {
+            kind: "backtest_entry".into(),
+            payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"asset_class":instrument.asset_class,"symbol":plan.symbol,"side":plan.side,"entry_price":entry,"quantity":quantity,"notional_usd":plan.notional_usd,"fee_usd":entry_fee,"stop_price":rebased_stop,"backtest_only":true}),
         })
     }
 }
@@ -880,11 +702,11 @@ mod tests {
 
     #[test]
     fn existing_stop_wins_over_same_bar_take_profit() {
-        let mut broker = PaperBroker::with_risk(
-            PaperConfig {
+        let mut broker = BacktestBroker::with_risk(
+            PortfolioConfig::default(),
+            BacktestConfig {
                 fee_bps_per_side: 0.0,
                 slippage_bps_per_side: 0.0,
-                ..PaperConfig::default()
             },
             RiskConfig::default(),
         );
@@ -897,83 +719,46 @@ mod tests {
         let events = broker.mark_to_market(&frame(1_900_000, 100.0, 98.0, 103.0));
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].payload["reason"], "protective_stop");
-        assert!(broker.positions().is_empty());
+        assert!(broker.positions.is_empty());
     }
 
     #[test]
     fn partial_take_profit_preserves_a_protected_runner() {
-        let mut broker = PaperBroker::with_risk(
-            PaperConfig {
+        let mut broker = BacktestBroker::with_risk(
+            PortfolioConfig::default(),
+            BacktestConfig {
                 fee_bps_per_side: 0.0,
                 slippage_bps_per_side: 0.0,
-                ..PaperConfig::default()
             },
             RiskConfig::default(),
         );
         broker.apply_plans(&frame(1_000_000, 100.0, 100.0, 100.0), &evaluation());
         let events = broker.mark_to_market(&frame(1_900_000, 102.0, 100.0, 103.0));
         assert_eq!(events.len(), 1);
-        assert_eq!(events[0].kind, "paper_partial_exit");
-        let position = broker.positions().get("BTCUSDT").unwrap();
+        assert_eq!(events[0].kind, "backtest_partial_exit");
+        let position = broker.positions.get("BTCUSDT").unwrap();
         assert!((position.remaining_quantity - position.quantity * 0.5).abs() < 1e-9);
         assert!(position.stop_price > position.entry_price);
     }
 
     #[test]
-    fn position_snapshot_marks_unrealized_pnl_at_the_current_frame() {
-        let mut broker = PaperBroker::with_risk(
-            PaperConfig {
-                fee_bps_per_side: 0.0,
-                slippage_bps_per_side: 0.0,
-                ..PaperConfig::default()
-            },
+    fn sleeve_ledger_attributes_fees_and_pnl_to_major() {
+        let mut broker = BacktestBroker::with_risk(
+            PortfolioConfig::default(),
+            BacktestConfig::default(),
             RiskConfig::default(),
         );
-        broker.apply_plans(&frame(1_000_000, 100.0, 100.0, 100.0), &evaluation());
-
-        let marked_frame = frame(1_900_000, 101.0, 100.0, 101.0);
-        let snapshots = broker.position_snapshots(&marked_frame);
-        let snapshot = snapshots.get("BTCUSDT").unwrap();
-        assert_eq!(snapshot.current_price, Some(101.0));
-        assert!((snapshot.current_notional_usd.unwrap() - 606.0).abs() < 1e-9);
-        assert!((snapshot.unrealized_pnl_usd.unwrap() - 6.0).abs() < 1e-9);
-        assert!((snapshot.unrealized_pnl_pct.unwrap() - 0.01).abs() < 1e-9);
-    }
-
-    #[test]
-    fn state_roundtrip_keeps_positions_and_seen_candidates() {
-        let mut broker = PaperBroker::with_risk(PaperConfig::default(), RiskConfig::default());
-        broker.apply_plans(&frame(1_000_000, 100.0, 100.0, 100.0), &evaluation());
-        let path = std::env::temp_dir().join(format!("greed-paper-{}.json", std::process::id()));
-        broker.save(path.to_str().unwrap()).unwrap();
-        let restored = PaperBroker::load_or_new(
-            PaperConfig::default(),
-            RiskConfig::default(),
-            path.to_str().unwrap(),
-            &["BTCUSDT".into()],
-        )
-        .unwrap();
-        assert!(restored.positions().contains_key("BTCUSDT"));
-        assert!(restored.seen.contains("candidate-1"));
-        std::fs::remove_file(path).unwrap();
-    }
-
-    #[test]
-    fn sleeve_ledger_attributes_fees_and_pnl_to_major() {
-        let mut broker = PaperBroker::with_risk(PaperConfig::default(), RiskConfig::default());
         let entry_frame = frame(1_000_000, 100.0, 100.0, 100.0);
         let events = broker.apply_plans(&entry_frame, &evaluation());
         assert_eq!(events[0].payload["asset_class"], "major");
         assert_eq!(events[0].payload["recipe"], "unknown");
-        let after_entry = broker.sleeve_snapshots(&entry_frame);
-        assert!(after_entry.major.realized_pnl_usd < 0.0);
-        assert_eq!(after_entry.altcoin.realized_pnl_usd, 0.0);
+        assert!(broker.sleeves.major.realized_pnl_usd < 0.0);
+        assert_eq!(broker.sleeves.altcoin.realized_pnl_usd, 0.0);
 
         let exit_frame = frame(1_900_000, 103.0, 103.0, 103.0);
         broker.close_all(&exit_frame, "test_exit");
-        let after_exit = broker.sleeve_snapshots(&exit_frame);
-        assert!(after_exit.major.realized_pnl_usd > 0.0);
-        assert_eq!(after_exit.altcoin.realized_pnl_usd, 0.0);
+        assert!(broker.sleeves.major.realized_pnl_usd > 0.0);
+        assert_eq!(broker.sleeves.altcoin.realized_pnl_usd, 0.0);
     }
 
     #[test]
@@ -985,7 +770,8 @@ mod tests {
             rolling_pf_cooldown_minutes: 60,
             ..RiskConfig::default()
         };
-        let mut broker = PaperBroker::with_risk(PaperConfig::default(), risk);
+        let mut broker =
+            BacktestBroker::with_risk(PortfolioConfig::default(), BacktestConfig::default(), risk);
         broker.recipe_performance.insert(
             "alt_cross_section_momentum".into(),
             RecipePerformance {

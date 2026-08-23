@@ -233,9 +233,7 @@ pub fn build(path: &str) -> Result<Value> {
     let mut max_frame_gap_ms = 0i64;
     let mut versions = BTreeSet::new();
     let mut config_hashes = BTreeSet::new();
-    let mut latest_sleeves = Value::Null;
     let mut daily: BTreeMap<String, DailyPerformance> = BTreeMap::new();
-    let mut sleeve_risk: BTreeMap<String, EquityRisk> = BTreeMap::new();
     let mut portfolio_risk = EquityRisk::default();
     let mut telemetry = TelemetryTotals::default();
     let mut current_run_telemetry = TelemetryTotals::default();
@@ -295,7 +293,7 @@ pub fn build(path: &str) -> Result<Value> {
                 record_plans(payload, &mut sleeve_funnels, &mut recipe_funnels);
                 record_diagnostics(payload, &mut diagnostic_states, &mut diagnostic_reasons);
             }
-            "paper_entry" | "exchange_entry" => {
+            "exchange_entry" => {
                 record_daily(payload, true, &mut daily);
                 record_entry(
                     payload,
@@ -309,11 +307,11 @@ pub fn build(path: &str) -> Result<Value> {
                     &mut open_trades,
                 );
             }
-            "paper_partial_exit" | "paper_exit" | "exchange_exit" => {
+            "exchange_exit" => {
                 record_daily(payload, false, &mut daily);
                 record_exit(
                     payload,
-                    kind == "paper_partial_exit",
+                    false,
                     &mut total,
                     &mut sleeves,
                     &mut recipes,
@@ -322,7 +320,7 @@ pub fn build(path: &str) -> Result<Value> {
                     &mut open_trades,
                 );
             }
-            "paper_plan_rejected" | "exchange_plan_rejected" | "exchange_order_rejected" => {
+            "exchange_plan_rejected" | "exchange_order_rejected" => {
                 let (sleeve, recipe) = classify(payload);
                 for stats in [
                     sleeve_funnels.entry(sleeve).or_default(),
@@ -331,24 +329,6 @@ pub fn build(path: &str) -> Result<Value> {
                     stats.plan_rejections += 1;
                     let reason = payload["reason"].as_str().unwrap_or("unknown");
                     *stats.blockers.entry(reason.into()).or_default() += 1;
-                }
-            }
-            "paper_equity" => {
-                latest_sleeves = payload["sleeves"].clone();
-                portfolio_risk.observe(payload);
-                for name in ["major", "altcoin"] {
-                    sleeve_risk
-                        .entry(name.into())
-                        .or_default()
-                        .observe(&payload["sleeves"][name]);
-                    if let Some(stage) = payload["funnels"][name]["current_stage"].as_str() {
-                        *sleeve_funnels
-                            .entry(name.into())
-                            .or_default()
-                            .stopped_stages
-                            .entry(stage.into())
-                            .or_default() += 1;
-                    }
                 }
             }
             "exchange_equity" => {
@@ -397,12 +377,10 @@ pub fn build(path: &str) -> Result<Value> {
         "performance_by_recipe_and_side":recipe_side_values,
         "daily_performance":daily,
         "portfolio_risk":portfolio_risk,
-        "risk_by_sleeve":sleeve_risk,
         "funnel_by_sleeve":sleeve_funnels,
         "funnel_by_recipe":recipe_funnels,
         "diagnostic_state_counts":diagnostic_states,
         "diagnostic_reason_counts":diagnostic_reasons,
-        "latest_sleeve_equity":latest_sleeves,
         "open_trade_count_at_report":open_trades.len(),
         "api_telemetry":telemetry,
         "api_average_latency_ms":(telemetry.requests>0).then_some(telemetry.total_latency_ms as f64/telemetry.requests as f64),
@@ -689,9 +667,9 @@ mod tests {
         let lines = [
             serde_json::json!({"recorded_ms":1,"kind":"runner_start","payload":{"runtime":{"git_commit":"abc","config_hash":"cfg"}}}),
             serde_json::json!({"recorded_ms":2,"kind":"data_health","payload":{"telemetry":{"requests":10,"successes":9,"failures":1,"rate_limits":1,"retries":1,"frames_requested":1,"frames_succeeded":1}}}),
-            serde_json::json!({"recorded_ms":3,"kind":"paper_entry","payload":{"ts_ms":3,"candidate_id":"BTCUSDT.recipe.trend_pullback:BTCUSDT:3","recipe":"major_trend_pullback","asset_class":"major","symbol":"BTCUSDT","side":"buy","fee_usd":0.2}}),
-            serde_json::json!({"recorded_ms":4,"kind":"paper_exit","payload":{"ts_ms":64_000,"candidate_id":"BTCUSDT.recipe.trend_pullback:BTCUSDT:3","recipe":"major_trend_pullback","asset_class":"major","symbol":"BTCUSDT","side":"buy","fee_usd":0.2,"pnl_usd":5.0}}),
-            serde_json::json!({"recorded_ms":5,"kind":"paper_plan_rejected","payload":{"ts_ms":65_000,"candidate_id":"alt.recipe.cross_section:SOLUSDT:cycle-1","recipe":"alt_cross_section_momentum","asset_class":"altcoin","symbol":"SOLUSDT","side":"buy","reason":"rolling_profit_factor_gate"}}),
+            serde_json::json!({"recorded_ms":3,"kind":"exchange_entry","payload":{"ts_ms":3,"candidate_id":"BTCUSDT.recipe.trend_pullback:BTCUSDT:3","recipe":"major_trend_pullback","asset_class":"major","symbol":"BTCUSDT","side":"buy","fee_usd":0.2}}),
+            serde_json::json!({"recorded_ms":4,"kind":"exchange_exit","payload":{"ts_ms":64_000,"candidate_id":"BTCUSDT.recipe.trend_pullback:BTCUSDT:3","recipe":"major_trend_pullback","asset_class":"major","symbol":"BTCUSDT","side":"buy","fee_usd":0.2,"pnl_usd":5.0}}),
+            serde_json::json!({"recorded_ms":5,"kind":"exchange_plan_rejected","payload":{"ts_ms":65_000,"candidate_id":"alt.recipe.cross_section:SOLUSDT:cycle-1","recipe":"alt_cross_section_momentum","asset_class":"altcoin","symbol":"SOLUSDT","side":"buy","reason":"rolling_profit_factor_gate"}}),
         ];
         std::fs::write(
             &path,

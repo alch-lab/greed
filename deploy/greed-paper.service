@@ -6,7 +6,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=/opt/greed
-ExecStart=/opt/greed/target/release/greed paper --config config/paper.toml
+ExecStart=/opt/greed/target/release/greed paper --config config/demo.toml
 Restart=always
 RestartSec=10
 EnvironmentFile=-/etc/greed-paper.env

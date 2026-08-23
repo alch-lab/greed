@@ -5,9 +5,13 @@ history_path = "data/runtime/demo-history.jsonl"
 status_path = "data/runtime/demo-status.json"
 execution_state_path = "data/runtime/binance-demo-state.json"
 
-[paper]
-initial_cash_usd = 3000.0
+[portfolio]
+initial_equity_usd = 3000.0
 max_positions = 7
+
+[backtest]
+fee_bps_per_side = 5.0
+slippage_bps_per_side = 5.0
 
 [execution]
 mode = "binance_demo"

@@ -1,7 +1,4 @@
-use crate::{
-    broker::{BrokerEvent, RecipeGateStatus},
-    config::{ExecutionConfig, PaperConfig},
-};
+use crate::config::{ExecutionConfig, PortfolioConfig};
 use anyhow::{anyhow, Context, Result};
 use greed_kernel::{AccountFrame, Artifact, AssetClass, GraphEvaluation, MarketFrame, Side};
 use greed_strategy::RiskConfig;
@@ -18,6 +15,20 @@ use std::{
 };
 
 type HmacSha256 = Hmac<Sha256>;
+
+pub struct ExchangeEvent {
+    pub kind: String,
+    pub payload: Value,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct RecipeGateStatus {
+    pub allowed: bool,
+    pub completed_trades: usize,
+    pub rolling_profit_factor: Option<f64>,
+    pub rolling_net_pnl_usd: f64,
+    pub next_probe_ms: Option<i64>,
+}
 
 #[derive(Debug, Clone)]
 struct SymbolRules {
@@ -100,7 +111,7 @@ struct RemoteAccount {
 pub struct BinanceDemoExecution {
     client: Client,
     config: ExecutionConfig,
-    paper: PaperConfig,
+    portfolio: PortfolioConfig,
     risk: RiskConfig,
     api_key: String,
     api_secret: String,
@@ -117,7 +128,7 @@ pub struct BinanceDemoExecution {
 impl BinanceDemoExecution {
     pub async fn connect(
         config: ExecutionConfig,
-        paper: PaperConfig,
+        portfolio: PortfolioConfig,
         risk: RiskConfig,
         state_path: String,
         majors: &[String],
@@ -139,7 +150,7 @@ impl BinanceDemoExecution {
         let mut value = Self {
             client,
             config,
-            paper,
+            portfolio,
             risk,
             api_key,
             api_secret,
@@ -234,7 +245,7 @@ impl BinanceDemoExecution {
             .with_context(|| format!("invalid Binance demo response: {path}"))
     }
 
-    pub async fn sync(&mut self) -> Result<Vec<BrokerEvent>> {
+    pub async fn sync(&mut self) -> Result<Vec<ExchangeEvent>> {
         let value = self.signed(Method::GET, "/fapi/v2/account", vec![]).await;
         match value {
             Ok(value) => {
@@ -309,7 +320,7 @@ impl BinanceDemoExecution {
                         if let Some(meta) = self.state.positions.get_mut(&symbol) {
                             meta.exit_requested = true;
                         }
-                        events.push(BrokerEvent {
+                        events.push(ExchangeEvent {
                             kind: "exchange_exit_requested".into(),
                             payload: serde_json::json!({"ts_ms":now_ms,"symbol":symbol,"reason":"protection_missing","venue":"binance_demo"}),
                         });
@@ -322,12 +333,12 @@ impl BinanceDemoExecution {
                                 if let Some(meta) = self.state.positions.get_mut(&symbol) {
                                     meta.exit_requested = true;
                                 }
-                                events.push(BrokerEvent {
+                                events.push(ExchangeEvent {
                                     kind: "exchange_exit_requested".into(),
                                     payload: serde_json::json!({"ts_ms":now_ms,"symbol":symbol,"reason":"max_hold","venue":"binance_demo"}),
                                 });
                             }
-                            Err(error) => events.push(BrokerEvent {
+                            Err(error) => events.push(ExchangeEvent {
                                 kind: "exchange_order_rejected".into(),
                                 payload: serde_json::json!({"ts_ms":now_ms,"symbol":symbol,"reason":format!("max-hold close failed: {error}"),"venue":"binance_demo"}),
                             }),
@@ -355,7 +366,7 @@ impl BinanceDemoExecution {
                                     pnl_usd: *pnl,
                                 });
                         }
-                        events.push(BrokerEvent {
+                        events.push(ExchangeEvent {
                             kind: "exchange_exit".into(),
                             payload: serde_json::json!({
                                 "ts_ms": chrono::Utc::now().timestamp_millis(),
@@ -397,7 +408,7 @@ impl BinanceDemoExecution {
             .baseline_wallet_usd
             .unwrap_or(account.wallet_balance);
         let realized = account.wallet_balance - baseline;
-        let equity = self.paper.initial_cash_usd + account.margin_balance - baseline;
+        let equity = self.portfolio.initial_equity_usd + account.margin_balance - baseline;
         let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
         if self.state.risk_day != day {
             self.state.risk_day = day;
@@ -417,7 +428,7 @@ impl BinanceDemoExecution {
         }
         Ok(AccountFrame {
             equity_usd: equity,
-            cash_usd: self.paper.initial_cash_usd + account.available_balance - baseline,
+            cash_usd: self.portfolio.initial_equity_usd + account.available_balance - baseline,
             realized_pnl_usd: realized,
             peak_equity_usd: peak,
             risk_day_start_equity_usd: self.state.risk_day_start_equity_usd.unwrap_or(equity),
@@ -545,7 +556,7 @@ impl BinanceDemoExecution {
         &mut self,
         frame: &MarketFrame,
         evaluation: &GraphEvaluation,
-    ) -> Vec<BrokerEvent> {
+    ) -> Vec<ExchangeEvent> {
         let mut events = Vec::new();
         for record in evaluation.artifacts.values() {
             let Artifact::PositionPlan(plan) = &record.artifact else {
@@ -568,7 +579,7 @@ impl BinanceDemoExecution {
             if self.account.as_ref().is_some_and(|account| {
                 account.positions.contains_key(&plan.symbol)
                     || self.state.positions.contains_key(&plan.symbol)
-                    || self.state.positions.len() >= self.paper.max_positions
+                    || self.state.positions.len() >= self.portfolio.max_positions
             }) {
                 continue;
             }
@@ -577,7 +588,7 @@ impl BinanceDemoExecution {
                 .unwrap_or_else(|| "unknown".into());
             if !self.recipe_gate_status(&recipe, frame.as_of_ms).allowed {
                 self.state.seen.insert(plan.candidate_id.clone());
-                events.push(BrokerEvent {
+                events.push(ExchangeEvent {
                     kind: "exchange_plan_rejected".into(),
                     payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"symbol":plan.symbol,"side":plan.side,"reason":"rolling_profit_factor_gate","venue":"binance_demo","paper_only":true}),
                 });
@@ -605,12 +616,12 @@ impl BinanceDemoExecution {
                         },
                     );
                     self.save().ok();
-                    events.push(BrokerEvent {
+                    events.push(ExchangeEvent {
                         kind: "exchange_entry".into(),
                         payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"asset_class":asset_class,"symbol":plan.symbol,"side":plan.side,"entry_price":entry_price,"quantity":quantity,"notional_usd":plan.notional_usd,"order_id":order_id,"venue":"binance_demo","paper_only":true}),
                     });
                 }
-                Err(error) => events.push(BrokerEvent {
+                Err(error) => events.push(ExchangeEvent {
                     kind: "exchange_order_rejected".into(),
                     payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"asset_class":asset_class,"symbol":plan.symbol,"side":plan.side,"reason":error.to_string(),"venue":"binance_demo","paper_only":true}),
                 }),

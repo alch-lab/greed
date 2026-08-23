@@ -40,7 +40,7 @@ struct ApiTelemetry {
     endpoints: BTreeMap<String, EndpointTelemetry>,
 }
 
-pub struct BinancePaperSource {
+pub struct BinanceMarketSource {
     config: RuntimeConfig,
     http: Client,
     oi_history: BTreeMap<String, VecDeque<(i64, f64)>>,
@@ -81,10 +81,10 @@ struct SlowSymbolContext {
     etf_rolling_5d_flow_usd: Option<f64>,
     cme_basis_pct: Option<f64>,
 }
-impl BinancePaperSource {
+impl BinanceMarketSource {
     pub fn new(config: RuntimeConfig) -> Result<Self> {
         let mut builder = Client::builder()
-            .user_agent("greed-paper/0.1")
+            .user_agent("greed-demo/0.1")
             .timeout(Duration::from_secs(config.request_timeout_seconds));
         if let Some(proxy) = config.proxy.as_deref() {
             builder = builder.proxy(reqwest::Proxy::all(proxy)?);
@@ -832,7 +832,7 @@ mod tests {
 
     #[test]
     fn telemetry_tracks_failures_rate_limits_and_latency() {
-        let source = BinancePaperSource::new(RuntimeConfig::default()).unwrap();
+        let source = BinanceMarketSource::new(RuntimeConfig::default()).unwrap();
         source.record_request(
             "https://fapi.binance.com/fapi/v1/depth?symbol=BTCUSDT",
             25,

@@ -1,7 +1,7 @@
 # greed
 
 可组合的加密货币策略研究与 Binance Demo 模拟交易系统。策略账户使用交易所模拟撮合，
-不会向 Binance 主网提交订单；本地 broker 只保留给历史回测。
+不会向 Binance 主网提交订单。历史回测使用独立的 K 线成交仿真，`paper/once` 无法调用它。
 
 ```text
 greed-kernel    领域合同、Artifact、DAG
@@ -15,8 +15,8 @@ greed-runtime   官方历史数据回测、公开实时行情、Binance Demo 执
 cargo test --workspace
 cargo build --release
 
-./target/release/greed validate --config config/paper.toml
-./target/release/greed backtest --config config/paper.toml \
+./target/release/greed validate --config config/demo.toml
+./target/release/greed backtest --config config/demo.toml \
   --train-from 2026-08-08 --split 2026-08-15 --to 2026-08-21
 ```
 
@@ -30,8 +30,8 @@ sudo install -m 600 /dev/null /etc/greed-paper.env
 # BINANCE_DEMO_API_KEY=...
 # BINANCE_DEMO_API_SECRET=...
 
-./target/release/greed once --config config/paper.toml
-./target/release/greed paper --config config/paper.toml
+./target/release/greed once --config config/demo.toml
+./target/release/greed paper --config config/demo.toml
 ./target/release/greed report --journal data/runtime/demo-events.jsonl
 ```
 

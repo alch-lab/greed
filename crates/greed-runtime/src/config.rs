@@ -4,7 +4,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppConfig {
     pub runtime: RuntimeConfig,
-    pub paper: PaperConfig,
+    pub portfolio: PortfolioConfig,
+    pub backtest: BacktestConfig,
     pub execution: ExecutionConfig,
     pub strategy: StrategyConfig,
 }
@@ -88,19 +89,31 @@ impl Default for RuntimeConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
-pub struct PaperConfig {
-    pub initial_cash_usd: f64,
-    pub fee_bps_per_side: f64,
-    pub slippage_bps_per_side: f64,
+pub struct PortfolioConfig {
+    pub initial_equity_usd: f64,
     pub max_positions: usize,
 }
-impl Default for PaperConfig {
+impl Default for PortfolioConfig {
     fn default() -> Self {
         Self {
-            initial_cash_usd: 3_000.0,
+            initial_equity_usd: 3_000.0,
+            max_positions: 5,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct BacktestConfig {
+    pub fee_bps_per_side: f64,
+    pub slippage_bps_per_side: f64,
+}
+
+impl Default for BacktestConfig {
+    fn default() -> Self {
+        Self {
             fee_bps_per_side: 5.0,
             slippage_bps_per_side: 5.0,
-            max_positions: 5,
         }
     }
 }
@@ -114,10 +127,10 @@ impl AppConfig {
         if !(120..=1000).contains(&self.runtime.candle_limit) {
             return Err("candle_limit must be 120..=1000".into());
         }
-        if self.paper.initial_cash_usd <= 0.0 {
-            return Err("initial_cash_usd must be positive".into());
+        if self.portfolio.initial_equity_usd <= 0.0 {
+            return Err("initial_equity_usd must be positive".into());
         }
-        if self.paper.max_positions == 0 {
+        if self.portfolio.max_positions == 0 {
             return Err("max_positions must be positive".into());
         }
         if ![
@@ -143,8 +156,8 @@ mod tests {
 
     #[test]
     fn demo_execution_rejects_mainnet_order_host() {
-        let mut config: AppConfig = toml::from_str(include_str!("../../../config/paper.toml"))
-            .expect("paper config parses");
+        let mut config: AppConfig =
+            toml::from_str(include_str!("../../../config/demo.toml")).expect("paper config parses");
         config.execution.base_url = "https://fapi.binance.com".into();
         assert!(config.validate().is_err());
     }

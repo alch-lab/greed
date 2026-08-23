@@ -1,4 +1,4 @@
-use crate::{broker::PaperBroker, config::AppConfig};
+use crate::{backtest_broker::BacktestBroker, config::AppConfig};
 use anyhow::{anyhow, Context, Result};
 use chrono::{Duration, NaiveDate, NaiveDateTime, TimeZone, Utc};
 use greed_kernel::{
@@ -210,9 +210,13 @@ fn simulate(
         );
     }
     let mut graph = build_graph(strategy)?;
-    let mut broker = PaperBroker::with_risk(app.paper.clone(), strategy.risk.clone());
+    let mut broker = BacktestBroker::with_risk(
+        app.portfolio.clone(),
+        app.backtest.clone(),
+        strategy.risk.clone(),
+    );
     let mut ledger = Ledger::default();
-    let mut peak = app.paper.initial_cash_usd;
+    let mut peak = app.portfolio.initial_equity_usd;
     let mut max_drawdown: f64 = 0.0;
     let mut last_frame = None;
     for ts in times {
@@ -265,10 +269,10 @@ fn simulate(
         profile: profile.into(),
         from: from.to_string(),
         to: to.to_string(),
-        starting_equity_usd: app.paper.initial_cash_usd,
+        starting_equity_usd: app.portfolio.initial_equity_usd,
         ending_equity_usd: ending,
-        net_pnl_usd: ending - app.paper.initial_cash_usd,
-        return_pct: ending / app.paper.initial_cash_usd - 1.0,
+        net_pnl_usd: ending - app.portfolio.initial_equity_usd,
+        return_pct: ending / app.portfolio.initial_equity_usd - 1.0,
         max_drawdown_pct: max_drawdown,
         entries: ledger.entry_fees.len() as u64,
         completed_trades: completed.len(),
@@ -287,7 +291,7 @@ impl Ledger {
         let fee = payload["fee_usd"].as_f64().unwrap_or(0.0);
         self.fees += fee;
         match kind {
-            "paper_entry" => {
+            "backtest_entry" => {
                 self.entry_fees.insert(id.clone(), fee);
                 let recipe = payload["recipe"]
                     .as_str()
@@ -300,10 +304,10 @@ impl Ledger {
                 );
                 *self.entries_by_recipe.entry(recipe).or_default() += 1;
             }
-            "paper_partial_exit" | "paper_exit" => {
+            "backtest_partial_exit" | "backtest_exit" => {
                 *self.trade_pnl.entry(id.clone()).or_default() +=
                     payload["pnl_usd"].as_f64().unwrap_or(0.0);
-                if kind == "paper_exit" {
+                if kind == "backtest_exit" {
                     *self.trade_pnl.entry(id.clone()).or_default() -=
                         self.entry_fees.get(&id).copied().unwrap_or(0.0);
                 }
