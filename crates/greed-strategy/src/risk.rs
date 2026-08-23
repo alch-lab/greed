@@ -22,11 +22,17 @@ impl PositionPlannerNode {
 
 fn candidate_size_multiplier(config: &RiskConfig, tags: &BTreeMap<String, String>) -> f64 {
     if tags.get("stop_profile").map(String::as_str) == Some("alt_outlier") {
-        match tags.get("anchor_context").map(String::as_str) {
+        let anchor = match tags.get("anchor_context").map(String::as_str) {
             Some("opposed") => config.alt_outlier_opposed_size_multiplier,
             Some("neutral") => config.alt_outlier_neutral_size_multiplier,
             _ => 1.0,
-        }
+        };
+        let breadth = match tags.get("breadth_context").map(String::as_str) {
+            Some("opposed") => config.alt_outlier_breadth_opposed_size_multiplier,
+            Some("neutral") => config.alt_outlier_breadth_neutral_size_multiplier,
+            _ => 1.0,
+        };
+        anchor * breadth
     } else if tags.get("anchor_confirmation").map(String::as_str) == Some("neutral") {
         config.alt_neutral_anchor_size_multiplier
     } else {
@@ -221,5 +227,11 @@ mod tests {
         ]);
         assert_eq!(candidate_size_multiplier(&config, &opposed), 0.50);
         assert_eq!(candidate_size_multiplier(&config, &neutral), 0.75);
+        let double_opposed = BTreeMap::from([
+            ("stop_profile".into(), "alt_outlier".into()),
+            ("anchor_context".into(), "opposed".into()),
+            ("breadth_context".into(), "opposed".into()),
+        ]);
+        assert_eq!(candidate_size_multiplier(&config, &double_opposed), 0.175);
     }
 }

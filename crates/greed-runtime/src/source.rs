@@ -408,10 +408,32 @@ impl BinancePaperSource {
         market: MarketKind,
         now: i64,
     ) -> Result<CandleSeries> {
-        let suffix = format!(
-            "{path}?symbol={symbol}&interval=15m&limit={}",
-            self.config.candle_limit
-        );
+        self.klines_at_interval(
+            bases,
+            path,
+            symbol,
+            market,
+            "15m",
+            900_000,
+            self.config.candle_limit,
+            now,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn klines_at_interval(
+        &self,
+        bases: &[String],
+        path: &str,
+        symbol: &str,
+        market: MarketKind,
+        interval: &str,
+        interval_ms: i64,
+        limit: usize,
+        now: i64,
+    ) -> Result<CandleSeries> {
+        let suffix = format!("{path}?symbol={symbol}&interval={interval}&limit={limit}");
         let values = self.get_from_bases(bases, &suffix).await?;
         let rows = values
             .as_array()
@@ -444,7 +466,7 @@ impl BinancePaperSource {
         Ok(CandleSeries {
             venue: "binance".into(),
             market,
-            interval_ms: 900_000,
+            interval_ms,
             meta: Self::meta(now, 120_000, "binance_klines", DataQuality::Complete),
             values: bars,
         })
@@ -660,6 +682,29 @@ impl BinancePaperSource {
                 }
             };
             let price = perpetual.values.last().map(|bar| bar.close).unwrap_or(0.0);
+            let fast_perpetual = if major {
+                None
+            } else {
+                match self
+                    .klines_at_interval(
+                        &futures_bases,
+                        "/fapi/v1/klines",
+                        symbol,
+                        MarketKind::Perpetual,
+                        "5m",
+                        300_000,
+                        120,
+                        now,
+                    )
+                    .await
+                {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        warnings.push(format!("fast perpetual klines {symbol}: {error}"));
+                        None
+                    }
+                }
+            };
             let (spot, book, derivatives, external) = if major {
                 let spot = match self
                     .klines(&spot_bases, "/api/v3/klines", symbol, MarketKind::Spot, now)
@@ -739,6 +784,7 @@ impl BinancePaperSource {
                     price,
                     spot,
                     perpetual,
+                    fast_perpetual,
                     book,
                     derivatives,
                     external,

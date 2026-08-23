@@ -1,6 +1,7 @@
 mod backtest;
 mod broker;
 mod config;
+mod execution;
 mod journal;
 mod monitor;
 mod report;
@@ -10,6 +11,7 @@ use anyhow::{Context, Result};
 use broker::PaperBroker;
 use clap::{Parser, Subcommand};
 use config::AppConfig;
+use execution::BinanceDemoExecution;
 use greed_kernel::{Artifact, AssetClass, GraphEvaluation, Verdict};
 use greed_strategy::{build_graph, StrategyConfig};
 use journal::{Journal, SampleRecorder, StatusWriter};
@@ -49,7 +51,7 @@ enum Command {
     },
     /// Summarize a completed or still-running paper JSONL journal.
     Report {
-        #[arg(long, default_value = "data/runtime/paper-events.jsonl")]
+        #[arg(long, default_value = "data/runtime/demo-events.jsonl")]
         journal: String,
     },
     /// Download official archives, select parameters on train data and report untouched validation.
@@ -96,122 +98,116 @@ fn summarize(evaluation: &GraphEvaluation) -> serde_json::Value {
     serde_json::json!({"node_order":evaluation.node_order,"candidates":candidates,"plans":plans})
 }
 
-fn strategy_funnels(
+fn strategy_funnels_demo(
     strategy: &StrategyConfig,
     evaluation: &GraphEvaluation,
-    broker: &PaperBroker,
-    now_ms: i64,
+    execution: &BinanceDemoExecution,
 ) -> serde_json::Value {
-    serde_json::json!({
-        "major": strategy_funnel(AssetClass::Major, strategy, evaluation, broker, now_ms),
-        "altcoin": strategy_funnel(AssetClass::Altcoin, strategy, evaluation, broker, now_ms),
-    })
-}
-
-fn strategy_funnel(
-    asset_class: AssetClass,
-    strategy: &StrategyConfig,
-    evaluation: &GraphEvaluation,
-    broker: &PaperBroker,
-    now_ms: i64,
-) -> serde_json::Value {
-    let is_symbol = |symbol: &str| match asset_class {
-        AssetClass::Major => strategy.majors.iter().any(|value| value == symbol),
-        AssetClass::Altcoin => strategy.altcoins.iter().any(|value| value == symbol),
-    };
-    let candidates: Vec<_> = evaluation
-        .artifacts
-        .values()
-        .filter_map(|record| record.artifact.candidate())
-        .filter(|candidate| is_symbol(&candidate.symbol))
-        .collect();
-    let passed = candidates
-        .iter()
-        .filter(|candidate| candidate.verdict == Verdict::Pass)
-        .count();
-    let performance_gated = candidates
-        .iter()
-        .filter(|candidate| {
-            candidate.verdict == Verdict::Pass
-                && !broker.recipe_gate_status(&candidate.recipe, now_ms).allowed
-        })
-        .count();
-    let consumed = candidates
-        .iter()
-        .filter(|candidate| candidate.verdict == Verdict::Pass && broker.has_seen(&candidate.id))
-        .count();
-    let unknown = candidates
-        .iter()
-        .filter(|candidate| candidate.verdict == Verdict::Unknown)
-        .count();
-    let blocked = candidates.len() - passed - unknown;
-    let plans = evaluation
-        .artifacts
-        .values()
-        .filter_map(|record| match &record.artifact {
-            Artifact::PositionPlan(value)
-                if is_symbol(&value.symbol)
-                    && !broker.has_seen(&value.candidate_id)
-                    && broker
+    let positions = execution.position_snapshots();
+    let build = |asset_class: AssetClass| {
+        let is_symbol = |symbol: &str| match asset_class {
+            AssetClass::Major => strategy.majors.iter().any(|value| value == symbol),
+            AssetClass::Altcoin => strategy.altcoins.iter().any(|value| value == symbol),
+        };
+        let candidates: Vec<_> = evaluation
+            .artifacts
+            .values()
+            .filter_map(|record| record.artifact.candidate())
+            .filter(|candidate| is_symbol(&candidate.symbol))
+            .collect();
+        let passed = candidates
+            .iter()
+            .filter(|candidate| candidate.verdict == Verdict::Pass)
+            .count();
+        let unknown = candidates
+            .iter()
+            .filter(|candidate| candidate.verdict == Verdict::Unknown)
+            .count();
+        let consumed = candidates
+            .iter()
+            .filter(|candidate| execution.has_seen(&candidate.id))
+            .count();
+        let performance_gated = candidates
+            .iter()
+            .filter(|candidate| {
+                candidate.verdict == Verdict::Pass
+                    && !execution
                         .recipe_gate_status(
-                            evaluation
-                                .artifacts
-                                .values()
-                                .filter_map(|record| record.artifact.candidate())
-                                .find(|candidate| candidate.id == value.candidate_id)
-                                .map(|candidate| candidate.recipe.as_str())
-                                .unwrap_or("unknown"),
-                            now_ms,
+                            &candidate.recipe,
+                            chrono::Utc::now().timestamp_millis(),
                         )
-                        .allowed =>
-            {
-                Some(value)
-            }
-            _ => None,
+                        .allowed
+            })
+            .count();
+        let plans = evaluation
+            .artifacts
+            .values()
+            .filter_map(|record| match &record.artifact {
+                Artifact::PositionPlan(value)
+                    if is_symbol(&value.symbol)
+                        && !execution.has_seen(&value.candidate_id)
+                        && evaluation
+                            .artifacts
+                            .values()
+                            .filter_map(|record| record.artifact.candidate())
+                            .find(|candidate| candidate.id == value.candidate_id)
+                            .is_some_and(|candidate| {
+                                execution
+                                    .recipe_gate_status(
+                                        &candidate.recipe,
+                                        chrono::Utc::now().timestamp_millis(),
+                                    )
+                                    .allowed
+                            }) =>
+                {
+                    Some(value)
+                }
+                _ => None,
+            })
+            .count();
+        let open_positions = positions
+            .values()
+            .filter(|position| position.asset_class == asset_class)
+            .count();
+        let mut blocker_set = candidates
+            .iter()
+            .flat_map(|candidate| candidate.blockers.iter())
+            .cloned()
+            .collect::<std::collections::BTreeSet<_>>();
+        if performance_gated > 0 {
+            blocker_set.insert("rolling PF gate is cooling down this recipe".into());
+        }
+        if consumed > 0 {
+            blocker_set.insert("current opportunity cycle was already consumed".into());
+        }
+        let blockers: Vec<_> = blocker_set.into_iter().take(5).collect();
+        let current_stage = if open_positions > 0 {
+            "position_management"
+        } else if candidates.is_empty() {
+            "signal_scan"
+        } else if passed == 0 {
+            "signal_gates"
+        } else if performance_gated == passed {
+            "performance_gate"
+        } else if consumed == passed {
+            "cooldown"
+        } else if plans == 0 {
+            "risk_sizing"
+        } else {
+            "exchange_execution"
+        };
+        serde_json::json!({
+            "asset_class": asset_class,
+            "current_stage": current_stage,
+            "candidate_counts": {"total":candidates.len(),"pass":passed,"unknown":unknown,"block":candidates.len()-passed-unknown},
+            "plans": plans,
+            "performance_gated": performance_gated,
+            "consumed": consumed,
+            "open_positions": open_positions,
+            "blockers": blockers,
         })
-        .count();
-    let open_positions = broker
-        .positions()
-        .values()
-        .filter(|position| position.asset_class == asset_class)
-        .count();
-    let mut blockers: std::collections::BTreeSet<String> = candidates
-        .iter()
-        .flat_map(|candidate| candidate.blockers.iter())
-        .cloned()
-        .collect();
-    if performance_gated > 0 {
-        blockers.insert("rolling PF gate is cooling down this recipe".into());
-    }
-    if consumed > 0 {
-        blockers.insert("current opportunity cycle was already consumed".into());
-    }
-    let blockers: Vec<_> = blockers.into_iter().take(8).collect();
-    let current_stage = if open_positions > 0 {
-        "position_management"
-    } else if candidates.is_empty() {
-        "signal_scan"
-    } else if passed == 0 {
-        "signal_gates"
-    } else if performance_gated == passed {
-        "performance_gate"
-    } else if consumed == passed {
-        "cooldown"
-    } else if plans == 0 {
-        "risk_sizing"
-    } else {
-        "paper_execution"
     };
-    serde_json::json!({
-        "asset_class": asset_class,
-        "current_stage": current_stage,
-        "candidate_counts": {"total":candidates.len(),"pass":passed,"unknown":unknown,"block":blocked},
-        "plans": plans,
-        "performance_gated": performance_gated,
-        "consumed": consumed,
-        "open_positions": open_positions,
-        "blockers": blockers,
-    })
+    serde_json::json!({"major":build(AssetClass::Major),"altcoin":build(AssetClass::Altcoin)})
 }
 
 fn runtime_identity(config: &AppConfig, started_ms: i64) -> serde_json::Value {
@@ -280,9 +276,10 @@ async fn main() -> Result<()> {
             let graph = build_graph(&config.strategy)?;
             drop(graph);
             println!(
-                "valid: {} majors, {} altcoins, paper_only=true",
+                "valid: {} majors, {} altcoins, paper_only=true, execution={:?}",
                 config.strategy.majors.len(),
-                config.strategy.altcoins.len()
+                config.strategy.altcoins.len(),
+                config.execution.mode,
             );
             Ok(())
         }
@@ -324,20 +321,33 @@ async fn main() -> Result<()> {
 }
 
 async fn run_paper(config: AppConfig, iterations: u64) -> Result<()> {
+    run_binance_demo(config, iterations).await
+}
+
+async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
     let started_ms = chrono::Utc::now().timestamp_millis();
     let identity = runtime_identity(&config, started_ms);
     let _monitor = monitor::start(&config.runtime).await?;
     let mut source = BinancePaperSource::new(config.runtime.clone())?;
-    let mut broker = PaperBroker::load_or_new(
+    let mut execution = BinanceDemoExecution::connect(
+        config.execution.clone(),
         config.paper.clone(),
         config.strategy.risk.clone(),
-        &config.runtime.paper_state_path,
+        config.runtime.execution_state_path.clone(),
         &config.strategy.majors,
-    )?;
+        config.runtime.proxy.as_deref(),
+    )
+    .await
+    .context("Binance demo execution initialization failed; no local-fill fallback is allowed")?;
     let journal = Journal::new(&config.runtime.journal_path)?;
     let history = Journal::new(&config.runtime.history_path)?;
     let status = StatusWriter::new(&config.runtime.status_path);
-    let start_payload = serde_json::json!({"paper_only":true,"config":config,"runtime":identity});
+    let start_payload = serde_json::json!({
+        "paper_only": true,
+        "execution": execution.health(),
+        "config": config,
+        "runtime": identity,
+    });
     journal.append("runner_start", start_payload.clone())?;
     history.append("runner_start", start_payload)?;
     let mut active_strategy = config.strategy.clone();
@@ -352,6 +362,22 @@ async fn run_paper(config: AppConfig, iterations: u64) -> Result<()> {
     let mut completed = 0u64;
     loop {
         let now_ms = chrono::Utc::now().timestamp_millis();
+        let sync_events = match execution.sync().await {
+            Ok(events) => events,
+            Err(error) => {
+                warn!(error=%error, "Binance demo account sync failed; blocking evaluation and orders");
+                journal.append(
+                    "exchange_sync_error",
+                    serde_json::json!({"ts_ms":now_ms,"error":error.to_string(),"venue":"binance_demo"}),
+                )?;
+                tokio::time::sleep(Duration::from_secs(config.runtime.poll_seconds.max(15))).await;
+                continue;
+            }
+        };
+        for event in sync_events {
+            history.append(&event.kind, event.payload.clone())?;
+            journal.append(&event.kind, event.payload)?;
+        }
         let refresh_ms = i64::from(config.strategy.universe.refresh_minutes) * 60_000;
         if config.strategy.universe.dynamic_enabled
             && now_ms - last_universe_refresh_ms >= refresh_ms
@@ -359,7 +385,10 @@ async fn run_paper(config: AppConfig, iterations: u64) -> Result<()> {
             last_universe_refresh_ms = now_ms;
             match source.discover_altcoins(&config.strategy, now_ms).await {
                 Ok(mut discovery) => {
-                    for symbol in broker.positions().keys() {
+                    discovery
+                        .symbols
+                        .retain(|symbol| execution.supports_symbol(symbol));
+                    for symbol in execution.position_symbols() {
                         if !config.strategy.majors.contains(symbol)
                             && !discovery.symbols.contains(symbol)
                         {
@@ -376,70 +405,70 @@ async fn run_paper(config: AppConfig, iterations: u64) -> Result<()> {
                     universe_status = serde_json::to_value(&discovery)?;
                     journal.append("universe_refresh", universe_status.clone())?;
                 }
-                Err(error) => {
-                    warn!(error=%error,"dynamic universe refresh failed; keeping previous symbols");
-                    journal.append(
-                        "universe_refresh_error",
-                        serde_json::json!({"ts_ms":now_ms,"error":error.to_string()}),
-                    )?;
-                }
+                Err(error) => journal.append(
+                    "universe_refresh_error",
+                    serde_json::json!({"ts_ms":now_ms,"error":error.to_string()}),
+                )?,
             }
         }
-        match source
-            .fetch_frame(&active_strategy, broker.account_frame())
-            .await
-        {
+        let account = execution.account_frame()?;
+        match source.fetch_frame(&active_strategy, account).await {
             Ok(mut frame) => {
                 samples.record(&journal, &frame)?;
                 let data_health = source.health();
-                journal.append("data_health", data_health.clone())?;
-                let broker_events = broker.mark_to_market(&frame);
-                for event in broker_events {
-                    history.append(&event.kind, event.payload.clone())?;
-                    journal.append(&event.kind, event.payload)?;
-                }
-                frame.account = broker.marked_account(&frame);
+                frame.account = execution.account_frame()?;
                 let evaluation = graph.evaluate(&frame)?;
                 journal.append("graph_evaluation", serde_json::to_value(&evaluation)?)?;
-                let fill_events = broker.apply_plans(&frame, &evaluation);
-                for event in fill_events {
+                let order_events = execution.apply_plans(&frame, &evaluation).await;
+                for event in &order_events {
                     history.append(&event.kind, event.payload.clone())?;
-                    journal.append(&event.kind, event.payload)?;
+                    journal.append(&event.kind, event.payload.clone())?;
                 }
-                broker.save(&config.runtime.paper_state_path)?;
-                let account = broker.marked_account(&frame);
-                let sleeves = broker.sleeve_snapshots(&frame);
-                let funnels =
-                    strategy_funnels(&active_strategy, &evaluation, &broker, frame.as_of_ms);
-                let recipe_gates = broker.recipe_gate_snapshots(frame.as_of_ms);
+                if !order_events.is_empty() {
+                    for event in execution.sync().await? {
+                        history.append(&event.kind, event.payload.clone())?;
+                        journal.append(&event.kind, event.payload)?;
+                    }
+                }
+                let account = execution.account_frame()?;
+                let funnels = strategy_funnels_demo(&active_strategy, &evaluation, &execution);
+                let execution_health = execution.health();
                 let observation = serde_json::json!({
-                    "ts_ms": frame.as_of_ms,
-                    "equity_usd": account.equity_usd,
-                    "cash_usd": account.cash_usd,
-                    "realized_pnl_usd": account.realized_pnl_usd,
-                    "gross_exposure_usd": account.gross_exposure_usd,
-                    "drawdown_pct": ((account.peak_equity_usd-account.equity_usd)/account.peak_equity_usd.max(1.0)).max(0.0),
-                    "daily_loss_pct": ((account.risk_day_start_equity_usd-account.equity_usd)/account.risk_day_start_equity_usd.max(1.0)).max(0.0),
-                    "sleeves": sleeves,
-                    "funnels": funnels,
-                    "recipe_gates": recipe_gates,
-                    "data_health": data_health,
-                    "runtime": identity,
+                    "ts_ms":frame.as_of_ms,
+                    "equity_usd":account.equity_usd,
+                    "cash_usd":account.cash_usd,
+                    "realized_pnl_usd":account.realized_pnl_usd,
+                    "gross_exposure_usd":account.gross_exposure_usd,
+                    "drawdown_pct":((account.peak_equity_usd-account.equity_usd)/account.peak_equity_usd.max(1.0)).max(0.0),
+                    "daily_loss_pct":((account.risk_day_start_equity_usd-account.equity_usd)/account.risk_day_start_equity_usd.max(1.0)).max(0.0),
+                    "execution":execution_health,
+                    "runtime":identity,
                 });
-                history.append("paper_equity", observation.clone())?;
-                journal.append("paper_equity", observation)?;
-                status.write(&serde_json::json!({"as_of_ms":frame.as_of_ms,"paper_only":true,"account":account,"sleeves":sleeves,"funnels":funnels,"recipe_gates":recipe_gates,"positions":broker.position_snapshots(&frame),"graph":summarize(&evaluation),"artifacts":evaluation.artifacts,"universe":universe_status,"data_health":data_health,"runtime":identity}))?;
+                history.append("exchange_equity", observation.clone())?;
+                journal.append("exchange_equity", observation)?;
+                status.write(&serde_json::json!({
+                    "as_of_ms":frame.as_of_ms,
+                    "paper_only":true,
+                    "account":account,
+                    "funnels":funnels,
+                    "recipe_gates":execution.recipe_gate_snapshots(frame.as_of_ms),
+                    "positions":execution.position_snapshots(),
+                    "graph":summarize(&evaluation),
+                    "artifacts":evaluation.artifacts,
+                    "universe":universe_status,
+                    "data_health":data_health,
+                    "execution":execution_health,
+                    "runtime":identity,
+                }))?;
                 completed += 1;
                 info!(
                     iteration = completed,
-                    equity = broker.account_frame().equity_usd,
-                    "paper frame complete"
+                    equity = account.equity_usd,
+                    "Binance demo frame complete"
                 );
             }
             Err(error) => {
-                warn!(error=%error,"paper frame failed; no strategy evaluation or order simulation performed");
-                let data_health = source.health();
-                journal.append("data_health", data_health)?;
+                warn!(error=%error,"market frame failed; no Binance demo orders submitted");
                 journal.append(
                     "frame_error",
                     serde_json::json!({"error":error.to_string()}),

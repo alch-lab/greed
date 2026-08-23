@@ -26,3 +26,6 @@ tracing-subscriber = { workspace = true }
 csv = { workspace = true }
 zip = { workspace = true }
 axum = { workspace = true }
+hmac = { workspace = true }
+sha2 = { workspace = true }
+url = { workspace = true }

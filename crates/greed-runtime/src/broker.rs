@@ -31,6 +31,7 @@ pub struct PaperPosition {
 }
 
 #[derive(Debug, Serialize)]
+#[cfg(test)]
 pub struct PositionSnapshot<'a> {
     #[serde(flatten)]
     pub position: &'a PaperPosition,
@@ -95,6 +96,7 @@ pub struct SleeveSnapshot {
 }
 
 #[derive(Debug, Clone, Serialize)]
+#[cfg(test)]
 pub struct SleeveSnapshots {
     pub major: SleeveSnapshot,
     pub altcoin: SleeveSnapshot,
@@ -168,6 +170,7 @@ impl PaperBroker {
             unattributed_realized_pnl_usd: 0.0,
         }
     }
+    #[cfg(test)]
     pub fn load_or_new(
         config: PaperConfig,
         risk: RiskConfig,
@@ -217,6 +220,7 @@ impl PaperBroker {
             Err(error) => Err(error.into()),
         }
     }
+    #[cfg(test)]
     pub fn save(&self, path: &str) -> anyhow::Result<()> {
         let path = std::path::Path::new(path);
         if let Some(parent) = path.parent() {
@@ -288,6 +292,7 @@ impl PaperBroker {
             open_positions,
         }
     }
+    #[cfg(test)]
     pub fn sleeve_snapshots(&self, frame: &MarketFrame) -> SleeveSnapshots {
         SleeveSnapshots {
             major: self.sleeve_snapshot(frame, AssetClass::Major),
@@ -317,9 +322,11 @@ impl PaperBroker {
             ledger.peak_equity_usd = ledger.peak_equity_usd.max(equity);
         }
     }
+    #[cfg(test)]
     pub fn positions(&self) -> &BTreeMap<String, PaperPosition> {
         &self.positions
     }
+    #[cfg(test)]
     pub fn position_snapshots<'a>(
         &'a self,
         frame: &MarketFrame,
@@ -351,9 +358,6 @@ impl PaperBroker {
                 )
             })
             .collect()
-    }
-    pub fn has_seen(&self, candidate_id: &str) -> bool {
-        self.seen.contains(candidate_id)
     }
     pub fn recipe_gate_status(&self, recipe: &str, now_ms: i64) -> RecipeGateStatus {
         let outcomes = self
@@ -388,19 +392,6 @@ impl PaperBroker {
             rolling_net_pnl_usd: window.iter().map(|outcome| outcome.pnl_usd).sum(),
             next_probe_ms,
         }
-    }
-    pub fn recipe_gate_snapshots(&self, now_ms: i64) -> BTreeMap<String, RecipeGateStatus> {
-        [
-            "major_trend_pullback",
-            "major_exhaustion_reversal",
-            "alt_cross_section_momentum",
-            "alt_cross_section_probe",
-            "alt_outlier_momentum",
-            "alt_shock_reversal",
-        ]
-        .into_iter()
-        .map(|recipe| (recipe.into(), self.recipe_gate_status(recipe, now_ms)))
-        .collect()
     }
     pub fn account_frame(&self) -> AccountFrame {
         AccountFrame {
@@ -781,7 +772,7 @@ fn recipe_from_candidate(candidate_id: &str) -> &'static str {
         "alt_cross_section_momentum"
     } else if candidate_id.contains("outlier_momentum") || candidate_id.contains("outlier-momentum")
     {
-        "alt_outlier_momentum"
+        "alt_outlier_continuation"
     } else if candidate_id.contains("shock_reversal") || candidate_id.contains("shock-reversal") {
         "alt_shock_reversal"
     } else {
@@ -828,6 +819,7 @@ mod tests {
                 meta: meta.clone(),
                 values: vec![candle],
             },
+            fast_perpetual: None,
             book: Some(BookState {
                 meta,
                 bid: price,

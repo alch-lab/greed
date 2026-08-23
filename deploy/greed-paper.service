@@ -9,8 +9,9 @@ WorkingDirectory=/opt/greed
 ExecStart=/opt/greed/target/release/greed paper --config config/paper.toml
 Restart=always
 RestartSec=10
+EnvironmentFile=-/etc/greed-paper.env
 
-# The binary contains no authenticated exchange client or live-order command.
+# Credentials in /etc/greed-paper.env must belong to Binance Demo only.
 NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=true

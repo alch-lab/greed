@@ -14,6 +14,13 @@ pub struct AltOutlierMomentumNode {
     min_return_4h: f64,
     min_volume_ratio: f64,
     min_efficiency: f64,
+    confirmation_min_5m: f64,
+    confirmation_max_5m: f64,
+    max_directional_wick_ratio: f64,
+    max_climax_range_ratio: f64,
+    pullback_min: f64,
+    pullback_max: f64,
+    candidate_expiry_ms: i64,
     anchor_symbol: String,
     dependencies: Vec<String>,
 }
@@ -26,6 +33,13 @@ impl AltOutlierMomentumNode {
         min_return_4h: f64,
         min_volume_ratio: f64,
         min_efficiency: f64,
+        confirmation_min_5m: f64,
+        confirmation_max_5m: f64,
+        max_directional_wick_ratio: f64,
+        max_climax_range_ratio: f64,
+        pullback_min: f64,
+        pullback_max: f64,
+        candidate_expiry_minutes: u32,
         anchor_symbol: &str,
         symbols: &[String],
     ) -> Self {
@@ -36,6 +50,13 @@ impl AltOutlierMomentumNode {
             min_return_4h,
             min_volume_ratio,
             min_efficiency,
+            confirmation_min_5m,
+            confirmation_max_5m,
+            max_directional_wick_ratio,
+            max_climax_range_ratio,
+            pullback_min,
+            pullback_max,
+            candidate_expiry_ms: i64::from(candidate_expiry_minutes) * 60_000,
             anchor_symbol: anchor_symbol.into(),
             dependencies: std::iter::once("alt.market_breadth".into())
                 .chain(std::iter::once(format!("{anchor_symbol}.trend_regime")))
@@ -89,7 +110,46 @@ struct Setup<'a> {
     return_4h: f64,
     volume_ratio: f64,
     efficiency: f64,
+    confirmation_5m: f64,
+    directional_wick_ratio: f64,
+    pattern: &'static str,
     score: f64,
+}
+
+fn directional_wick(bar: &greed_kernel::Candle, side: Side) -> f64 {
+    let range = (bar.high - bar.low).max(f64::EPSILON);
+    match side {
+        Side::Buy => (bar.high - bar.open.max(bar.close)) / range,
+        Side::Sell => (bar.open.min(bar.close) - bar.low) / range,
+    }
+    .clamp(0.0, 1.0)
+}
+
+fn ordered_pullback(bars: &[&greed_kernel::Candle], side: Side) -> f64 {
+    match side {
+        Side::Buy => bars
+            .iter()
+            .enumerate()
+            .map(|(index, bar)| {
+                let low_after = bars[index..]
+                    .iter()
+                    .map(|value| value.low)
+                    .fold(f64::INFINITY, f64::min);
+                (bar.high - low_after) / bar.high.max(f64::EPSILON)
+            })
+            .fold(0.0, f64::max),
+        Side::Sell => bars
+            .iter()
+            .enumerate()
+            .map(|(index, bar)| {
+                let high_after = bars[index..]
+                    .iter()
+                    .map(|value| value.high)
+                    .fold(0.0, f64::max);
+                (high_after - bar.low) / bar.low.max(f64::EPSILON)
+            })
+            .fold(0.0, f64::max),
+    }
 }
 
 impl StrategyNode for AltOutlierMomentumNode {
@@ -114,6 +174,8 @@ impl StrategyNode for AltOutlierMomentumNode {
         let mut move_hits = 0u64;
         let mut volume_hits = 0u64;
         let mut trend_hits = 0u64;
+        let mut fast_missing = 0u64;
+        let mut climax_blocks = 0u64;
         let mut best_return_1h: f64 = 0.0;
         let mut best_return_4h: f64 = 0.0;
         let mut best_volume_ratio: f64 = 0.0;
@@ -175,22 +237,71 @@ impl StrategyNode for AltOutlierMomentumNode {
             } else {
                 Side::Sell
             };
-            let at_edge = match side {
-                Side::Buy => {
-                    let high = window.iter().map(|bar| bar.high).fold(0.0, f64::max);
-                    bars[i].close >= high * 0.995
-                }
-                Side::Sell => {
-                    let low = window
-                        .iter()
-                        .map(|bar| bar.low)
-                        .fold(f64::INFINITY, f64::min);
-                    bars[i].close <= low * 1.005
-                }
+            let Some(fast_series) = instrument.fast_perpetual.as_ref() else {
+                fast_missing += 1;
+                continue;
             };
-            if !at_edge {
+            let fast = closed_bars(fast_series);
+            if fast.len() < 25 {
+                fast_missing += 1;
                 continue;
             }
+            let f = fast.len() - 1;
+            let last = fast[f];
+            let confirmation_5m = side.sign() * (last.close / fast[f - 1].close - 1.0);
+            let wick_ratio = directional_wick(last, side);
+            let average_range = fast[f - 20..f]
+                .iter()
+                .map(|bar| (bar.high - bar.low) / bar.close.max(f64::EPSILON))
+                .sum::<f64>()
+                / 20.0;
+            let current_range = (last.high - last.low) / last.close.max(f64::EPSILON);
+            let range_ratio = current_range / average_range.max(f64::EPSILON);
+            let climax = wick_ratio > self.max_directional_wick_ratio
+                || range_ratio > self.max_climax_range_ratio
+                || confirmation_5m > self.confirmation_max_5m;
+            if climax {
+                climax_blocks += 1;
+                continue;
+            }
+            let near_fast_edge = match side {
+                Side::Buy => {
+                    last.close
+                        >= fast[f - 5..=f]
+                            .iter()
+                            .map(|bar| bar.high)
+                            .fold(0.0, f64::max)
+                            * 0.997
+                }
+                Side::Sell => {
+                    last.close
+                        <= fast[f - 5..=f]
+                            .iter()
+                            .map(|bar| bar.low)
+                            .fold(f64::INFINITY, f64::min)
+                            * 1.003
+                }
+            };
+            let continuation = confirmation_5m >= self.confirmation_min_5m
+                && confirmation_5m <= self.confirmation_max_5m
+                && near_fast_edge;
+            let pullback = ordered_pullback(&fast[f - 5..=f], side);
+            let reclaimed = match side {
+                Side::Buy => last.close > fast[f - 1].high,
+                Side::Sell => last.close < fast[f - 1].low,
+            };
+            let reclaim = pullback >= self.pullback_min
+                && pullback <= self.pullback_max
+                && confirmation_5m >= self.confirmation_min_5m
+                && reclaimed
+                && last.quote_volume >= fast[f - 1].quote_volume * 0.9;
+            let pattern = if continuation {
+                "continuation"
+            } else if reclaim {
+                "pullback_reclaim"
+            } else {
+                continue;
+            };
             trend_hits += 1;
             let score =
                 return_1h.abs() * 2.0 + return_4h.abs() + volume_ratio.ln_1p() * efficiency * 0.01;
@@ -201,6 +312,9 @@ impl StrategyNode for AltOutlierMomentumNode {
                 return_4h,
                 volume_ratio,
                 efficiency,
+                confirmation_5m,
+                directional_wick_ratio: wick_ratio,
+                pattern,
                 score,
             });
         }
@@ -211,6 +325,8 @@ impl StrategyNode for AltOutlierMomentumNode {
             ("move_hits".into(), move_hits as f64),
             ("volume_hits".into(), volume_hits as f64),
             ("trend_hits".into(), trend_hits as f64),
+            ("fast_data_missing".into(), fast_missing as f64),
+            ("climax_blocks".into(), climax_blocks as f64),
             (
                 "selected_symbols".into(),
                 setups.len().min(self.names) as f64,
@@ -226,7 +342,11 @@ impl StrategyNode for AltOutlierMomentumNode {
         let mut out = vec![self.status(
             ctx,
             if setups.is_empty() {
-                "scanning_for_outlier"
+                if move_hits > 0 {
+                    "waiting_for_fast_confirmation"
+                } else {
+                    "scanning_for_outlier"
+                }
             } else {
                 "outlier_ready"
             },
@@ -236,10 +356,12 @@ impl StrategyNode for AltOutlierMomentumNode {
                 Verdict::Pass
             },
             if setups.is_empty() {
-                vec![
-                    "no liquid altcoin has confirmed individual momentum and volume expansion"
-                        .into(),
-                ]
+                vec![if move_hits > 0 {
+                    "radar triggered, but no 5m continuation or pullback reclaim is safe to enter"
+                        .into()
+                } else {
+                    "no liquid altcoin has reached the early-momentum radar".into()
+                }]
             } else {
                 vec![]
             },
@@ -263,18 +385,25 @@ impl StrategyNode for AltOutlierMomentumNode {
                 } else {
                     "neutral"
                 };
-            let signal_ms = closed_bars(&setup.instrument.perpetual)
-                .last()
-                .expect("outlier setup has bars")
-                .close_ms;
-            let cycle = signal_ms.div_euclid(4 * BAR_MS);
+            let signal_ms = setup
+                .instrument
+                .fast_perpetual
+                .as_ref()
+                .map(closed_bars)
+                .and_then(|bars| bars.last().map(|bar| bar.close_ms))
+                .unwrap_or(ctx.frame.as_of_ms);
+            let cycle = signal_ms.div_euclid(BAR_MS);
             let candidate = TradeCandidate {
                 id: format!("{}:{}:cycle-{cycle}", self.id, setup.instrument.symbol),
-                recipe: "alt_outlier_momentum".into(),
+                recipe: match setup.pattern {
+                    "pullback_reclaim" => "alt_outlier_pullback_reclaim",
+                    _ => "alt_outlier_continuation",
+                }
+                .into(),
                 symbol: setup.instrument.symbol.clone(),
                 side: setup.side,
                 signal_ms,
-                expires_ms: signal_ms + BAR_MS,
+                expires_ms: signal_ms + self.candidate_expiry_ms,
                 reference_price: setup.instrument.price,
                 score: setup.score,
                 confidence: (setup.efficiency
@@ -293,6 +422,15 @@ impl StrategyNode for AltOutlierMomentumNode {
                     ("return_1h".into(), format!("{:.8}", setup.return_1h)),
                     ("return_4h".into(), format!("{:.8}", setup.return_4h)),
                     ("volume_ratio".into(), format!("{:.4}", setup.volume_ratio)),
+                    (
+                        "confirmation_5m".into(),
+                        format!("{:.8}", setup.confirmation_5m),
+                    ),
+                    (
+                        "directional_wick_ratio".into(),
+                        format!("{:.4}", setup.directional_wick_ratio),
+                    ),
+                    ("entry_pattern".into(), setup.pattern.into()),
                     ("stop_profile".into(), "alt_outlier".into()),
                     ("hold_profile".into(), "alt_outlier".into()),
                     ("anchor_context".into(), anchor_context.into()),

@@ -2,9 +2,9 @@
 
 ## 安全边界
 
-`greed` 只包含公开行情读取、历史回测和本地 paper 撮合。它没有 API key、
-签名、账户查询和交易所下单代码，也没有 `live` 子命令。配置错误最多产生本地模拟成交，
-不可能提交真实订单。
+`greed` 的 forward test 只连接 Binance Demo/Testnet，不允许配置主网交易域名。API key 和
+secret 只从环境变量读取，不写入 TOML、状态或日志。历史回测仍使用本地 broker；`paper`
+命令使用 Binance Demo 的账户、撮合、订单过滤器和保护单。程序没有主网 `live` 模式。
 
 旧 runner、旧插件注册表和旧账户代码已经删除。
 
@@ -12,13 +12,13 @@
 
 - `greed-kernel`：无 I/O 领域合同、Artifact、DAG 拓扑和执行。
 - `greed-strategy`：特征原语、状态分类器、recipe 和组合风控。
-- `greed-runtime`：公开行情适配、限频/备用域名、paper broker、持久化和 JSONL journal。
+- `greed-runtime`：公开行情适配、Binance Demo 鉴权执行、本地回测 broker、持久化和 journal。
 
 事件处理入口固定为：
 
 ```text
 MarketFrame → Primitive DAG → State DAG → Recipe → PositionPlanner
-            → PaperBroker → Journal / Status / Report
+            → Binance Demo → Account/Order Reconcile → Journal / Status / Report
 ```
 
 任何节点的数据不足必须输出 `Unknown` 或不产生候选，不允许把缺失值解释为零或通过。
@@ -33,7 +33,7 @@ MarketFrame → Primitive DAG → State DAG → Recipe → PositionPlanner
 - 结构：64 档蜡烛成交量近似 POC；其质量明确标为 `Partial`，不能冒充逐笔 POC。
 - 订单墙：最大盘口档位、名义金额和跨轮询持续性；墙撤销后持久度归零。
 - 横截面：合格山寨币池的中位收益、上涨/下跌参与率、相对强弱排名。
-- 退出：初始硬止损、首段止盈、runner 跟踪保护、时间退出。
+- 退出：交易所 STOP_MARKET、TAKE_PROFIT_MARKET 和 reduce-only 时间退出。
 - 风控：北京时间风险日、日亏损熔断、峰值回撤熔断、已有仓位总敞口上限。
 
 模拟资金为 3000 USDT，并硬分成主流币、山寨币各 1500 USDT 的独立资金桶。当前主流币
@@ -48,23 +48,23 @@ MarketFrame → Primitive DAG → State DAG → Recipe → PositionPlanner
 - `major_trend_pullback`：BTC/ETH 趋势、现货/永续 CVD、OI 新仓、流动性、Coinbase
   true premium、回踩和收回。
 - `major_exhaustion_reversal`：大幅移动、跨市场 CVD 反转、去杠杆完成和流动性确认。
-- `alt_outlier_momentum`：独立检测单币 1h/4h 加速、量能扩张、路径效率和阶段突破；BTC
-  与市场广度只调整仓位，不否决个币方向。
+- `alt_outlier_momentum`：1h/4h 加速、量能和路径效率先触发雷达，再使用 5m K 线区分延续、
+  回踩收复和高潮风险；只有延续或回踩收复产生候选。BTC 与市场广度只调整仓位。
 - `alt_cross_section_momentum`：保留作研究分支，生产配置暂时关闭。
 - `alt_shock_reversal`：一小时冲击、15m 强反转、量能异常和全市场方向锚。
 
 当前职责刻意不对称：Major 使用 24 小时趋势窗口、更高趋势效率和回踩/订单流确认，作为
 低频压仓石；Altcoin 是受控进攻桶。运行时每 15 分钟从全部可交易 USDT 永续中组合高流动性
-合约和涨跌异动合约，最多保留 30 个进入完整 K 线、盘口和 OI 评估。妖币动量同一标的按
-1 小时 cycle 去重，最长持仓 3 小时；BTC 同向使用标准仓位，中性或反向只缩仓。冲击反转
+合约和涨跌异动合约，最多保留 30 个进入 15m/5m K 线、盘口和 OI 评估。妖币候选按
+15 分钟 cycle 去重、10 分钟过期、最长持仓 3 小时；BTC 同向使用标准仓位，中性或反向只缩仓。冲击反转
 每帧记录距离移动、反转和量能门槛的差距，不再静默返回。
 
 所有 recipe 都生成带 blocker、证据 lineage 和过期时间的候选。只有 `Pass` 候选才会进入
 paper position planner；`Block/Unknown` 仍写 journal，用来研究漏斗和数据缺口。
 
-每个 recipe 另有滚动 10 笔 PF 门控：积累至少 5 笔后，若费用后 PF 低于 0.80，则冷却
-8 小时；冷却结束只放行下一个探测机会。被拒绝的计划写入 `paper_plan_rejected`，不会从
-交易历史和周报中消失。
+Demo forward test 以交易所实际成交与费用为准。订单拒绝写入 `exchange_order_rejected`；
+账户同步失败时整帧停止。入场成交后如果任一保护单失败，程序撤销残单并立即发送
+reduce-only 市价平仓。每轮同步还会检查止损和止盈是否仍存在，缺失时强制退出。
 
 ## 一周运行
 
@@ -78,6 +78,15 @@ cargo build --release -p greed-runtime
 服务器使用 `deploy/greed-paper.service`。需要网络代理时只填写
 `runtime.proxy`；程序会在每次请求前节流，并轮换 Binance 官方备用域名。单个非关键接口
 失败会降级为 `Unknown`，不会放宽策略门槛。
+
+创建仅用于 Binance Demo 的环境文件，并将 Demo 账户切换为 One-way Mode：
+
+```bash
+install -m 600 /dev/null /etc/greed-paper.env
+vi /etc/greed-paper.env
+# BINANCE_DEMO_API_KEY=...
+# BINANCE_DEMO_API_SECRET=...
+```
 
 首次安装 service 前先创建隔离用户和可写目录：
 
@@ -96,18 +105,17 @@ journalctl -u greed-paper -f
 
 持久文件：
 
-- `data/runtime/paper-events.jsonl`：蜡烛、盘口/OI/外部快照、全量 Artifact、模拟成交和错误。
-- `data/runtime/paper-history.jsonl`：供监控页读取的紧凑权益曲线、Major/Altcoin 漏斗和模拟成交历史。
-- `data/runtime/paper-state.json`：账户、仓位、止损、已见候选，以及 Major/Altcoin 各自的
-  1500 USDT 账本，原子更新。旧状态首次迁移时无法可靠归属的历史已实现盈亏会单列为
-  `unattributed_realized_pnl_usd`，不会伪造到任一策略。
+- `data/runtime/demo-events.jsonl`：行情、全量 Artifact、交易所请求结果、成交和错误。
+- `data/runtime/demo-history.jsonl`：供监控页读取的账户曲线和交易所活动。
+- `data/runtime/binance-demo-state.json`：Demo 钱包基线、已见候选以及交易所仓位的策略归属。
+  交易所持仓是事实来源；状态文件不存在但账户仍有仓位时，程序拒绝启动新增交易。
 - `data/runtime/status.json`：当前账户、持仓、候选、风控和所有原语状态。
 - `data/runtime/slow-context.json`：确认后的 ETF/CME 日频输入，可参考示例文件。
 
 一周后执行：
 
 ```bash
-./target/release/greed report --journal data/runtime/paper-events.jsonl \
+./target/release/greed report --journal data/runtime/demo-events.jsonl \
   > data/runtime/week-1-report.json
 ```
 
@@ -115,7 +123,7 @@ journalctl -u greed-paper -f
 PF 和平均持仓时间；同时包含两套资金曲线的最大回撤/日亏损、候选漏斗及高频 blocker、
 程序重启与 commit/config 版本、帧空窗，以及 Binance 各接口请求、失败、429/418、重试、
 备用域名和延迟统计。山寨币两个 recipe 的每帧状态及原因也会汇总。因此只要保留
-`paper-events.jsonl`，一周后可以定位“哪套策略、哪条
+`demo-events.jsonl`，一周后可以定位“哪套策略、哪条
 recipe、哪一天、卡在哪一关、当时接口是否异常”。
 
 ## 一周评审门槛
@@ -134,19 +142,15 @@ recipe、哪一天、卡在哪一关、当时接口是否异常”。
 
 ## 当前回测结论
 
-回测数据来自 Binance 官方归档，费用和滑点均按单边 5 bps 计入。2026-07-22～08-14
-训练段显示，单纯放宽 BTC 震荡并提高到 4～6 小时轮动会明显过度交易；因此未采用该版本。
-当前 paper 参数使用更严格的 24h BTC/广度确认、2 个标的、8h cycle 和滚动 PF 门控，但
-在方向形成时立即触发，不再等待固定钟点。对比结果：
+回测数据来自 Binance 官方 15m/5m 归档，费用和滑点均按单边 5 bps 计入。默认 balanced
+雷达在 2026-08-15～08-21 上涨验证段的组合收益为 +0.82 USDT，PF 1.02、最大回撤
+0.80%；其中延续入场 +2.52，回踩收复 -3.41。2026-07-30～08-07 震荡验证段组合
+-13.26，其中山寨币延续入场 -7.56。激进雷达在上涨周收益更高，但震荡段亏损也更大。
 
-- 训练段旧固定窗口：组合 -15.98 USDT，其中山寨币 -7.31 USDT。
-- 训练段机会驱动版：组合 -32.66 USDT，其中山寨币 -24.05 USDT。
-- 2026-08-15～08-21 验证段旧固定窗口：组合 +57.13 USDT，其中山寨币 +55.50 USDT。
-- 同一验证段机会驱动版：组合 +98.24 USDT，其中山寨币 +96.63 USDT，PF 2.63，最大
-  回撤 0.90%。
-
-机会驱动版在上涨趋势中捕获更多收益，但在此前阶段亏损也更大，所以它符合“进攻桶”定位，
-尚不代表稳定 alpha。当前结论仍是“允许 paper forward test，禁止直接开启实盘”。
+因此 5m 确认解决的是“不要在单根高潮 K 线末端盲目追入”，并没有证明策略已经稳定盈利。
+Continuation 与 Pullback Reclaim 使用独立滚动 PF 门控，避免一个分支拖累后继续无条件试错。
+当前结论是：只允许 Binance Demo forward test，禁止主网下单；一周后依据交易所真实拒单、
+成交、费用和短周期路径决定删除或保留各分支。
 一周 paper 后只有同时满足以下条件才进入下一阶段评审：
 
 1. 行情与 OI 关键数据完整率至少 99%，没有连续五分钟空窗。

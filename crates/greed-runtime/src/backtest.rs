@@ -21,6 +21,7 @@ const WARMUP_DAYS: i64 = 2;
 #[derive(Clone)]
 struct SeriesData {
     perpetual: Vec<Candle>,
+    fast_perpetual: Vec<Candle>,
     spot: Vec<Candle>,
     oi: BTreeMap<i64, f64>,
     depth: BTreeMap<i64, (f64, f64)>,
@@ -158,34 +159,32 @@ fn score(row: &ResultRow) -> f64 {
 
 fn profiles(base: &StrategyConfig) -> Vec<(String, StrategyConfig)> {
     let mut responsive = base.clone();
-    responsive.recipes.outlier_min_return_1h_pct = 0.015;
-    responsive.recipes.outlier_min_return_4h_pct = 0.035;
-    responsive.recipes.outlier_min_volume_ratio = 1.20;
-    responsive.recipes.outlier_min_efficiency = 0.35;
+    responsive.recipes.outlier_min_return_1h_pct = 0.010;
+    responsive.recipes.outlier_min_return_4h_pct = 0.025;
+    responsive.recipes.outlier_min_volume_ratio = 1.10;
+    responsive.recipes.outlier_min_efficiency = 0.25;
     let mut balanced = base.clone();
-    balanced.recipes.outlier_min_return_1h_pct = 0.020;
-    balanced.recipes.outlier_min_return_4h_pct = 0.045;
-    balanced.recipes.outlier_min_volume_ratio = 1.40;
-    balanced.recipes.outlier_min_efficiency = 0.40;
+    balanced.recipes.outlier_min_return_1h_pct = 0.015;
+    balanced.recipes.outlier_min_return_4h_pct = 0.035;
+    balanced.recipes.outlier_min_volume_ratio = 1.30;
+    balanced.recipes.outlier_min_efficiency = 0.35;
     let mut selective = base.clone();
-    selective.recipes.outlier_min_return_1h_pct = 0.025;
-    selective.recipes.outlier_min_return_4h_pct = 0.055;
-    selective.recipes.outlier_min_volume_ratio = 1.60;
-    selective.recipes.outlier_min_efficiency = 0.50;
-    let mut extreme = base.clone();
-    extreme.recipes.outlier_min_return_1h_pct = 0.035;
-    extreme.recipes.outlier_min_return_4h_pct = 0.070;
-    extreme.recipes.outlier_min_volume_ratio = 1.80;
-    extreme.recipes.outlier_min_efficiency = 0.55;
+    selective.recipes.outlier_min_return_1h_pct = 0.020;
+    selective.recipes.outlier_min_return_4h_pct = 0.045;
+    selective.recipes.outlier_min_volume_ratio = 1.50;
+    selective.recipes.outlier_min_efficiency = 0.45;
+    let mut anti_climax = balanced.clone();
+    anti_climax.recipes.outlier_max_directional_wick_ratio = 0.25;
+    anti_climax.recipes.outlier_max_climax_range_ratio = 2.2;
     let mut tight_exit = balanced.clone();
     tight_exit.risk.alt_outlier_stop_pct = 0.010;
     tight_exit.risk.alt_outlier_take_profit_pct = 0.016;
-    tight_exit.risk.alt_outlier_max_hold_minutes = 120;
+    tight_exit.risk.alt_outlier_max_hold_minutes = 90;
     vec![
         ("outlier_responsive".into(), responsive),
         ("outlier_balanced".into(), balanced),
         ("outlier_selective".into(), selective),
-        ("outlier_extreme".into(), extreme),
+        ("outlier_anti_climax".into(), anti_climax),
         ("outlier_tight_exit".into(), tight_exit),
     ]
 }
@@ -324,7 +323,7 @@ fn candidate_recipe(id: &str) -> String {
     } else if id.contains("cross_section") {
         "alt_cross_section_momentum"
     } else if id.contains("outlier_momentum") {
-        "alt_outlier_momentum"
+        "alt_outlier_continuation"
     } else if id.contains("shock_reversal") {
         "alt_shock_reversal"
     } else {
@@ -399,6 +398,17 @@ fn frame_at(
                     meta: meta(DataQuality::Complete),
                     values: perpetual,
                 },
+                fast_perpetual: (!major).then(|| CandleSeries {
+                    venue: "binance".into(),
+                    market: MarketKind::Perpetual,
+                    interval_ms: 300_000,
+                    meta: meta(if source.fast_perpetual.is_empty() {
+                        DataQuality::Missing
+                    } else {
+                        DataQuality::Complete
+                    }),
+                    values: history(&source.fast_perpetual, ts),
+                }),
                 book: depth.map(|(bid_depth, ask_depth)| BookState {
                     meta: meta(DataQuality::Partial),
                     bid: price * 0.99995,
@@ -536,6 +546,14 @@ impl Archive {
                     ),
                 ));
             }
+            for symbol in alts {
+                out.push(self.spec(
+                    "futures-klines-5m",
+                    symbol,
+                    day,
+                    format!("data/futures/um/daily/klines/{symbol}/5m/{symbol}-5m-{day}.zip"),
+                ));
+            }
             for symbol in majors {
                 out.push(self.spec(
                     "spot-klines",
@@ -571,6 +589,7 @@ impl Archive {
         for symbol in majors.iter().chain(alts) {
             let mut data = SeriesData {
                 perpetual: vec![],
+                fast_perpetual: vec![],
                 spot: vec![],
                 oi: BTreeMap::new(),
                 depth: BTreeMap::new(),
@@ -584,6 +603,15 @@ impl Archive {
                         .join(symbol)
                         .join(format!("{day}.zip")),
                 )?)?);
+                if alts.contains(symbol) {
+                    data.fast_perpetual.extend(parse_klines(&read_zip(
+                        &self
+                            .cache
+                            .join("futures-klines-5m")
+                            .join(symbol)
+                            .join(format!("{day}.zip")),
+                    )?)?);
+                }
                 if majors.contains(symbol) {
                     data.spot.extend(parse_klines(&read_zip(
                         &self
@@ -610,6 +638,7 @@ impl Archive {
                 day += Duration::days(1);
             }
             data.perpetual.sort_by_key(|bar| bar.close_ms);
+            data.fast_perpetual.sort_by_key(|bar| bar.close_ms);
             data.spot.sort_by_key(|bar| bar.close_ms);
             result.insert(symbol.clone(), data);
         }

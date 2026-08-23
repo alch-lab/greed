@@ -295,7 +295,7 @@ pub fn build(path: &str) -> Result<Value> {
                 record_plans(payload, &mut sleeve_funnels, &mut recipe_funnels);
                 record_diagnostics(payload, &mut diagnostic_states, &mut diagnostic_reasons);
             }
-            "paper_entry" => {
+            "paper_entry" | "exchange_entry" => {
                 record_daily(payload, true, &mut daily);
                 record_entry(
                     payload,
@@ -309,7 +309,7 @@ pub fn build(path: &str) -> Result<Value> {
                     &mut open_trades,
                 );
             }
-            "paper_partial_exit" | "paper_exit" => {
+            "paper_partial_exit" | "paper_exit" | "exchange_exit" => {
                 record_daily(payload, false, &mut daily);
                 record_exit(
                     payload,
@@ -322,7 +322,7 @@ pub fn build(path: &str) -> Result<Value> {
                     &mut open_trades,
                 );
             }
-            "paper_plan_rejected" => {
+            "paper_plan_rejected" | "exchange_plan_rejected" | "exchange_order_rejected" => {
                 let (sleeve, recipe) = classify(payload);
                 for stats in [
                     sleeve_funnels.entry(sleeve).or_default(),
@@ -350,6 +350,9 @@ pub fn build(path: &str) -> Result<Value> {
                             .or_default() += 1;
                     }
                 }
+            }
+            "exchange_equity" => {
+                portfolio_risk.observe(payload);
             }
             _ => {}
         }
@@ -500,7 +503,7 @@ fn recipe_from_id(id: &str) -> &'static str {
     } else if id.contains("cross_section") || id.contains("cross-section") {
         "alt_cross_section_momentum"
     } else if id.contains("outlier_momentum") || id.contains("outlier-momentum") {
-        "alt_outlier_momentum"
+        "alt_outlier_continuation"
     } else if id.contains("shock_reversal") || id.contains("shock-reversal") {
         "alt_shock_reversal"
     } else {

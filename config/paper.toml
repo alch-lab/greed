@@ -1,9 +1,20 @@
 [runtime]
 # proxy = "http://127.0.0.1:7890"
+journal_path = "data/runtime/demo-events.jsonl"
+history_path = "data/runtime/demo-history.jsonl"
+status_path = "data/runtime/demo-status.json"
+execution_state_path = "data/runtime/binance-demo-state.json"
 
 [paper]
 initial_cash_usd = 3000.0
 max_positions = 7
+
+[execution]
+mode = "binance_demo"
+base_url = "https://demo-fapi.binance.com"
+api_key_env = "BINANCE_DEMO_API_KEY"
+api_secret_env = "BINANCE_DEMO_API_SECRET"
+recv_window_ms = 5000
 
 [strategy]
 majors = ["BTCUSDT", "ETHUSDT"]
@@ -38,10 +49,17 @@ cross_opportunity_driven = true
 alt_neutral_anchor_allowed = true
 alt_shock_neutral_anchor_allowed = false
 outlier_names = 3
-outlier_min_return_1h_pct = 0.025
-outlier_min_return_4h_pct = 0.055
-outlier_min_volume_ratio = 1.60
-outlier_min_efficiency = 0.50
+outlier_min_return_1h_pct = 0.015
+outlier_min_return_4h_pct = 0.035
+outlier_min_volume_ratio = 1.30
+outlier_min_efficiency = 0.35
+outlier_confirmation_min_5m_pct = 0.001
+outlier_confirmation_max_5m_pct = 0.012
+outlier_max_directional_wick_ratio = 0.35
+outlier_max_climax_range_ratio = 2.8
+outlier_pullback_min_pct = 0.004
+outlier_pullback_max_pct = 0.015
+outlier_candidate_expiry_minutes = 10
 pullback_min_pct = 0.003
 exhaustion_move_pct = 0.024
 shock_min_return_pct = 0.060
@@ -59,6 +77,8 @@ alt_neutral_anchor_max_hold_minutes = 240
 alt_outlier_gross_per_trade = 0.05
 alt_outlier_opposed_size_multiplier = 0.50
 alt_outlier_neutral_size_multiplier = 0.75
+alt_outlier_breadth_opposed_size_multiplier = 0.35
+alt_outlier_breadth_neutral_size_multiplier = 0.65
 alt_outlier_stop_pct = 0.012
 alt_outlier_take_profit_pct = 0.020
 alt_outlier_max_hold_minutes = 180

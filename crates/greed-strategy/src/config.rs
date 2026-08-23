@@ -113,6 +113,13 @@ pub struct RecipeConfig {
     pub outlier_min_return_4h_pct: f64,
     pub outlier_min_volume_ratio: f64,
     pub outlier_min_efficiency: f64,
+    pub outlier_confirmation_min_5m_pct: f64,
+    pub outlier_confirmation_max_5m_pct: f64,
+    pub outlier_max_directional_wick_ratio: f64,
+    pub outlier_max_climax_range_ratio: f64,
+    pub outlier_pullback_min_pct: f64,
+    pub outlier_pullback_max_pct: f64,
+    pub outlier_candidate_expiry_minutes: u32,
     pub shock_min_return_pct: f64,
     pub shock_min_reversal_pct: f64,
     pub shock_min_volume_ratio: f64,
@@ -139,6 +146,13 @@ impl Default for RecipeConfig {
             outlier_min_return_4h_pct: 0.05,
             outlier_min_volume_ratio: 1.50,
             outlier_min_efficiency: 0.45,
+            outlier_confirmation_min_5m_pct: 0.001,
+            outlier_confirmation_max_5m_pct: 0.012,
+            outlier_max_directional_wick_ratio: 0.35,
+            outlier_max_climax_range_ratio: 2.8,
+            outlier_pullback_min_pct: 0.004,
+            outlier_pullback_max_pct: 0.015,
+            outlier_candidate_expiry_minutes: 10,
             shock_min_return_pct: 0.045,
             shock_min_reversal_pct: 0.006,
             shock_min_volume_ratio: 2.5,
@@ -158,6 +172,8 @@ pub struct RiskConfig {
     pub alt_outlier_gross_per_trade: f64,
     pub alt_outlier_opposed_size_multiplier: f64,
     pub alt_outlier_neutral_size_multiplier: f64,
+    pub alt_outlier_breadth_opposed_size_multiplier: f64,
+    pub alt_outlier_breadth_neutral_size_multiplier: f64,
     pub alt_outlier_stop_pct: f64,
     pub alt_outlier_take_profit_pct: f64,
     pub alt_outlier_max_hold_minutes: u32,
@@ -193,6 +209,8 @@ impl Default for RiskConfig {
             alt_outlier_gross_per_trade: 0.05,
             alt_outlier_opposed_size_multiplier: 0.50,
             alt_outlier_neutral_size_multiplier: 0.75,
+            alt_outlier_breadth_opposed_size_multiplier: 0.35,
+            alt_outlier_breadth_neutral_size_multiplier: 0.65,
             alt_outlier_stop_pct: 0.012,
             alt_outlier_take_profit_pct: 0.020,
             alt_outlier_max_hold_minutes: 180,
@@ -246,6 +264,16 @@ impl StrategyConfig {
             || !(0.01..=0.30).contains(&self.recipes.outlier_min_return_4h_pct)
             || !(1.0..=10.0).contains(&self.recipes.outlier_min_volume_ratio)
             || !(0.10..=0.95).contains(&self.recipes.outlier_min_efficiency)
+            || !(0.0005..=0.01).contains(&self.recipes.outlier_confirmation_min_5m_pct)
+            || !(0.003..=0.03).contains(&self.recipes.outlier_confirmation_max_5m_pct)
+            || self.recipes.outlier_confirmation_min_5m_pct
+                >= self.recipes.outlier_confirmation_max_5m_pct
+            || !(0.10..=0.80).contains(&self.recipes.outlier_max_directional_wick_ratio)
+            || !(1.2..=6.0).contains(&self.recipes.outlier_max_climax_range_ratio)
+            || self.recipes.outlier_pullback_min_pct <= 0.0
+            || self.recipes.outlier_pullback_min_pct >= self.recipes.outlier_pullback_max_pct
+            || self.recipes.outlier_pullback_max_pct > 0.05
+            || !(3..=30).contains(&self.recipes.outlier_candidate_expiry_minutes)
         {
             return Err("outlier recipe parameters are outside safe paper ranges".into());
         }
@@ -274,6 +302,10 @@ impl StrategyConfig {
             || self.risk.alt_outlier_opposed_size_multiplier == 0.0
             || !(0.0..=1.0).contains(&self.risk.alt_outlier_neutral_size_multiplier)
             || self.risk.alt_outlier_neutral_size_multiplier == 0.0
+            || !(0.0..=1.0).contains(&self.risk.alt_outlier_breadth_opposed_size_multiplier)
+            || self.risk.alt_outlier_breadth_opposed_size_multiplier == 0.0
+            || !(0.0..=1.0).contains(&self.risk.alt_outlier_breadth_neutral_size_multiplier)
+            || self.risk.alt_outlier_breadth_neutral_size_multiplier == 0.0
             || !(0.0..=0.03).contains(&self.risk.alt_outlier_stop_pct)
             || self.risk.alt_outlier_stop_pct == 0.0
             || !(0.0..=0.06).contains(&self.risk.alt_outlier_take_profit_pct)
