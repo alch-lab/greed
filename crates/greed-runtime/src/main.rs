@@ -378,7 +378,7 @@ async fn run_paper(config: AppConfig, iterations: u64) -> Result<()> {
                 });
                 history.append("paper_equity", observation.clone())?;
                 journal.append("paper_equity", observation)?;
-                status.write(&serde_json::json!({"as_of_ms":frame.as_of_ms,"paper_only":true,"account":account,"sleeves":sleeves,"funnels":funnels,"recipe_gates":recipe_gates,"positions":broker.positions(),"graph":summarize(&evaluation),"artifacts":evaluation.artifacts,"data_health":data_health,"runtime":identity}))?;
+                status.write(&serde_json::json!({"as_of_ms":frame.as_of_ms,"paper_only":true,"account":account,"sleeves":sleeves,"funnels":funnels,"recipe_gates":recipe_gates,"positions":broker.position_snapshots(&frame),"graph":summarize(&evaluation),"artifacts":evaluation.artifacts,"data_health":data_health,"runtime":identity}))?;
                 completed += 1;
                 info!(
                     iteration = completed,

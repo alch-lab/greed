@@ -30,6 +30,16 @@ pub struct PaperPosition {
     pub last_bar_ms: i64,
 }
 
+#[derive(Debug, Serialize)]
+pub struct PositionSnapshot<'a> {
+    #[serde(flatten)]
+    pub position: &'a PaperPosition,
+    pub current_price: Option<f64>,
+    pub current_notional_usd: Option<f64>,
+    pub unrealized_pnl_usd: Option<f64>,
+    pub unrealized_pnl_pct: Option<f64>,
+}
+
 fn unknown_recipe() -> String {
     "unknown".into()
 }
@@ -309,6 +319,38 @@ impl PaperBroker {
     }
     pub fn positions(&self) -> &BTreeMap<String, PaperPosition> {
         &self.positions
+    }
+    pub fn position_snapshots<'a>(
+        &'a self,
+        frame: &MarketFrame,
+    ) -> BTreeMap<&'a str, PositionSnapshot<'a>> {
+        self.positions
+            .iter()
+            .map(|(symbol, position)| {
+                let current_price = frame.instrument(symbol).map(|instrument| instrument.price);
+                let current_notional_usd =
+                    current_price.map(|price| price * position.remaining_quantity);
+                let unrealized_pnl_usd = current_price.map(|price| {
+                    position.side.sign()
+                        * (price - position.entry_price)
+                        * position.remaining_quantity
+                });
+                let entry_notional_usd = position.entry_price * position.remaining_quantity;
+                let unrealized_pnl_pct = unrealized_pnl_usd
+                    .filter(|_| entry_notional_usd > f64::EPSILON)
+                    .map(|pnl| pnl / entry_notional_usd);
+                (
+                    symbol.as_str(),
+                    PositionSnapshot {
+                        position,
+                        current_price,
+                        current_notional_usd,
+                        unrealized_pnl_usd,
+                        unrealized_pnl_pct,
+                    },
+                )
+            })
+            .collect()
     }
     pub fn has_seen(&self, candidate_id: &str) -> bool {
         self.seen.contains(candidate_id)
@@ -874,6 +916,27 @@ mod tests {
         let position = broker.positions().get("BTCUSDT").unwrap();
         assert!((position.remaining_quantity - position.quantity * 0.5).abs() < 1e-9);
         assert!(position.stop_price > position.entry_price);
+    }
+
+    #[test]
+    fn position_snapshot_marks_unrealized_pnl_at_the_current_frame() {
+        let mut broker = PaperBroker::with_risk(
+            PaperConfig {
+                fee_bps_per_side: 0.0,
+                slippage_bps_per_side: 0.0,
+                ..PaperConfig::default()
+            },
+            RiskConfig::default(),
+        );
+        broker.apply_plans(&frame(1_000_000, 100.0, 100.0, 100.0), &evaluation());
+
+        let marked_frame = frame(1_900_000, 101.0, 100.0, 101.0);
+        let snapshots = broker.position_snapshots(&marked_frame);
+        let snapshot = snapshots.get("BTCUSDT").unwrap();
+        assert_eq!(snapshot.current_price, Some(101.0));
+        assert!((snapshot.current_notional_usd.unwrap() - 606.0).abs() < 1e-9);
+        assert!((snapshot.unrealized_pnl_usd.unwrap() - 6.0).abs() < 1e-9);
+        assert!((snapshot.unrealized_pnl_pct.unwrap() - 0.01).abs() < 1e-9);
     }
 
     #[test]
