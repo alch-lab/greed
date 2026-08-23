@@ -97,6 +97,11 @@ type DiscoveryRow = (
     Option<f64>,
 );
 
+// The all-market ticker stream only includes contracts whose rolling ticker
+// changed in that update. A quiet but liquid contract must not fall out of the
+// universe merely because it was absent from a few one-second arrays.
+const DISCOVERY_TICKER_TTL_MS: i64 = 60_000;
+
 fn median_abs(values: impl Iterator<Item = Option<f64>>, floor: f64) -> f64 {
     let mut values: Vec<_> = values.flatten().map(f64::abs).collect();
     values.sort_by(f64::total_cmp);
@@ -207,7 +212,8 @@ impl BinanceMarketSource {
         let eligible: BTreeSet<_> = self.eligible_contracts.iter().cloned().collect();
         let mut rows = Vec::new();
         for (symbol, ticker) in tickers {
-            if !eligible.contains(&symbol) || now_ms - ticker.received_ms > 15_000 {
+            if !eligible.contains(&symbol) || now_ms - ticker.received_ms > DISCOVERY_TICKER_TTL_MS
+            {
                 continue;
             }
             let price = ticker.price;
