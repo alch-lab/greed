@@ -80,6 +80,7 @@ pub struct RecipeConfig {
     pub cross_rebalance_bars: usize,
     pub cross_opportunity_driven: bool,
     pub alt_neutral_anchor_allowed: bool,
+    pub alt_shock_neutral_anchor_allowed: bool,
     pub shock_min_return_pct: f64,
     pub shock_min_reversal_pct: f64,
     pub shock_min_volume_ratio: f64,
@@ -99,6 +100,7 @@ impl Default for RecipeConfig {
             cross_rebalance_bars: 24,
             cross_opportunity_driven: true,
             alt_neutral_anchor_allowed: false,
+            alt_shock_neutral_anchor_allowed: false,
             shock_min_return_pct: 0.045,
             shock_min_reversal_pct: 0.006,
             shock_min_volume_ratio: 2.5,
@@ -111,6 +113,10 @@ impl Default for RecipeConfig {
 pub struct RiskConfig {
     pub major_gross_per_trade: f64,
     pub alt_gross_per_trade: f64,
+    pub alt_neutral_anchor_size_multiplier: f64,
+    pub alt_neutral_anchor_stop_pct: f64,
+    pub alt_neutral_anchor_take_profit_pct: f64,
+    pub alt_neutral_anchor_max_hold_minutes: u32,
     pub major_max_gross: f64,
     pub alt_max_gross: f64,
     pub max_total_gross: f64,
@@ -136,6 +142,10 @@ impl Default for RiskConfig {
         Self {
             major_gross_per_trade: 0.20,
             alt_gross_per_trade: 0.10,
+            alt_neutral_anchor_size_multiplier: 0.60,
+            alt_neutral_anchor_stop_pct: 0.012,
+            alt_neutral_anchor_take_profit_pct: 0.018,
+            alt_neutral_anchor_max_hold_minutes: 240,
             major_max_gross: 0.50,
             alt_max_gross: 0.50,
             max_total_gross: 1.0,
@@ -191,6 +201,22 @@ impl StrategyConfig {
             || self.risk.alt_gross_per_trade > self.risk.alt_max_gross
         {
             return Err("per-trade gross may not exceed its capital bucket".into());
+        }
+        if !(0.0..=1.0).contains(&self.risk.alt_neutral_anchor_size_multiplier)
+            || self.risk.alt_neutral_anchor_size_multiplier == 0.0
+        {
+            return Err("alt_neutral_anchor_size_multiplier must be in (0, 1]".into());
+        }
+        if !(0.0..=0.03).contains(&self.risk.alt_neutral_anchor_stop_pct)
+            || self.risk.alt_neutral_anchor_stop_pct == 0.0
+            || !(0.0..=0.05).contains(&self.risk.alt_neutral_anchor_take_profit_pct)
+            || self.risk.alt_neutral_anchor_take_profit_pct == 0.0
+            || self.risk.alt_neutral_anchor_max_hold_minutes == 0
+        {
+            return Err(
+                "neutral-anchor stop/take-profit must be positive and hold time must be non-zero"
+                    .into(),
+            );
         }
         if self.risk.rolling_pf_window < self.risk.rolling_pf_min_trades
             || self.risk.rolling_pf_min_trades < 3

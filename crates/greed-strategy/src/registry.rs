@@ -111,7 +111,7 @@ pub fn build_graph(config: &StrategyConfig) -> Result<StrategyGraph, GraphError>
                 r.shock_min_return_pct,
                 r.shock_min_reversal_pct,
                 r.shock_min_volume_ratio,
-                r.alt_neutral_anchor_allowed,
+                r.alt_shock_neutral_anchor_allowed,
                 anchor,
                 &config.altcoins,
             )));

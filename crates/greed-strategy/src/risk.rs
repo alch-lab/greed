@@ -19,6 +19,15 @@ impl PositionPlannerNode {
         }
     }
 }
+
+fn candidate_size_multiplier(config: &RiskConfig, tags: &BTreeMap<String, String>) -> f64 {
+    if tags.get("anchor_confirmation").map(String::as_str) == Some("neutral") {
+        config.alt_neutral_anchor_size_multiplier
+    } else {
+        1.0
+    }
+}
+
 impl StrategyNode for PositionPlannerNode {
     fn id(&self) -> &str {
         &self.id
@@ -95,11 +104,18 @@ impl StrategyNode for PositionPlannerNode {
             let Some(instrument) = ctx.frame.instrument(&candidate.symbol) else {
                 continue;
             };
-            let per_trade = if instrument.asset_class == AssetClass::Major {
+            let base_per_trade = if instrument.asset_class == AssetClass::Major {
                 self.config.major_gross_per_trade
             } else {
                 self.config.alt_gross_per_trade
             };
+            let neutral_anchor = candidate
+                .tags
+                .get("anchor_confirmation")
+                .map(String::as_str)
+                == Some("neutral");
+            let per_trade =
+                base_per_trade * candidate_size_multiplier(&self.config, &candidate.tags);
             let bucket_has_room = match instrument.asset_class {
                 AssetClass::Major => major_gross + per_trade <= self.config.major_max_gross,
                 AssetClass::Altcoin => alt_gross + per_trade <= self.config.alt_max_gross,
@@ -115,21 +131,33 @@ impl StrategyNode for PositionPlannerNode {
                 AssetClass::Major => major_gross += per_trade,
                 AssetClass::Altcoin => alt_gross += per_trade,
             }
-            let stop_pct = match candidate.tags.get("stop_profile").map(String::as_str) {
-                Some("exhaustion") => self.config.initial_stop_pct * 0.75,
-                Some("alt_shock") => self.config.initial_stop_pct * 1.5,
-                Some("alt_cross") => self.config.alt_cross_stop_pct,
-                _ => self.config.initial_stop_pct,
+            let stop_pct = if neutral_anchor {
+                self.config.alt_neutral_anchor_stop_pct
+            } else {
+                match candidate.tags.get("stop_profile").map(String::as_str) {
+                    Some("exhaustion") => self.config.initial_stop_pct * 0.75,
+                    Some("alt_shock") => self.config.initial_stop_pct * 1.5,
+                    Some("alt_cross") => self.config.alt_cross_stop_pct,
+                    _ => self.config.initial_stop_pct,
+                }
             };
-            let take_profit_pct = match candidate.tags.get("stop_profile").map(String::as_str) {
-                Some("alt_cross") => self.config.alt_cross_take_profit_pct,
-                _ => self.config.first_take_profit_pct,
+            let take_profit_pct = if neutral_anchor {
+                self.config.alt_neutral_anchor_take_profit_pct
+            } else {
+                match candidate.tags.get("stop_profile").map(String::as_str) {
+                    Some("alt_cross") => self.config.alt_cross_take_profit_pct,
+                    _ => self.config.first_take_profit_pct,
+                }
             };
             let stop_price = candidate.reference_price * (1.0 - candidate.side.sign() * stop_pct);
             let tp = candidate.reference_price * (1.0 + candidate.side.sign() * take_profit_pct);
-            let max_hold_minutes = match candidate.tags.get("hold_profile").map(String::as_str) {
-                Some("alt_cross") => self.config.alt_cross_max_hold_minutes,
-                _ => self.config.max_hold_minutes,
+            let max_hold_minutes = if neutral_anchor {
+                self.config.alt_neutral_anchor_max_hold_minutes
+            } else {
+                match candidate.tags.get("hold_profile").map(String::as_str) {
+                    Some("alt_cross") => self.config.alt_cross_max_hold_minutes,
+                    _ => self.config.max_hold_minutes,
+                }
             };
             let plan = PositionPlan {
                 candidate_id: candidate.id.clone(),
@@ -151,5 +179,20 @@ impl StrategyNode for PositionPlannerNode {
             });
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn neutral_btc_anchor_reduces_altcoin_candidate_size() {
+        let config = RiskConfig::default();
+        let neutral = BTreeMap::from([("anchor_confirmation".into(), "neutral".into())]);
+        let confirmed = BTreeMap::from([("anchor_confirmation".into(), "confirmed".into())]);
+
+        assert_eq!(candidate_size_multiplier(&config, &neutral), 0.60);
+        assert_eq!(candidate_size_multiplier(&config, &confirmed), 1.0);
     }
 }

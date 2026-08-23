@@ -38,7 +38,8 @@ cargo build --release
 blocker、recipe 归属、程序 commit/config 版本及 Binance 限流/重试/延迟遥测。`report`
 会把这些事件汇总成逐日、分资金桶、分 recipe 的一周审计报告。
 
-Major 使用高确认、低频参数；Altcoin 在 BTC 与市场广度同向后机会驱动入场，以 8 小时
+Major 使用高确认、低频参数；Altcoin 在 BTC 与市场广度同向时以标准仓位机会驱动入场，
+BTC 中性但山寨币广度明确时允许 30% 缩仓、短周期止盈止损探索，BTC 明确反向时仍阻止入场。策略以 8 小时
 cycle 去重，并由滚动 10 笔 PF 门控限制坏行情中的连续试错。所有等待条件和 PF 拒单均会
 进入状态、历史和周报。
 

@@ -165,6 +165,7 @@ fn profiles(base: &StrategyConfig) -> Vec<(String, StrategyConfig)> {
     let mut responsive = base.clone();
     responsive.recipes.cross_opportunity_driven = true;
     responsive.recipes.alt_neutral_anchor_allowed = true;
+    responsive.recipes.alt_shock_neutral_anchor_allowed = true;
     responsive.primitives.trend_min_return_pct = 0.0045;
     responsive.primitives.breadth_threshold = 0.006;
     responsive.primitives.breadth_horizon_bars = 48;
@@ -197,12 +198,25 @@ fn profiles(base: &StrategyConfig) -> Vec<(String, StrategyConfig)> {
     selective.risk.alt_cross_stop_pct = 0.018;
     selective.risk.alt_cross_take_profit_pct = 0.03;
     selective.risk.alt_cross_max_hold_minutes = 960;
-    vec![
+    let mut profiles = vec![
         ("legacy_fixed_strict".into(), legacy),
         ("opportunity_balanced".into(), balanced),
         ("opportunity_responsive".into(), responsive),
         ("opportunity_selective".into(), selective),
-    ]
+    ];
+    for multiplier in [0.30, 0.45, 0.60] {
+        let mut neutral = base.clone();
+        neutral.recipes.alt_neutral_anchor_allowed = true;
+        neutral.risk.alt_neutral_anchor_size_multiplier = multiplier;
+        profiles.push((
+            format!(
+                "opportunity_selective_neutral_{}pct",
+                (multiplier * 100.0) as u32
+            ),
+            neutral,
+        ));
+    }
+    profiles
 }
 
 fn simulate(
@@ -305,7 +319,10 @@ impl Ledger {
         match kind {
             "paper_entry" => {
                 self.entry_fees.insert(id.clone(), fee);
-                let recipe = candidate_recipe(&id);
+                let recipe = payload["recipe"]
+                    .as_str()
+                    .map(str::to_owned)
+                    .unwrap_or_else(|| candidate_recipe(&id));
                 self.recipe_by_candidate.insert(id, recipe.clone());
                 self.side_by_candidate.insert(
                     payload["candidate_id"].as_str().unwrap_or("").into(),
@@ -331,6 +348,8 @@ fn candidate_recipe(id: &str) -> String {
         "major_trend_pullback"
     } else if id.contains("exhaustion") {
         "major_exhaustion_reversal"
+    } else if id.contains("cross_section") && id.contains("neutral") {
+        "alt_cross_section_probe"
     } else if id.contains("cross_section") {
         "alt_cross_section_momentum"
     } else if id.contains("shock_reversal") {

@@ -149,9 +149,16 @@ impl StrategyNode for AltCrossSectionNode {
             "anchor_neutral".into(),
             if anchor_neutral { 1.0 } else { 0.0 },
         );
-        if anchor_conflict || (anchor_neutral && !self.neutral_anchor_allowed) {
+        let neutral_short = anchor_neutral && side == Side::Sell;
+        metrics.insert(
+            "neutral_short".into(),
+            if neutral_short { 1.0 } else { 0.0 },
+        );
+        if anchor_conflict || (anchor_neutral && (!self.neutral_anchor_allowed || neutral_short)) {
             let reason = if anchor_conflict {
                 "BTC trend explicitly opposes altcoin market breadth"
+            } else if neutral_short && self.neutral_anchor_allowed {
+                "BTC is neutral; exploratory altcoin shorts require explicit BTC confirmation"
             } else {
                 "BTC trend is neutral and strict anchor confirmation is enabled"
             };
@@ -216,10 +223,7 @@ impl StrategyNode for AltCrossSectionNode {
             Some(side),
             Verdict::Pass,
             if anchor_neutral {
-                vec![
-                    "BTC is neutral; strong altcoin breadth is allowed with normal risk caps"
-                        .into(),
-                ]
+                vec!["BTC is neutral; strong altcoin breadth is allowed at reduced size".into()]
             } else {
                 vec![]
             },
@@ -235,13 +239,25 @@ impl StrategyNode for AltCrossSectionNode {
                 blockers.push("ranked symbol is not moving in market direction".into());
             }
             let candidate_key = if self.opportunity_driven {
-                format!("cycle-{cycle}")
+                format!(
+                    "cycle-{cycle}-{}",
+                    if anchor_neutral {
+                        "neutral"
+                    } else {
+                        "confirmed"
+                    }
+                )
             } else {
                 signal_ms.to_string()
             };
             let candidate = TradeCandidate {
                 id: format!("{}:{}:{candidate_key}", self.id, instrument.symbol),
-                recipe: "alt_cross_section_momentum".into(),
+                recipe: if anchor_neutral {
+                    "alt_cross_section_probe"
+                } else {
+                    "alt_cross_section_momentum"
+                }
+                .into(),
                 symbol: instrument.symbol.clone(),
                 side,
                 signal_ms,

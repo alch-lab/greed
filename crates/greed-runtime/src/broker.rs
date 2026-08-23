@@ -394,6 +394,7 @@ impl PaperBroker {
             "major_trend_pullback",
             "major_exhaustion_reversal",
             "alt_cross_section_momentum",
+            "alt_cross_section_probe",
             "alt_shock_reversal",
         ]
         .into_iter()
@@ -771,6 +772,10 @@ fn recipe_from_candidate(candidate_id: &str) -> &'static str {
         "major_trend_pullback"
     } else if candidate_id.contains("exhaustion") {
         "major_exhaustion_reversal"
+    } else if (candidate_id.contains("cross_section") || candidate_id.contains("cross-section"))
+        && candidate_id.contains("neutral")
+    {
+        "alt_cross_section_probe"
     } else if candidate_id.contains("cross_section") || candidate_id.contains("cross-section") {
         "alt_cross_section_momentum"
     } else if candidate_id.contains("shock_reversal") || candidate_id.contains("shock-reversal") {

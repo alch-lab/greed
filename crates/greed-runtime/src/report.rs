@@ -488,6 +488,10 @@ fn recipe_from_id(id: &str) -> &'static str {
         "major_trend_pullback"
     } else if id.contains("exhaustion") {
         "major_exhaustion_reversal"
+    } else if (id.contains("cross_section") || id.contains("cross-section"))
+        && id.contains("neutral")
+    {
+        "alt_cross_section_probe"
     } else if id.contains("cross_section") || id.contains("cross-section") {
         "alt_cross_section_momentum"
     } else if id.contains("shock_reversal") || id.contains("shock-reversal") {
