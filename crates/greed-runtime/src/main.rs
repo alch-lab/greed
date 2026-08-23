@@ -314,10 +314,12 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
     let identity = runtime_identity(&config, started_ms);
     let _monitor = monitor::start(&config.runtime).await?;
     let mut source = BinanceMarketSource::new(config.runtime.clone())?;
-    source
-        .start_market_stream(&config.strategy)
-        .await
-        .context("Binance market websocket initialization failed")?;
+    if let Err(error) = source.start_market_stream(&config.strategy).await {
+        // The stream hub owns reconnect loops. A cold-start timeout must halt
+        // trading, but it must not kill the monitoring API or systemd service;
+        // subsequent paper frames keep retrying until fresh market data exists.
+        warn!(error=%error, "Binance market websocket is not warm; keeping runtime alive and blocking orders until reconnect");
+    }
     let mut execution = BinanceDemoExecution::connect(
         config.execution.clone(),
         config.portfolio.clone(),
