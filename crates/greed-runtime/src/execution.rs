@@ -728,20 +728,16 @@ impl BinanceDemoExecution {
     }
 
     pub fn recipe_gate_snapshots(&self, now_ms: i64) -> BTreeMap<String, RecipeGateStatus> {
-        [
-            "trend_continuation",
-            "liquidation_impulse",
-            "cross_venue_crowding",
-        ]
-        .into_iter()
-        .flat_map(|recipe| {
-            [Side::Buy, Side::Sell].into_iter().map(move |side| {
-                let key = gate_key(recipe, side);
-                let status = self.recipe_gate_status(&key, now_ms);
-                (key, status)
+        ["trend_continuation", "ignition_sprint"]
+            .into_iter()
+            .flat_map(|recipe| {
+                [Side::Buy, Side::Sell].into_iter().map(move |side| {
+                    let key = gate_key(recipe, side);
+                    let status = self.recipe_gate_status(&key, now_ms);
+                    (key, status)
+                })
             })
-        })
-        .collect()
+            .collect()
     }
 
     pub fn position_symbols(&self) -> impl Iterator<Item = &String> {
@@ -910,7 +906,7 @@ impl BinanceDemoExecution {
                         .and_then(|value| value.parse::<i64>().ok());
                     events.push(ExchangeEvent {
                         kind: "exchange_entry".into(),
-                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"entry_price":entry_price,"quantity":quantity,"notional_usd":plan.notional_usd * size_multiplier,"probe_size_multiplier":size_multiplier,"order_id":order_id,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
+                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"entry_mode":if plan.entry_limit.is_some(){"post_only_limit"}else{"market"},"requested_limit":plan.entry_limit,"entry_price":entry_price,"quantity":quantity,"notional_usd":plan.notional_usd * size_multiplier,"probe_size_multiplier":size_multiplier,"order_id":order_id,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
                     });
                 }
                 Err(error) => events.push(ExchangeEvent {
@@ -965,8 +961,16 @@ impl BinanceDemoExecution {
         .await
         .with_context(|| format!("set {} leverage to {}x", plan.symbol, self.config.leverage))?;
         let client_id = client_order_id("entry", &plan.candidate_id);
-        let entry = self
-            .submit_or_lookup(
+        let entry = if let Some(limit) = plan.entry_limit {
+            let price = if plan.side == Side::Buy {
+                floor_step(limit, rules.price_tick)
+            } else {
+                ceil_step(limit, rules.price_tick)
+            };
+            self.place_post_only_entry(plan, quantity, price, rules, &client_id)
+                .await?
+        } else {
+            self.submit_or_lookup(
                 &plan.symbol,
                 &client_id,
                 vec![
@@ -978,8 +982,12 @@ impl BinanceDemoExecution {
                     ("newOrderRespType".into(), "RESULT".into()),
                 ],
             )
-            .await?;
+            .await?
+        };
         let executed = parse_f64(&entry, "executedQty").unwrap_or(quantity);
+        if executed <= f64::EPSILON {
+            return Err(anyhow!("entry order completed without a fill"));
+        }
         let entry_price = parse_f64(&entry, "avgPrice")
             .filter(|value| *value > 0.0)
             .unwrap_or(plan.reference_price);
@@ -1065,6 +1073,101 @@ impl BinanceDemoExecution {
             stop_price,
             take_profit_prices,
         ))
+    }
+
+    async fn place_post_only_entry(
+        &self,
+        plan: &greed_kernel::PositionPlan,
+        quantity: f64,
+        price: f64,
+        rules: &SymbolRules,
+        client_id: &str,
+    ) -> Result<Value> {
+        let mut order = self
+            .submit_or_lookup(
+                &plan.symbol,
+                client_id,
+                vec![
+                    ("symbol".into(), plan.symbol.clone()),
+                    ("side".into(), side_name(plan.side).into()),
+                    ("type".into(), "LIMIT".into()),
+                    ("timeInForce".into(), "GTX".into()),
+                    ("quantity".into(), decimal(quantity, rules.quantity_step)),
+                    ("price".into(), decimal(price, rules.price_tick)),
+                    ("newClientOrderId".into(), client_id.into()),
+                    ("newOrderRespType".into(), "ACK".into()),
+                ],
+            )
+            .await?;
+        let deadline =
+            chrono::Utc::now().timestamp_millis() + plan.entry_timeout_ms.clamp(5_000, 60_000);
+        loop {
+            let status = order.get("status").and_then(Value::as_str).unwrap_or("NEW");
+            if status == "FILLED" {
+                return Ok(order);
+            }
+            if matches!(status, "CANCELED" | "EXPIRED" | "REJECTED") {
+                let executed = parse_f64(&order, "executedQty").unwrap_or_default();
+                if executed > f64::EPSILON {
+                    return Ok(order);
+                }
+                return Err(anyhow!("post-only entry ended with status {status}"));
+            }
+            if chrono::Utc::now().timestamp_millis() >= deadline {
+                let canceled = match self
+                    .signed(
+                        Method::DELETE,
+                        "/fapi/v1/order",
+                        vec![
+                            ("symbol".into(), plan.symbol.clone()),
+                            ("origClientOrderId".into(), client_id.into()),
+                        ],
+                    )
+                    .await
+                {
+                    Ok(value) => value,
+                    Err(cancel_error) => self
+                        .signed(
+                            Method::GET,
+                            "/fapi/v1/order",
+                            vec![
+                                ("symbol".into(), plan.symbol.clone()),
+                                ("origClientOrderId".into(), client_id.into()),
+                            ],
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "post-only cancel failed ({cancel_error}) and final reconciliation failed"
+                            )
+                        })?,
+                };
+                let executed = parse_f64(&canceled, "executedQty")
+                    .or_else(|| parse_f64(&order, "executedQty"))
+                    .unwrap_or_default();
+                if executed > f64::EPSILON {
+                    return Ok(canceled);
+                }
+                return Err(anyhow!(
+                    "post-only entry expired without fill after {}ms",
+                    plan.entry_timeout_ms
+                ));
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            if let Ok(value) = self
+                .signed(
+                    Method::GET,
+                    "/fapi/v1/order",
+                    vec![
+                        ("symbol".into(), plan.symbol.clone()),
+                        ("origClientOrderId".into(), client_id.into()),
+                    ],
+                )
+                .await
+            {
+                order = value;
+            }
+        }
     }
 
     async fn place_close_all_trigger(
@@ -1376,6 +1479,14 @@ fn gate_key(recipe: &str, side: Side) -> String {
 fn floor_step(value: f64, step: f64) -> f64 {
     (value / step).floor() * step
 }
+
+fn ceil_step(value: f64, step: f64) -> f64 {
+    if step <= 0.0 {
+        value
+    } else {
+        (value / step).ceil() * step
+    }
+}
 fn round_step(value: f64, step: f64) -> f64 {
     (value / step).round() * step
 }
@@ -1406,6 +1517,7 @@ mod tests {
     fn exchange_quantization_never_rounds_quantity_up() {
         assert_eq!(floor_step(1.239, 0.01), 1.23);
         assert_eq!(decimal(1.23, 0.01), "1.23");
+        assert_eq!(ceil_step(1.231, 0.01), 1.24);
     }
 
     #[test]

@@ -98,23 +98,32 @@ pub struct BookState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DerivativesState {
-    pub meta: ObservationMeta,
-    pub open_interest_usd: Option<f64>,
-    pub open_interest_change_pct: Option<f64>,
-    pub funding_rate: Option<f64>,
-    pub basis_pct: Option<f64>,
-    pub long_liquidations_usd: Option<f64>,
-    pub short_liquidations_usd: Option<f64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MicrostructureState {
     pub meta: ObservationMeta,
     pub buy_notional_60s: f64,
     pub sell_notional_60s: f64,
     pub long_liquidations_60s: f64,
     pub short_liquidations_60s: f64,
+    /// Cont-style top-of-book order-flow imbalance derived from consecutive
+    /// 500ms depth snapshots and normalized by average visible top-level
+    /// notional. This is snapshot OFI, not exchange tick-by-tick L2 OFI.
+    #[serde(default)]
+    pub snapshot_ofi_10s: Option<f64>,
+    #[serde(default)]
+    pub snapshot_ofi_60s: Option<f64>,
+    #[serde(default)]
+    pub mid_return_bps_10s: Option<f64>,
+    #[serde(default)]
+    pub mid_return_bps_60s: Option<f64>,
+    /// Absolute price response per unit of normalized snapshot OFI. A low
+    /// value means aggressive book pressure produced little price progress,
+    /// which is an absorption candidate rather than a trading signal.
+    #[serde(default)]
+    pub price_impact_bps_per_ofi_10s: Option<f64>,
+    #[serde(default)]
+    pub book_updates_10s: u32,
+    #[serde(default)]
+    pub book_updates_60s: u32,
 }
 
 impl MicrostructureState {
@@ -125,31 +134,16 @@ impl MicrostructureState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct CrossVenueState {
-    pub meta: ObservationMeta,
-    pub hyper_mark_price: f64,
-    pub hyper_open_interest_usd: f64,
-    pub hyper_funding_per_hour: f64,
-    pub hyper_premium_pct: Option<f64>,
-    pub binance_funding_per_hour: Option<f64>,
-    pub funding_gap_per_hour: Option<f64>,
-    pub mark_premium_pct: Option<f64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct InstrumentFrame {
     pub symbol: String,
     pub price: f64,
     pub perpetual: CandleSeries,
     /// Optional short-interval perpetual candles used for execution timing.
     pub fast_perpetual: Option<CandleSeries>,
-    /// Optional one-minute websocket observations collected for execution research.
-    /// These remain observation-only until a survivorship-safe backtest supports them.
+    /// One-minute websocket observations used by the ignition reclaim entry.
     pub micro_perpetual: Option<CandleSeries>,
     pub book: Option<BookState>,
-    pub derivatives: Option<DerivativesState>,
     pub microstructure: Option<MicrostructureState>,
-    pub cross_venue: Option<CrossVenueState>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

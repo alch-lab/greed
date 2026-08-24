@@ -17,6 +17,15 @@ use tracing::warn;
 const STREAM_TTL_MS: i64 = 15_000;
 const CANDLE_CACHE_LIMIT: usize = 200;
 const TICKER_HISTORY_MS: i64 = 20 * 60_000;
+const BOOK_FLOW_HISTORY_MS: i64 = 2 * 60_000;
+
+#[derive(Debug, Clone)]
+struct BookFlowObservation {
+    event_ms: i64,
+    raw_ofi_usd: f64,
+    visible_top_usd: f64,
+    mid: f64,
+}
 
 #[derive(Debug, Clone)]
 pub struct StreamTicker {
@@ -35,15 +44,6 @@ impl StreamTicker {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct StreamMark {
-    pub event_ms: i64,
-    pub received_ms: i64,
-    pub mark_price: f64,
-    pub index_price: f64,
-    pub funding_rate: Option<f64>,
-}
-
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct StreamTelemetry {
     pub radar_connected: bool,
@@ -60,6 +60,9 @@ pub struct StreamTelemetry {
     pub last_error: Option<String>,
     pub subscribed_symbols: usize,
     pub micro_candle_symbols: usize,
+    /// Symbols with enough recent depth changes to calculate a 10-second
+    /// snapshot OFI observation.
+    pub book_flow_ready_symbols: usize,
 }
 
 #[derive(Default)]
@@ -69,9 +72,8 @@ struct StreamState {
     candles: BTreeMap<(String, String), VecDeque<Candle>>,
     candle_update_ms: BTreeMap<(String, String), i64>,
     books: BTreeMap<String, BookState>,
-    marks: BTreeMap<String, StreamMark>,
+    book_flow: BTreeMap<String, VecDeque<BookFlowObservation>>,
     trades: BTreeMap<String, VecDeque<(i64, bool, f64)>>,
-    liquidations: BTreeMap<String, VecDeque<(i64, bool, f64)>>,
     telemetry: StreamTelemetry,
 }
 
@@ -134,15 +136,6 @@ impl MarketStreamHub {
             })
     }
 
-    pub fn mark(&self, symbol: &str) -> Option<StreamMark> {
-        self.state
-            .read()
-            .expect("stream state poisoned")
-            .marks
-            .get(&symbol.to_uppercase())
-            .cloned()
-    }
-
     pub fn microstructure(&self, symbol: &str, now_ms: i64) -> Option<MicrostructureState> {
         let symbol = symbol.to_uppercase();
         let state = self.state.read().expect("stream state poisoned");
@@ -156,19 +149,15 @@ impl MarketStreamHub {
                 sell += notional
             }
         }
-        let mut long_liq = 0.0;
-        let mut short_liq = 0.0;
-        if let Some(values) = state.liquidations.get(&symbol) {
-            for (_, is_long, notional) in values.iter().filter(|(ts, _, _)| *ts >= now_ms - 60_000)
-            {
-                if *is_long {
-                    long_liq += notional
-                } else {
-                    short_liq += notional
-                }
-            }
-        }
         let latest = trades.back().map(|value| value.0).unwrap_or_default();
+        let flow_10s = state
+            .book_flow
+            .get(&symbol)
+            .and_then(|values| aggregate_book_flow(values, now_ms, 10_000));
+        let flow_60s = state
+            .book_flow
+            .get(&symbol)
+            .and_then(|values| aggregate_book_flow(values, now_ms, 60_000));
         Some(MicrostructureState {
             meta: ObservationMeta {
                 event_ms: latest,
@@ -183,8 +172,18 @@ impl MarketStreamHub {
             },
             buy_notional_60s: buy,
             sell_notional_60s: sell,
-            long_liquidations_60s: long_liq,
-            short_liquidations_60s: short_liq,
+            long_liquidations_60s: 0.0,
+            short_liquidations_60s: 0.0,
+            snapshot_ofi_10s: flow_10s.as_ref().map(|value| value.normalized_ofi),
+            snapshot_ofi_60s: flow_60s.as_ref().map(|value| value.normalized_ofi),
+            mid_return_bps_10s: flow_10s.as_ref().map(|value| value.mid_return_bps),
+            mid_return_bps_60s: flow_60s.as_ref().map(|value| value.mid_return_bps),
+            price_impact_bps_per_ofi_10s: flow_10s.as_ref().and_then(|value| {
+                (value.normalized_ofi.abs() > 1e-9)
+                    .then_some(value.mid_return_bps.abs() / value.normalized_ofi.abs())
+            }),
+            book_updates_10s: flow_10s.as_ref().map_or(0, |value| value.updates),
+            book_updates_60s: flow_60s.as_ref().map_or(0, |value| value.updates),
         })
     }
 
@@ -195,6 +194,12 @@ impl MarketStreamHub {
             .candles
             .iter()
             .filter(|((_, interval), values)| interval == "1m" && !values.is_empty())
+            .count();
+        let now_ms = chrono::Utc::now().timestamp_millis();
+        telemetry.book_flow_ready_symbols = state
+            .book_flow
+            .values()
+            .filter(|values| aggregate_book_flow(values, now_ms, 10_000).is_some())
             .count();
         telemetry
     }
@@ -326,9 +331,7 @@ fn market_url(base: &str, symbols: &[String]) -> String {
         streams.push(format!("{symbol}@kline_15m"));
         streams.push(format!("{symbol}@kline_5m"));
         streams.push(format!("{symbol}@kline_1m"));
-        streams.push(format!("{symbol}@markPrice@1s"));
         streams.push(format!("{symbol}@aggTrade"));
-        streams.push(format!("{symbol}@forceOrder"));
     }
     format!(
         "{}/market/stream?streams={}",
@@ -380,9 +383,7 @@ fn handle_payload(
     }
     match payload.get("e").and_then(Value::as_str) {
         Some("kline") => update_kline(state, payload, received_ms),
-        Some("markPriceUpdate") => update_mark(state, payload, received_ms),
         Some("aggTrade") => update_trade(state, payload, received_ms),
-        Some("forceOrder") => update_liquidation(state, payload, received_ms),
         Some("24hrTicker") => update_ticker(state, payload, received_ms),
         _ if (payload.get("b").is_some() || payload.get("bids").is_some())
             && (payload.get("a").is_some() || payload.get("asks").is_some()) =>
@@ -404,38 +405,6 @@ fn update_trade(state: &Arc<RwLock<StreamState>>, value: &Value, received_ms: i6
     let mut state = state.write().expect("stream state poisoned");
     let values = state.trades.entry(symbol).or_default();
     values.push_back((event_ms, is_taker_buy, notional));
-    while values
-        .front()
-        .is_some_and(|(ts, _, _)| *ts < received_ms - 120_000)
-    {
-        values.pop_front();
-    }
-    Ok(())
-}
-
-fn update_liquidation(
-    state: &Arc<RwLock<StreamState>>,
-    value: &Value,
-    received_ms: i64,
-) -> Result<()> {
-    let order = value
-        .get("o")
-        .ok_or_else(|| anyhow!("missing force order payload"))?;
-    let symbol = string(order, "s")?.to_uppercase();
-    let price = optional_number(order, "ap")
-        .filter(|v| *v > 0.0)
-        .unwrap_or(number(order, "p")?);
-    let quantity = optional_number(order, "z")
-        .filter(|v| *v > 0.0)
-        .unwrap_or(number(order, "q")?);
-    let is_long_liquidation = string(order, "S")? == "SELL";
-    let event_ms = order
-        .get("T")
-        .and_then(Value::as_i64)
-        .unwrap_or(received_ms);
-    let mut state = state.write().expect("stream state poisoned");
-    let values = state.liquidations.entry(symbol).or_default();
-    values.push_back((event_ms, is_long_liquidation, price * quantity));
     while values
         .front()
         .is_some_and(|(ts, _, _)| *ts < received_ms - 120_000)
@@ -521,24 +490,6 @@ fn update_kline(state: &Arc<RwLock<StreamState>>, value: &Value, received_ms: i6
     Ok(())
 }
 
-fn update_mark(state: &Arc<RwLock<StreamState>>, value: &Value, received_ms: i64) -> Result<()> {
-    let symbol = string(value, "s")?.to_uppercase();
-    state.write().expect("stream state poisoned").marks.insert(
-        symbol,
-        StreamMark {
-            event_ms: value
-                .get("E")
-                .and_then(Value::as_i64)
-                .unwrap_or(received_ms),
-            received_ms,
-            mark_price: number(value, "p")?,
-            index_price: number(value, "i")?,
-            funding_rate: optional_number(value, "r"),
-        },
-    );
-    Ok(())
-}
-
 fn update_depth(state: &Arc<RwLock<StreamState>>, value: &Value, received_ms: i64) -> Result<()> {
     let symbol = string(value, "s")?.to_uppercase();
     let parse = |short: &str, long: &str| -> Result<Vec<(f64, f64)>> {
@@ -591,12 +542,105 @@ fn update_depth(state: &Arc<RwLock<StreamState>>, value: &Value, received_ms: i6
             })
             .collect(),
     };
-    state
-        .write()
-        .expect("stream state poisoned")
-        .books
-        .insert(symbol, book);
+    let mut state = state.write().expect("stream state poisoned");
+    if let Some(previous) = state.books.get(&symbol) {
+        if let Some(observation) = book_flow_observation(previous, &book) {
+            let values = state.book_flow.entry(symbol.clone()).or_default();
+            values.push_back(observation);
+            while values
+                .front()
+                .is_some_and(|value| value.event_ms < received_ms - BOOK_FLOW_HISTORY_MS)
+            {
+                values.pop_front();
+            }
+        }
+    }
+    state.books.insert(symbol, book);
     Ok(())
+}
+
+fn book_flow_observation(previous: &BookState, current: &BookState) -> Option<BookFlowObservation> {
+    if previous.bid <= 0.0
+        || previous.ask <= 0.0
+        || current.bid <= 0.0
+        || current.ask <= 0.0
+        || previous.bids.is_empty()
+        || previous.asks.is_empty()
+        || current.bids.is_empty()
+        || current.asks.is_empty()
+    {
+        return None;
+    }
+    let previous_bid = previous.bids.first()?;
+    let current_bid = current.bids.first()?;
+    let previous_ask = previous.asks.first()?;
+    let current_ask = current.asks.first()?;
+    let previous_bid_usd = previous_bid.price * previous_bid.quantity;
+    let current_bid_usd = current_bid.price * current_bid.quantity;
+    let previous_ask_usd = previous_ask.price * previous_ask.quantity;
+    let current_ask_usd = current_ask.price * current_ask.quantity;
+
+    let bid_flow = if current_bid.price > previous_bid.price {
+        current_bid_usd
+    } else if current_bid.price == previous_bid.price {
+        current_bid_usd - previous_bid_usd
+    } else {
+        -previous_bid_usd
+    };
+    let ask_flow = if current_ask.price < previous_ask.price {
+        -current_ask_usd
+    } else if current_ask.price == previous_ask.price {
+        previous_ask_usd - current_ask_usd
+    } else {
+        previous_ask_usd
+    };
+    Some(BookFlowObservation {
+        event_ms: current.meta.event_ms,
+        raw_ofi_usd: bid_flow + ask_flow,
+        visible_top_usd: ((previous_bid_usd
+            + current_bid_usd
+            + previous_ask_usd
+            + current_ask_usd)
+            / 4.0)
+            .max(f64::EPSILON),
+        mid: (current.bid + current.ask) / 2.0,
+    })
+}
+
+struct BookFlowAggregate {
+    normalized_ofi: f64,
+    mid_return_bps: f64,
+    updates: u32,
+}
+
+fn aggregate_book_flow(
+    values: &VecDeque<BookFlowObservation>,
+    now_ms: i64,
+    window_ms: i64,
+) -> Option<BookFlowAggregate> {
+    let selected: Vec<_> = values
+        .iter()
+        .filter(|value| value.event_ms >= now_ms - window_ms && value.event_ms <= now_ms + 1_000)
+        .collect();
+    if selected.len() < 2 {
+        return None;
+    }
+    let raw_ofi = selected.iter().map(|value| value.raw_ofi_usd).sum::<f64>();
+    let average_visible = selected
+        .iter()
+        .map(|value| value.visible_top_usd)
+        .sum::<f64>()
+        / selected.len() as f64;
+    let first_mid = selected.first()?.mid;
+    let last_mid = selected.last()?.mid;
+    if first_mid <= 0.0 || average_visible <= 0.0 {
+        return None;
+    }
+    Some(BookFlowAggregate {
+        normalized_ofi: raw_ofi / average_visible,
+        mid_return_bps: (last_mid / first_mid - 1.0) * 10_000.0,
+        updates: u32::try_from(selected.len()).unwrap_or(u32::MAX),
+    })
 }
 
 fn set_connected(
@@ -700,6 +744,38 @@ fn sweep_slippage(levels: &[(f64, f64)], notional: f64, reference: f64) -> Optio
 mod tests {
     use super::*;
 
+    fn test_book(
+        event_ms: i64,
+        bid: f64,
+        bid_quantity: f64,
+        ask: f64,
+        ask_quantity: f64,
+    ) -> BookState {
+        BookState {
+            meta: ObservationMeta {
+                event_ms,
+                received_ms: event_ms,
+                expires_ms: event_ms + STREAM_TTL_MS,
+                source: "test".into(),
+                quality: DataQuality::Complete,
+            },
+            bid,
+            ask,
+            bid_depth_usd: bid * bid_quantity,
+            ask_depth_usd: ask * ask_quantity,
+            expected_buy_slippage_bps: None,
+            expected_sell_slippage_bps: None,
+            bids: vec![PriceLevel {
+                price: bid,
+                quantity: bid_quantity,
+            }],
+            asks: vec![PriceLevel {
+                price: ask,
+                quantity: ask_quantity,
+            }],
+        }
+    }
+
     #[test]
     fn parses_combined_ticker_kline_and_depth_messages() {
         let state = Arc::new(RwLock::new(StreamState::default()));
@@ -741,7 +817,7 @@ mod tests {
         assert!(market.contains("ybusdt@kline_1m"));
         assert!(market.contains("btcusdt@kline_5m"));
         assert!(market.contains("btcusdt@aggTrade"));
-        assert!(market.contains("btcusdt@forceOrder"));
+        assert!(!market.contains("forceOrder"));
         assert!(public.contains("/public/stream?streams="));
         assert!(public.contains("btcusdt@depth20@500ms"));
     }
@@ -764,5 +840,43 @@ mod tests {
         let ticker = state.read().unwrap().tickers["YBUSDT"].clone();
         assert!((ticker.return_1m.unwrap() - 0.10).abs() < 1e-9);
         assert!(ticker.return_5m.is_none());
+    }
+
+    #[test]
+    fn snapshot_ofi_is_positive_when_bid_queue_grows() {
+        let previous = test_book(1_000, 99.0, 10.0, 101.0, 10.0);
+        let current = test_book(1_500, 99.0, 20.0, 101.0, 10.0);
+        let observation = book_flow_observation(&previous, &current).unwrap();
+        assert!(observation.raw_ofi_usd > 0.0);
+    }
+
+    #[test]
+    fn snapshot_ofi_is_negative_when_ask_queue_grows() {
+        let previous = test_book(1_000, 99.0, 10.0, 101.0, 10.0);
+        let current = test_book(1_500, 99.0, 10.0, 101.0, 20.0);
+        let observation = book_flow_observation(&previous, &current).unwrap();
+        assert!(observation.raw_ofi_usd < 0.0);
+    }
+
+    #[test]
+    fn aggregates_snapshot_ofi_and_price_response() {
+        let values = VecDeque::from([
+            BookFlowObservation {
+                event_ms: 1_000,
+                raw_ofi_usd: 1_000.0,
+                visible_top_usd: 10_000.0,
+                mid: 100.0,
+            },
+            BookFlowObservation {
+                event_ms: 1_500,
+                raw_ofi_usd: 2_000.0,
+                visible_top_usd: 10_000.0,
+                mid: 100.1,
+            },
+        ]);
+        let aggregate = aggregate_book_flow(&values, 1_500, 10_000).unwrap();
+        assert!((aggregate.normalized_ofi - 0.3).abs() < 1e-9);
+        assert!((aggregate.mid_return_bps - 10.0).abs() < 1e-9);
+        assert_eq!(aggregate.updates, 2);
     }
 }

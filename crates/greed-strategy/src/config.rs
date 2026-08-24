@@ -48,8 +48,7 @@ impl Default for UniverseConfig {
 #[serde(default)]
 pub struct LaneConfig {
     pub trend_continuation_enabled: bool,
-    pub liquidation_impulse_enabled: bool,
-    pub cross_venue_crowding_enabled: bool,
+    pub ignition_sprint_enabled: bool,
     pub max_candidates_per_lane: usize,
     pub max_spread_bps: f64,
     pub min_depth_usd: f64,
@@ -58,21 +57,25 @@ pub struct LaneConfig {
     pub trend_min_hour_volume_ratio: f64,
     pub trend_min_flow_imbalance: f64,
     pub trend_max_signal_age_seconds: u32,
-    pub liquidation_min_notional_usd: f64,
-    pub liquidation_min_oi_fraction: f64,
-    pub liquidation_min_oi_flush_pct: f64,
-    pub liquidation_min_reclaim_pct: f64,
-    pub crowding_min_funding_gap_per_hour: f64,
-    pub crowding_min_premium_abs_pct: f64,
-    pub crowding_min_oi_change_pct: f64,
+    pub ignition_min_return_5m: f64,
+    pub ignition_min_volume_ratio: f64,
+    pub ignition_min_flow_imbalance: f64,
+    pub ignition_reclaim_flow_imbalance: f64,
+    pub ignition_max_extension_30m: f64,
+    pub ignition_max_wait_seconds: u32,
+    pub ignition_limit_offset_atr: f64,
+    pub ignition_entry_timeout_seconds: u32,
+    pub ignition_stop_atr_multiple: f64,
+    pub ignition_target_r: f64,
+    pub ignition_max_hold_minutes: u32,
+    pub ignition_risk_per_trade_pct: f64,
 }
 
 impl Default for LaneConfig {
     fn default() -> Self {
         Self {
             trend_continuation_enabled: true,
-            liquidation_impulse_enabled: false,
-            cross_venue_crowding_enabled: false,
+            ignition_sprint_enabled: true,
             max_candidates_per_lane: 2,
             max_spread_bps: 6.0,
             min_depth_usd: 75_000.0,
@@ -81,13 +84,18 @@ impl Default for LaneConfig {
             trend_min_hour_volume_ratio: 0.65,
             trend_min_flow_imbalance: 0.0,
             trend_max_signal_age_seconds: 300,
-            liquidation_min_notional_usd: 50_000.0,
-            liquidation_min_oi_fraction: 0.0005,
-            liquidation_min_oi_flush_pct: 0.003,
-            liquidation_min_reclaim_pct: 0.0015,
-            crowding_min_funding_gap_per_hour: 0.00002,
-            crowding_min_premium_abs_pct: 0.001,
-            crowding_min_oi_change_pct: 0.003,
+            ignition_min_return_5m: 0.010,
+            ignition_min_volume_ratio: 3.0,
+            ignition_min_flow_imbalance: 0.20,
+            ignition_reclaim_flow_imbalance: 0.10,
+            ignition_max_extension_30m: 0.03,
+            ignition_max_wait_seconds: 180,
+            ignition_limit_offset_atr: 0.05,
+            ignition_entry_timeout_seconds: 30,
+            ignition_stop_atr_multiple: 1.0,
+            ignition_target_r: 1.25,
+            ignition_max_hold_minutes: 10,
+            ignition_risk_per_trade_pct: 0.0025,
         }
     }
 }
@@ -168,9 +176,18 @@ impl StrategyConfig {
             || !(-0.50..=0.50).contains(&lanes.trend_min_flow_imbalance)
             || lanes.max_spread_bps <= 0.0
             || lanes.min_depth_usd <= 0.0
-            || lanes.liquidation_min_notional_usd <= 0.0
-            || !(0.0001..=0.01).contains(&lanes.liquidation_min_oi_fraction)
-            || lanes.crowding_min_funding_gap_per_hour <= 0.0
+            || !(0.003..=0.03).contains(&lanes.ignition_min_return_5m)
+            || !(1.0..=10.0).contains(&lanes.ignition_min_volume_ratio)
+            || !(0.0..=0.8).contains(&lanes.ignition_min_flow_imbalance)
+            || !(0.0..=0.8).contains(&lanes.ignition_reclaim_flow_imbalance)
+            || !(0.01..=0.10).contains(&lanes.ignition_max_extension_30m)
+            || !(60..=300).contains(&lanes.ignition_max_wait_seconds)
+            || !(0.0..=0.5).contains(&lanes.ignition_limit_offset_atr)
+            || !(5..=60).contains(&lanes.ignition_entry_timeout_seconds)
+            || !(0.5..=3.0).contains(&lanes.ignition_stop_atr_multiple)
+            || !(0.5..=3.0).contains(&lanes.ignition_target_r)
+            || !(3..=30).contains(&lanes.ignition_max_hold_minutes)
+            || !(0.001..=0.005).contains(&lanes.ignition_risk_per_trade_pct)
         {
             return Err("alpha lane parameters are invalid".into());
         }

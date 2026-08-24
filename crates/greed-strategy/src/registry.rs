@@ -1,8 +1,5 @@
 use crate::{
-    recipes::{
-        cross_venue_crowding::CrossVenueCrowdingNode, liquidation_impulse::LiquidationImpulseNode,
-        trend_continuation::TrendContinuationNode,
-    },
+    recipes::{ignition_sprint::IgnitionSprintNode, trend_continuation::TrendContinuationNode},
     risk::PositionPlannerNode,
     StrategyConfig,
 };
@@ -18,19 +15,12 @@ pub fn build_graph(config: &StrategyConfig) -> Result<StrategyGraph, GraphError>
         )));
         lanes.push("lane.trend_continuation".into());
     }
-    if config.lanes.liquidation_impulse_enabled {
-        nodes.push(Box::new(LiquidationImpulseNode::new(
+    if config.lanes.ignition_sprint_enabled {
+        nodes.push(Box::new(IgnitionSprintNode::new(
             &config.symbols,
             config.lanes.clone(),
         )));
-        lanes.push("lane.liquidation_impulse".into());
-    }
-    if config.lanes.cross_venue_crowding_enabled {
-        nodes.push(Box::new(CrossVenueCrowdingNode::new(
-            &config.symbols,
-            config.lanes.clone(),
-        )));
-        lanes.push("lane.cross_venue_crowding".into());
+        lanes.push("lane.ignition_sprint".into());
     }
     nodes.push(Box::new(PositionPlannerNode::new(
         lanes,

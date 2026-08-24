@@ -1,11 +1,8 @@
 [runtime]
 # proxy = "http://127.0.0.1:7890"
 binance_futures_ws_base = "wss://fstream.binance.com"
-hyperliquid_info_url = "https://api.hyperliquid.xyz/info"
-hyperliquid_refresh_seconds = 60
 poll_seconds = 15
 stream_warmup_seconds = 20
-oi_refresh_seconds = 120
 request_spacing_ms = 150
 request_timeout_seconds = 8
 candle_limit = 160
@@ -41,8 +38,7 @@ refresh_seconds = 15
 
 [strategy.lanes]
 trend_continuation_enabled = true
-liquidation_impulse_enabled = false
-cross_venue_crowding_enabled = false
+ignition_sprint_enabled = true
 max_candidates_per_lane = 2
 max_spread_bps = 6.0
 min_depth_usd = 75000.0
@@ -51,13 +47,18 @@ trend_min_efficiency = 0.45
 trend_min_hour_volume_ratio = 0.65
 trend_min_flow_imbalance = 0.0
 trend_max_signal_age_seconds = 300
-liquidation_min_notional_usd = 50000.0
-liquidation_min_oi_fraction = 0.0005
-liquidation_min_oi_flush_pct = 0.003
-liquidation_min_reclaim_pct = 0.0015
-crowding_min_funding_gap_per_hour = 0.00002
-crowding_min_premium_abs_pct = 0.001
-crowding_min_oi_change_pct = 0.003
+ignition_min_return_5m = 0.010
+ignition_min_volume_ratio = 3.0
+ignition_min_flow_imbalance = 0.20
+ignition_reclaim_flow_imbalance = 0.10
+ignition_max_extension_30m = 0.03
+ignition_max_wait_seconds = 180
+ignition_limit_offset_atr = 0.05
+ignition_entry_timeout_seconds = 30
+ignition_stop_atr_multiple = 1.0
+ignition_target_r = 1.25
+ignition_max_hold_minutes = 10
+ignition_risk_per_trade_pct = 0.0025
 
 [strategy.risk]
 risk_per_trade_pct = 0.010

@@ -5,6 +5,14 @@ use greed_kernel::{
 };
 use std::collections::BTreeMap;
 
+fn tag_f64(candidate: &greed_kernel::TradeCandidate, key: &str) -> Option<f64> {
+    candidate.tags.get(key)?.parse().ok()
+}
+
+fn tag_i64(candidate: &greed_kernel::TradeCandidate, key: &str) -> Option<i64> {
+    candidate.tags.get(key)?.parse().ok()
+}
+
 pub struct PositionPlannerNode {
     id: String,
     dependencies: Vec<String>,
@@ -97,12 +105,20 @@ impl StrategyNode for PositionPlannerNode {
             if !market_ok {
                 continue;
             }
-            let risk_pct = if c.confidence >= self.config.high_confidence_threshold {
+            let default_risk_pct = if c.confidence >= self.config.high_confidence_threshold {
                 self.config.high_confidence_risk_per_trade_pct
             } else {
                 self.config.risk_per_trade_pct
             };
-            let notional = (a.equity_usd * risk_pct / self.config.initial_stop_pct)
+            let risk_pct = tag_f64(c, "risk_per_trade_pct").unwrap_or(default_risk_pct);
+            let stop_pct = tag_f64(c, "stop_pct")
+                .unwrap_or(self.config.initial_stop_pct)
+                .clamp(0.003, 0.03);
+            let target_r = tag_f64(c, "target_r").unwrap_or(self.config.first_take_profit_r);
+            let take_fraction = tag_f64(c, "take_profit_fraction")
+                .unwrap_or(self.config.first_take_profit_fraction)
+                .clamp(0.1, 1.0);
+            let notional = (a.equity_usd * risk_pct / stop_pct)
                 .min(a.equity_usd * self.config.max_notional_per_trade_multiple);
             let multiple = notional / a.equity_usd.max(1.0);
             if planned_gross + multiple > self.config.max_total_gross_multiple + f64::EPSILON {
@@ -111,11 +127,10 @@ impl StrategyNode for PositionPlannerNode {
             planned_gross += multiple;
             slots -= 1;
             let sign = c.side.sign();
-            let stop = c.reference_price * (1.0 - sign * self.config.initial_stop_pct);
-            let tp1 = c.reference_price
-                * (1.0 + sign * self.config.initial_stop_pct * self.config.first_take_profit_r);
-            let mut take_profit_prices = vec![(tp1, self.config.first_take_profit_fraction)];
-            if self.config.runner_take_profit_r > 0.0 {
+            let stop = c.reference_price * (1.0 - sign * stop_pct);
+            let tp1 = c.reference_price * (1.0 + sign * stop_pct * target_r);
+            let mut take_profit_prices = vec![(tp1, take_fraction)];
+            if take_fraction < 1.0 && self.config.runner_take_profit_r > 0.0 {
                 let runner = c.reference_price
                     * (1.0
                         + sign * self.config.initial_stop_pct * self.config.runner_take_profit_r);
@@ -127,16 +142,17 @@ impl StrategyNode for PositionPlannerNode {
                 side: c.side,
                 reference_price: c.reference_price,
                 notional_usd: notional,
-                entry_limit: None,
+                entry_limit: tag_f64(c, "entry_limit"),
+                entry_timeout_ms: tag_i64(c, "entry_timeout_ms").unwrap_or_default(),
                 stop_price: stop,
                 take_profit_prices,
-                break_even_after_fraction: Some(self.config.first_take_profit_fraction),
+                break_even_after_fraction: (take_fraction < 1.0).then_some(take_fraction),
                 break_even_buffer_pct: self.config.break_even_buffer_pct,
-                trailing_activation_pct: Some(
-                    self.config.initial_stop_pct * self.config.first_take_profit_r,
-                ),
-                trailing_distance_pct: Some(self.config.trailing_distance_pct),
-                max_hold_ms: i64::from(self.config.max_hold_minutes) * 60_000,
+                trailing_activation_pct: (take_fraction < 1.0).then_some(stop_pct * target_r),
+                trailing_distance_pct: (take_fraction < 1.0)
+                    .then_some(self.config.trailing_distance_pct),
+                max_hold_ms: tag_i64(c, "max_hold_ms")
+                    .unwrap_or_else(|| i64::from(self.config.max_hold_minutes) * 60_000),
             };
             out.push(ArtifactRecord {
                 key: format!("plan.{}", c.id),

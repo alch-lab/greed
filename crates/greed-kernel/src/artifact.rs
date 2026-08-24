@@ -63,6 +63,7 @@ pub struct PositionPlan {
     pub reference_price: f64,
     pub notional_usd: f64,
     pub entry_limit: Option<f64>,
+    pub entry_timeout_ms: i64,
     pub stop_price: f64,
     pub take_profit_prices: Vec<(f64, f64)>,
     pub break_even_after_fraction: Option<f64>,

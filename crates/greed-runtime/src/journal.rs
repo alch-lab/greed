@@ -44,10 +44,10 @@ impl SampleRecorder {
                     "as_of_ms":frame.as_of_ms,
                     "symbol":instrument.symbol,
                     "price":instrument.price,
+                    "last_5m":instrument.fast_perpetual.as_ref().and_then(|series|series.values.last()),
+                    "last_1m":instrument.micro_perpetual.as_ref().and_then(|series|series.values.last()),
                     "book":instrument.book,
-                    "derivatives":instrument.derivatives,
-                    "microstructure":instrument.microstructure,
-                    "cross_venue":instrument.cross_venue
+                    "microstructure":instrument.microstructure
                 }),
             )?;
         }

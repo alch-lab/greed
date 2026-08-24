@@ -1,5 +1,5 @@
 [Unit]
-Description=greed paper strategy sampler
+Description=greed Binance Demo strategy runtime
 After=network-online.target
 Wants=network-online.target
 

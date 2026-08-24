@@ -196,8 +196,7 @@ fn strategy_funnels_demo(
     };
     serde_json::json!({
         "trend_continuation":build("trend_continuation"),
-        "liquidation_impulse":build("liquidation_impulse"),
-        "cross_venue_crowding":build("cross_venue_crowding")
+        "ignition_sprint":build("ignition_sprint")
     })
 }
 
@@ -277,8 +276,7 @@ async fn main() -> Result<()> {
             let graph = build_graph(&config.strategy)?;
             drop(graph);
             let enabled_lanes = usize::from(config.strategy.lanes.trend_continuation_enabled)
-                + usize::from(config.strategy.lanes.liquidation_impulse_enabled)
-                + usize::from(config.strategy.lanes.cross_venue_crowding_enabled);
+                + usize::from(config.strategy.lanes.ignition_sprint_enabled);
             println!(
                 "valid: {} seed symbols, {} funded alpha lane(s), paper_only=true, execution={:?}",
                 config.strategy.symbols.len(),

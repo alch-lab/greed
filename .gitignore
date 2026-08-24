@@ -8,4 +8,7 @@ out/
 /data/backtest/cache/
 /data/alpha-backtest/cache/
 /data/runtime/
+/data/alpha-backtest/
+/research/
+/tools/
 __pycache__/
