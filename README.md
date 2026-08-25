@@ -41,5 +41,13 @@ export BINANCE_DEMO_API_SECRET='...'
 ./target/release/greed paper --config config/demo.toml
 ```
 
+服务器首次启动或交易接口升级后，先停止运行时并执行零成交预检。脚本会验证普通订单 test
+endpoint，以及创建、查询并撤销一张远离市价的 Demo 条件保护单；它拒绝在存在持仓或挂单时运行：
+
+```bash
+sudo systemctl stop greed-paper
+sudo /opt/greed/deploy/preflight-binance-demo.sh /etc/greed-paper.env
+```
+
 API 默认监听 `127.0.0.1:8088`：`/api/health`、`/api/status`、`/api/events`、
 `/api/history`。运行细节见 [架构说明](docs/ARCHITECTURE.zh-CN.md)。
