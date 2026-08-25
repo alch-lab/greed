@@ -94,4 +94,6 @@ rolling_pf_min_trades = 8
 rolling_pf_floor = 1.00
 rolling_pf_cooldown_minutes = 360
 rolling_pf_probe_size_multiplier = 1.00
-rolling_pf_epoch = 6
+# Epoch 7 starts after the Binance conditional-order API migration and
+# at-most-once candidate execution fix.
+rolling_pf_epoch = 7

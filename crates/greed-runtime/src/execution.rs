@@ -38,6 +38,12 @@ struct SymbolRules {
     min_notional: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+enum ProtectiveOrderId {
+    Standard(i64),
+    Algo(i64),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExecutionMeta {
     candidate_id: String,
@@ -89,6 +95,7 @@ struct DemoState {
     positions: BTreeMap<String, ExecutionMeta>,
     recipe_outcomes: BTreeMap<String, Vec<ExecutionOutcome>>,
     performance_epoch: u32,
+    execution_halt_reason: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -181,6 +188,7 @@ impl BinanceDemoExecution {
         if performance_epoch_reset {
             state.recipe_outcomes.clear();
             state.performance_epoch = risk.rolling_pf_epoch;
+            state.execution_halt_reason = None;
         }
         let mut value = Self {
             client,
@@ -199,6 +207,28 @@ impl BinanceDemoExecution {
             performance_epoch_reset,
         };
         value.initialize().await?;
+        if value.performance_epoch_reset {
+            let account_is_flat = value
+                .account
+                .as_ref()
+                .is_some_and(|account| account.positions.is_empty());
+            if !account_is_flat || !value.state.positions.is_empty() {
+                return Err(anyhow!(
+                    "cannot start a new performance epoch while Binance demo positions are open"
+                ));
+            }
+            let wallet = value
+                .account
+                .as_ref()
+                .map(|account| account.wallet_balance)
+                .ok_or_else(|| anyhow!("demo account not synchronized"))?;
+            value.state.baseline_wallet_usd = Some(wallet);
+            value.state.peak_equity_usd = Some(value.portfolio.initial_equity_usd);
+            value.state.risk_day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            value.state.risk_day_start_equity_usd = Some(value.portfolio.initial_equity_usd);
+            value.state.seen.clear();
+            value.save()?;
+        }
         Ok(value)
     }
 
@@ -315,7 +345,7 @@ impl BinanceDemoExecution {
                     .collect();
                 let mut events = Vec::new();
                 let mut protected: BTreeMap<String, (bool, bool)> = BTreeMap::new();
-                let mut stop_orders: BTreeMap<String, i64> = BTreeMap::new();
+                let mut stop_orders: BTreeMap<String, ProtectiveOrderId> = BTreeMap::new();
                 for symbol in account.positions.keys() {
                     let open_orders = self
                         .signed(
@@ -333,7 +363,37 @@ impl BinanceDemoExecution {
                             "STOP_MARKET" => {
                                 entry.0 = true;
                                 if let Some(order_id) = order["orderId"].as_i64() {
-                                    stop_orders.insert(symbol.clone(), order_id);
+                                    stop_orders.insert(
+                                        symbol.clone(),
+                                        ProtectiveOrderId::Standard(order_id),
+                                    );
+                                }
+                            }
+                            "TAKE_PROFIT_MARKET" => entry.1 = true,
+                            _ => {}
+                        }
+                    }
+                    let open_algo_orders = self
+                        .signed(
+                            Method::GET,
+                            "/fapi/v1/openAlgoOrders",
+                            vec![
+                                ("algoType".into(), "CONDITIONAL".into()),
+                                ("symbol".into(), symbol.clone()),
+                            ],
+                        )
+                        .await?;
+                    for order in open_algo_orders
+                        .as_array()
+                        .ok_or_else(|| anyhow!("openAlgoOrders response is not an array"))?
+                    {
+                        let entry = protected.entry(symbol.clone()).or_insert((false, false));
+                        match order["orderType"].as_str().unwrap_or_default() {
+                            "STOP_MARKET" => {
+                                entry.0 = true;
+                                if let Some(algo_id) = order["algoId"].as_i64() {
+                                    stop_orders
+                                        .insert(symbol.clone(), ProtectiveOrderId::Algo(algo_id));
                                 }
                             }
                             "TAKE_PROFIT_MARKET" => entry.1 = true,
@@ -490,7 +550,7 @@ impl BinanceDemoExecution {
                         .ok_or_else(|| anyhow!("missing exchange rules for {symbol}"))?;
                     let replacement = async {
                         if let Some(order_id) = stop_order_id {
-                            self.cancel_order(&symbol, order_id).await?;
+                            self.cancel_protective_order(&symbol, order_id).await?;
                         }
                         self.place_close_all_trigger(
                             &symbol,
@@ -812,6 +872,9 @@ impl BinanceDemoExecution {
         evaluation: &GraphEvaluation,
     ) -> Vec<ExchangeEvent> {
         let mut events = Vec::new();
+        if self.state.execution_halt_reason.is_some() {
+            return events;
+        }
         for record in evaluation.artifacts.values() {
             let Artifact::PositionPlan(plan) = &record.artifact else {
                 continue;
@@ -857,9 +920,15 @@ impl BinanceDemoExecution {
             } else {
                 1.0
             };
+            // Claim the candidate before touching the exchange. At-most-once is the
+            // safe failure mode: an entry can fill even when a later protection or
+            // reconciliation request fails. Retrying the same signal would open and
+            // flatten it repeatedly, paying spread and fees on every frame.
+            self.state.seen.insert(plan.candidate_id.clone());
+            self.save().ok();
+            let attempt_started_ms = chrono::Utc::now().timestamp_millis();
             match self.place_bracket(plan, size_multiplier).await {
                 Ok((entry_price, quantity, order_id, stop_price, take_profit_prices)) => {
-                    self.state.seen.insert(plan.candidate_id.clone());
                     self.state.positions.insert(
                         plan.symbol.clone(),
                         ExecutionMeta {
@@ -878,15 +947,17 @@ impl BinanceDemoExecution {
                                 .map(|value| value.0)
                                 .unwrap_or_default(),
                             take_profit_prices,
-                            break_even_after_fraction: plan.break_even_after_fraction.map(|fraction| {
-                                self.rules
-                                    .get(&plan.symbol)
-                                    .map(|rules| {
-                                        floor_step(quantity * fraction, rules.quantity_step)
-                                            / quantity.max(f64::EPSILON)
-                                    })
-                                    .unwrap_or(fraction)
-                            }),
+                            break_even_after_fraction: plan.break_even_after_fraction.map(
+                                |fraction| {
+                                    self.rules
+                                        .get(&plan.symbol)
+                                        .map(|rules| {
+                                            floor_step(quantity * fraction, rules.quantity_step)
+                                                / quantity.max(f64::EPSILON)
+                                        })
+                                        .unwrap_or(fraction)
+                                },
+                            ),
                             break_even_buffer_pct: plan.break_even_buffer_pct,
                             break_even_armed: false,
                             extreme_price: entry_price,
@@ -909,10 +980,41 @@ impl BinanceDemoExecution {
                         payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"entry_mode":if plan.entry_limit.is_some(){"post_only_limit"}else{"market"},"requested_limit":plan.entry_limit,"entry_price":entry_price,"quantity":quantity,"notional_usd":plan.notional_usd * size_multiplier,"probe_size_multiplier":size_multiplier,"order_id":order_id,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
                     });
                 }
-                Err(error) => events.push(ExchangeEvent {
-                    kind: "exchange_order_rejected".into(),
-                    payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"reason":error.to_string(),"venue":"binance_demo","paper_only":true}),
-                }),
+                Err(error) => {
+                    // A rejected bracket may still contain a filled entry followed
+                    // by an emergency close. Preserve that round trip in the
+                    // diagnostic ledger instead of reporting it as a zero-cost
+                    // rejection.
+                    let attempt = self
+                        .trade_summary(&plan.symbol, attempt_started_ms.saturating_sub(1_000))
+                        .await
+                        .ok();
+                    events.push(ExchangeEvent {
+                        kind: "exchange_order_rejected".into(),
+                        payload: serde_json::json!({
+                            "ts_ms":frame.as_of_ms,
+                            "candidate_id":plan.candidate_id,
+                            "recipe":recipe,
+                            "lane":recipe,
+                            "symbol":plan.symbol,
+                            "side":plan.side,
+                            "reason":error.to_string(),
+                            "attempt_exit_price":attempt.as_ref().map(|value| value.0),
+                            "attempt_exit_quantity":attempt.as_ref().map(|value| value.1),
+                            "attempt_fee_usd":attempt.as_ref().map(|value| value.2),
+                            "attempt_net_pnl_usd":attempt.as_ref().map(|value| value.3),
+                            "venue":"binance_demo",
+                            "paper_only":true
+                        }),
+                    });
+                    if error.to_string().contains("protective order failed") {
+                        self.state.execution_halt_reason = Some(format!(
+                            "execution halted after a filled entry could not establish protection: {error}"
+                        ));
+                        self.save().ok();
+                        break;
+                    }
+                }
             }
         }
         events
@@ -1179,21 +1281,21 @@ impl BinanceDemoExecution {
         rules: &SymbolRules,
         client_id: String,
     ) -> Result<()> {
-        self.submit_or_lookup(
-            symbol,
+        self.submit_algo_or_lookup(
             &client_id,
             vec![
+                ("algoType".into(), "CONDITIONAL".into()),
                 ("symbol".into(), symbol.into()),
                 ("side".into(), side_name(side).into()),
                 ("type".into(), kind.into()),
                 (
-                    "stopPrice".into(),
+                    "triggerPrice".into(),
                     decimal(round_step(trigger, rules.price_tick), rules.price_tick),
                 ),
                 ("closePosition".into(), "true".into()),
                 ("workingType".into(), "MARK_PRICE".into()),
                 ("priceProtect".into(), "true".into()),
-                ("newClientOrderId".into(), client_id.clone()),
+                ("clientAlgoId".into(), client_id.clone()),
             ],
         )
         .await?;
@@ -1209,22 +1311,22 @@ impl BinanceDemoExecution {
         rules: &SymbolRules,
         client_id: String,
     ) -> Result<()> {
-        self.submit_or_lookup(
-            symbol,
+        self.submit_algo_or_lookup(
             &client_id,
             vec![
+                ("algoType".into(), "CONDITIONAL".into()),
                 ("symbol".into(), symbol.into()),
                 ("side".into(), side_name(side).into()),
                 ("type".into(), "TAKE_PROFIT_MARKET".into()),
                 (
-                    "stopPrice".into(),
+                    "triggerPrice".into(),
                     decimal(round_step(trigger, rules.price_tick), rules.price_tick),
                 ),
                 ("quantity".into(), decimal(quantity, rules.quantity_step)),
                 ("reduceOnly".into(), "true".into()),
                 ("workingType".into(), "MARK_PRICE".into()),
                 ("priceProtect".into(), "true".into()),
-                ("newClientOrderId".into(), client_id.clone()),
+                ("clientAlgoId".into(), client_id.clone()),
             ],
         )
         .await?;
@@ -1272,26 +1374,88 @@ impl BinanceDemoExecution {
         }
     }
 
+    async fn submit_algo_or_lookup(
+        &self,
+        client_id: &str,
+        parameters: Vec<(String, String)>,
+    ) -> Result<Value> {
+        match self
+            .signed(Method::POST, "/fapi/v1/algoOrder", parameters)
+            .await
+        {
+            Ok(value) => Ok(value),
+            Err(submit_error) => {
+                let mut lookup_error = None;
+                for _ in 0..3 {
+                    tokio::time::sleep(Duration::from_millis(250)).await;
+                    match self
+                        .signed(
+                            Method::GET,
+                            "/fapi/v1/algoOrder",
+                            vec![("clientAlgoId".into(), client_id.into())],
+                        )
+                        .await
+                    {
+                        Ok(value) => return Ok(value),
+                        Err(error) => lookup_error = Some(error),
+                    }
+                }
+                Err(lookup_error.unwrap_or_else(|| anyhow!("algo order lookup failed")))
+                    .with_context(|| {
+                        format!(
+                            "algo order submission failed and deterministic reconciliation found no order: {submit_error}"
+                        )
+                    })
+            }
+        }
+    }
+
     async fn cancel_all(&self, symbol: &str) -> Result<()> {
-        self.signed(
-            Method::DELETE,
-            "/fapi/v1/allOpenOrders",
-            vec![("symbol".into(), symbol.into())],
-        )
-        .await?;
+        let regular = self
+            .signed(
+                Method::DELETE,
+                "/fapi/v1/allOpenOrders",
+                vec![("symbol".into(), symbol.into())],
+            )
+            .await;
+        let algo = self
+            .signed(
+                Method::DELETE,
+                "/fapi/v1/algoOpenOrders",
+                vec![("symbol".into(), symbol.into())],
+            )
+            .await;
+        regular.context("cancel regular open orders")?;
+        algo.context("cancel conditional algo orders")?;
         Ok(())
     }
 
-    async fn cancel_order(&self, symbol: &str, order_id: i64) -> Result<()> {
-        self.signed(
-            Method::DELETE,
-            "/fapi/v1/order",
-            vec![
-                ("symbol".into(), symbol.into()),
-                ("orderId".into(), order_id.to_string()),
-            ],
-        )
-        .await?;
+    async fn cancel_protective_order(
+        &self,
+        symbol: &str,
+        order_id: ProtectiveOrderId,
+    ) -> Result<()> {
+        match order_id {
+            ProtectiveOrderId::Standard(order_id) => {
+                self.signed(
+                    Method::DELETE,
+                    "/fapi/v1/order",
+                    vec![
+                        ("symbol".into(), symbol.into()),
+                        ("orderId".into(), order_id.to_string()),
+                    ],
+                )
+                .await?;
+            }
+            ProtectiveOrderId::Algo(algo_id) => {
+                self.signed(
+                    Method::DELETE,
+                    "/fapi/v1/algoOrder",
+                    vec![("algoId".into(), algo_id.to_string())],
+                )
+                .await?;
+            }
+        }
         Ok(())
     }
 
@@ -1373,7 +1537,8 @@ impl BinanceDemoExecution {
             "venue": "binance_demo",
             "authenticated": self.account.is_some(),
             "last_sync_ms": self.last_sync_ms,
-            "last_error": self.last_error,
+            "last_error": self.state.execution_halt_reason.as_ref().or(self.last_error.as_ref()),
+            "execution_halted": self.state.execution_halt_reason.is_some(),
             "remote_matching": true,
             "leverage": self.config.leverage,
             "performance_epoch": self.state.performance_epoch,
