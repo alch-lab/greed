@@ -82,6 +82,12 @@ struct ExecutionMeta {
     max_hold_ms: i64,
     #[serde(default)]
     exit_requested: bool,
+    #[serde(default)]
+    pending_exit_reason: Option<String>,
+    #[serde(default)]
+    stop_algo_id: Option<i64>,
+    #[serde(default)]
+    take_profit_order_ids: Vec<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -156,6 +162,8 @@ struct EntryExecution {
 
 #[derive(Debug, Clone, Default)]
 struct TradeSummary {
+    entry_price: f64,
+    entry_quantity: f64,
     exit_price: f64,
     exit_quantity: f64,
     last_exit_price: f64,
@@ -166,6 +174,21 @@ struct TradeSummary {
     taker_fills: usize,
     maker_notional_usd: f64,
     taker_notional_usd: f64,
+}
+
+#[derive(Debug)]
+struct BracketExecution {
+    entry_price: f64,
+    quantity: f64,
+    order_id: i64,
+    stop_price: f64,
+    take_profit_prices: Vec<(f64, f64)>,
+    stop_algo_id: i64,
+    take_profit_order_ids: Vec<i64>,
+    entry_mode: &'static str,
+    entry_price_source: &'static str,
+    maker_attempted: bool,
+    maker_wait_ms: i64,
 }
 
 #[derive(Debug)]
@@ -495,6 +518,8 @@ impl BinanceDemoExecution {
                             "side":side,
                             "reason":"staged_take_profit",
                             "exit_price":summary.as_ref().map(|value| value.last_exit_price),
+                            "trade_entry_price":summary.as_ref().map(|value| value.entry_price),
+                            "trade_entry_quantity":summary.as_ref().map(|value| value.entry_quantity),
                             "closed_quantity":closed_quantity,
                             "remaining_quantity":remaining_quantity,
                             "fee_usd":fee_delta,
@@ -610,10 +635,11 @@ impl BinanceDemoExecution {
                     }
                     .await;
                     match replacement {
-                        Ok(()) => {
+                        Ok(stop_algo_id) => {
                             if let Some(meta) = self.state.positions.get_mut(&symbol) {
                                 meta.stop_price = desired;
                                 meta.break_even_armed = true;
+                                meta.stop_algo_id = Some(stop_algo_id);
                             }
                             events.push(ExchangeEvent {
                                 kind: "exchange_protection_updated".into(),
@@ -628,6 +654,7 @@ impl BinanceDemoExecution {
                             })?;
                             if let Some(meta) = self.state.positions.get_mut(&symbol) {
                                 meta.exit_requested = true;
+                                meta.pending_exit_reason = Some("protection_update_failed".into());
                             }
                             events.push(ExchangeEvent {
                                 kind: "exchange_exit_requested".into(),
@@ -662,6 +689,7 @@ impl BinanceDemoExecution {
                         })?;
                         if let Some(meta) = self.state.positions.get_mut(&symbol) {
                             meta.exit_requested = true;
+                            meta.pending_exit_reason = Some("protection_missing".into());
                         }
                         events.push(ExchangeEvent {
                             kind: "exchange_exit_requested".into(),
@@ -675,6 +703,7 @@ impl BinanceDemoExecution {
                             Ok(()) => {
                                 if let Some(meta) = self.state.positions.get_mut(&symbol) {
                                     meta.exit_requested = true;
+                                    meta.pending_exit_reason = Some("max_hold".into());
                                 }
                                 events.push(ExchangeEvent {
                                     kind: "exchange_exit_requested".into(),
@@ -697,6 +726,8 @@ impl BinanceDemoExecution {
                     .collect();
                 for symbol in disappeared {
                     if let Some(meta) = self.state.positions.remove(&symbol) {
+                        let (exit_reason, exit_order_id, exit_order_status) =
+                            self.attribute_exit(&symbol, &meta).await;
                         self.cancel_all(&symbol).await.ok();
                         let summary = self
                             .trade_summary(&symbol, meta.entry_ms, meta.side)
@@ -726,6 +757,8 @@ impl BinanceDemoExecution {
                                 "symbol": symbol,
                                 "side": meta.side,
                                 "exit_price": summary.as_ref().map(|value| value.last_exit_price),
+                                "trade_entry_price": summary.as_ref().map(|value| value.entry_price),
+                                "trade_entry_quantity": summary.as_ref().map(|value| value.entry_quantity),
                                 "exit_quantity": summary.as_ref().map(|value| value.last_exit_quantity),
                                 "average_exit_price": summary.as_ref().map(|value| value.exit_price),
                                 "trade_exit_quantity": summary.as_ref().map(|value| value.exit_quantity),
@@ -739,7 +772,9 @@ impl BinanceDemoExecution {
                                 "mfe_pct": mfe_pct,
                                 "mae_pct": mae_pct,
                                 "hold_ms": now_ms - meta.entry_ms,
-                                "reason": "exchange_position_reconciled",
+                                "reason": exit_reason,
+                                "exit_order_id": exit_order_id,
+                                "exit_order_status": exit_order_status,
                                 "venue": "binance_demo"
                             }),
                         });
@@ -980,16 +1015,7 @@ impl BinanceDemoExecution {
             self.save().ok();
             let attempt_started_ms = chrono::Utc::now().timestamp_millis();
             match self.place_bracket(plan, size_multiplier).await {
-                Ok((
-                    entry_price,
-                    quantity,
-                    order_id,
-                    stop_price,
-                    take_profit_prices,
-                    entry_mode,
-                    maker_attempted,
-                    maker_wait_ms,
-                )) => {
+                Ok(fill) => {
                     self.state.positions.insert(
                         plan.symbol.clone(),
                         ExecutionMeta {
@@ -997,36 +1023,42 @@ impl BinanceDemoExecution {
                             recipe: recipe.clone(),
                             side: plan.side,
                             entry_ms: frame.as_of_ms,
-                            entry_price,
-                            initial_quantity: quantity,
-                            last_observed_quantity: quantity,
+                            entry_price: fill.entry_price,
+                            initial_quantity: fill.quantity,
+                            last_observed_quantity: fill.quantity,
                             cumulative_reported_fee_usd: 0.0,
                             cumulative_reported_pnl_usd: 0.0,
-                            stop_price,
-                            take_profit_price: take_profit_prices
+                            stop_price: fill.stop_price,
+                            take_profit_price: fill
+                                .take_profit_prices
                                 .last()
                                 .map(|value| value.0)
                                 .unwrap_or_default(),
-                            take_profit_prices,
+                            take_profit_prices: fill.take_profit_prices.clone(),
                             break_even_after_fraction: plan.break_even_after_fraction.map(
                                 |fraction| {
                                     self.rules
                                         .get(&plan.symbol)
                                         .map(|rules| {
-                                            floor_step(quantity * fraction, rules.quantity_step)
-                                                / quantity.max(f64::EPSILON)
+                                            floor_step(
+                                                fill.quantity * fraction,
+                                                rules.quantity_step,
+                                            ) / fill.quantity.max(f64::EPSILON)
                                         })
                                         .unwrap_or(fraction)
                                 },
                             ),
                             break_even_buffer_pct: plan.break_even_buffer_pct,
                             break_even_armed: false,
-                            extreme_price: entry_price,
-                            adverse_price: entry_price,
+                            extreme_price: fill.entry_price,
+                            adverse_price: fill.entry_price,
                             trailing_activation_pct: plan.trailing_activation_pct,
                             trailing_distance_pct: plan.trailing_distance_pct,
                             max_hold_ms: plan.max_hold_ms,
                             exit_requested: false,
+                            pending_exit_reason: None,
+                            stop_algo_id: Some(fill.stop_algo_id),
+                            take_profit_order_ids: fill.take_profit_order_ids.clone(),
                         },
                     );
                     self.save().ok();
@@ -1038,7 +1070,7 @@ impl BinanceDemoExecution {
                         .and_then(|value| value.parse::<i64>().ok());
                     events.push(ExchangeEvent {
                         kind: "exchange_entry".into(),
-                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"entry_mode":entry_mode,"maker_attempted":maker_attempted,"maker_wait_ms":maker_wait_ms,"requested_limit":plan.entry_limit,"entry_price":entry_price,"quantity":quantity,"notional_usd":plan.notional_usd * size_multiplier,"probe_size_multiplier":size_multiplier,"order_id":order_id,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
+                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"entry_mode":fill.entry_mode,"entry_price_source":fill.entry_price_source,"maker_attempted":fill.maker_attempted,"maker_wait_ms":fill.maker_wait_ms,"requested_limit":plan.entry_limit,"entry_price":fill.entry_price,"quantity":fill.quantity,"notional_usd":plan.notional_usd * size_multiplier,"probe_size_multiplier":size_multiplier,"order_id":fill.order_id,"stop_algo_id":fill.stop_algo_id,"take_profit_order_ids":fill.take_profit_order_ids,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
                     });
                 }
                 Err(error) => {
@@ -1091,7 +1123,7 @@ impl BinanceDemoExecution {
         &self,
         plan: &greed_kernel::PositionPlan,
         size_multiplier: f64,
-    ) -> Result<(f64, f64, i64, f64, Vec<(f64, f64)>, &'static str, bool, i64)> {
+    ) -> Result<BracketExecution> {
         let rules = self
             .rules
             .get(&plan.symbol)
@@ -1119,6 +1151,7 @@ impl BinanceDemoExecution {
                 ));
             }
         }
+        self.prepare_symbol_for_entry(&plan.symbol).await?;
         self.signed(
             Method::POST,
             "/fapi/v1/leverage",
@@ -1221,10 +1254,11 @@ impl BinanceDemoExecution {
         if executed <= f64::EPSILON {
             return Err(anyhow!("entry order completed without a fill"));
         }
-        let entry_price = parse_f64(&entry.order, "avgPrice")
-            .filter(|value| *value > 0.0)
-            .unwrap_or(plan.reference_price);
         let order_id = entry.order["orderId"].as_i64().unwrap_or_default();
+        let (entry_price, entry_price_source) = self
+            .resolve_entry_price(&plan.symbol, order_id, &entry.order, plan.side)
+            .await
+            .unwrap_or((plan.reference_price, "strategy_reference_fallback"));
         // Preserve the planned risk/reward distances from the actual exchange
         // fill. A fast market can move between signal construction and fill;
         // anchoring protection to the stale reference would silently change
@@ -1242,60 +1276,243 @@ impl BinanceDemoExecution {
             })
             .collect();
         let protective = async {
-            self.place_close_all_trigger(
-                &plan.symbol,
-                plan.side.opposite(),
-                "STOP_MARKET",
-                stop_price,
-                rules,
-                client_order_id("stop", &plan.candidate_id),
-            )
-            .await?;
-            for (index, (take_profit, fraction)) in take_profit_prices.iter().enumerate() {
-                self.place_reduce_only_take_profit(
+            let stop_algo_id = self
+                .place_close_all_trigger(
                     &plan.symbol,
                     plan.side.opposite(),
-                    *take_profit,
-                    floor_step(executed * fraction, rules.quantity_step),
+                    "STOP_MARKET",
+                    stop_price,
                     rules,
-                    client_order_id(&format!("take{index}"), &plan.candidate_id),
+                    client_order_id("stop", &plan.candidate_id),
                 )
                 .await?;
+            let mut take_profit_order_ids = Vec::new();
+            for (index, (take_profit, fraction)) in take_profit_prices.iter().enumerate() {
+                take_profit_order_ids.push(
+                    self.place_reduce_only_take_profit(
+                        &plan.symbol,
+                        plan.side.opposite(),
+                        *take_profit,
+                        floor_step(executed * fraction, rules.quantity_step),
+                        rules,
+                        client_order_id(&format!("take{index}"), &plan.candidate_id),
+                    )
+                    .await?,
+                );
             }
-            Result::<()>::Ok(())
+            Result::<(i64, Vec<i64>)>::Ok((stop_algo_id, take_profit_order_ids))
         }
         .await;
-        if let Err(error) = protective {
-            self.cancel_all(&plan.symbol).await.ok();
-            self.signed(
-                Method::POST,
-                "/fapi/v1/order",
-                vec![
-                    ("symbol".into(), plan.symbol.clone()),
-                    ("side".into(), side_name(plan.side.opposite()).into()),
-                    ("type".into(), "MARKET".into()),
-                    ("quantity".into(), decimal(executed, rules.quantity_step)),
-                    ("reduceOnly".into(), "true".into()),
-                ],
-            )
-            .await
-            .with_context(|| {
-                format!("protective order failed ({error}); emergency close also failed")
-            })?;
-            return Err(anyhow!(
-                "protective order failed; entry was immediately closed: {error}"
-            ));
-        }
-        Ok((
+        let (stop_algo_id, take_profit_order_ids) = match protective {
+            Ok(value) => value,
+            Err(error) => {
+                self.cancel_all(&plan.symbol).await.ok();
+                self.signed(
+                    Method::POST,
+                    "/fapi/v1/order",
+                    vec![
+                        ("symbol".into(), plan.symbol.clone()),
+                        ("side".into(), side_name(plan.side.opposite()).into()),
+                        ("type".into(), "MARKET".into()),
+                        ("quantity".into(), decimal(executed, rules.quantity_step)),
+                        ("reduceOnly".into(), "true".into()),
+                    ],
+                )
+                .await
+                .with_context(|| {
+                    format!("protective order failed ({error}); emergency close also failed")
+                })?;
+                return Err(anyhow!(
+                    "protective order failed; entry was immediately closed: {error}"
+                ));
+            }
+        };
+        Ok(BracketExecution {
             entry_price,
-            executed,
+            quantity: executed,
             order_id,
             stop_price,
             take_profit_prices,
-            entry.mode,
-            entry.maker_attempted,
-            entry.maker_wait_ms,
+            stop_algo_id,
+            take_profit_order_ids,
+            entry_mode: entry.mode,
+            entry_price_source,
+            maker_attempted: entry.maker_attempted,
+            maker_wait_ms: entry.maker_wait_ms,
+        })
+    }
+
+    async fn prepare_symbol_for_entry(&self, symbol: &str) -> Result<()> {
+        let regular = self
+            .signed(
+                Method::GET,
+                "/fapi/v1/openOrders",
+                vec![("symbol".into(), symbol.into())],
+            )
+            .await?;
+        for order in regular
+            .as_array()
+            .ok_or_else(|| anyhow!("openOrders response is not an array"))?
+        {
+            let client_id = order["clientOrderId"].as_str().unwrap_or_default();
+            if !client_id.starts_with("greed-") {
+                return Err(anyhow!(
+                    "{symbol} has a foreign open order; refusing to open a strategy position"
+                ));
+            }
+            self.signed(
+                Method::DELETE,
+                "/fapi/v1/order",
+                vec![
+                    ("symbol".into(), symbol.into()),
+                    ("orderId".into(), order["orderId"].to_string()),
+                ],
+            )
+            .await
+            .with_context(|| format!("cancel orphaned greed order on {symbol}"))?;
+        }
+
+        let algo = self
+            .signed(
+                Method::GET,
+                "/fapi/v1/openAlgoOrders",
+                vec![
+                    ("algoType".into(), "CONDITIONAL".into()),
+                    ("symbol".into(), symbol.into()),
+                ],
+            )
+            .await?;
+        for order in algo
+            .as_array()
+            .ok_or_else(|| anyhow!("openAlgoOrders response is not an array"))?
+        {
+            let client_id = order["clientAlgoId"].as_str().unwrap_or_default();
+            if !client_id.starts_with("greed-") {
+                return Err(anyhow!(
+                    "{symbol} has a foreign conditional order; refusing to open a strategy position"
+                ));
+            }
+            self.signed(
+                Method::DELETE,
+                "/fapi/v1/algoOrder",
+                vec![("algoId".into(), order["algoId"].to_string())],
+            )
+            .await
+            .with_context(|| format!("cancel orphaned greed conditional order on {symbol}"))?;
+        }
+        Ok(())
+    }
+
+    async fn resolve_entry_price(
+        &self,
+        symbol: &str,
+        order_id: i64,
+        order: &Value,
+        side: Side,
+    ) -> Result<(f64, &'static str)> {
+        if let Some(price) = order_average_price(order) {
+            return Ok((price, "order_response"));
+        }
+        if order_id > 0 {
+            if let Ok(reconciled) = self
+                .signed(
+                    Method::GET,
+                    "/fapi/v1/order",
+                    vec![
+                        ("symbol".into(), symbol.into()),
+                        ("orderId".into(), order_id.to_string()),
+                    ],
+                )
+                .await
+            {
+                if let Some(price) = order_average_price(&reconciled) {
+                    return Ok((price, "order_reconciliation"));
+                }
+            }
+            for _ in 0..3 {
+                let trades = self
+                    .signed(
+                        Method::GET,
+                        "/fapi/v1/userTrades",
+                        vec![
+                            ("symbol".into(), symbol.into()),
+                            ("orderId".into(), order_id.to_string()),
+                            ("limit".into(), "1000".into()),
+                        ],
+                    )
+                    .await?;
+                if let Some(rows) = trades.as_array() {
+                    if let Some(price) = average_fills(rows, side_name(side)) {
+                        return Ok((price, "user_trades"));
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        Err(anyhow!(
+            "Binance did not expose a verifiable entry fill price"
         ))
+    }
+
+    async fn attribute_exit(
+        &self,
+        symbol: &str,
+        meta: &ExecutionMeta,
+    ) -> (String, Option<i64>, Option<String>) {
+        if let Some(reason) = meta.pending_exit_reason.clone() {
+            return (reason, None, Some("requested".into()));
+        }
+        if let Some(algo_id) = meta.stop_algo_id {
+            if let Ok(order) = self
+                .signed(
+                    Method::GET,
+                    "/fapi/v1/algoOrder",
+                    vec![("algoId".into(), algo_id.to_string())],
+                )
+                .await
+            {
+                let status = order["algoStatus"]
+                    .as_str()
+                    .or_else(|| order["status"].as_str())
+                    .unwrap_or_default()
+                    .to_string();
+                if matches!(status.as_str(), "FINISHED" | "TRIGGERED" | "FILLED") {
+                    let reason = if meta.break_even_armed {
+                        "trailing_or_protected_stop"
+                    } else {
+                        "initial_stop"
+                    };
+                    return (reason.into(), Some(algo_id), Some(status));
+                }
+            }
+        }
+        let full_take_profit = meta
+            .take_profit_prices
+            .iter()
+            .map(|(_, fraction)| *fraction)
+            .sum::<f64>()
+            >= 1.0 - 1e-6;
+        if full_take_profit {
+            for order_id in &meta.take_profit_order_ids {
+                if let Ok(order) = self
+                    .signed(
+                        Method::GET,
+                        "/fapi/v1/order",
+                        vec![
+                            ("symbol".into(), symbol.into()),
+                            ("orderId".into(), order_id.to_string()),
+                        ],
+                    )
+                    .await
+                {
+                    let status = order["status"].as_str().unwrap_or_default().to_string();
+                    if status == "FILLED" {
+                        return ("take_profit".into(), Some(*order_id), Some(status));
+                    }
+                }
+            }
+        }
+        ("external_or_manual_close".into(), None, None)
     }
 
     async fn place_post_only_entry(
@@ -1306,22 +1523,69 @@ impl BinanceDemoExecution {
         rules: &SymbolRules,
         client_id: &str,
     ) -> Result<PostOnlyEntry> {
-        let mut order = self
-            .submit_or_lookup(
-                &plan.symbol,
-                client_id,
-                vec![
-                    ("symbol".into(), plan.symbol.clone()),
-                    ("side".into(), side_name(plan.side).into()),
-                    ("type".into(), "LIMIT".into()),
-                    ("timeInForce".into(), "GTX".into()),
-                    ("quantity".into(), decimal(quantity, rules.quantity_step)),
-                    ("price".into(), decimal(price, rules.price_tick)),
-                    ("newClientOrderId".into(), client_id.into()),
-                    ("newOrderRespType".into(), "ACK".into()),
-                ],
-            )
-            .await?;
+        let mut active_client_id = client_id.to_string();
+        let mut passive_price = price;
+        let mut reprice_attempt = 0u8;
+        let mut order = loop {
+            let submitted = self
+                .submit_or_lookup(
+                    &plan.symbol,
+                    &active_client_id,
+                    vec![
+                        ("symbol".into(), plan.symbol.clone()),
+                        ("side".into(), side_name(plan.side).into()),
+                        ("type".into(), "LIMIT".into()),
+                        ("timeInForce".into(), "GTX".into()),
+                        ("quantity".into(), decimal(quantity, rules.quantity_step)),
+                        ("price".into(), decimal(passive_price, rules.price_tick)),
+                        ("newClientOrderId".into(), active_client_id.clone()),
+                        ("newOrderRespType".into(), "ACK".into()),
+                    ],
+                )
+                .await;
+            match submitted {
+                Ok(order) => break order,
+                Err(error) if is_post_only_rejection(&error) => {
+                    reprice_attempt += 1;
+                    if reprice_attempt > 3 {
+                        return Err(error).context("post-only entry crossed after three reprices");
+                    }
+                    let ticker = self
+                        .public_get_params(
+                            "/fapi/v1/ticker/bookTicker",
+                            &[("symbol", plan.symbol.as_str())],
+                        )
+                        .await?;
+                    passive_price = match plan.side {
+                        Side::Buy => floor_step(
+                            parse_f64(&ticker, "bidPrice")
+                                .ok_or_else(|| anyhow!("book ticker bid is missing"))?,
+                            rules.price_tick,
+                        ),
+                        Side::Sell => ceil_step(
+                            parse_f64(&ticker, "askPrice")
+                                .ok_or_else(|| anyhow!("book ticker ask is missing"))?,
+                            rules.price_tick,
+                        ),
+                    };
+                    let adverse_bps = plan.side.sign()
+                        * (passive_price / plan.reference_price.max(f64::EPSILON) - 1.0)
+                        * 10_000.0;
+                    if adverse_bps > plan.max_entry_adverse_bps {
+                        return Err(anyhow!(
+                            "post-only reprice drifted {adverse_bps:.1} bps against the signal (max {:.1})",
+                            plan.max_entry_adverse_bps
+                        ));
+                    }
+                    active_client_id = format!(
+                        "{}-{reprice_attempt}",
+                        &client_id[..client_id.len().min(34)]
+                    );
+                    tokio::time::sleep(Duration::from_millis(100)).await;
+                }
+                Err(error) => return Err(error),
+            }
+        };
         let started_ms = chrono::Utc::now().timestamp_millis();
         let deadline = started_ms + plan.entry_timeout_ms.clamp(5_000, 120_000);
         loop {
@@ -1353,7 +1617,7 @@ impl BinanceDemoExecution {
                         "/fapi/v1/order",
                         vec![
                             ("symbol".into(), plan.symbol.clone()),
-                            ("origClientOrderId".into(), client_id.into()),
+                            ("origClientOrderId".into(), active_client_id.clone()),
                         ],
                     )
                     .await
@@ -1365,7 +1629,7 @@ impl BinanceDemoExecution {
                             "/fapi/v1/order",
                             vec![
                                 ("symbol".into(), plan.symbol.clone()),
-                                ("origClientOrderId".into(), client_id.into()),
+                                ("origClientOrderId".into(), active_client_id.clone()),
                             ],
                         )
                         .await
@@ -1397,7 +1661,7 @@ impl BinanceDemoExecution {
                     "/fapi/v1/order",
                     vec![
                         ("symbol".into(), plan.symbol.clone()),
-                        ("origClientOrderId".into(), client_id.into()),
+                        ("origClientOrderId".into(), active_client_id.clone()),
                     ],
                 )
                 .await
@@ -1415,26 +1679,29 @@ impl BinanceDemoExecution {
         trigger: f64,
         rules: &SymbolRules,
         client_id: String,
-    ) -> Result<()> {
-        self.submit_algo_or_lookup(
-            &client_id,
-            vec![
-                ("algoType".into(), "CONDITIONAL".into()),
-                ("symbol".into(), symbol.into()),
-                ("side".into(), side_name(side).into()),
-                ("type".into(), kind.into()),
-                (
-                    "triggerPrice".into(),
-                    decimal(round_step(trigger, rules.price_tick), rules.price_tick),
-                ),
-                ("closePosition".into(), "true".into()),
-                ("workingType".into(), "MARK_PRICE".into()),
-                ("priceProtect".into(), "true".into()),
-                ("clientAlgoId".into(), client_id.clone()),
-            ],
-        )
-        .await?;
-        Ok(())
+    ) -> Result<i64> {
+        let order = self
+            .submit_algo_or_lookup(
+                &client_id,
+                vec![
+                    ("algoType".into(), "CONDITIONAL".into()),
+                    ("symbol".into(), symbol.into()),
+                    ("side".into(), side_name(side).into()),
+                    ("type".into(), kind.into()),
+                    (
+                        "triggerPrice".into(),
+                        decimal(round_step(trigger, rules.price_tick), rules.price_tick),
+                    ),
+                    ("closePosition".into(), "true".into()),
+                    ("workingType".into(), "MARK_PRICE".into()),
+                    ("priceProtect".into(), "true".into()),
+                    ("clientAlgoId".into(), client_id.clone()),
+                ],
+            )
+            .await?;
+        order["algoId"]
+            .as_i64()
+            .ok_or_else(|| anyhow!("conditional protection response is missing algoId"))
     }
 
     async fn place_reduce_only_take_profit(
@@ -1445,34 +1712,37 @@ impl BinanceDemoExecution {
         quantity: f64,
         rules: &SymbolRules,
         client_id: String,
-    ) -> Result<()> {
+    ) -> Result<i64> {
         let price = if side == Side::Buy {
             floor_step(target, rules.price_tick)
         } else {
             ceil_step(target, rules.price_tick)
         };
-        self.submit_or_lookup(
-            symbol,
-            &client_id,
-            vec![
-                ("symbol".into(), symbol.into()),
-                ("side".into(), side_name(side).into()),
-                ("type".into(), "LIMIT".into()),
-                // A target submitted before price reaches it rests and earns maker
-                // liquidity. GTC intentionally permits an immediate profitable
-                // fill if price crosses the target while the stop is being placed;
-                // strict GTX would reject that race and turn a winning move into a
-                // protection failure plus emergency close.
-                ("timeInForce".into(), "GTC".into()),
-                ("price".into(), decimal(price, rules.price_tick)),
-                ("quantity".into(), decimal(quantity, rules.quantity_step)),
-                ("reduceOnly".into(), "true".into()),
-                ("newClientOrderId".into(), client_id.clone()),
-                ("newOrderRespType".into(), "ACK".into()),
-            ],
-        )
-        .await?;
-        Ok(())
+        let order = self
+            .submit_or_lookup(
+                symbol,
+                &client_id,
+                vec![
+                    ("symbol".into(), symbol.into()),
+                    ("side".into(), side_name(side).into()),
+                    ("type".into(), "LIMIT".into()),
+                    // A target submitted before price reaches it rests and earns maker
+                    // liquidity. GTC intentionally permits an immediate profitable
+                    // fill if price crosses the target while the stop is being placed;
+                    // strict GTX would reject that race and turn a winning move into a
+                    // protection failure plus emergency close.
+                    ("timeInForce".into(), "GTC".into()),
+                    ("price".into(), decimal(price, rules.price_tick)),
+                    ("quantity".into(), decimal(quantity, rules.quantity_step)),
+                    ("reduceOnly".into(), "true".into()),
+                    ("newClientOrderId".into(), client_id.clone()),
+                    ("newOrderRespType".into(), "ACK".into()),
+                ],
+            )
+            .await?;
+        order["orderId"]
+            .as_i64()
+            .ok_or_else(|| anyhow!("take-profit response is missing orderId"))
     }
 
     async fn submit_or_lookup(
@@ -1487,6 +1757,9 @@ impl BinanceDemoExecution {
         {
             Ok(value) => Ok(value),
             Err(submit_error) => {
+                if is_post_only_rejection(&submit_error) {
+                    return Err(submit_error);
+                }
                 let mut lookup_error = None;
                 for _ in 0..3 {
                     tokio::time::sleep(Duration::from_millis(250)).await;
@@ -1676,6 +1949,8 @@ impl BinanceDemoExecution {
 }
 
 fn summarize_trades(rows: &[Value], position_side: Side) -> TradeSummary {
+    let mut entry_notional = 0.0;
+    let mut entry_quantity = 0.0;
     let mut exit_notional = 0.0;
     let mut exit_quantity = 0.0;
     let mut fees = 0.0;
@@ -1689,6 +1964,7 @@ fn summarize_trades(rows: &[Value], position_side: Side) -> TradeSummary {
         Side::Buy => "SELL",
         Side::Sell => "BUY",
     };
+    let entry_side = side_name(position_side);
     for row in rows {
         let pnl = parse_f64(row, "realizedPnl").unwrap_or(0.0);
         let quantity = parse_f64(row, "qty").unwrap_or(0.0);
@@ -1702,6 +1978,13 @@ fn summarize_trades(rows: &[Value], position_side: Side) -> TradeSummary {
         }
         fees += parse_f64(row, "commission").unwrap_or(0.0);
         realized += pnl;
+        if row["side"]
+            .as_str()
+            .is_some_and(|value| value.eq_ignore_ascii_case(entry_side))
+        {
+            entry_quantity += quantity;
+            entry_notional += price * quantity;
+        }
         if row["side"]
             .as_str()
             .is_some_and(|value| value.eq_ignore_ascii_case(exit_side))
@@ -1730,6 +2013,12 @@ fn summarize_trades(rows: &[Value], position_side: Side) -> TradeSummary {
         0.0
     };
     TradeSummary {
+        entry_price: if entry_quantity > f64::EPSILON {
+            entry_notional / entry_quantity
+        } else {
+            0.0
+        },
+        entry_quantity,
         exit_price,
         exit_quantity,
         last_exit_price,
@@ -1855,6 +2144,37 @@ fn decimal(value: f64, step: f64) -> String {
     let precision = (-step.log10().floor()).max(0.0) as usize;
     format!("{value:.precision$}")
 }
+fn order_average_price(order: &Value) -> Option<f64> {
+    parse_f64(order, "avgPrice")
+        .filter(|value| *value > 0.0)
+        .or_else(|| {
+            let quote = parse_f64(order, "cumQuote")?;
+            let quantity = parse_f64(order, "executedQty")?;
+            (quantity > f64::EPSILON).then_some(quote / quantity)
+        })
+}
+fn average_fills(rows: &[Value], side: &str) -> Option<f64> {
+    let (notional, quantity) = rows
+        .iter()
+        .filter(|row| {
+            row["side"]
+                .as_str()
+                .is_some_and(|value| value.eq_ignore_ascii_case(side))
+        })
+        .fold((0.0, 0.0), |(notional, quantity), row| {
+            let fill_quantity = parse_f64(row, "qty").unwrap_or_default();
+            let fill_price = parse_f64(row, "price").unwrap_or_default();
+            (
+                notional + fill_price * fill_quantity,
+                quantity + fill_quantity,
+            )
+        });
+    (quantity > f64::EPSILON).then_some(notional / quantity)
+}
+fn is_post_only_rejection(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("-5022") || message.contains("could not be executed as maker")
+}
 fn client_order_id(prefix: &str, candidate_id: &str) -> String {
     let digest = hex_bytes(&Sha256::digest(candidate_id.as_bytes()));
     format!("greed-{prefix}-{}", &digest[..20])
@@ -1899,10 +2219,33 @@ mod tests {
             serde_json::json!({"side":"SELL","price":"104","qty":"3","realizedPnl":"0","commission":"0.2","maker":false,"orderId":3,"time":3}),
         ];
         let summary = summarize_trades(&rows, Side::Buy);
+        assert_eq!(summary.entry_price, 100.0);
+        assert_eq!(summary.entry_quantity, 10.0);
         assert!((summary.exit_price - 106.7).abs() < 1e-9);
         assert_eq!(summary.exit_quantity, 10.0);
         assert!((summary.last_exit_price - 104.5).abs() < 1e-9);
         assert_eq!(summary.last_exit_quantity, 6.0);
         assert!((summary.net_pnl_usd - 54.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn fill_average_uses_cumulative_quote_when_avg_price_is_missing() {
+        let order = serde_json::json!({"avgPrice":"0","cumQuote":"25.96","executedQty":"10000"});
+        assert!((order_average_price(&order).unwrap() - 0.002596).abs() < 1e-12);
+        let fills = vec![
+            serde_json::json!({"side":"BUY","price":"0.002595","qty":"4000"}),
+            serde_json::json!({"side":"BUY","price":"0.002597","qty":"6000"}),
+            serde_json::json!({"side":"SELL","price":"0.002600","qty":"1000"}),
+        ];
+        assert!((average_fills(&fills, "BUY").unwrap() - 0.0025962).abs() < 1e-12);
+    }
+
+    #[test]
+    fn recognizes_definitive_post_only_rejection() {
+        let error = anyhow!(
+            "{}",
+            "Binance returned {\"code\":-5022,\"msg\":\"Due to the order could not be executed as maker\"}"
+        );
+        assert!(is_post_only_rejection(&error));
     }
 }

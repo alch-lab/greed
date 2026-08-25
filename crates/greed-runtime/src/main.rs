@@ -229,6 +229,13 @@ fn git_commit() -> Option<String> {
     }
 }
 
+fn with_run_id(mut payload: serde_json::Value, identity: &serde_json::Value) -> serde_json::Value {
+    if let (Some(object), Some(run_id)) = (payload.as_object_mut(), identity["run_id"].as_str()) {
+        object.insert("run_id".into(), serde_json::Value::String(run_id.into()));
+    }
+    payload
+}
+
 async fn one_frame(
     config: &AppConfig,
     source: &mut BinanceMarketSource,
@@ -365,8 +372,9 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
             }
         };
         for event in sync_events {
-            history.append(&event.kind, event.payload.clone())?;
-            journal.append(&event.kind, event.payload)?;
+            let payload = with_run_id(event.payload, &identity);
+            history.append(&event.kind, payload.clone())?;
+            journal.append(&event.kind, payload)?;
         }
         let refresh_ms = i64::from(config.strategy.universe.refresh_seconds) * 1_000;
         if config.strategy.universe.dynamic_enabled
@@ -429,13 +437,15 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                 journal.append("graph_evaluation", serde_json::to_value(&evaluation)?)?;
                 let order_events = execution.apply_plans(&frame, &evaluation).await;
                 for event in &order_events {
-                    history.append(&event.kind, event.payload.clone())?;
-                    journal.append(&event.kind, event.payload.clone())?;
+                    let payload = with_run_id(event.payload.clone(), &identity);
+                    history.append(&event.kind, payload.clone())?;
+                    journal.append(&event.kind, payload)?;
                 }
                 if !order_events.is_empty() {
                     for event in execution.sync().await? {
-                        history.append(&event.kind, event.payload.clone())?;
-                        journal.append(&event.kind, event.payload)?;
+                        let payload = with_run_id(event.payload, &identity);
+                        history.append(&event.kind, payload.clone())?;
+                        journal.append(&event.kind, payload)?;
                     }
                 }
                 let account = execution.account_frame()?;

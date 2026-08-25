@@ -32,6 +32,7 @@ struct PageQuery {
     #[serde(default = "default_page_limit")]
     limit: usize,
     before: Option<u64>,
+    run_id: Option<String>,
 }
 
 fn default_limit() -> usize {
@@ -92,11 +93,17 @@ async fn history(State(state): State<ApiState>, Query(query): Query<EventQuery>)
 }
 
 async fn trades(State(state): State<ApiState>, Query(query): Query<PageQuery>) -> Response {
+    let run_id = query.run_id;
     paged_jsonl_response(
         &state.history_path,
         query.limit.clamp(1, 100),
         query.before,
-        is_trade_event,
+        move |value| {
+            is_trade_event(value)
+                && run_id.as_ref().is_none_or(|expected| {
+                    value["payload"]["run_id"].as_str() == Some(expected.as_str())
+                })
+        },
     )
 }
 
