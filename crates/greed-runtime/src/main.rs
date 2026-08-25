@@ -403,10 +403,10 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                         active_strategy.symbols.clone_from(&discovery.symbols);
                         graph = build_graph(&active_strategy)?;
                         source.set_stream_symbols(&active_strategy);
-                        // The market and public supervisors rebuild their
-                        // combined subscriptions on a universe change. Allow
-                        // several 500ms depth snapshots to arrive before the
-                        // first frame evaluates newly admitted symbols.
+                        // Existing websocket sessions apply incremental
+                        // SUBSCRIBE/UNSUBSCRIBE changes. Allow newly admitted
+                        // symbols several 500ms depth snapshots before their
+                        // first evaluation; retained symbols remain live.
                         tokio::time::sleep(Duration::from_secs(2)).await;
                     }
                     universe_status = serde_json::to_value(&discovery)?;
