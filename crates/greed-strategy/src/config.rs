@@ -142,6 +142,7 @@ pub struct RiskConfig {
     pub rolling_pf_min_trades: usize,
     pub rolling_pf_floor: f64,
     pub rolling_pf_cooldown_minutes: u32,
+    pub loss_cooldown_minutes: u32,
     pub rolling_pf_probe_size_multiplier: f64,
     pub rolling_pf_epoch: u32,
 }
@@ -168,6 +169,7 @@ impl Default for RiskConfig {
             rolling_pf_min_trades: 8,
             rolling_pf_floor: 1.0,
             rolling_pf_cooldown_minutes: 360,
+            loss_cooldown_minutes: 180,
             rolling_pf_probe_size_multiplier: 1.0,
             rolling_pf_epoch: 6,
         }
@@ -240,6 +242,7 @@ impl StrategyConfig {
         }
         if risk.rolling_pf_window < risk.rolling_pf_min_trades
             || risk.rolling_pf_min_trades < 3
+            || !(60..=1_440).contains(&risk.loss_cooldown_minutes)
             || risk.rolling_pf_epoch == 0
         {
             return Err("rolling PF parameters are invalid".into());

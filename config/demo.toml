@@ -44,7 +44,7 @@ refresh_seconds = 15
 [strategy.lanes]
 sfp_reversal_enabled = true
 trend_continuation_enabled = true
-ignition_sprint_enabled = true
+ignition_sprint_enabled = false
 max_candidates_per_lane = 2
 max_spread_bps = 6.0
 # Ten times the standard 2,000 USDT trend notional; spread remains capped at 6 bps.
@@ -57,7 +57,7 @@ sfp_confirmation_hours = 3
 sfp_max_signal_age_seconds = 300
 sfp_target_r = 2.0
 sfp_max_hold_minutes = 180
-sfp_risk_per_trade_pct = 0.005
+sfp_risk_per_trade_pct = 0.0025
 trend_min_return_4h = 0.06
 trend_min_efficiency = 0.45
 trend_min_hour_volume_ratio = 0.65
@@ -89,7 +89,7 @@ first_take_profit_r = 2.0
 first_take_profit_fraction = 0.40
 runner_take_profit_r = 0.0
 break_even_buffer_pct = 0.0018
-trailing_distance_pct = 0.005
+trailing_distance_pct = 0.003
 # Zero disables time-based exits. Hard stop, cost shield, and trailing protection remain exchange-side.
 max_hold_minutes = 0
 daily_loss_limit_pct = 0.025
@@ -98,6 +98,7 @@ rolling_pf_window = 20
 rolling_pf_min_trades = 8
 rolling_pf_floor = 1.00
 rolling_pf_cooldown_minutes = 360
+loss_cooldown_minutes = 180
 rolling_pf_probe_size_multiplier = 1.00
-# Epoch 8 starts the maker-first entry and reduce-only maker take-profit policy.
-rolling_pf_epoch = 8
+# Epoch 9 starts the validated loss cooldown and tighter runner trail policy.
+rolling_pf_epoch = 9

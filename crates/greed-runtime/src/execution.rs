@@ -100,6 +100,7 @@ struct DemoState {
     seen: BTreeSet<String>,
     positions: BTreeMap<String, ExecutionMeta>,
     recipe_outcomes: BTreeMap<String, Vec<ExecutionOutcome>>,
+    symbol_outcomes: BTreeMap<String, Vec<ExecutionOutcome>>,
     performance_epoch: u32,
     execution_halt_reason: Option<String>,
 }
@@ -238,6 +239,7 @@ impl BinanceDemoExecution {
         let performance_epoch_reset = state.performance_epoch != risk.rolling_pf_epoch;
         if performance_epoch_reset {
             state.recipe_outcomes.clear();
+            state.symbol_outcomes.clear();
             state.performance_epoch = risk.rolling_pf_epoch;
             state.execution_halt_reason = None;
         }
@@ -734,14 +736,20 @@ impl BinanceDemoExecution {
                             .await
                             .ok();
                         if let Some(summary) = summary.as_ref() {
+                            let outcome = ExecutionOutcome {
+                                exit_ms: now_ms,
+                                pnl_usd: summary.net_pnl_usd,
+                            };
                             self.state
                                 .recipe_outcomes
                                 .entry(gate_key(&meta.recipe, meta.side))
                                 .or_default()
-                                .push(ExecutionOutcome {
-                                    exit_ms: now_ms,
-                                    pnl_usd: summary.net_pnl_usd,
-                                });
+                                .push(outcome.clone());
+                            self.state
+                                .symbol_outcomes
+                                .entry(symbol.clone())
+                                .or_default()
+                                .push(outcome);
                         }
                         let mfe_pct = meta.side.sign()
                             * (meta.extreme_price / meta.entry_price.max(f64::EPSILON) - 1.0);
@@ -874,6 +882,13 @@ impl BinanceDemoExecution {
         self.recipe_gate_status(&gate_key(recipe, side), now_ms)
     }
 
+    fn symbol_loss_cooldown_until(&self, symbol: &str) -> Option<i64> {
+        loss_cooldown_until(
+            self.state.symbol_outcomes.get(symbol).map(Vec::as_slice),
+            self.risk.loss_cooldown_minutes,
+        )
+    }
+
     pub fn recipe_gate_snapshots(&self, now_ms: i64) -> BTreeMap<String, RecipeGateStatus> {
         ["sfp_reversal", "trend_continuation", "ignition_sprint"]
             .into_iter()
@@ -991,6 +1006,17 @@ impl BinanceDemoExecution {
                 .map(|value| value.recipe.clone())
                 .unwrap_or_else(|| "unknown".into());
             let performance_key = gate_key(&recipe, plan.side);
+            if self
+                .symbol_loss_cooldown_until(&plan.symbol)
+                .is_some_and(|until_ms| frame.as_of_ms < until_ms)
+            {
+                self.state.seen.insert(plan.candidate_id.clone());
+                events.push(ExchangeEvent {
+                    kind: "exchange_plan_rejected".into(),
+                    payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"symbol":plan.symbol,"side":plan.side,"reason":"symbol_loss_cooldown","cooldown_until_ms":self.symbol_loss_cooldown_until(&plan.symbol),"venue":"binance_demo","paper_only":true}),
+                });
+                continue;
+            }
             let performance_gate = self.recipe_gate_status(&performance_key, frame.as_of_ms);
             if !performance_gate.allowed {
                 self.state.seen.insert(plan.candidate_id.clone());
@@ -2126,6 +2152,15 @@ fn gate_key(recipe: &str, side: Side) -> String {
         }
     )
 }
+fn loss_cooldown_until(
+    outcomes: Option<&[ExecutionOutcome]>,
+    cooldown_minutes: u32,
+) -> Option<i64> {
+    outcomes
+        .and_then(|values| values.last())
+        .filter(|outcome| outcome.pnl_usd < 0.0)
+        .map(|outcome| outcome.exit_ms + i64::from(cooldown_minutes) * 60_000)
+}
 fn floor_step(value: f64, step: f64) -> f64 {
     (value / step).floor() * step
 }
@@ -2247,5 +2282,25 @@ mod tests {
             "Binance returned {\"code\":-5022,\"msg\":\"Due to the order could not be executed as maker\"}"
         );
         assert!(is_post_only_rejection(&error));
+    }
+
+    #[test]
+    fn only_a_latest_loss_arms_the_symbol_cooldown() {
+        let loss = ExecutionOutcome {
+            exit_ms: 1_000,
+            pnl_usd: -2.0,
+        };
+        assert_eq!(loss_cooldown_until(Some(&[loss]), 180), Some(10_801_000));
+        let recovered = [
+            ExecutionOutcome {
+                exit_ms: 1_000,
+                pnl_usd: -2.0,
+            },
+            ExecutionOutcome {
+                exit_ms: 2_000,
+                pnl_usd: 1.0,
+            },
+        ];
+        assert_eq!(loss_cooldown_until(Some(&recovered), 180), None);
     }
 }

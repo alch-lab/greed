@@ -1,0 +1,261 @@
+{
+  "strategy": "trend_pullback_risk_management_v2",
+  "status": "research_candidate",
+  "selection": "train and validation only; locked test untouched",
+  "grid": 384,
+  "eligible": 28,
+  "selected": {
+    "score": -0.01650268662048271,
+    "config": {
+      "min_return_4h": 0.06,
+      "min_efficiency": 0.45,
+      "max_extension_atr": 100.0,
+      "stop_fraction": 0.01,
+      "target_r": 2.0,
+      "take_fraction": 0.4,
+      "trail_fraction": 0.003,
+      "loss_cooldown_minutes": 180
+    }
+  },
+  "train": {
+    "start": 2000.0,
+    "end": 2121.621168911182,
+    "return_pct": 0.060810584455591066,
+    "max_dd_pct": 0.10837078944504386,
+    "trades": 43,
+    "trades_per_day": 0.8113207547169812,
+    "win_rate": 0.37209302325581395,
+    "pf": 1.165201955433755,
+    "average_pnl_usd": 2.8283992770042286,
+    "profitable_symbols": 10,
+    "traded_symbols": 22,
+    "top_symbol_pnl_share": 0.436771468207922
+  },
+  "validation": {
+    "start": 2000.0,
+    "end": 2075.3654162040784,
+    "return_pct": 0.03768270810203922,
+    "max_dd_pct": 0.03524393957522631,
+    "trades": 9,
+    "trades_per_day": 0.4090909090909091,
+    "win_rate": 0.4444444444444444,
+    "pf": 1.624002304527832,
+    "average_pnl_usd": 8.373935133786482,
+    "profitable_symbols": 4,
+    "traded_symbols": 9,
+    "top_symbol_pnl_share": 0.3119316743902194
+  },
+  "locked_test": {
+    "start": 2000.0,
+    "end": 2231.5418768795794,
+    "return_pct": 0.11577093843978958,
+    "max_dd_pct": 0.05102285780280924,
+    "trades": 22,
+    "trades_per_day": 2.75,
+    "win_rate": 0.5,
+    "pf": 1.8047187138265635,
+    "average_pnl_usd": 10.524630767253665,
+    "profitable_symbols": 9,
+    "traded_symbols": 16,
+    "top_symbol_pnl_share": 0.19425773917291872
+  },
+  "locked_test_15bps_per_side": {
+    "start": 2000.0,
+    "end": 2150.677624750016,
+    "return_pct": 0.07533881237500806,
+    "max_dd_pct": 0.06478653699679549,
+    "trades": 22,
+    "trades_per_day": 2.75,
+    "win_rate": 0.5,
+    "pf": 1.4554001059560164,
+    "average_pnl_usd": 6.848982943182545,
+    "profitable_symbols": 9,
+    "traded_symbols": 16,
+    "top_symbol_pnl_share": 0.1871167433970915
+  },
+  "eligible_family_locked_test": {
+    "count": 28,
+    "profitable_fraction": 0.9642857142857143,
+    "median_return_pct": 0.1052166197981046,
+    "min_return_pct": -0.013798959135283506,
+    "max_return_pct": 0.1392810384470593
+  },
+  "locked_test_trades": [
+    {
+      "symbol": "GALAUSDT",
+      "side": -1,
+      "entry_ts": 1787022900000,
+      "exit_ts": 1787024700000,
+      "pnl": 78.70581113079942,
+      "reason": "stop_or_trail"
+    },
+    {
+      "symbol": "FILUSDT",
+      "side": -1,
+      "entry_ts": 1787022900000,
+      "exit_ts": 1787025600000,
+      "pnl": 37.336377330602915,
+      "reason": "stop_or_trail"
+    },
+    {
+      "symbol": "SUIUSDT",
+      "side": 1,
+      "entry_ts": 1787153400000,
+      "exit_ts": 1787154300000,
+      "pnl": -25.15712280699343,
+      "reason": "stop_or_trail"
+    },
+    {
+      "symbol": "LDOUSDT",
+      "side": 1,
+      "entry_ts": 1787153400000,
+      "exit_ts": 1787156100000,
+      "pnl": -25.157122806993595,
+      "reason": "stop_or_trail"
+    },
+    {
+      "symbol": "ETHUSDT",
+      "side": 1,
+      "entry_ts": 1787153400000,
+      "exit_ts": 1787170500000,
+      "pnl": 36.4938236986369,
+      "reason": "stop_or_trail"
+    },
+    {
+      "symbol": "CRVUSDT",
+      "side": 1,
+      "entry_ts": 1787268600000,
+      "exit_ts": 1787274000000,
+      "pnl": 42.870188161963846,
+      "reason": "stop_or_trail"
+    },
+    {
+      "symbol": "CRVUSDT",
+      "side": 1,
+      "entry_ts": 1787280300000,
+      "exit_ts": 1787283000000,
+      "pnl": 58.00243160642298,
+      "reason": "stop_or_trail"
+    },
+    {
+      "symbol": "YBUSDT",
+      "side": 1,
+      "entry_ts": 1787285700000,
+      "exit_ts": 1787286600000,
+      "pnl": -26.192065703666206,
+      "reason": "stop_or_trail"
+    },
+    {
+      "symbol": "BCHUSDT",
+      "side": 1,
+      "entry_ts": 1787293800000,
+      "exit_ts": 1787296500000,
+      "pnl": 61.2992810106301,
+      "reason": "stop_or_trail"
+    },
+    {
+      "symbol": "GALAUSDT",
+      "side": 1,
+      "entry_ts": 1787298300000,
+      "exit_ts": 1787299200000,
+      "pnl": -26.609447044976022,
+      "reason": "stop_or_trail"
+    },
+    {
+      "symbol": "ORDIUSDT",
+      "side": 1,
+      "entry_ts": 1787299200000,
+      "exit_ts": 1787301000000,
+      "pnl": 37.003081898903886,
+      "reason": "stop_or_trail"
+    },
+    {
+      "symbol": "AAVEUSDT",
+      "side": 1,
+      "entry_ts": 1787301000000,
+      "exit_ts": 1787302800000,
+      "pnl": -26.733014500226922,
+      "reason": "stop_or_trail"
+    },
+    {
+      "symbol": "XRPUSDT",
+      "side": 1,
+      "entry_ts": 1787302800000,
+      "exit_ts": 1787303700000,
+      "pnl": -26.415192042597894,
+      "reason": "stop_or_trail"
+    },
+    {
+      "symbol": "TIAUSDT",
+      "side": 1,
+      "entry_ts": 1787305500000,
+      "exit_ts": 1787311800000,
+      "pnl": 42.98382826373047,
+      "reason": "stop_or_trail"
+    },
+    {
+      "symbol": "JUPUSDT",
+      "side": 1,
+      "entry_ts": 1787314500000,
+      "exit_ts": 1787315400000,
+      "pnl": -26.61217262192296,
+      "reason": "stop_or_trail"
+    },
+    {
+      "symbol": "1000BONKUSDT",
+      "side": 1,
+      "entry_ts": 1787332500000,
+      "exit_ts": 1787333400000,
+      "pnl": -26.29578682467332,
+      "reason": "stop_or_trail"
+    },
+    {
+      "symbol": "GALAUSDT",
+      "side": 1,
+      "entry_ts": 1787346000000,
+      "exit_ts": 1787346900000,
+      "pnl": -25.983162462993615,
+      "reason": "stop_or_trail"
+    },
+    {
+      "symbol": "YBUSDT",
+      "side": 1,
+      "entry_ts": 1787358600000,
+      "exit_ts": 1787359500000,
+      "pnl": -25.674254818070427,
+      "reason": "stop_or_trail"
+    },
+    {
+      "symbol": "WLDUSDT",
+      "side": 1,
+      "entry_ts": 1787360400000,
+      "exit_ts": 1787367600000,
+      "pnl": 41.330302255360515,
+      "reason": "stop_or_trail"
+    },
+    {
+      "symbol": "ORDIUSDT",
+      "side": 1,
+      "entry_ts": 1787367600000,
+      "exit_ts": 1787370300000,
+      "pnl": 35.78692548004206,
+      "reason": "stop_or_trail"
+    },
+    {
+      "symbol": "ENAUSDT",
+      "side": 1,
+      "entry_ts": 1787368500000,
+      "exit_ts": 1787370300000,
+      "pnl": 47.4600265476589,
+      "reason": "stop_or_trail"
+    },
+    {
+      "symbol": "JUPUSDT",
+      "side": -1,
+      "entry_ts": 1787388300000,
+      "exit_ts": 1787390100000,
+      "pnl": -26.90085887205697,
+      "reason": "stop_or_trail"
+    }
+  ]
+}
