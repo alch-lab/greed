@@ -158,6 +158,8 @@ struct EntryExecution {
 struct TradeSummary {
     exit_price: f64,
     exit_quantity: f64,
+    last_exit_price: f64,
+    last_exit_quantity: f64,
     fees_usd: f64,
     net_pnl_usd: f64,
     maker_fills: usize,
@@ -467,7 +469,7 @@ impl BinanceDemoExecution {
                     side,
                 ) in partial_exits
                 {
-                    let summary = self.trade_summary(&symbol, entry_ms).await.ok();
+                    let summary = self.trade_summary(&symbol, entry_ms, side).await.ok();
                     let (fee_delta, pnl_delta) = if let Some(summary) = summary.as_ref() {
                         let meta = self.state.positions.get(&symbol);
                         (
@@ -492,6 +494,7 @@ impl BinanceDemoExecution {
                             "symbol":symbol,
                             "side":side,
                             "reason":"staged_take_profit",
+                            "exit_price":summary.as_ref().map(|value| value.last_exit_price),
                             "closed_quantity":closed_quantity,
                             "remaining_quantity":remaining_quantity,
                             "fee_usd":fee_delta,
@@ -695,7 +698,10 @@ impl BinanceDemoExecution {
                 for symbol in disappeared {
                     if let Some(meta) = self.state.positions.remove(&symbol) {
                         self.cancel_all(&symbol).await.ok();
-                        let summary = self.trade_summary(&symbol, meta.entry_ms).await.ok();
+                        let summary = self
+                            .trade_summary(&symbol, meta.entry_ms, meta.side)
+                            .await
+                            .ok();
                         if let Some(summary) = summary.as_ref() {
                             self.state
                                 .recipe_outcomes
@@ -719,8 +725,10 @@ impl BinanceDemoExecution {
                                 "recipe": meta.recipe,
                                 "symbol": symbol,
                                 "side": meta.side,
-                                "exit_price": summary.as_ref().map(|value| value.exit_price),
-                                "quantity": summary.as_ref().map(|value| value.exit_quantity),
+                                "exit_price": summary.as_ref().map(|value| value.last_exit_price),
+                                "exit_quantity": summary.as_ref().map(|value| value.last_exit_quantity),
+                                "average_exit_price": summary.as_ref().map(|value| value.exit_price),
+                                "trade_exit_quantity": summary.as_ref().map(|value| value.exit_quantity),
                                 "fee_usd": summary.as_ref().map(|value| value.fees_usd - meta.cumulative_reported_fee_usd),
                                 "pnl_usd": summary.as_ref().map(|value| value.net_pnl_usd - meta.cumulative_reported_pnl_usd),
                                 "trade_net_pnl_usd": summary.as_ref().map(|value| value.net_pnl_usd),
@@ -1039,7 +1047,11 @@ impl BinanceDemoExecution {
                     // diagnostic ledger instead of reporting it as a zero-cost
                     // rejection.
                     let attempt = self
-                        .trade_summary(&plan.symbol, attempt_started_ms.saturating_sub(1_000))
+                        .trade_summary(
+                            &plan.symbol,
+                            attempt_started_ms.saturating_sub(1_000),
+                            plan.side,
+                        )
                         .await
                         .ok();
                     events.push(ExchangeEvent {
@@ -1589,7 +1601,12 @@ impl BinanceDemoExecution {
         Ok(())
     }
 
-    async fn trade_summary(&self, symbol: &str, start_ms: i64) -> Result<TradeSummary> {
+    async fn trade_summary(
+        &self,
+        symbol: &str,
+        start_ms: i64,
+        position_side: Side,
+    ) -> Result<TradeSummary> {
         let value = self
             .signed(
                 Method::GET,
@@ -1604,47 +1621,7 @@ impl BinanceDemoExecution {
         let rows = value
             .as_array()
             .ok_or_else(|| anyhow!("userTrades response is not an array"))?;
-        let mut exit_notional = 0.0;
-        let mut exit_quantity = 0.0;
-        let mut fees = 0.0;
-        let mut realized = 0.0;
-        let mut maker_fills = 0usize;
-        let mut taker_fills = 0usize;
-        let mut maker_notional = 0.0;
-        let mut taker_notional = 0.0;
-        for row in rows {
-            let pnl = parse_f64(row, "realizedPnl").unwrap_or(0.0);
-            let quantity = parse_f64(row, "qty").unwrap_or(0.0);
-            let price = parse_f64(row, "price").unwrap_or(0.0);
-            if row["maker"].as_bool().unwrap_or(false) {
-                maker_fills += 1;
-                maker_notional += price * quantity;
-            } else {
-                taker_fills += 1;
-                taker_notional += price * quantity;
-            }
-            fees += parse_f64(row, "commission").unwrap_or(0.0);
-            realized += pnl;
-            if pnl.abs() > f64::EPSILON {
-                exit_quantity += quantity;
-                exit_notional += price * quantity;
-            }
-        }
-        let exit_price = if exit_quantity > f64::EPSILON {
-            exit_notional / exit_quantity
-        } else {
-            0.0
-        };
-        Ok(TradeSummary {
-            exit_price,
-            exit_quantity,
-            fees_usd: fees,
-            net_pnl_usd: realized - fees,
-            maker_fills,
-            taker_fills,
-            maker_notional_usd: maker_notional,
-            taker_notional_usd: taker_notional,
-        })
+        Ok(summarize_trades(rows, position_side))
     }
 
     async fn close_market(&self, position: &RemotePosition) -> Result<()> {
@@ -1695,6 +1672,74 @@ impl BinanceDemoExecution {
             "performance_epoch": self.state.performance_epoch,
             "performance_epoch_reset": self.performance_epoch_reset,
         })
+    }
+}
+
+fn summarize_trades(rows: &[Value], position_side: Side) -> TradeSummary {
+    let mut exit_notional = 0.0;
+    let mut exit_quantity = 0.0;
+    let mut fees = 0.0;
+    let mut realized = 0.0;
+    let mut maker_fills = 0usize;
+    let mut taker_fills = 0usize;
+    let mut maker_notional = 0.0;
+    let mut taker_notional = 0.0;
+    let mut exit_orders: BTreeMap<i64, (i64, f64, f64)> = BTreeMap::new();
+    let exit_side = match position_side {
+        Side::Buy => "SELL",
+        Side::Sell => "BUY",
+    };
+    for row in rows {
+        let pnl = parse_f64(row, "realizedPnl").unwrap_or(0.0);
+        let quantity = parse_f64(row, "qty").unwrap_or(0.0);
+        let price = parse_f64(row, "price").unwrap_or(0.0);
+        if row["maker"].as_bool().unwrap_or(false) {
+            maker_fills += 1;
+            maker_notional += price * quantity;
+        } else {
+            taker_fills += 1;
+            taker_notional += price * quantity;
+        }
+        fees += parse_f64(row, "commission").unwrap_or(0.0);
+        realized += pnl;
+        if row["side"]
+            .as_str()
+            .is_some_and(|value| value.eq_ignore_ascii_case(exit_side))
+        {
+            exit_quantity += quantity;
+            exit_notional += price * quantity;
+            let order_id = row["orderId"].as_i64().unwrap_or_default();
+            let entry = exit_orders.entry(order_id).or_default();
+            entry.0 = entry.0.max(row["time"].as_i64().unwrap_or_default());
+            entry.1 += price * quantity;
+            entry.2 += quantity;
+        }
+    }
+    let exit_price = if exit_quantity > f64::EPSILON {
+        exit_notional / exit_quantity
+    } else {
+        0.0
+    };
+    let (_, last_exit_notional, last_exit_quantity) = exit_orders
+        .into_values()
+        .max_by_key(|value| value.0)
+        .unwrap_or_default();
+    let last_exit_price = if last_exit_quantity > f64::EPSILON {
+        last_exit_notional / last_exit_quantity
+    } else {
+        0.0
+    };
+    TradeSummary {
+        exit_price,
+        exit_quantity,
+        last_exit_price,
+        last_exit_quantity,
+        fees_usd: fees,
+        net_pnl_usd: realized - fees,
+        maker_fills,
+        taker_fills,
+        maker_notional_usd: maker_notional,
+        taker_notional_usd: taker_notional,
     }
 }
 
@@ -1841,5 +1886,23 @@ mod tests {
         let value = client_order_id("entry", "alt.recipe:test:cycle-123");
         assert_eq!(value, client_order_id("entry", "alt.recipe:test:cycle-123"));
         assert!(value.len() <= 36);
+    }
+
+    #[test]
+    fn trade_summary_separates_latest_exit_from_trade_average() {
+        let rows = vec![
+            serde_json::json!({"side":"BUY","price":"100","qty":"10","realizedPnl":"0","commission":"0.4","maker":true,"orderId":1,"time":1}),
+            serde_json::json!({"side":"SELL","price":"110","qty":"4","realizedPnl":"40","commission":"0.1","maker":true,"orderId":2,"time":2}),
+            serde_json::json!({"side":"SELL","price":"105","qty":"3","realizedPnl":"15","commission":"0.2","maker":false,"orderId":3,"time":3}),
+            // A break-even fill still belongs to the exit order even though
+            // realizedPnl is zero.
+            serde_json::json!({"side":"SELL","price":"104","qty":"3","realizedPnl":"0","commission":"0.2","maker":false,"orderId":3,"time":3}),
+        ];
+        let summary = summarize_trades(&rows, Side::Buy);
+        assert!((summary.exit_price - 106.7).abs() < 1e-9);
+        assert_eq!(summary.exit_quantity, 10.0);
+        assert!((summary.last_exit_price - 104.5).abs() < 1e-9);
+        assert_eq!(summary.last_exit_quantity, 6.0);
+        assert!((summary.net_pnl_usd - 54.1).abs() < 1e-9);
     }
 }
