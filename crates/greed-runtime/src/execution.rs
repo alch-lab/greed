@@ -1323,7 +1323,7 @@ impl BinanceDemoExecution {
             )
             .await?;
         let started_ms = chrono::Utc::now().timestamp_millis();
-        let deadline = started_ms + plan.entry_timeout_ms.clamp(5_000, 60_000);
+        let deadline = started_ms + plan.entry_timeout_ms.clamp(5_000, 120_000);
         loop {
             let status = order.get("status").and_then(Value::as_str).unwrap_or("NEW");
             if status == "FILLED" {
@@ -1387,7 +1387,7 @@ impl BinanceDemoExecution {
                     });
                 }
                 return Ok(PostOnlyEntry::Unfilled {
-                    waited_ms: plan.entry_timeout_ms.clamp(5_000, 60_000),
+                    waited_ms: plan.entry_timeout_ms.clamp(5_000, 120_000),
                 });
             }
             tokio::time::sleep(Duration::from_secs(1)).await;

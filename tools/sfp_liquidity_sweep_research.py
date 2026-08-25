@@ -339,6 +339,11 @@ def main() -> None:
     ) = selected
     locked_result = portfolio(rows, *locked)
     stress_result = portfolio(rows, *locked, cost_bps=30.0)
+    leaderboard = sorted(
+        evaluated,
+        key=lambda value: (value[0], value[1], value[2]),
+        reverse=True,
+    )[:10]
     report = {
         "strategy": "sfp_liquidity_sweep_v1",
         "status": "provisional_demo" if eligible_rows else "development_failed",
@@ -347,6 +352,32 @@ def main() -> None:
         "selected": {**asdict(cfg), "universe_mode": universe_mode, "side_mode": side_mode},
         "train": train_result, "validation": validation_result,
         "locked_test": locked_result, "locked_test_30bps": stress_result,
+        "leaderboard": [
+            {
+                "eligible": value[0],
+                "score": value[1],
+                "config": {
+                    **asdict(value[3]),
+                    "universe_mode": value[4],
+                    "side_mode": value[5],
+                },
+                "train": {
+                    key: value[7][key]
+                    for key in (
+                        "trades", "trades_per_day", "pnl_usd",
+                        "profit_factor", "max_drawdown_pct",
+                    )
+                },
+                "validation": {
+                    key: value[8][key]
+                    for key in (
+                        "trades", "trades_per_day", "pnl_usd",
+                        "profit_factor", "max_drawdown_pct",
+                    )
+                },
+            }
+            for value in leaderboard
+        ],
         "assumptions": {
             "signal": "completed 15m/1h sweep of a mature rolling high/low and directional close back inside",
             "entry": "break of the rejection bar within three bars, replayed on 1m data",

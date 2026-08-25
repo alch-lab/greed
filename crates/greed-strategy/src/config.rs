@@ -213,7 +213,7 @@ impl StrategyConfig {
             || !(0.01..=0.10).contains(&lanes.ignition_max_extension_30m)
             || !(60..=300).contains(&lanes.ignition_max_wait_seconds)
             || !(0.0..=0.5).contains(&lanes.ignition_limit_offset_atr)
-            || !(5..=60).contains(&lanes.ignition_entry_timeout_seconds)
+            || !(5..=120).contains(&lanes.ignition_entry_timeout_seconds)
             || !(0.5..=3.0).contains(&lanes.ignition_stop_atr_multiple)
             || !(0.5..=3.0).contains(&lanes.ignition_target_r)
             || !(3..=30).contains(&lanes.ignition_max_hold_minutes)

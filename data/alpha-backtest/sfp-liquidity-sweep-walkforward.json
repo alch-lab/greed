@@ -128,6 +128,298 @@
     },
     "skipped": {}
   },
+  "leaderboard": [
+    {
+      "eligible": true,
+      "score": 1.0532989418090943,
+      "config": {
+        "bar_minutes": 60,
+        "lookback_bars": 288,
+        "min_sweep_atr": 0.1,
+        "max_sweep_atr": 1.25,
+        "min_volume_ratio": 1.0,
+        "target_r": 2.0,
+        "max_hold_minutes": 180,
+        "universe_mode": "all",
+        "side_mode": "sell"
+      },
+      "train": {
+        "trades": 12,
+        "trades_per_day": 0.22641509433962265,
+        "pnl_usd": 1.7702881246041215,
+        "profit_factor": 1.0532989418090943,
+        "max_drawdown_pct": 0.008949150039078146
+      },
+      "validation": {
+        "trades": 6,
+        "trades_per_day": 0.2727272727272727,
+        "pnl_usd": 3.118298575652034,
+        "profit_factor": 1.2418667350899746,
+        "max_drawdown_pct": 0.004039355986201754
+      }
+    },
+    {
+      "eligible": false,
+      "score": 1.3328426668872149,
+      "config": {
+        "bar_minutes": 60,
+        "lookback_bars": 288,
+        "min_sweep_atr": 0.05,
+        "max_sweep_atr": 0.75,
+        "min_volume_ratio": 1.5,
+        "target_r": 1.25,
+        "max_hold_minutes": 360,
+        "universe_mode": "core_10",
+        "side_mode": "buy"
+      },
+      "train": {
+        "trades": 2,
+        "trades_per_day": 0.03773584905660377,
+        "pnl_usd": 7.729835283294278,
+        "profit_factor": 3.132330962411637,
+        "max_drawdown_pct": 0.001812531783188076
+      },
+      "validation": {
+        "trades": 3,
+        "trades_per_day": 0.13636363636363635,
+        "pnl_usd": 3.640707356293433,
+        "profit_factor": 1.3328426668872149,
+        "max_drawdown_pct": 0.005469111563042195
+      }
+    },
+    {
+      "eligible": false,
+      "score": 1.3328426668872149,
+      "config": {
+        "bar_minutes": 60,
+        "lookback_bars": 288,
+        "min_sweep_atr": 0.05,
+        "max_sweep_atr": 1.25,
+        "min_volume_ratio": 1.5,
+        "target_r": 1.25,
+        "max_hold_minutes": 360,
+        "universe_mode": "core_10",
+        "side_mode": "buy"
+      },
+      "train": {
+        "trades": 2,
+        "trades_per_day": 0.03773584905660377,
+        "pnl_usd": 7.729835283294278,
+        "profit_factor": 3.132330962411637,
+        "max_drawdown_pct": 0.001812531783188076
+      },
+      "validation": {
+        "trades": 3,
+        "trades_per_day": 0.13636363636363635,
+        "pnl_usd": 3.640707356293433,
+        "profit_factor": 1.3328426668872149,
+        "max_drawdown_pct": 0.005469111563042195
+      }
+    },
+    {
+      "eligible": false,
+      "score": 1.1396178155644556,
+      "config": {
+        "bar_minutes": 60,
+        "lookback_bars": 288,
+        "min_sweep_atr": 0.05,
+        "max_sweep_atr": 0.75,
+        "min_volume_ratio": 1.0,
+        "target_r": 1.25,
+        "max_hold_minutes": 180,
+        "universe_mode": "core_10",
+        "side_mode": "buy"
+      },
+      "train": {
+        "trades": 3,
+        "trades_per_day": 0.05660377358490566,
+        "pnl_usd": 1.4860572438583404,
+        "profit_factor": 1.1396178155644556,
+        "max_drawdown_pct": 0.005321875427753753
+      },
+      "validation": {
+        "trades": 3,
+        "trades_per_day": 0.13636363636363635,
+        "pnl_usd": 3.781948803267369,
+        "profit_factor": 2.202351306008029,
+        "max_drawdown_pct": 0.0015727303594088582
+      }
+    },
+    {
+      "eligible": false,
+      "score": 1.1396178155644556,
+      "config": {
+        "bar_minutes": 60,
+        "lookback_bars": 288,
+        "min_sweep_atr": 0.05,
+        "max_sweep_atr": 1.25,
+        "min_volume_ratio": 1.0,
+        "target_r": 1.25,
+        "max_hold_minutes": 180,
+        "universe_mode": "core_10",
+        "side_mode": "buy"
+      },
+      "train": {
+        "trades": 3,
+        "trades_per_day": 0.05660377358490566,
+        "pnl_usd": 1.4860572438583404,
+        "profit_factor": 1.1396178155644556,
+        "max_drawdown_pct": 0.005321875427753753
+      },
+      "validation": {
+        "trades": 3,
+        "trades_per_day": 0.13636363636363635,
+        "pnl_usd": 3.781948803267369,
+        "profit_factor": 2.202351306008029,
+        "max_drawdown_pct": 0.0015727303594088582
+      }
+    },
+    {
+      "eligible": false,
+      "score": 1.1396178155644556,
+      "config": {
+        "bar_minutes": 60,
+        "lookback_bars": 288,
+        "min_sweep_atr": 0.1,
+        "max_sweep_atr": 0.75,
+        "min_volume_ratio": 1.0,
+        "target_r": 1.25,
+        "max_hold_minutes": 180,
+        "universe_mode": "core_10",
+        "side_mode": "buy"
+      },
+      "train": {
+        "trades": 3,
+        "trades_per_day": 0.05660377358490566,
+        "pnl_usd": 1.4860572438583404,
+        "profit_factor": 1.1396178155644556,
+        "max_drawdown_pct": 0.005321875427753753
+      },
+      "validation": {
+        "trades": 2,
+        "trades_per_day": 0.09090909090909091,
+        "pnl_usd": 3.6463416215601683,
+        "profit_factor": 2.159239280829692,
+        "max_drawdown_pct": 0.0015727303594088582
+      }
+    },
+    {
+      "eligible": false,
+      "score": 1.1396178155644556,
+      "config": {
+        "bar_minutes": 60,
+        "lookback_bars": 288,
+        "min_sweep_atr": 0.1,
+        "max_sweep_atr": 1.25,
+        "min_volume_ratio": 1.0,
+        "target_r": 1.25,
+        "max_hold_minutes": 180,
+        "universe_mode": "core_10",
+        "side_mode": "buy"
+      },
+      "train": {
+        "trades": 3,
+        "trades_per_day": 0.05660377358490566,
+        "pnl_usd": 1.4860572438583404,
+        "profit_factor": 1.1396178155644556,
+        "max_drawdown_pct": 0.005321875427753753
+      },
+      "validation": {
+        "trades": 2,
+        "trades_per_day": 0.09090909090909091,
+        "pnl_usd": 3.6463416215601683,
+        "profit_factor": 2.159239280829692,
+        "max_drawdown_pct": 0.0015727303594088582
+      }
+    },
+    {
+      "eligible": false,
+      "score": 1.0868643876529762,
+      "config": {
+        "bar_minutes": 60,
+        "lookback_bars": 288,
+        "min_sweep_atr": 0.05,
+        "max_sweep_atr": 0.75,
+        "min_volume_ratio": 1.0,
+        "target_r": 1.5,
+        "max_hold_minutes": 180,
+        "universe_mode": "core_10",
+        "side_mode": "buy"
+      },
+      "train": {
+        "trades": 3,
+        "trades_per_day": 0.05660377358490566,
+        "pnl_usd": 0.9245629003944487,
+        "profit_factor": 1.0868643876529762,
+        "max_drawdown_pct": 0.005321875427753753
+      },
+      "validation": {
+        "trades": 3,
+        "trades_per_day": 0.13636363636363635,
+        "pnl_usd": 3.781948803267369,
+        "profit_factor": 2.202351306008029,
+        "max_drawdown_pct": 0.0015727303594088582
+      }
+    },
+    {
+      "eligible": false,
+      "score": 1.0868643876529762,
+      "config": {
+        "bar_minutes": 60,
+        "lookback_bars": 288,
+        "min_sweep_atr": 0.05,
+        "max_sweep_atr": 0.75,
+        "min_volume_ratio": 1.0,
+        "target_r": 2.0,
+        "max_hold_minutes": 180,
+        "universe_mode": "core_10",
+        "side_mode": "buy"
+      },
+      "train": {
+        "trades": 3,
+        "trades_per_day": 0.05660377358490566,
+        "pnl_usd": 0.9245629003944487,
+        "profit_factor": 1.0868643876529762,
+        "max_drawdown_pct": 0.005321875427753753
+      },
+      "validation": {
+        "trades": 3,
+        "trades_per_day": 0.13636363636363635,
+        "pnl_usd": 3.781948803267369,
+        "profit_factor": 2.202351306008029,
+        "max_drawdown_pct": 0.0015727303594088582
+      }
+    },
+    {
+      "eligible": false,
+      "score": 1.0868643876529762,
+      "config": {
+        "bar_minutes": 60,
+        "lookback_bars": 288,
+        "min_sweep_atr": 0.05,
+        "max_sweep_atr": 1.25,
+        "min_volume_ratio": 1.0,
+        "target_r": 1.5,
+        "max_hold_minutes": 180,
+        "universe_mode": "core_10",
+        "side_mode": "buy"
+      },
+      "train": {
+        "trades": 3,
+        "trades_per_day": 0.05660377358490566,
+        "pnl_usd": 0.9245629003944487,
+        "profit_factor": 1.0868643876529762,
+        "max_drawdown_pct": 0.005321875427753753
+      },
+      "validation": {
+        "trades": 3,
+        "trades_per_day": 0.13636363636363635,
+        "pnl_usd": 3.781948803267369,
+        "profit_factor": 2.202351306008029,
+        "max_drawdown_pct": 0.0015727303594088582
+      }
+    }
+  ],
   "assumptions": {
     "signal": "completed 15m/1h sweep of a mature rolling high/low and directional close back inside",
     "entry": "break of the rejection bar within three bars, replayed on 1m data",

@@ -204,7 +204,10 @@ impl StrategyNode for IgnitionSprintNode {
                     series
                         .values
                         .iter()
-                        .filter(|bar| bar.open_ms >= ignition.close_ms)
+                        // Keep live confirmation identical to walk-forward:
+                        // an in-progress candle can briefly satisfy the
+                        // close-location and flow gates before reversing.
+                        .filter(|bar| bar.closed && bar.open_ms >= ignition.close_ms)
                         .collect()
                 })
                 .unwrap_or_default();

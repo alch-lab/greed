@@ -167,6 +167,8 @@ impl StrategyNode for SfpReversalNode {
         let mut sweep_hits = 0u64;
         let mut confirmation_hits = 0u64;
         let mut history_ready = 0u64;
+        let mut near_sweep_hits = 0u64;
+        let mut nearest_sweep: Option<(f64, String, bool)> = None;
 
         for symbol in &self.symbols {
             let Some(instrument) = ctx.frame.instrument(symbol) else {
@@ -184,6 +186,24 @@ impl StrategyNode for SfpReversalNode {
                 continue;
             }
             history_ready += 1;
+            let latest_index = hourly.len() - 1;
+            let latest = &hourly[latest_index];
+            let prior = &hourly[latest_index - self.config.sfp_lookback_hours..latest_index];
+            let level = prior
+                .iter()
+                .map(|value| value.high)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let distance_atr =
+                (level - latest.high) / atr(&hourly, latest_index, 14).max(f64::EPSILON);
+            let swept = distance_atr <= 0.0;
+            let proximity = distance_atr.max(0.0);
+            near_sweep_hits += u64::from(proximity <= 0.25);
+            if nearest_sweep
+                .as_ref()
+                .is_none_or(|current| proximity < current.0)
+            {
+                nearest_sweep = Some((proximity, symbol.clone(), swept));
+            }
             let start = hourly
                 .len()
                 .saturating_sub(self.config.sfp_confirmation_hours as usize + 1)
@@ -340,6 +360,16 @@ impl StrategyNode for SfpReversalNode {
                     format!(
                         "loading 12-day 1h structure history ({history_ready}/{inspected} symbols ready)"
                     )
+                } else if let Some((distance, symbol, swept)) = nearest_sweep.as_ref() {
+                    if *swept {
+                        format!(
+                            "{symbol} swept the 12-day high, but the closed 1h rejection shape or volume is not valid"
+                        )
+                    } else {
+                        format!(
+                            "{symbol} is closest: the 12-day high is {distance:.2} ATR above the latest closed 1h high"
+                        )
+                    }
                 } else {
                     "waiting for a 1h prior-high sweep and close back below the level".into()
                 }
@@ -357,6 +387,8 @@ impl StrategyNode for SfpReversalNode {
                     "ready_to_fade_failed_breakout"
                 } else if sweep_hits > 0 {
                     "waiting_for_sfp_confirmation"
+                } else if near_sweep_hits > 0 {
+                    "approaching_hourly_liquidity_sweep"
                 } else {
                     "scanning_hourly_liquidity_sweeps"
                 }
@@ -372,6 +404,11 @@ impl StrategyNode for SfpReversalNode {
                 metrics: BTreeMap::from([
                     ("inspected_symbols".into(), inspected as f64),
                     ("history_ready".into(), history_ready as f64),
+                    ("near_sweep_hits".into(), near_sweep_hits as f64),
+                    (
+                        "nearest_sweep_distance_atr".into(),
+                        nearest_sweep.as_ref().map_or(0.0, |value| value.0),
+                    ),
                     ("sweep_hits".into(), sweep_hits as f64),
                     ("confirmation_hits".into(), confirmation_hits as f64),
                     ("pass_candidates".into(), passed.len() as f64),
