@@ -159,6 +159,11 @@ impl StrategyNode for PositionPlannerNode {
                 notional_usd: notional,
                 entry_limit: tag_f64(c, "entry_limit"),
                 entry_timeout_ms: tag_i64(c, "entry_timeout_ms").unwrap_or_default(),
+                taker_fallback: c
+                    .tags
+                    .get("taker_fallback")
+                    .is_some_and(|value| value == "true"),
+                max_entry_adverse_bps: tag_f64(c, "max_entry_adverse_bps").unwrap_or_default(),
                 stop_price: stop,
                 take_profit_prices,
                 break_even_after_fraction: (take_fraction < 1.0).then_some(take_fraction),

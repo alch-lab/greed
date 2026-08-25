@@ -146,6 +146,32 @@ struct RemoteAccount {
     positions: BTreeMap<String, RemotePosition>,
 }
 
+#[derive(Debug)]
+struct EntryExecution {
+    order: Value,
+    mode: &'static str,
+    maker_attempted: bool,
+    maker_wait_ms: i64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct TradeSummary {
+    exit_price: f64,
+    exit_quantity: f64,
+    fees_usd: f64,
+    net_pnl_usd: f64,
+    maker_fills: usize,
+    taker_fills: usize,
+    maker_notional_usd: f64,
+    taker_notional_usd: f64,
+}
+
+#[derive(Debug)]
+enum PostOnlyEntry {
+    Filled { order: Value, waited_ms: i64 },
+    Unfilled { waited_ms: i64 },
+}
+
 pub struct BinanceDemoExecution {
     client: Client,
     config: ExecutionConfig,
@@ -252,12 +278,17 @@ impl BinanceDemoExecution {
     }
 
     async fn public_get(&self, path: &str) -> Result<Value> {
+        self.public_get_params(path, &[]).await
+    }
+
+    async fn public_get_params(&self, path: &str, parameters: &[(&str, &str)]) -> Result<Value> {
         let response = self
             .client
             .get(format!(
                 "{}{path}",
                 self.config.base_url.trim_end_matches('/')
             ))
+            .query(parameters)
             .send()
             .await?;
         let status = response.status();
@@ -370,6 +401,9 @@ impl BinanceDemoExecution {
                                 }
                             }
                             "TAKE_PROFIT_MARKET" => entry.1 = true,
+                            "LIMIT" if order["reduceOnly"].as_bool().unwrap_or(false) => {
+                                entry.1 = true
+                            }
                             _ => {}
                         }
                     }
@@ -434,15 +468,17 @@ impl BinanceDemoExecution {
                 ) in partial_exits
                 {
                     let summary = self.trade_summary(&symbol, entry_ms).await.ok();
-                    let (fee_delta, pnl_delta) = if let Some((_, _, fee, pnl)) = summary.as_ref() {
+                    let (fee_delta, pnl_delta) = if let Some(summary) = summary.as_ref() {
                         let meta = self.state.positions.get(&symbol);
                         (
-                            fee - meta
-                                .map(|value| value.cumulative_reported_fee_usd)
-                                .unwrap_or(0.0),
-                            pnl - meta
-                                .map(|value| value.cumulative_reported_pnl_usd)
-                                .unwrap_or(0.0),
+                            summary.fees_usd
+                                - meta
+                                    .map(|value| value.cumulative_reported_fee_usd)
+                                    .unwrap_or(0.0),
+                            summary.net_pnl_usd
+                                - meta
+                                    .map(|value| value.cumulative_reported_pnl_usd)
+                                    .unwrap_or(0.0),
                         )
                     } else {
                         (0.0, 0.0)
@@ -460,16 +496,20 @@ impl BinanceDemoExecution {
                             "remaining_quantity":remaining_quantity,
                             "fee_usd":fee_delta,
                             "pnl_usd":pnl_delta,
-                            "cumulative_fee_usd":summary.as_ref().map(|value| value.2),
-                            "cumulative_net_pnl_usd":summary.as_ref().map(|value| value.3),
+                            "cumulative_fee_usd":summary.as_ref().map(|value| value.fees_usd),
+                            "cumulative_net_pnl_usd":summary.as_ref().map(|value| value.net_pnl_usd),
+                            "maker_fills":summary.as_ref().map(|value| value.maker_fills),
+                            "taker_fills":summary.as_ref().map(|value| value.taker_fills),
+                            "maker_notional_usd":summary.as_ref().map(|value| value.maker_notional_usd),
+                            "taker_notional_usd":summary.as_ref().map(|value| value.taker_notional_usd),
                             "venue":"binance_demo"
                         }),
                     });
                     if let Some(meta) = self.state.positions.get_mut(&symbol) {
                         meta.last_observed_quantity = remaining_quantity;
-                        if let Some((_, _, fee, pnl)) = summary {
-                            meta.cumulative_reported_fee_usd = fee;
-                            meta.cumulative_reported_pnl_usd = pnl;
+                        if let Some(summary) = summary {
+                            meta.cumulative_reported_fee_usd = summary.fees_usd;
+                            meta.cumulative_reported_pnl_usd = summary.net_pnl_usd;
                         }
                     }
                 }
@@ -656,14 +696,14 @@ impl BinanceDemoExecution {
                     if let Some(meta) = self.state.positions.remove(&symbol) {
                         self.cancel_all(&symbol).await.ok();
                         let summary = self.trade_summary(&symbol, meta.entry_ms).await.ok();
-                        if let Some((_, _, _, pnl)) = summary.as_ref() {
+                        if let Some(summary) = summary.as_ref() {
                             self.state
                                 .recipe_outcomes
                                 .entry(gate_key(&meta.recipe, meta.side))
                                 .or_default()
                                 .push(ExecutionOutcome {
                                     exit_ms: now_ms,
-                                    pnl_usd: *pnl,
+                                    pnl_usd: summary.net_pnl_usd,
                                 });
                         }
                         let mfe_pct = meta.side.sign()
@@ -679,11 +719,15 @@ impl BinanceDemoExecution {
                                 "recipe": meta.recipe,
                                 "symbol": symbol,
                                 "side": meta.side,
-                                "exit_price": summary.as_ref().map(|value| value.0),
-                                "quantity": summary.as_ref().map(|value| value.1),
-                                "fee_usd": summary.as_ref().map(|value| value.2 - meta.cumulative_reported_fee_usd),
-                                "pnl_usd": summary.as_ref().map(|value| value.3 - meta.cumulative_reported_pnl_usd),
-                                "trade_net_pnl_usd": summary.as_ref().map(|value| value.3),
+                                "exit_price": summary.as_ref().map(|value| value.exit_price),
+                                "quantity": summary.as_ref().map(|value| value.exit_quantity),
+                                "fee_usd": summary.as_ref().map(|value| value.fees_usd - meta.cumulative_reported_fee_usd),
+                                "pnl_usd": summary.as_ref().map(|value| value.net_pnl_usd - meta.cumulative_reported_pnl_usd),
+                                "trade_net_pnl_usd": summary.as_ref().map(|value| value.net_pnl_usd),
+                                "maker_fills":summary.as_ref().map(|value| value.maker_fills),
+                                "taker_fills":summary.as_ref().map(|value| value.taker_fills),
+                                "maker_notional_usd":summary.as_ref().map(|value| value.maker_notional_usd),
+                                "taker_notional_usd":summary.as_ref().map(|value| value.taker_notional_usd),
                                 "mfe_pct": mfe_pct,
                                 "mae_pct": mae_pct,
                                 "hold_ms": now_ms - meta.entry_ms,
@@ -928,7 +972,16 @@ impl BinanceDemoExecution {
             self.save().ok();
             let attempt_started_ms = chrono::Utc::now().timestamp_millis();
             match self.place_bracket(plan, size_multiplier).await {
-                Ok((entry_price, quantity, order_id, stop_price, take_profit_prices)) => {
+                Ok((
+                    entry_price,
+                    quantity,
+                    order_id,
+                    stop_price,
+                    take_profit_prices,
+                    entry_mode,
+                    maker_attempted,
+                    maker_wait_ms,
+                )) => {
                     self.state.positions.insert(
                         plan.symbol.clone(),
                         ExecutionMeta {
@@ -977,7 +1030,7 @@ impl BinanceDemoExecution {
                         .and_then(|value| value.parse::<i64>().ok());
                     events.push(ExchangeEvent {
                         kind: "exchange_entry".into(),
-                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"entry_mode":if plan.entry_limit.is_some(){"post_only_limit"}else{"market"},"requested_limit":plan.entry_limit,"entry_price":entry_price,"quantity":quantity,"notional_usd":plan.notional_usd * size_multiplier,"probe_size_multiplier":size_multiplier,"order_id":order_id,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
+                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"entry_mode":entry_mode,"maker_attempted":maker_attempted,"maker_wait_ms":maker_wait_ms,"requested_limit":plan.entry_limit,"entry_price":entry_price,"quantity":quantity,"notional_usd":plan.notional_usd * size_multiplier,"probe_size_multiplier":size_multiplier,"order_id":order_id,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
                     });
                 }
                 Err(error) => {
@@ -999,10 +1052,12 @@ impl BinanceDemoExecution {
                             "symbol":plan.symbol,
                             "side":plan.side,
                             "reason":error.to_string(),
-                            "attempt_exit_price":attempt.as_ref().map(|value| value.0),
-                            "attempt_exit_quantity":attempt.as_ref().map(|value| value.1),
-                            "attempt_fee_usd":attempt.as_ref().map(|value| value.2),
-                            "attempt_net_pnl_usd":attempt.as_ref().map(|value| value.3),
+                            "attempt_exit_price":attempt.as_ref().map(|value| value.exit_price),
+                            "attempt_exit_quantity":attempt.as_ref().map(|value| value.exit_quantity),
+                            "attempt_fee_usd":attempt.as_ref().map(|value| value.fees_usd),
+                            "attempt_net_pnl_usd":attempt.as_ref().map(|value| value.net_pnl_usd),
+                            "attempt_maker_fills":attempt.as_ref().map(|value| value.maker_fills),
+                            "attempt_taker_fills":attempt.as_ref().map(|value| value.taker_fills),
                             "venue":"binance_demo",
                             "paper_only":true
                         }),
@@ -1024,7 +1079,7 @@ impl BinanceDemoExecution {
         &self,
         plan: &greed_kernel::PositionPlan,
         size_multiplier: f64,
-    ) -> Result<(f64, f64, i64, f64, Vec<(f64, f64)>)> {
+    ) -> Result<(f64, f64, i64, f64, Vec<(f64, f64)>, &'static str, bool, i64)> {
         let rules = self
             .rules
             .get(&plan.symbol)
@@ -1069,31 +1124,95 @@ impl BinanceDemoExecution {
             } else {
                 ceil_step(limit, rules.price_tick)
             };
-            self.place_post_only_entry(plan, quantity, price, rules, &client_id)
+            match self
+                .place_post_only_entry(plan, quantity, price, rules, &client_id)
                 .await?
+            {
+                PostOnlyEntry::Filled { order, waited_ms } => EntryExecution {
+                    order,
+                    mode: "maker_limit",
+                    maker_attempted: true,
+                    maker_wait_ms: waited_ms,
+                },
+                PostOnlyEntry::Unfilled { waited_ms } if plan.taker_fallback => {
+                    let ticker = self
+                        .public_get_params(
+                            "/fapi/v1/ticker/bookTicker",
+                            &[("symbol", plan.symbol.as_str())],
+                        )
+                        .await?;
+                    let executable = if plan.side == Side::Buy {
+                        parse_f64(&ticker, "askPrice")
+                    } else {
+                        parse_f64(&ticker, "bidPrice")
+                    }
+                    .ok_or_else(|| anyhow!("book ticker is missing an executable price"))?;
+                    let adverse_bps = plan.side.sign()
+                        * (executable / plan.reference_price.max(f64::EPSILON) - 1.0)
+                        * 10_000.0;
+                    if adverse_bps > plan.max_entry_adverse_bps {
+                        return Err(anyhow!(
+                            "maker entry expired and price drifted {adverse_bps:.1} bps against the signal (max {:.1})",
+                            plan.max_entry_adverse_bps
+                        ));
+                    }
+                    let fallback_id = client_order_id("fallback", &plan.candidate_id);
+                    let order = self
+                        .submit_or_lookup(
+                            &plan.symbol,
+                            &fallback_id,
+                            vec![
+                                ("symbol".into(), plan.symbol.clone()),
+                                ("side".into(), side_name(plan.side).into()),
+                                ("type".into(), "MARKET".into()),
+                                ("quantity".into(), decimal(quantity, rules.quantity_step)),
+                                ("newClientOrderId".into(), fallback_id.clone()),
+                                ("newOrderRespType".into(), "RESULT".into()),
+                            ],
+                        )
+                        .await?;
+                    EntryExecution {
+                        order,
+                        mode: "maker_timeout_taker_fallback",
+                        maker_attempted: true,
+                        maker_wait_ms: waited_ms,
+                    }
+                }
+                PostOnlyEntry::Unfilled { waited_ms } => {
+                    return Err(anyhow!(
+                        "maker entry expired without fill after {waited_ms}ms; chasing is disabled"
+                    ));
+                }
+            }
         } else {
-            self.submit_or_lookup(
-                &plan.symbol,
-                &client_id,
-                vec![
-                    ("symbol".into(), plan.symbol.clone()),
-                    ("side".into(), side_name(plan.side).into()),
-                    ("type".into(), "MARKET".into()),
-                    ("quantity".into(), decimal(quantity, rules.quantity_step)),
-                    ("newClientOrderId".into(), client_id.clone()),
-                    ("newOrderRespType".into(), "RESULT".into()),
-                ],
-            )
-            .await?
+            EntryExecution {
+                order: self
+                    .submit_or_lookup(
+                        &plan.symbol,
+                        &client_id,
+                        vec![
+                            ("symbol".into(), plan.symbol.clone()),
+                            ("side".into(), side_name(plan.side).into()),
+                            ("type".into(), "MARKET".into()),
+                            ("quantity".into(), decimal(quantity, rules.quantity_step)),
+                            ("newClientOrderId".into(), client_id.clone()),
+                            ("newOrderRespType".into(), "RESULT".into()),
+                        ],
+                    )
+                    .await?,
+                mode: "taker_market",
+                maker_attempted: false,
+                maker_wait_ms: 0,
+            }
         };
-        let executed = parse_f64(&entry, "executedQty").unwrap_or(quantity);
+        let executed = parse_f64(&entry.order, "executedQty").unwrap_or(quantity);
         if executed <= f64::EPSILON {
             return Err(anyhow!("entry order completed without a fill"));
         }
-        let entry_price = parse_f64(&entry, "avgPrice")
+        let entry_price = parse_f64(&entry.order, "avgPrice")
             .filter(|value| *value > 0.0)
             .unwrap_or(plan.reference_price);
-        let order_id = entry["orderId"].as_i64().unwrap_or_default();
+        let order_id = entry.order["orderId"].as_i64().unwrap_or_default();
         // Preserve the planned risk/reward distances from the actual exchange
         // fill. A fast market can move between signal construction and fill;
         // anchoring protection to the stale reference would silently change
@@ -1121,28 +1240,15 @@ impl BinanceDemoExecution {
             )
             .await?;
             for (index, (take_profit, fraction)) in take_profit_prices.iter().enumerate() {
-                let last = index + 1 == take_profit_prices.len();
-                if last && *fraction >= 1.0 - f64::EPSILON {
-                    self.place_close_all_trigger(
-                        &plan.symbol,
-                        plan.side.opposite(),
-                        "TAKE_PROFIT_MARKET",
-                        *take_profit,
-                        rules,
-                        client_order_id("runner", &plan.candidate_id),
-                    )
-                    .await?;
-                } else {
-                    self.place_partial_trigger(
-                        &plan.symbol,
-                        plan.side.opposite(),
-                        *take_profit,
-                        floor_step(executed * fraction, rules.quantity_step),
-                        rules,
-                        client_order_id(&format!("take{index}"), &plan.candidate_id),
-                    )
-                    .await?;
-                }
+                self.place_reduce_only_take_profit(
+                    &plan.symbol,
+                    plan.side.opposite(),
+                    *take_profit,
+                    floor_step(executed * fraction, rules.quantity_step),
+                    rules,
+                    client_order_id(&format!("take{index}"), &plan.candidate_id),
+                )
+                .await?;
             }
             Result::<()>::Ok(())
         }
@@ -1174,6 +1280,9 @@ impl BinanceDemoExecution {
             order_id,
             stop_price,
             take_profit_prices,
+            entry.mode,
+            entry.maker_attempted,
+            entry.maker_wait_ms,
         ))
     }
 
@@ -1184,7 +1293,7 @@ impl BinanceDemoExecution {
         price: f64,
         rules: &SymbolRules,
         client_id: &str,
-    ) -> Result<Value> {
+    ) -> Result<PostOnlyEntry> {
         let mut order = self
             .submit_or_lookup(
                 &plan.symbol,
@@ -1201,17 +1310,27 @@ impl BinanceDemoExecution {
                 ],
             )
             .await?;
-        let deadline =
-            chrono::Utc::now().timestamp_millis() + plan.entry_timeout_ms.clamp(5_000, 60_000);
+        let started_ms = chrono::Utc::now().timestamp_millis();
+        let deadline = started_ms + plan.entry_timeout_ms.clamp(5_000, 60_000);
         loop {
             let status = order.get("status").and_then(Value::as_str).unwrap_or("NEW");
             if status == "FILLED" {
-                return Ok(order);
+                return Ok(PostOnlyEntry::Filled {
+                    order,
+                    waited_ms: chrono::Utc::now()
+                        .timestamp_millis()
+                        .saturating_sub(started_ms),
+                });
             }
             if matches!(status, "CANCELED" | "EXPIRED" | "REJECTED") {
                 let executed = parse_f64(&order, "executedQty").unwrap_or_default();
                 if executed > f64::EPSILON {
-                    return Ok(order);
+                    return Ok(PostOnlyEntry::Filled {
+                        order,
+                        waited_ms: chrono::Utc::now()
+                            .timestamp_millis()
+                            .saturating_sub(started_ms),
+                    });
                 }
                 return Err(anyhow!("post-only entry ended with status {status}"));
             }
@@ -1248,12 +1367,16 @@ impl BinanceDemoExecution {
                     .or_else(|| parse_f64(&order, "executedQty"))
                     .unwrap_or_default();
                 if executed > f64::EPSILON {
-                    return Ok(canceled);
+                    return Ok(PostOnlyEntry::Filled {
+                        order: canceled,
+                        waited_ms: chrono::Utc::now()
+                            .timestamp_millis()
+                            .saturating_sub(started_ms),
+                    });
                 }
-                return Err(anyhow!(
-                    "post-only entry expired without fill after {}ms",
-                    plan.entry_timeout_ms
-                ));
+                return Ok(PostOnlyEntry::Unfilled {
+                    waited_ms: plan.entry_timeout_ms.clamp(5_000, 60_000),
+                });
             }
             tokio::time::sleep(Duration::from_secs(1)).await;
             if let Ok(value) = self
@@ -1302,31 +1425,38 @@ impl BinanceDemoExecution {
         Ok(())
     }
 
-    async fn place_partial_trigger(
+    async fn place_reduce_only_take_profit(
         &self,
         symbol: &str,
         side: Side,
-        trigger: f64,
+        target: f64,
         quantity: f64,
         rules: &SymbolRules,
         client_id: String,
     ) -> Result<()> {
-        self.submit_algo_or_lookup(
+        let price = if side == Side::Buy {
+            floor_step(target, rules.price_tick)
+        } else {
+            ceil_step(target, rules.price_tick)
+        };
+        self.submit_or_lookup(
+            symbol,
             &client_id,
             vec![
-                ("algoType".into(), "CONDITIONAL".into()),
                 ("symbol".into(), symbol.into()),
                 ("side".into(), side_name(side).into()),
-                ("type".into(), "TAKE_PROFIT_MARKET".into()),
-                (
-                    "triggerPrice".into(),
-                    decimal(round_step(trigger, rules.price_tick), rules.price_tick),
-                ),
+                ("type".into(), "LIMIT".into()),
+                // A target submitted before price reaches it rests and earns maker
+                // liquidity. GTC intentionally permits an immediate profitable
+                // fill if price crosses the target while the stop is being placed;
+                // strict GTX would reject that race and turn a winning move into a
+                // protection failure plus emergency close.
+                ("timeInForce".into(), "GTC".into()),
+                ("price".into(), decimal(price, rules.price_tick)),
                 ("quantity".into(), decimal(quantity, rules.quantity_step)),
                 ("reduceOnly".into(), "true".into()),
-                ("workingType".into(), "MARK_PRICE".into()),
-                ("priceProtect".into(), "true".into()),
-                ("clientAlgoId".into(), client_id.clone()),
+                ("newClientOrderId".into(), client_id.clone()),
+                ("newOrderRespType".into(), "ACK".into()),
             ],
         )
         .await?;
@@ -1459,7 +1589,7 @@ impl BinanceDemoExecution {
         Ok(())
     }
 
-    async fn trade_summary(&self, symbol: &str, start_ms: i64) -> Result<(f64, f64, f64, f64)> {
+    async fn trade_summary(&self, symbol: &str, start_ms: i64) -> Result<TradeSummary> {
         let value = self
             .signed(
                 Method::GET,
@@ -1478,14 +1608,26 @@ impl BinanceDemoExecution {
         let mut exit_quantity = 0.0;
         let mut fees = 0.0;
         let mut realized = 0.0;
+        let mut maker_fills = 0usize;
+        let mut taker_fills = 0usize;
+        let mut maker_notional = 0.0;
+        let mut taker_notional = 0.0;
         for row in rows {
             let pnl = parse_f64(row, "realizedPnl").unwrap_or(0.0);
+            let quantity = parse_f64(row, "qty").unwrap_or(0.0);
+            let price = parse_f64(row, "price").unwrap_or(0.0);
+            if row["maker"].as_bool().unwrap_or(false) {
+                maker_fills += 1;
+                maker_notional += price * quantity;
+            } else {
+                taker_fills += 1;
+                taker_notional += price * quantity;
+            }
             fees += parse_f64(row, "commission").unwrap_or(0.0);
             realized += pnl;
             if pnl.abs() > f64::EPSILON {
-                let quantity = parse_f64(row, "qty").unwrap_or(0.0);
                 exit_quantity += quantity;
-                exit_notional += parse_f64(row, "price").unwrap_or(0.0) * quantity;
+                exit_notional += price * quantity;
             }
         }
         let exit_price = if exit_quantity > f64::EPSILON {
@@ -1493,7 +1635,16 @@ impl BinanceDemoExecution {
         } else {
             0.0
         };
-        Ok((exit_price, exit_quantity, fees, realized - fees))
+        Ok(TradeSummary {
+            exit_price,
+            exit_quantity,
+            fees_usd: fees,
+            net_pnl_usd: realized - fees,
+            maker_fills,
+            taker_fills,
+            maker_notional_usd: maker_notional,
+            taker_notional_usd: taker_notional,
+        })
     }
 
     async fn close_market(&self, position: &RemotePosition) -> Result<()> {

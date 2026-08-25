@@ -201,6 +201,23 @@ impl StrategyNode for TrendContinuationNode {
             } else {
                 Verdict::Block
             };
+            let mut tags = BTreeMap::from([("lane".into(), "trend_continuation".into())]);
+            if verdict == Verdict::Pass {
+                if let Some(book) = instrument.book.as_ref() {
+                    tags.insert(
+                        "entry_limit".into(),
+                        if side == Side::Buy {
+                            book.bid
+                        } else {
+                            book.ask
+                        }
+                        .to_string(),
+                    );
+                    tags.insert("entry_timeout_ms".into(), "30000".into());
+                    tags.insert("taker_fallback".into(), "true".into());
+                    tags.insert("max_entry_adverse_bps".into(), "12".into());
+                }
+            }
             let candidate = TradeCandidate {
                 id: format!("trend_continuation:{symbol}:{}", bar.close_ms),
                 recipe: "trend_continuation".into(),
@@ -222,7 +239,7 @@ impl StrategyNode for TrendContinuationNode {
                     format!("{symbol}.binance_15m_trend"),
                     format!("{symbol}.book"),
                 ],
-                tags: BTreeMap::from([("lane".into(), "trend_continuation".into())]),
+                tags,
             };
             if verdict == Verdict::Pass {
                 passed.push((score, candidate));

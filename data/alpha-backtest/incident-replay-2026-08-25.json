@@ -1,0 +1,69 @@
+{
+  "report": "2026-08-25 execution-incident counterfactual replay",
+  "generated_at": "2026-08-25T22:25:44+08:00",
+  "starting_equity_usd": 2000.0,
+  "observed": {
+    "unique_candidates": 2,
+    "exchange_attempts": 11,
+    "ending_equity_usd": 1945.49828307,
+    "net_pnl_usd": -54.50171693,
+    "cause": "the same PROMUSDT/TACUSDT trend candidates were repeatedly entered and emergency-closed after the legacy conditional-order endpoint returned Binance -4120"
+  },
+  "counterfactual_policy": {
+    "candidate_semantics": "at-most-once; one PROMUSDT long and one TACUSDT long",
+    "notional_usd_per_trade": 2000.0,
+    "initial_stop_pct": 0.01,
+    "first_take_profit_r": 2.0,
+    "first_take_profit_fraction": 0.4,
+    "break_even_buffer_pct": 0.0018,
+    "trailing_distance_pct": 0.005,
+    "maker_fee_assumption": 0.0002,
+    "taker_fee_assumption": 0.0005
+  },
+  "primary_replay": {
+    "model": "one-minute bars; trailing extreme sampled from closes; conservative relative to intraminute high",
+    "trades": [
+      {
+        "symbol": "PROMUSDT",
+        "side": "buy",
+        "entry_time": "2026-08-25T10:45:32+08:00",
+        "entry_price": 4.238,
+        "exit_time": "2026-08-25T10:47:00+08:00",
+        "exit_price": 4.19562,
+        "exit_reason": "initial_stop",
+        "gross_pnl_usd": -20.0,
+        "fees_usd": 1.39,
+        "net_pnl_usd": -21.39
+      },
+      {
+        "symbol": "TACUSDT",
+        "side": "buy",
+        "entry_time": "2026-08-25T10:45:32+08:00",
+        "entry_price": 0.0025,
+        "tp1_time": "2026-08-25T10:46:00+08:00",
+        "exit_time": "2026-08-25T10:49:00+08:00",
+        "exit_price": 0.002651675,
+        "exit_reason": "trailing_stop",
+        "gross_pnl_usd": 88.804,
+        "fees_usd": 1.199602,
+        "net_pnl_usd": 87.604398
+      }
+    ],
+    "ending_equity_usd": 2066.214398,
+    "net_pnl_usd": 66.214398,
+    "return_pct": 3.31072
+  },
+  "intraminute_sensitivity": {
+    "description": "if the TAC trailing extreme followed the one-minute high before the next-minute pullback",
+    "ending_equity_usd": 2079.1032,
+    "net_pnl_usd": 79.1032,
+    "return_pct": 3.95516
+  },
+  "data_quality": {
+    "candidate_identity_and_incident_pnl": "exact from greed-paper-diagnostics-20260825-213704",
+    "PROMUSDT": "Binance public spot aggregate trades and one-minute bars; futures basis is not represented",
+    "TACUSDT": "Gate USDT perpetual one-minute proxy because Binance Futures public history was unreachable from the analysis environment",
+    "classification": "counterfactual incident replay, not an exchange-exact tick backtest",
+    "result_range_usd": [66.214398, 79.1032]
+  }
+}

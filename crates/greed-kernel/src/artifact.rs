@@ -64,6 +64,10 @@ pub struct PositionPlan {
     pub notional_usd: f64,
     pub entry_limit: Option<f64>,
     pub entry_timeout_ms: i64,
+    #[serde(default)]
+    pub taker_fallback: bool,
+    #[serde(default)]
+    pub max_entry_adverse_bps: f64,
     pub stop_price: f64,
     pub take_profit_prices: Vec<(f64, f64)>,
     pub break_even_after_fraction: Option<f64>,

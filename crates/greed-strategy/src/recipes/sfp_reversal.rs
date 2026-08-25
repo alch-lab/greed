@@ -270,6 +270,7 @@ impl StrategyNode for SfpReversalNode {
             confirmation_hits += u64::from(ready);
             let progress = (7usize.saturating_sub(blockers.len()).min(7) as f64) / 7.0;
             let score = setup.sweep_atr * setup.volume_ratio;
+            let passive_entry = instrument.book.as_ref().map(|book| book.ask);
             let candidate = TradeCandidate {
                 id: format!("sfp_reversal:{symbol}:{}", signal.close_ms),
                 recipe: "sfp_reversal".into(),
@@ -302,6 +303,12 @@ impl StrategyNode for SfpReversalNode {
                     ("stop_pct".into(), stop_pct.to_string()),
                     ("target_r".into(), self.config.sfp_target_r.to_string()),
                     ("take_profit_fraction".into(), "1.0".into()),
+                    (
+                        "entry_limit".into(),
+                        passive_entry.unwrap_or(instrument.price).to_string(),
+                    ),
+                    ("entry_timeout_ms".into(), "60000".into()),
+                    ("taker_fallback".into(), "false".into()),
                     (
                         "max_hold_ms".into(),
                         (i64::from(self.config.sfp_max_hold_minutes) * 60_000).to_string(),
