@@ -108,8 +108,8 @@ impl AppConfig {
         if !self.runtime.binance_futures_ws_base.starts_with("wss://") {
             return Err("binance_futures_ws_base must use wss".into());
         }
-        if !(120..=1000).contains(&self.runtime.candle_limit) {
-            return Err("candle_limit must be 120..=1000".into());
+        if !(120..=1500).contains(&self.runtime.candle_limit) {
+            return Err("candle_limit must be 120..=1500".into());
         }
         if self.portfolio.initial_equity_usd <= 0.0 {
             return Err("initial_equity_usd must be positive".into());

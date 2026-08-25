@@ -1,5 +1,8 @@
 use crate::{
-    recipes::{ignition_sprint::IgnitionSprintNode, trend_continuation::TrendContinuationNode},
+    recipes::{
+        ignition_sprint::IgnitionSprintNode, sfp_reversal::SfpReversalNode,
+        trend_continuation::TrendContinuationNode,
+    },
     risk::PositionPlannerNode,
     StrategyConfig,
 };
@@ -8,6 +11,13 @@ use greed_kernel::{GraphError, StrategyGraph, StrategyNode};
 pub fn build_graph(config: &StrategyConfig) -> Result<StrategyGraph, GraphError> {
     let mut nodes: Vec<Box<dyn StrategyNode>> = Vec::new();
     let mut lanes = Vec::new();
+    if config.lanes.sfp_reversal_enabled {
+        nodes.push(Box::new(SfpReversalNode::new(
+            &config.symbols,
+            config.lanes.clone(),
+        )));
+        lanes.push("lane.sfp_reversal".into());
+    }
     if config.lanes.trend_continuation_enabled {
         nodes.push(Box::new(TrendContinuationNode::new(
             &config.symbols,

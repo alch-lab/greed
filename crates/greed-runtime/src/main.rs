@@ -195,6 +195,7 @@ fn strategy_funnels_demo(
         })
     };
     serde_json::json!({
+        "sfp_reversal":build("sfp_reversal"),
         "trend_continuation":build("trend_continuation"),
         "ignition_sprint":build("ignition_sprint")
     })
@@ -275,7 +276,8 @@ async fn main() -> Result<()> {
             let config = load(&config)?;
             let graph = build_graph(&config.strategy)?;
             drop(graph);
-            let enabled_lanes = usize::from(config.strategy.lanes.trend_continuation_enabled)
+            let enabled_lanes = usize::from(config.strategy.lanes.sfp_reversal_enabled)
+                + usize::from(config.strategy.lanes.trend_continuation_enabled)
                 + usize::from(config.strategy.lanes.ignition_sprint_enabled);
             println!(
                 "valid: {} seed symbols, {} funded alpha lane(s), paper_only=true, execution={:?}",

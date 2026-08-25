@@ -728,7 +728,7 @@ impl BinanceDemoExecution {
     }
 
     pub fn recipe_gate_snapshots(&self, now_ms: i64) -> BTreeMap<String, RecipeGateStatus> {
-        ["trend_continuation", "ignition_sprint"]
+        ["sfp_reversal", "trend_continuation", "ignition_sprint"]
             .into_iter()
             .flat_map(|recipe| {
                 [Side::Buy, Side::Sell].into_iter().map(move |side| {

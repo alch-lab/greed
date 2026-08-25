@@ -87,14 +87,27 @@ impl StrategyNode for PositionPlannerNode {
             .filter_map(|r| r.artifact.candidate())
             .filter(|c| c.verdict == Verdict::Pass && c.expires_ms >= ctx.frame.as_of_ms)
             .collect();
-        candidates.sort_by(|a, b| b.score.total_cmp(&a.score));
+        candidates.sort_by(|a, b| {
+            tag_f64(b, "priority")
+                .unwrap_or(1.0)
+                .total_cmp(&tag_f64(a, "priority").unwrap_or(1.0))
+                .then_with(|| b.score.total_cmp(&a.score))
+        });
         let mut planned_gross = gross;
         let mut slots = self.config.max_positions.saturating_sub(a.open_positions);
+        let mut planned_symbols = std::collections::BTreeSet::new();
         for c in candidates {
             if slots == 0 {
                 break;
             }
+            // A failed breakout and a continuation signal can coexist briefly
+            // in the same frame.  Fund only the higher-priority interpretation
+            // instead of submitting opposing plans for one contract.
+            if !planned_symbols.insert(c.symbol.clone()) {
+                continue;
+            }
             let Some(i) = ctx.frame.instrument(&c.symbol) else {
+                planned_symbols.remove(&c.symbol);
                 continue;
             };
             let market_ok = i
@@ -103,6 +116,7 @@ impl StrategyNode for PositionPlannerNode {
                 .is_some_and(|b| b.meta.usable_at(ctx.frame.as_of_ms))
                 && i.perpetual.meta.usable_at(ctx.frame.as_of_ms);
             if !market_ok {
+                planned_symbols.remove(&c.symbol);
                 continue;
             }
             let default_risk_pct = if c.confidence >= self.config.high_confidence_threshold {
@@ -122,6 +136,7 @@ impl StrategyNode for PositionPlannerNode {
                 .min(a.equity_usd * self.config.max_notional_per_trade_multiple);
             let multiple = notional / a.equity_usd.max(1.0);
             if planned_gross + multiple > self.config.max_total_gross_multiple + f64::EPSILON {
+                planned_symbols.remove(&c.symbol);
                 continue;
             }
             planned_gross += multiple;

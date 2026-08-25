@@ -1,0 +1,138 @@
+{
+  "strategy": "sfp_liquidity_sweep_v1",
+  "status": "provisional_demo",
+  "selection": "train and validation only; locked test untouched",
+  "universe_symbols": 45,
+  "grid": 1728,
+  "eligible": 1,
+  "selected": {
+    "bar_minutes": 60,
+    "lookback_bars": 288,
+    "min_sweep_atr": 0.1,
+    "max_sweep_atr": 1.25,
+    "min_volume_ratio": 1.0,
+    "target_r": 2.0,
+    "max_hold_minutes": 180,
+    "universe_mode": "all",
+    "side_mode": "sell"
+  },
+  "train": {
+    "start_ms": 1780272000000,
+    "end_ms": 1784851200000,
+    "start_equity_usd": 2000.0,
+    "end_equity_usd": 2001.7702881246041,
+    "pnl_usd": 1.7702881246041215,
+    "return_pct": 0.0008851440623021123,
+    "max_drawdown_pct": 0.008949150039078146,
+    "trades": 12,
+    "trades_per_day": 0.22641509433962265,
+    "win_rate": 0.6666666666666666,
+    "profit_factor": 1.0532989418090943,
+    "average_pnl_usd": 0.14752401038366825,
+    "round_trip_cost_bps": 16.0,
+    "by_side": {
+      "buy": {
+        "trades": 0,
+        "pnl_usd": 0,
+        "profit_factor": null
+      },
+      "sell": {
+        "trades": 12,
+        "pnl_usd": 1.7702881246040192,
+        "profit_factor": 1.0532989418090943
+      }
+    },
+    "skipped": {}
+  },
+  "validation": {
+    "start_ms": 1784851200000,
+    "end_ms": 1786752000000,
+    "start_equity_usd": 2000.0,
+    "end_equity_usd": 2003.118298575652,
+    "pnl_usd": 3.118298575652034,
+    "return_pct": 0.0015591492878259672,
+    "max_drawdown_pct": 0.004039355986201754,
+    "trades": 6,
+    "trades_per_day": 0.2727272727272727,
+    "win_rate": 0.16666666666666666,
+    "profit_factor": 1.2418667350899746,
+    "average_pnl_usd": 0.5197164292753345,
+    "round_trip_cost_bps": 16.0,
+    "by_side": {
+      "buy": {
+        "trades": 0,
+        "pnl_usd": 0,
+        "profit_factor": null
+      },
+      "sell": {
+        "trades": 6,
+        "pnl_usd": 3.118298575652007,
+        "profit_factor": 1.2418667350899746
+      }
+    },
+    "skipped": {}
+  },
+  "locked_test": {
+    "start_ms": 1786752000000,
+    "end_ms": 1787529600000,
+    "start_equity_usd": 2000.0,
+    "end_equity_usd": 2019.5280032537567,
+    "pnl_usd": 19.52800325375665,
+    "return_pct": 0.009764001626878294,
+    "max_drawdown_pct": 0.00021630544565320875,
+    "trades": 3,
+    "trades_per_day": 0.3333333333333333,
+    "win_rate": 0.6666666666666666,
+    "profit_factor": 46.13987892163008,
+    "average_pnl_usd": 6.509334417918882,
+    "round_trip_cost_bps": 16.0,
+    "by_side": {
+      "buy": {
+        "trades": 0,
+        "pnl_usd": 0,
+        "profit_factor": null
+      },
+      "sell": {
+        "trades": 3,
+        "pnl_usd": 19.528003253756644,
+        "profit_factor": 46.13987892163008
+      }
+    },
+    "skipped": {}
+  },
+  "locked_test_30bps": {
+    "start_ms": 1786752000000,
+    "end_ms": 1787529600000,
+    "start_equity_usd": 2000.0,
+    "end_equity_usd": 2017.359470085631,
+    "pnl_usd": 17.359470085631074,
+    "return_pct": 0.008679735042815606,
+    "max_drawdown_pct": 0.0005855823375872093,
+    "trades": 3,
+    "trades_per_day": 0.3333333333333333,
+    "win_rate": 0.6666666666666666,
+    "profit_factor": 15.822398979072826,
+    "average_pnl_usd": 5.786490028543676,
+    "round_trip_cost_bps": 30.0,
+    "by_side": {
+      "buy": {
+        "trades": 0,
+        "pnl_usd": 0,
+        "profit_factor": null
+      },
+      "sell": {
+        "trades": 3,
+        "pnl_usd": 17.359470085631028,
+        "profit_factor": 15.822398979072826
+      }
+    },
+    "skipped": {}
+  },
+  "assumptions": {
+    "signal": "completed 15m/1h sweep of a mature rolling high/low and directional close back inside",
+    "entry": "break of the rejection bar within three bars, replayed on 1m data",
+    "intrabar_priority": "stop before target",
+    "portfolio": "0.5% risk, 1.5x single, 4x gross, max 3 positions",
+    "cost": "16 bps round trip; 30 bps stress"
+  }
+}

@@ -5,7 +5,8 @@ poll_seconds = 15
 stream_warmup_seconds = 20
 request_spacing_ms = 150
 request_timeout_seconds = 8
-candle_limit = 160
+# 1,200 x 15m bars provide the 12-day structural history required by SFP.
+candle_limit = 1200
 journal_path = "data/runtime/alpha-events.jsonl"
 history_path = "data/runtime/alpha-history.jsonl"
 status_path = "data/runtime/alpha-status.json"
@@ -37,12 +38,22 @@ min_24h_quote_volume_usd = 25000000.0
 refresh_seconds = 15
 
 [strategy.lanes]
+sfp_reversal_enabled = true
 trend_continuation_enabled = true
 ignition_sprint_enabled = true
 max_candidates_per_lane = 2
 max_spread_bps = 6.0
 # Ten times the standard 2,000 USDT trend notional; spread remains capped at 6 bps.
 min_depth_usd = 20000.0
+sfp_lookback_hours = 288
+sfp_min_sweep_atr = 0.10
+sfp_max_sweep_atr = 1.25
+sfp_min_volume_ratio = 1.0
+sfp_confirmation_hours = 3
+sfp_max_signal_age_seconds = 300
+sfp_target_r = 2.0
+sfp_max_hold_minutes = 180
+sfp_risk_per_trade_pct = 0.005
 trend_min_return_4h = 0.06
 trend_min_efficiency = 0.45
 trend_min_hour_volume_ratio = 0.65
@@ -83,4 +94,4 @@ rolling_pf_min_trades = 8
 rolling_pf_floor = 1.00
 rolling_pf_cooldown_minutes = 360
 rolling_pf_probe_size_multiplier = 1.00
-rolling_pf_epoch = 5
+rolling_pf_epoch = 6

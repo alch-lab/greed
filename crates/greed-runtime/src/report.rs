@@ -441,6 +441,7 @@ fn record_diagnostics(
         return;
     };
     for key in [
+        "lane.sfp_reversal.status",
         "lane.trend_continuation.status",
         "lane.ignition_sprint.status",
         "portfolio.risk",
@@ -503,7 +504,9 @@ fn classify(payload: &Value) -> (String, String) {
 }
 
 fn recipe_from_id(id: &str) -> &'static str {
-    if id.contains("trend_continuation") {
+    if id.contains("sfp_reversal") {
+        "sfp_reversal"
+    } else if id.contains("trend_continuation") {
         "trend_continuation"
     } else if id.contains("ignition_sprint") {
         "ignition_sprint"
@@ -514,6 +517,7 @@ fn recipe_from_id(id: &str) -> &'static str {
 
 fn lane_for_recipe(recipe: &str) -> &'static str {
     match recipe {
+        "sfp_reversal" => "sfp_reversal",
         "trend_continuation" => "trend_continuation",
         "ignition_sprint" => "ignition_sprint",
         _ => "unknown",

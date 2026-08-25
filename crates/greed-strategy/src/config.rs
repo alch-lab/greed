@@ -47,11 +47,21 @@ impl Default for UniverseConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LaneConfig {
+    pub sfp_reversal_enabled: bool,
     pub trend_continuation_enabled: bool,
     pub ignition_sprint_enabled: bool,
     pub max_candidates_per_lane: usize,
     pub max_spread_bps: f64,
     pub min_depth_usd: f64,
+    pub sfp_lookback_hours: usize,
+    pub sfp_min_sweep_atr: f64,
+    pub sfp_max_sweep_atr: f64,
+    pub sfp_min_volume_ratio: f64,
+    pub sfp_confirmation_hours: u32,
+    pub sfp_max_signal_age_seconds: u32,
+    pub sfp_target_r: f64,
+    pub sfp_max_hold_minutes: u32,
+    pub sfp_risk_per_trade_pct: f64,
     pub trend_min_return_4h: f64,
     pub trend_min_efficiency: f64,
     pub trend_min_hour_volume_ratio: f64,
@@ -74,11 +84,21 @@ pub struct LaneConfig {
 impl Default for LaneConfig {
     fn default() -> Self {
         Self {
+            sfp_reversal_enabled: true,
             trend_continuation_enabled: true,
             ignition_sprint_enabled: true,
             max_candidates_per_lane: 2,
             max_spread_bps: 6.0,
             min_depth_usd: 20_000.0,
+            sfp_lookback_hours: 288,
+            sfp_min_sweep_atr: 0.10,
+            sfp_max_sweep_atr: 1.25,
+            sfp_min_volume_ratio: 1.0,
+            sfp_confirmation_hours: 3,
+            sfp_max_signal_age_seconds: 300,
+            sfp_target_r: 2.0,
+            sfp_max_hold_minutes: 180,
+            sfp_risk_per_trade_pct: 0.005,
             trend_min_return_4h: 0.06,
             trend_min_efficiency: 0.45,
             trend_min_hour_volume_ratio: 0.65,
@@ -149,7 +169,7 @@ impl Default for RiskConfig {
             rolling_pf_floor: 1.0,
             rolling_pf_cooldown_minutes: 360,
             rolling_pf_probe_size_multiplier: 1.0,
-            rolling_pf_epoch: 5,
+            rolling_pf_epoch: 6,
         }
     }
 }
@@ -170,6 +190,16 @@ impl StrategyConfig {
         }
         let lanes = &self.lanes;
         if !(1..=5).contains(&lanes.max_candidates_per_lane)
+            || !(48..=480).contains(&lanes.sfp_lookback_hours)
+            || !(0.01..=1.0).contains(&lanes.sfp_min_sweep_atr)
+            || lanes.sfp_max_sweep_atr <= lanes.sfp_min_sweep_atr
+            || lanes.sfp_max_sweep_atr > 3.0
+            || !(0.5..=5.0).contains(&lanes.sfp_min_volume_ratio)
+            || !(1..=6).contains(&lanes.sfp_confirmation_hours)
+            || !(60..=900).contains(&lanes.sfp_max_signal_age_seconds)
+            || !(0.5..=3.0).contains(&lanes.sfp_target_r)
+            || !(30..=720).contains(&lanes.sfp_max_hold_minutes)
+            || !(0.001..=0.005).contains(&lanes.sfp_risk_per_trade_pct)
             || !(0.02..=0.20).contains(&lanes.trend_min_return_4h)
             || !(0.10..=0.90).contains(&lanes.trend_min_efficiency)
             || lanes.trend_min_hour_volume_ratio <= 0.0
