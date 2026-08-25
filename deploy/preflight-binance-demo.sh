@@ -123,7 +123,7 @@ position_mode="$(signed_request GET /fapi/v1/positionSide/dual)"
   || fail "account is in Hedge Mode; greed requires One-way Mode"
 pass "account is in One-way Mode"
 
-open_positions="$(jq '[.positions[] | select((.positionAmt | tonumber | fabs) > 0)] | length' \
+open_positions="$(jq '[.positions[] | select((.positionAmt | tonumber) != 0)] | length' \
   <<<"${account}")"
 [[ "${open_positions}" == "0" ]] \
   || fail "account has ${open_positions} open position(s); flatten them before preflight"
