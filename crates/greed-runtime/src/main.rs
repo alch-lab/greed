@@ -360,7 +360,7 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                     "exchange_sync_error",
                     serde_json::json!({"ts_ms":now_ms,"error":error.to_string(),"venue":"binance_demo"}),
                 )?;
-                tokio::time::sleep(Duration::from_secs(config.runtime.poll_seconds.max(15))).await;
+                tokio::time::sleep(Duration::from_secs(config.runtime.poll_seconds)).await;
                 continue;
             }
         };
@@ -486,6 +486,6 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
         if iterations > 0 && completed >= iterations {
             return Ok(());
         }
-        tokio::time::sleep(Duration::from_secs(config.runtime.poll_seconds.max(15))).await;
+        tokio::time::sleep(Duration::from_secs(config.runtime.poll_seconds)).await;
     }
 }

@@ -20,6 +20,7 @@
 首次进入币池时才用REST补齐K线；不再拉取无资金策略需要的OI、Hyperliquid或清算数据。
 币池换入换出通过常驻WebSocket上的增量`SUBSCRIBE/UNSUBSCRIBE`完成，不重建其他币种的
 market/depth连接；重连成功后清除历史连接错误，盘口就绪统计只计算当前币池。
+账户、仓位与保护单每5秒与Binance Demo对账；前端只读本地状态接口，不会因刷新频率增加交易所请求。
 
 ## SFP失败突破反转
 
