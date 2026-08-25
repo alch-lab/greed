@@ -78,7 +78,7 @@ impl Default for LaneConfig {
             ignition_sprint_enabled: true,
             max_candidates_per_lane: 2,
             max_spread_bps: 6.0,
-            min_depth_usd: 75_000.0,
+            min_depth_usd: 20_000.0,
             trend_min_return_4h: 0.06,
             trend_min_efficiency: 0.45,
             trend_min_hour_volume_ratio: 0.65,
@@ -149,7 +149,7 @@ impl Default for RiskConfig {
             rolling_pf_floor: 1.0,
             rolling_pf_cooldown_minutes: 360,
             rolling_pf_probe_size_multiplier: 1.0,
-            rolling_pf_epoch: 4,
+            rolling_pf_epoch: 5,
         }
     }
 }

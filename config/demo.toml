@@ -41,7 +41,8 @@ trend_continuation_enabled = true
 ignition_sprint_enabled = true
 max_candidates_per_lane = 2
 max_spread_bps = 6.0
-min_depth_usd = 75000.0
+# Ten times the standard 2,000 USDT trend notional; spread remains capped at 6 bps.
+min_depth_usd = 20000.0
 trend_min_return_4h = 0.06
 trend_min_efficiency = 0.45
 trend_min_hour_volume_ratio = 0.65
@@ -82,4 +83,4 @@ rolling_pf_min_trades = 8
 rolling_pf_floor = 1.00
 rolling_pf_cooldown_minutes = 360
 rolling_pf_probe_size_multiplier = 1.00
-rolling_pf_epoch = 4
+rolling_pf_epoch = 5

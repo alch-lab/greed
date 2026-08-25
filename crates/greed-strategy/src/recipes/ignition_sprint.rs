@@ -40,6 +40,75 @@ fn atr(values: &[&Candle], end: usize, window: usize) -> f64 {
     rows.iter().sum::<f64>() / rows.len().max(1) as f64
 }
 
+#[allow(clippy::too_many_arguments)]
+fn impulse_blockers(
+    config: &LaneConfig,
+    sign: f64,
+    return_5m: f64,
+    return_10m: f64,
+    return_30m: f64,
+    volume_ratio: f64,
+    flow: Option<f64>,
+    directional_close: bool,
+    broke_range: bool,
+    body: f64,
+    atr: f64,
+) -> Vec<String> {
+    let mut blockers = Vec::new();
+    if sign * return_5m < config.ignition_min_return_5m {
+        blockers.push(format!(
+            "5m speed {:.2}% / need {:.2}%",
+            sign * return_5m * 100.0,
+            config.ignition_min_return_5m * 100.0
+        ));
+    }
+    if sign * return_10m < config.ignition_min_return_5m * 1.15 {
+        blockers.push(format!(
+            "10m continuation {:.2}% / need {:.2}%",
+            sign * return_10m * 100.0,
+            config.ignition_min_return_5m * 115.0
+        ));
+    }
+    if sign * return_30m > config.ignition_max_extension_30m {
+        blockers.push(format!(
+            "30m extension {:.2}% / max {:.2}%",
+            sign * return_30m * 100.0,
+            config.ignition_max_extension_30m * 100.0
+        ));
+    }
+    if volume_ratio < config.ignition_min_volume_ratio {
+        blockers.push(format!(
+            "5m volume {:.1}x / need {:.1}x",
+            volume_ratio, config.ignition_min_volume_ratio
+        ));
+    }
+    match flow {
+        Some(value) if sign * value < config.ignition_min_flow_imbalance => blockers.push(format!(
+            "5m taker flow {:.1}% / need {:.1}%",
+            sign * value * 100.0,
+            config.ignition_min_flow_imbalance * 100.0
+        )),
+        None => blockers.push("5m taker flow is not ready".into()),
+        _ => {}
+    }
+    if !directional_close || !broke_range {
+        blockers.push("waiting for a directional micro-range break".into());
+    }
+    if return_5m.abs() > 0.035 {
+        blockers.push(format!(
+            "5m impulse {:.2}% / max 3.50%",
+            return_5m.abs() * 100.0
+        ));
+    }
+    if body > 2.5 * atr {
+        blockers.push(format!(
+            "5m body {:.1} ATR / max 2.5 ATR",
+            body / atr.max(f64::EPSILON)
+        ));
+    }
+    blockers
+}
+
 impl StrategyNode for IgnitionSprintNode {
     fn id(&self) -> &str {
         &self.id
@@ -109,37 +178,21 @@ impl StrategyNode for IgnitionSprintNode {
                 ignition.close < prior_low
             };
             let atr = atr(&closed, index, 14);
-            let ignition_ready = sign * return_5m >= self.config.ignition_min_return_5m
-                && sign * return_10m >= self.config.ignition_min_return_5m * 1.15
-                && sign * return_30m <= self.config.ignition_max_extension_30m
-                && volume_ratio >= self.config.ignition_min_volume_ratio
-                && flow
-                    .is_some_and(|value| sign * value >= self.config.ignition_min_flow_imbalance)
-                && directional_close
-                && broke_range
-                && return_5m.abs() <= 0.035
-                && (ignition.close - ignition.open).abs() <= 2.5 * atr;
+            let mut blockers = impulse_blockers(
+                &self.config,
+                sign,
+                return_5m,
+                return_10m,
+                return_30m,
+                volume_ratio,
+                flow,
+                directional_close,
+                broke_range,
+                (ignition.close - ignition.open).abs(),
+                atr,
+            );
+            let ignition_ready = blockers.is_empty();
             ignition_hits += u64::from(ignition_ready);
-
-            let mut blockers = Vec::new();
-            if !ignition_ready {
-                if sign * return_5m < self.config.ignition_min_return_5m {
-                    blockers.push(format!(
-                        "5m speed {:.2}% / need {:.2}%",
-                        sign * return_5m * 100.0,
-                        self.config.ignition_min_return_5m * 100.0
-                    ));
-                }
-                if volume_ratio < self.config.ignition_min_volume_ratio {
-                    blockers.push(format!(
-                        "5m volume {:.1}x / need {:.1}x",
-                        volume_ratio, self.config.ignition_min_volume_ratio
-                    ));
-                }
-                if !directional_close || !broke_range {
-                    blockers.push("waiting for a directional micro-range break".into());
-                }
-            }
             if age_ms < 0 || age_ms > i64::from(self.config.ignition_max_wait_seconds) * 1_000 {
                 blockers.push("no live ignition inside the 3-minute entry window".into());
             }
@@ -203,9 +256,10 @@ impl StrategyNode for IgnitionSprintNode {
             let trade_ready = microstructure
                 .and_then(|value| value.trade_imbalance())
                 .is_some_and(|value| sign * value >= self.config.ignition_reclaim_flow_imbalance);
-            if ignition_ready && (!ofi_ready || !trade_ready) {
-                blockers.push("10s OFI and 60s aggressive flow have not reconfirmed".into());
-            }
+            // The historical walk-forward validates the completed 1m taker-flow
+            // reclaim above, but has no order-level OFI archive. Keep these live
+            // measurements as diagnostics instead of adding an untested hard gate.
+            let live_flow_confirmed = ofi_ready && trade_ready;
             let mut entry_limit = instrument.price;
             match instrument.book.as_ref() {
                 None => blockers.push("order book is not ready".into()),
@@ -236,15 +290,7 @@ impl StrategyNode for IgnitionSprintNode {
                     };
                 }
             }
-            let ready = ignition_ready
-                && age_ms >= 0
-                && age_ms <= i64::from(self.config.ignition_max_wait_seconds) * 1_000
-                && retest_seen
-                && !invalid
-                && reclaim
-                && ofi_ready
-                && trade_ready
-                && blockers.is_empty();
+            let ready = blockers.is_empty();
             reclaim_hits += u64::from(ready);
             let stop_pct =
                 self.config.ignition_stop_atr_multiple * atr / entry_limit.max(f64::EPSILON);
@@ -285,6 +331,10 @@ impl StrategyNode for IgnitionSprintNode {
                     ("stop_pct".into(), stop_pct.to_string()),
                     ("target_r".into(), self.config.ignition_target_r.to_string()),
                     ("take_profit_fraction".into(), "1.0".into()),
+                    (
+                        "live_flow_confirmed".into(),
+                        live_flow_confirmed.to_string(),
+                    ),
                     (
                         "max_hold_ms".into(),
                         (i64::from(self.config.ignition_max_hold_minutes) * 60_000).to_string(),
@@ -349,5 +399,50 @@ impl StrategyNode for IgnitionSprintNode {
                 }),
         );
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_impulse_failure_has_a_visible_blocker() {
+        let config = LaneConfig::default();
+        let blockers = impulse_blockers(
+            &config,
+            1.0,
+            0.012,
+            0.005,
+            0.02,
+            4.0,
+            Some(0.30),
+            true,
+            true,
+            1.0,
+            1.0,
+        );
+        assert!(blockers
+            .iter()
+            .any(|value| value.starts_with("10m continuation")));
+    }
+
+    #[test]
+    fn validated_impulse_has_no_hidden_blockers() {
+        let config = LaneConfig::default();
+        let blockers = impulse_blockers(
+            &config,
+            -1.0,
+            -0.012,
+            -0.016,
+            -0.025,
+            4.0,
+            Some(-0.30),
+            true,
+            true,
+            1.0,
+            1.0,
+        );
+        assert!(blockers.is_empty(), "{blockers:?}");
     }
 }
