@@ -72,6 +72,8 @@ pub struct PositionPlan {
     pub take_profit_prices: Vec<(f64, f64)>,
     pub break_even_after_fraction: Option<f64>,
     pub break_even_buffer_pct: f64,
+    #[serde(default)]
+    pub profit_shield_activation_pct: Option<f64>,
     pub trailing_activation_pct: Option<f64>,
     pub trailing_distance_pct: Option<f64>,
     pub max_hold_ms: i64,

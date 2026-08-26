@@ -81,6 +81,21 @@ impl StrategyNode for TrendContinuationNode {
                 Side::Sell
             };
             let sign = side.sign();
+            let atr = (i.saturating_sub(19)..=i)
+                .map(|index| {
+                    let prior_close = if index == 0 {
+                        closed[index].close
+                    } else {
+                        closed[index - 1].close
+                    };
+                    (closed[index].high - closed[index].low)
+                        .max((closed[index].high - prior_close).abs())
+                        .max((closed[index].low - prior_close).abs())
+                })
+                .sum::<f64>()
+                / 20.0;
+            let extension_atr = sign * (bar.close - ema21[i]) / atr.max(f64::EPSILON);
+            let reclaim_body_atr = (bar.close - bar.open).abs() / atr.max(f64::EPSILON);
             let touched = if side == Side::Buy {
                 closed[i - 3..i]
                     .iter()
@@ -201,7 +216,16 @@ impl StrategyNode for TrendContinuationNode {
             } else {
                 Verdict::Block
             };
-            let mut tags = BTreeMap::from([("lane".into(), "trend_continuation".into())]);
+            let mut tags = BTreeMap::from([
+                ("lane".into(), "trend_continuation".into()),
+                ("return_4h".into(), return_4h.to_string()),
+                ("trend_efficiency".into(), efficiency.to_string()),
+                ("trend_extension_atr".into(), extension_atr.to_string()),
+                (
+                    "trend_reclaim_body_atr".into(),
+                    reclaim_body_atr.to_string(),
+                ),
+            ]);
             if verdict == Verdict::Pass {
                 if let Some(book) = instrument.book.as_ref() {
                     tags.insert(

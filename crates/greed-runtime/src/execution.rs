@@ -70,6 +70,8 @@ struct ExecutionMeta {
     #[serde(default)]
     break_even_buffer_pct: f64,
     #[serde(default)]
+    profit_shield_activation_pct: Option<f64>,
+    #[serde(default)]
     break_even_armed: bool,
     #[serde(default)]
     extreme_price: f64,
@@ -126,6 +128,7 @@ pub struct DemoPositionSnapshot {
     pub take_profit_prices: Vec<(f64, f64)>,
     pub max_hold_ms: i64,
     pub break_even_armed: bool,
+    pub profit_shield_activation_pct: Option<f64>,
     pub extreme_price: Option<f64>,
     pub trailing_activation_pct: Option<f64>,
     pub trailing_distance_pct: Option<f64>,
@@ -566,19 +569,27 @@ impl BinanceDemoExecution {
                     let initial_quantity = meta.initial_quantity.max(position.quantity.abs());
                     let closed_fraction =
                         1.0 - position.quantity.abs() / initial_quantity.max(f64::EPSILON);
-                    let shield_hit = meta
+                    let partial_shield_hit = meta
                         .break_even_after_fraction
                         .is_some_and(|threshold| closed_fraction + 1e-6 >= threshold);
+                    let favorable = meta.side.sign()
+                        * (meta.extreme_price / meta.entry_price.max(f64::EPSILON) - 1.0);
+                    let profit_shield_hit = meta
+                        .profit_shield_activation_pct
+                        .is_some_and(|activation| favorable >= activation);
+                    let shield_hit = partial_shield_hit || profit_shield_hit;
                     let mut desired_stop = None;
-                    let mut reason = "risk_shield";
+                    let mut reason = if profit_shield_hit && !partial_shield_hit {
+                        "pre_tp_profit_shield"
+                    } else {
+                        "risk_shield"
+                    };
                     if shield_hit && !meta.break_even_armed && meta.entry_price > 0.0 {
                         desired_stop = Some(
                             meta.entry_price
                                 * (1.0 + meta.side.sign() * meta.break_even_buffer_pct),
                         );
                     }
-                    let favorable = meta.side.sign()
-                        * (meta.extreme_price / meta.entry_price.max(f64::EPSILON) - 1.0);
                     if shield_hit
                         && meta
                             .trailing_activation_pct
@@ -953,6 +964,8 @@ impl BinanceDemoExecution {
                             .unwrap_or_default(),
                         max_hold_ms: meta.map(|value| value.max_hold_ms).unwrap_or_default(),
                         break_even_armed: meta.map(|value| value.break_even_armed).unwrap_or(false),
+                        profit_shield_activation_pct: meta
+                            .and_then(|value| value.profit_shield_activation_pct),
                         extreme_price: meta.map(|value| value.extreme_price),
                         trailing_activation_pct: meta
                             .and_then(|value| value.trailing_activation_pct),
@@ -1083,6 +1096,7 @@ impl BinanceDemoExecution {
                                 },
                             ),
                             break_even_buffer_pct: plan.break_even_buffer_pct,
+                            profit_shield_activation_pct: plan.profit_shield_activation_pct,
                             break_even_armed: false,
                             extreme_price: fill.entry_price,
                             adverse_price: fill.entry_price,

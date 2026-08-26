@@ -168,6 +168,9 @@ impl StrategyNode for PositionPlannerNode {
                 take_profit_prices,
                 break_even_after_fraction: (take_fraction < 1.0).then_some(take_fraction),
                 break_even_buffer_pct: self.config.break_even_buffer_pct,
+                profit_shield_activation_pct: (take_fraction < 1.0
+                    && self.config.profit_shield_activation_r > 0.0)
+                    .then_some(stop_pct * self.config.profit_shield_activation_r),
                 trailing_activation_pct: (take_fraction < 1.0).then_some(stop_pct * target_r),
                 trailing_distance_pct: (take_fraction < 1.0)
                     .then_some(self.config.trailing_distance_pct),

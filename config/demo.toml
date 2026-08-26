@@ -89,6 +89,8 @@ first_take_profit_r = 2.0
 first_take_profit_fraction = 0.40
 runner_take_profit_r = 0.0
 break_even_buffer_pct = 0.0018
+# Before TP1, lock estimated round-trip costs once the trade reaches +1.25R.
+profit_shield_activation_r = 1.25
 trailing_distance_pct = 0.003
 # Zero disables time-based exits. Hard stop, cost shield, and trailing protection remain exchange-side.
 max_hold_minutes = 0
@@ -100,5 +102,5 @@ rolling_pf_floor = 1.00
 rolling_pf_cooldown_minutes = 360
 loss_cooldown_minutes = 180
 rolling_pf_probe_size_multiplier = 1.00
-# Epoch 9 starts the validated loss cooldown and tighter runner trail policy.
-rolling_pf_epoch = 9
+# Epoch 10 starts the pre-TP profit-shield policy with a clean PF window.
+rolling_pf_epoch = 10

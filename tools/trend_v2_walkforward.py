@@ -12,7 +12,7 @@ import itertools
 import json
 import statistics
 from collections import defaultdict
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -29,6 +29,7 @@ class Config:
     take_fraction: float
     trail_fraction: float
     loss_cooldown_minutes: int
+    profit_shield_r: float = 0.0
 
 
 @dataclass(frozen=True)
@@ -50,6 +51,7 @@ class Position:
     stop: float
     extreme: float
     partial: bool = False
+    shielded: bool = False
     realized: float = 0.0
     entry_fee: float = 0.0
 
@@ -183,6 +185,31 @@ def simulate(cfg: Config, bars_by_symbol, signals, start_ms, end_ms, *,
                     else min(position.stop, cost_lock)
             elif invalid:
                 reason = "trend_invalid"
+            # Arm the pre-TP cost shield only after this whole bar has closed.
+            # This avoids assuming a favorable intrabar ordering when one
+            # candle crosses both the activation and the stop.
+            shield = position.entry * (
+                1.0
+                + position.signal.side
+                * position.signal.stop_fraction
+                * cfg.profit_shield_r
+            )
+            shield_hit = (
+                bar.high >= shield if position.signal.side > 0 else bar.low <= shield
+            )
+            if (
+                cfg.profit_shield_r > 0.0
+                and not position.shielded
+                and not position.partial
+                and reason is None
+                and shield_hit
+            ):
+                cost_lock = position.entry * (
+                    1.0 + position.signal.side * (2.0 * per_side_cost + 0.0002)
+                )
+                position.stop = max(position.stop, cost_lock) if position.signal.side > 0 \
+                    else min(position.stop, cost_lock)
+                position.shielded = True
             if position.partial and reason is None:
                 trail = position.extreme * (
                     1.0 - position.signal.side * cfg.trail_fraction
@@ -264,7 +291,8 @@ def simulate(cfg: Config, bars_by_symbol, signals, start_ms, end_ms, *,
 def configs():
     for values in itertools.product(
         (0.03, 0.06), (0.45, 0.60), (5.0, 100.0), (0.0075, 0.0100),
-        (1.25, 1.75, 2.0), (0.40, 0.60), (0.003, 0.005), (180, 360),
+        (1.25, 1.75, 2.0), (0.40, 0.60), (0.003, 0.005),
+        (180, 360), (0.0, 1.0, 1.25, 1.5),
     ):
         yield Config(*values)
 
@@ -306,18 +334,43 @@ def main():
     _, stress = simulate(
         cfg, bars, signals, *periods["locked_test"], per_side_cost=0.0015
     )
+    baseline_cfg = replace(cfg, profit_shield_r=0.0)
+    _, locked_baseline = simulate(
+        baseline_cfg, bars, signals, *periods["locked_test"]
+    )
+    recent_symbols = sorted(
+        path.name for path in (root / "klines").iterdir()
+        if path.is_dir()
+        and any(path.glob("*-2026-08-2[45].zip"))
+        and any(path.glob("*-2026-08-26.zip"))
+    )
+    recent_bars = {symbol: base.load_bars(root, symbol) for symbol in recent_symbols}
+    recent_period = (base.ms("2026-08-24"), base.ms("2026-08-27"))
+    recent_signals = generate(cfg, recent_bars, *recent_period)
+    recent_trades, recent = simulate(cfg, recent_bars, recent_signals, *recent_period)
+    _, recent_stress = simulate(
+        cfg, recent_bars, recent_signals, *recent_period, per_side_cost=0.0015
+    )
+    _, recent_baseline = simulate(
+        baseline_cfg, recent_bars, recent_signals, *recent_period
+    )
     family = []
     for _, candidate_cfg, candidate_signals, _, _ in eligible:
         _, value = simulate(candidate_cfg, bars, candidate_signals, *periods["locked_test"])
         family.append(value["return_pct"])
     report = {
-        "strategy": "trend_pullback_risk_management_v2",
+        "strategy": "trend_pullback_profit_shield_v3",
         "status": "research_candidate" if eligible else "development_failed",
         "selection": "train and validation only; locked test untouched",
         "grid": len(rows), "eligible": len(eligible),
         "selected": {"score": score, "config": asdict(cfg)},
         "train": train, "validation": validation,
         "locked_test": locked, "locked_test_15bps_per_side": stress,
+        "locked_test_without_profit_shield": locked_baseline,
+        "recent_2026_08_24_to_26_partial": recent,
+        "recent_15bps_per_side": recent_stress,
+        "recent_without_profit_shield": recent_baseline,
+        "recent_symbols": recent_symbols,
         "eligible_family_locked_test": {
             "count": len(family),
             "profitable_fraction": sum(value > 0 for value in family) / len(family) if family else None,
@@ -326,6 +379,7 @@ def main():
             "max_return_pct": max(family) if family else None,
         },
         "locked_test_trades": test_trades,
+        "recent_trades": recent_trades,
     }
     output = Path("data/alpha-backtest/trend-v2-walkforward.json")
     output.write_text(json.dumps(report, indent=2))
