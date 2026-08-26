@@ -32,6 +32,18 @@ fn ema(values: &[&Candle], period: usize) -> Vec<f64> {
     output
 }
 
+fn trend_age_bars(values: &[&Candle], end: usize, sign: f64, threshold: f64) -> usize {
+    let mut age = 0;
+    for cursor in (16..=end).rev() {
+        let return_4h = values[cursor].close / values[cursor - 16].close - 1.0;
+        if sign * return_4h < threshold {
+            break;
+        }
+        age += 1;
+    }
+    age
+}
+
 impl StrategyNode for TrendContinuationNode {
     fn id(&self) -> &str {
         &self.id
@@ -81,6 +93,7 @@ impl StrategyNode for TrendContinuationNode {
                 Side::Sell
             };
             let sign = side.sign();
+            let trend_age_bars = trend_age_bars(&closed, i, sign, self.config.trend_min_return_4h);
             let atr = (i.saturating_sub(19)..=i)
                 .map(|index| {
                     let prior_close = if index == 0 {
@@ -133,6 +146,12 @@ impl StrategyNode for TrendContinuationNode {
                     "4h move {:.2}% / need {:.2}%",
                     return_4h.abs() * 100.0,
                     self.config.trend_min_return_4h * 100.0
+                ));
+            }
+            if trend_age_bars > self.config.trend_max_age_bars {
+                blockers.push(format!(
+                    "trend is {trend_age_bars} bars old / max {} bars for a fresh entry",
+                    self.config.trend_max_age_bars
                 ));
             }
             if sign * return_12h <= 0.0 {
@@ -204,13 +223,14 @@ impl StrategyNode for TrendContinuationNode {
                 }
             }
             let trend_ready = return_4h.abs() >= self.config.trend_min_return_4h
+                && trend_age_bars <= self.config.trend_max_age_bars
                 && sign * return_12h > 0.0
                 && ema_aligned
                 && efficiency >= self.config.trend_min_efficiency;
             trend_hits += u64::from(trend_ready);
             reclaim_hits += u64::from(trend_ready && touched && reclaimed);
             let score = return_4h.abs() * efficiency * volume_ratio;
-            let progress = (10usize.saturating_sub(blockers.len()).min(10) as f64) / 10.0;
+            let progress = (11usize.saturating_sub(blockers.len()).min(11) as f64) / 11.0;
             let verdict = if blockers.is_empty() {
                 Verdict::Pass
             } else {
@@ -220,6 +240,7 @@ impl StrategyNode for TrendContinuationNode {
                 ("lane".into(), "trend_continuation".into()),
                 ("return_4h".into(), return_4h.to_string()),
                 ("trend_efficiency".into(), efficiency.to_string()),
+                ("trend_age_bars".into(), trend_age_bars.to_string()),
                 ("trend_extension_atr".into(), extension_atr.to_string()),
                 (
                     "trend_reclaim_body_atr".into(),
@@ -348,5 +369,35 @@ impl StrategyNode for TrendContinuationNode {
                 }),
         );
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn candle(open_ms: i64, close: f64) -> Candle {
+        Candle {
+            open_ms,
+            close_ms: open_ms + 899_999,
+            open: close,
+            high: close,
+            low: close,
+            close,
+            quote_volume: 1.0,
+            taker_buy_quote: Some(0.5),
+            closed: true,
+        }
+    }
+
+    #[test]
+    fn trend_age_counts_only_consecutive_threshold_bars() {
+        let mut values: Vec<_> = (0..17)
+            .map(|index| candle(index * 900_000, 100.0))
+            .collect();
+        values.extend((17..20).map(|index| candle(index * 900_000, 106.0)));
+        let references: Vec<_> = values.iter().collect();
+        assert_eq!(trend_age_bars(&references, 19, 1.0, 0.06), 3);
+        assert_eq!(trend_age_bars(&references, 19, -1.0, 0.06), 0);
     }
 }

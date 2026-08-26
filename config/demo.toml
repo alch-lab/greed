@@ -62,6 +62,9 @@ trend_min_return_4h = 0.06
 trend_min_efficiency = 0.45
 trend_min_hour_volume_ratio = 0.65
 trend_min_flow_imbalance = 0.0
+# A 6% / 4h trend is actionable only during its first two completed 15m bars.
+# Later pullbacks belong to a mature move and must not be presented as fresh.
+trend_max_age_bars = 2
 trend_max_signal_age_seconds = 300
 ignition_min_return_5m = 0.010
 ignition_min_volume_ratio = 3.0
@@ -89,8 +92,8 @@ first_take_profit_r = 2.0
 first_take_profit_fraction = 0.40
 runner_take_profit_r = 0.0
 break_even_buffer_pct = 0.0018
-# Before TP1, lock estimated round-trip costs once the trade reaches +1.25R.
-profit_shield_activation_r = 1.25
+# With the fresh-trend gate, lock estimated round-trip costs at +1R.
+profit_shield_activation_r = 1.00
 trailing_distance_pct = 0.003
 # Zero disables time-based exits. Hard stop, cost shield, and trailing protection remain exchange-side.
 max_hold_minutes = 0
@@ -102,5 +105,5 @@ rolling_pf_floor = 1.00
 rolling_pf_cooldown_minutes = 360
 loss_cooldown_minutes = 180
 rolling_pf_probe_size_multiplier = 1.00
-# Epoch 10 starts the pre-TP profit-shield policy with a clean PF window.
-rolling_pf_epoch = 10
+# Epoch 11 starts the fresh-trend age gate with a clean PF window.
+rolling_pf_epoch = 11

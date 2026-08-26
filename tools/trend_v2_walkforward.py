@@ -30,6 +30,7 @@ class Config:
     trail_fraction: float
     loss_cooldown_minutes: int
     profit_shield_r: float = 0.0
+    max_trend_age_bars: int = 2
 
 
 @dataclass(frozen=True)
@@ -69,6 +70,14 @@ def generate(cfg: Config, bars_by_symbol, start_ms: int, end_ms: int):
             return_4h = bar.close / bars[i - 16].close - 1.0
             return_12h = bar.close / bars[i - 48].close - 1.0
             side = 1 if return_4h > 0 else -1
+            trend_age_bars = 0
+            for cursor in range(i, 15, -1):
+                historical_return_4h = (
+                    bars[cursor].close / bars[cursor - 16].close - 1.0
+                )
+                if side * historical_return_4h < cfg.min_return_4h:
+                    break
+                trend_age_bars += 1
             path = sum(
                 abs(bars[j].close / bars[j - 1].close - 1.0)
                 for j in range(i - 15, i + 1)
@@ -96,6 +105,7 @@ def generate(cfg: Config, bars_by_symbol, start_ms: int, end_ms: int):
             if (
                 not touched
                 or not reclaimed
+                or trend_age_bars > cfg.max_trend_age_bars
                 or extension_atr > cfg.max_extension_atr
                 or side * bar.imbalance < 0.0
                 or volume_ratio < 0.65
@@ -359,7 +369,7 @@ def main():
         _, value = simulate(candidate_cfg, bars, candidate_signals, *periods["locked_test"])
         family.append(value["return_pct"])
     report = {
-        "strategy": "trend_pullback_profit_shield_v3",
+        "strategy": "fresh_trend_pullback_v4",
         "status": "research_candidate" if eligible else "development_failed",
         "selection": "train and validation only; locked test untouched",
         "grid": len(rows), "eligible": len(eligible),

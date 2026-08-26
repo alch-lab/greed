@@ -1,11 +1,11 @@
 {
-  "strategy": "trend_pullback_profit_shield_v3",
+  "strategy": "fresh_trend_pullback_v4",
   "status": "research_candidate",
   "selection": "train and validation only; locked test untouched",
   "grid": 1536,
-  "eligible": 106,
+  "eligible": 82,
   "selected": {
-    "score": -0.013135252716643675,
+    "score": -0.030507424675030814,
     "config": {
       "min_return_4h": 0.06,
       "min_efficiency": 0.45,
@@ -15,119 +15,120 @@
       "take_fraction": 0.4,
       "trail_fraction": 0.003,
       "loss_cooldown_minutes": 180,
-      "profit_shield_r": 1.25
+      "profit_shield_r": 1.0,
+      "max_trend_age_bars": 2
     }
   },
   "train": {
     "start": 2000.0,
-    "end": 2172.654016371973,
-    "return_pct": 0.08632700818598638,
-    "max_dd_pct": 0.10163592163736579,
-    "trades": 43,
-    "trades_per_day": 0.8113207547169812,
-    "win_rate": 0.37209302325581395,
-    "pf": 1.2491194155544099,
-    "average_pnl_usd": 4.015209683069117,
+    "end": 2139.1538355979214,
+    "return_pct": 0.06957691779896069,
+    "max_dd_pct": 0.10115516384139822,
+    "trades": 34,
+    "trades_per_day": 0.6415094339622641,
+    "win_rate": 0.38235294117647056,
+    "pf": 1.3045101733943814,
+    "average_pnl_usd": 4.0927598705270976,
     "profitable_symbols": 10,
-    "traded_symbols": 22,
-    "top_symbol_pnl_share": 0.43838763982403184
+    "traded_symbols": 21,
+    "top_symbol_pnl_share": 0.19476249529780126
   },
   "validation": {
     "start": 2000.0,
-    "end": 2075.3654162040784,
-    "return_pct": 0.03768270810203922,
+    "end": 2040.1403144913368,
+    "return_pct": 0.020070157245668296,
     "max_dd_pct": 0.03524393957522631,
-    "trades": 9,
-    "trades_per_day": 0.4090909090909091,
-    "win_rate": 0.4444444444444444,
-    "pf": 1.624002304527832,
-    "average_pnl_usd": 8.373935133786482,
-    "profitable_symbols": 4,
-    "traded_symbols": 9,
-    "top_symbol_pnl_share": 0.3119316743902194
+    "trades": 8,
+    "trades_per_day": 0.36363636363636365,
+    "win_rate": 0.375,
+    "pf": 1.3347148823503412,
+    "average_pnl_usd": 5.01753931141716,
+    "profitable_symbols": 3,
+    "traded_symbols": 8,
+    "top_symbol_pnl_share": 0.3757536754607637
   },
   "locked_test": {
     "start": 2000.0,
-    "end": 2167.2554342370204,
-    "return_pct": 0.08362771711851025,
-    "max_dd_pct": 0.046907659157838344,
-    "trades": 22,
-    "trades_per_day": 2.75,
-    "win_rate": 0.36363636363636365,
-    "pf": 1.7162759028455423,
-    "average_pnl_usd": 7.6025197380463965,
-    "profitable_symbols": 7,
+    "end": 2125.6337452306648,
+    "return_pct": 0.06281687261533242,
+    "max_dd_pct": 0.05833456192635489,
+    "trades": 21,
+    "trades_per_day": 2.625,
+    "win_rate": 0.3333333333333333,
+    "pf": 1.5426985569290135,
+    "average_pnl_usd": 5.982559296698357,
+    "profitable_symbols": 6,
     "traded_symbols": 16,
-    "top_symbol_pnl_share": 0.24730655685009392
+    "top_symbol_pnl_share": 0.27751976506515025
   },
   "locked_test_15bps_per_side": {
     "start": 2000.0,
-    "end": 2095.6861754652746,
-    "return_pct": 0.047843087732637235,
-    "max_dd_pct": 0.05625747211810228,
-    "trades": 22,
-    "trades_per_day": 2.75,
-    "win_rate": 0.36363636363636365,
-    "pf": 1.3454541337506691,
-    "average_pnl_usd": 4.349371612057949,
-    "profitable_symbols": 7,
+    "end": 2026.2727188575236,
+    "return_pct": 0.013136359428761901,
+    "max_dd_pct": 0.07017985390719694,
+    "trades": 21,
+    "trades_per_day": 2.625,
+    "win_rate": 0.2857142857142857,
+    "pf": 1.096605580041612,
+    "average_pnl_usd": 1.251081850358272,
+    "profitable_symbols": 5,
     "traded_symbols": 16,
-    "top_symbol_pnl_share": 0.23791449532258843
+    "top_symbol_pnl_share": 0.2924326304545776
   },
   "locked_test_without_profit_shield": {
     "start": 2000.0,
-    "end": 2231.5418768795794,
-    "return_pct": 0.11577093843978958,
+    "end": 2196.181218143681,
+    "return_pct": 0.0980906090718403,
     "max_dd_pct": 0.05102285780280924,
-    "trades": 22,
-    "trades_per_day": 2.75,
-    "win_rate": 0.5,
-    "pf": 1.8047187138265635,
-    "average_pnl_usd": 10.524630767253665,
+    "trades": 21,
+    "trades_per_day": 2.625,
+    "win_rate": 0.47619047619047616,
+    "pf": 1.6828351271614006,
+    "average_pnl_usd": 9.341962768746766,
     "profitable_symbols": 9,
     "traded_symbols": 16,
-    "top_symbol_pnl_share": 0.19425773917291872
+    "top_symbol_pnl_share": 0.20863643768788956
   },
   "recent_2026_08_24_to_26_partial": {
     "start": 2000.0,
-    "end": 1956.6368546552965,
-    "return_pct": -0.021681572672351712,
-    "max_dd_pct": 0.058089948793819346,
-    "trades": 9,
-    "trades_per_day": 3.0,
-    "win_rate": 0.2222222222222222,
-    "pf": 0.6999677269061966,
-    "average_pnl_usd": -4.818127260522627,
+    "end": 1980.178729074801,
+    "return_pct": -0.009910635462599515,
+    "max_dd_pct": 0.046757070090647224,
+    "trades": 8,
+    "trades_per_day": 2.6666666666666665,
+    "win_rate": 0.25,
+    "pf": 0.8378012448012141,
+    "average_pnl_usd": -2.4776588656499308,
     "profitable_symbols": 2,
-    "traded_symbols": 8,
+    "traded_symbols": 7,
     "top_symbol_pnl_share": 0.6234029277078093
   },
   "recent_15bps_per_side": {
     "start": 2000.0,
-    "end": 1886.246816835687,
-    "return_pct": -0.05687659158215652,
-    "max_dd_pct": 0.054834996464563246,
+    "end": 1972.619637170754,
+    "return_pct": -0.01369018141462297,
+    "max_dd_pct": 0.041440551634435385,
     "trades": 7,
     "trades_per_day": 2.3333333333333335,
-    "win_rate": 0.14285714285714285,
-    "pf": 0.22326911323716814,
-    "average_pnl_usd": -16.250454737758975,
-    "profitable_symbols": 1,
+    "win_rate": 0.2857142857142857,
+    "pf": 0.7743622840577801,
+    "average_pnl_usd": -3.9114804041779756,
+    "profitable_symbols": 2,
     "traded_symbols": 6,
-    "top_symbol_pnl_share": 1.0
+    "top_symbol_pnl_share": 0.6360893490338173
   },
   "recent_without_profit_shield": {
     "start": 2000.0,
-    "end": 1956.6368546552965,
-    "return_pct": -0.021681572672351712,
-    "max_dd_pct": 0.058089948793819346,
-    "trades": 9,
-    "trades_per_day": 3.0,
-    "win_rate": 0.2222222222222222,
-    "pf": 0.6999677269061966,
-    "average_pnl_usd": -4.818127260522627,
+    "end": 1980.178729074801,
+    "return_pct": -0.009910635462599515,
+    "max_dd_pct": 0.046757070090647224,
+    "trades": 8,
+    "trades_per_day": 2.6666666666666665,
+    "win_rate": 0.25,
+    "pf": 0.8378012448012141,
+    "average_pnl_usd": -2.4776588656499308,
     "profitable_symbols": 2,
-    "traded_symbols": 8,
+    "traded_symbols": 7,
     "top_symbol_pnl_share": 0.6234029277078093
   },
   "recent_symbols": [
@@ -192,11 +193,11 @@
     "ZROUSDT"
   ],
   "eligible_family_locked_test": {
-    "count": 106,
-    "profitable_fraction": 0.9433962264150944,
-    "median_return_pct": 0.07180197075338146,
-    "min_return_pct": -0.019052952939396017,
-    "max_return_pct": 0.1392810384470593
+    "count": 82,
+    "profitable_fraction": 1.0,
+    "median_return_pct": 0.07040596503243068,
+    "min_return_pct": 0.04237770703859356,
+    "max_return_pct": 0.1561807849637038
   },
   "locked_test_trades": [
     {
@@ -307,8 +308,8 @@
       "symbol": "TIAUSDT",
       "side": 1,
       "entry_ts": 1787305500000,
-      "exit_ts": 1787311800000,
-      "pnl": 42.737036030982765,
+      "exit_ts": 1787308200000,
+      "pnl": -0.22208138592018312,
       "reason": "stop_or_trail"
     },
     {
@@ -316,7 +317,7 @@
       "side": 1,
       "entry_ts": 1787314500000,
       "exit_ts": 1787315400000,
-      "pnl": -26.459378472008364,
+      "pnl": -25.948647732125103,
       "reason": "stop_or_trail"
     },
     {
@@ -324,7 +325,7 @@
       "side": 1,
       "entry_ts": 1787332500000,
       "exit_ts": 1787333400000,
-      "pnl": -26.144809208103172,
+      "pnl": -25.640150424636758,
       "reason": "stop_or_trail"
     },
     {
@@ -332,7 +333,7 @@
       "side": 1,
       "entry_ts": 1787346000000,
       "exit_ts": 1787346900000,
-      "pnl": -25.833979783434597,
+      "pnl": -25.335320768337887,
       "reason": "stop_or_trail"
     },
     {
@@ -340,7 +341,7 @@
       "side": 1,
       "entry_ts": 1787358600000,
       "exit_ts": 1787359500000,
-      "pnl": -25.526845735942878,
+      "pnl": -25.03411515939527,
       "reason": "stop_or_trail"
     },
     {
@@ -348,15 +349,7 @@
       "side": 1,
       "entry_ts": 1787360400000,
       "exit_ts": 1787362200000,
-      "pnl": -0.2158520779733164,
-      "reason": "stop_or_trail"
-    },
-    {
-      "symbol": "ORDIUSDT",
-      "side": 1,
-      "entry_ts": 1787367600000,
-      "exit_ts": 1787369400000,
-      "pnl": -0.21583011727608237,
+      "pnl": -0.2116856047658946,
       "reason": "stop_or_trail"
     },
     {
@@ -364,7 +357,7 @@
       "side": 1,
       "entry_ts": 1787368500000,
       "exit_ts": 1787370300000,
-      "pnl": 46.28622706583002,
+      "pnl": 45.392789639824535,
       "reason": "stop_or_trail"
     },
     {
@@ -372,7 +365,7 @@
       "side": -1,
       "entry_ts": 1787388300000,
       "exit_ts": 1787390100000,
-      "pnl": -0.21297450949694263,
+      "pnl": -0.2088843784212382,
       "reason": "stop_or_trail"
     }
   ],
@@ -410,19 +403,11 @@
       "reason": "stop_or_trail"
     },
     {
-      "symbol": "ZROUSDT",
-      "side": 1,
-      "entry_ts": 1787665500000,
-      "exit_ts": 1787666400000,
-      "pnl": -22.665757406344184,
-      "reason": "stop_or_trail"
-    },
-    {
       "symbol": "TLMUSDT",
       "side": 1,
       "entry_ts": 1787668200000,
       "exit_ts": 1787670000000,
-      "pnl": 63.066634830303485,
+      "pnl": 63.825440325407655,
       "reason": "stop_or_trail"
     },
     {
@@ -430,7 +415,7 @@
       "side": 1,
       "entry_ts": 1787709600000,
       "exit_ts": 1787711400000,
-      "pnl": 38.09848972596585,
+      "pnl": 38.55688335101055,
       "reason": "stop_or_trail"
     },
     {
@@ -438,7 +423,7 @@
       "side": 1,
       "entry_ts": 1787715000000,
       "exit_ts": 1787715900000,
-      "pnl": -23.599017730939913,
+      "pnl": -23.88295652649292,
       "reason": "stop_or_trail"
     },
     {
@@ -446,7 +431,7 @@
       "side": -1,
       "entry_ts": 1787761800000,
       "exit_ts": 1787788799999,
-      "pnl": -4.749354582394223,
+      "pnl": -4.806497893830069,
       "reason": "window_mark"
     }
   ]
