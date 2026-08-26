@@ -1005,6 +1005,14 @@ impl BinanceDemoExecution {
             let recipe = candidate
                 .map(|value| value.recipe.clone())
                 .unwrap_or_else(|| "unknown".into());
+            if !self.supports_symbol(&plan.symbol) {
+                self.state.seen.insert(plan.candidate_id.clone());
+                events.push(ExchangeEvent {
+                    kind: "exchange_plan_rejected".into(),
+                    payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"symbol":plan.symbol,"side":plan.side,"reason":"symbol_not_tradable_on_binance_demo","venue":"binance_demo","paper_only":true}),
+                });
+                continue;
+            }
             let performance_key = gate_key(&recipe, plan.side);
             if self
                 .symbol_loss_cooldown_until(&plan.symbol)
@@ -1100,6 +1108,12 @@ impl BinanceDemoExecution {
                     });
                 }
                 Err(error) => {
+                    if is_invalid_symbol_error(&error) {
+                        // Demo exchangeInfo can briefly retain contracts that
+                        // its order gateway no longer accepts. Quarantine the
+                        // symbol so the next universe refresh removes it.
+                        self.rules.remove(&plan.symbol);
+                    }
                     // A rejected bracket may still contain a filled entry followed
                     // by an emergency close. Preserve that round trip in the
                     // diagnostic ledger instead of reporting it as a zero-cost
@@ -2067,6 +2081,12 @@ fn parse_rules(value: &Value) -> Result<BTreeMap<String, SymbolRules>> {
         let Some(name) = symbol["symbol"].as_str() else {
             continue;
         };
+        if symbol["status"].as_str() != Some("TRADING")
+            || symbol["contractType"].as_str() != Some("PERPETUAL")
+            || symbol["quoteAsset"].as_str() != Some("USDT")
+        {
+            continue;
+        }
         let filters = symbol["filters"].as_array().cloned().unwrap_or_default();
         let filter = |kind: &str, field: &str| {
             filters
@@ -2210,6 +2230,10 @@ fn is_post_only_rejection(error: &anyhow::Error) -> bool {
     let message = error.to_string();
     message.contains("-5022") || message.contains("could not be executed as maker")
 }
+fn is_invalid_symbol_error(error: &anyhow::Error) -> bool {
+    let message = error.to_string();
+    message.contains("\"code\":-1121") || message.contains("Invalid symbol")
+}
 fn client_order_id(prefix: &str, candidate_id: &str) -> String {
     let digest = hex_bytes(&Sha256::digest(candidate_id.as_bytes()));
     format!("greed-{prefix}-{}", &digest[..20])
@@ -2282,6 +2306,28 @@ mod tests {
             "Binance returned {\"code\":-5022,\"msg\":\"Due to the order could not be executed as maker\"}"
         );
         assert!(is_post_only_rejection(&error));
+    }
+
+    #[test]
+    fn recognizes_invalid_demo_symbol_rejection() {
+        let error = anyhow!(
+            "{}",
+            "Binance demo /fapi/v1/order returned 400 Bad Request: {\"code\":-1121,\"msg\":\"Invalid symbol.\"}"
+        );
+        assert!(is_invalid_symbol_error(&error));
+    }
+
+    #[test]
+    fn exchange_rules_only_admit_tradable_usdt_perpetuals() {
+        let info = serde_json::json!({"symbols":[
+            {"symbol":"BTCUSDT","status":"TRADING","contractType":"PERPETUAL","quoteAsset":"USDT","filters":[]},
+            {"symbol":"OLDUSDT","status":"SETTLING","contractType":"PERPETUAL","quoteAsset":"USDT","filters":[]},
+            {"symbol":"BTCUSDC","status":"TRADING","contractType":"PERPETUAL","quoteAsset":"USDC","filters":[]},
+            {"symbol":"BTCUSDT_260925","status":"TRADING","contractType":"CURRENT_QUARTER","quoteAsset":"USDT","filters":[]}
+        ]});
+        let rules = parse_rules(&info).unwrap();
+        assert_eq!(rules.len(), 1);
+        assert!(rules.contains_key("BTCUSDT"));
     }
 
     #[test]
