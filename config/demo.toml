@@ -117,5 +117,6 @@ rolling_pf_floor = 1.00
 rolling_pf_cooldown_minutes = 360
 loss_cooldown_minutes = 180
 rolling_pf_probe_size_multiplier = 1.00
-# Epoch 14 starts adaptive bounded-maker execution with a clean PF window.
-rolling_pf_epoch = 14
+# Keep the current paper run and rolling PF history continuous while execution
+# mechanics are improved; changing this value intentionally starts a new gate window.
+rolling_pf_epoch = 13
