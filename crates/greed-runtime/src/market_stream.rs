@@ -19,6 +19,8 @@ const CANDLE_CACHE_LIMIT: usize = 200;
 const TICKER_HISTORY_MS: i64 = 20 * 60_000;
 const BOOK_FLOW_HISTORY_MS: i64 = 2 * 60_000;
 const TRADE_STREAM_SHARDS: usize = 3;
+const PUBLIC_STREAM_SHARDS: usize = 3;
+const SYMBOL_WARMUP_MS: i64 = 10_000;
 
 #[derive(Debug, Clone)]
 struct BookFlowObservation {
@@ -53,6 +55,8 @@ pub struct StreamTelemetry {
     pub trade_shards_connected: usize,
     pub trade_shards_total: usize,
     pub public_connected: bool,
+    pub public_shards_connected: usize,
+    pub public_shards_total: usize,
     pub last_radar_message_ms: Option<i64>,
     pub last_market_message_ms: Option<i64>,
     pub last_trade_message_ms: Option<i64>,
@@ -81,7 +85,9 @@ struct StreamState {
     book_flow: BTreeMap<String, VecDeque<BookFlowObservation>>,
     trades: BTreeMap<String, VecDeque<(i64, bool, f64)>>,
     desired_symbols: BTreeSet<String>,
+    symbol_admitted_ms: BTreeMap<String, i64>,
     trade_connections: [bool; TRADE_STREAM_SHARDS],
+    public_connections: [bool; PUBLIC_STREAM_SHARDS],
     telemetry: StreamTelemetry,
 }
 
@@ -95,6 +101,7 @@ impl MarketStreamHub {
     pub fn start(base_url: String) -> Self {
         let mut initial_state = StreamState::default();
         initial_state.telemetry.trade_shards_total = TRADE_STREAM_SHARDS;
+        initial_state.telemetry.public_shards_total = PUBLIC_STREAM_SHARDS;
         let state = Arc::new(RwLock::new(initial_state));
         let (symbols, receiver) = watch::channel(Vec::new());
         tokio::spawn(run_supervisor(base_url, Arc::clone(&state), receiver));
@@ -107,6 +114,16 @@ impl MarketStreamHub {
         normalized.dedup();
         if *self.symbols.borrow() != normalized {
             let mut state = self.state.write().expect("stream state poisoned");
+            let now_ms = chrono::Utc::now().timestamp_millis();
+            for symbol in &normalized {
+                state
+                    .symbol_admitted_ms
+                    .entry(symbol.clone())
+                    .or_insert(now_ms);
+            }
+            state
+                .symbol_admitted_ms
+                .retain(|symbol, _| normalized.binary_search(symbol).is_ok());
             state.telemetry.subscribed_symbols = normalized.len();
             state.desired_symbols = normalized.iter().cloned().collect();
             drop(state);
@@ -148,6 +165,15 @@ impl MarketStreamHub {
                 }
                 book
             })
+    }
+
+    pub fn symbol_is_warming(&self, symbol: &str, now_ms: i64) -> bool {
+        self.state
+            .read()
+            .expect("stream state poisoned")
+            .symbol_admitted_ms
+            .get(&symbol.to_uppercase())
+            .is_some_and(|admitted_ms| now_ms - admitted_ms < SYMBOL_WARMUP_MS)
     }
 
     pub fn microstructure(&self, symbol: &str, now_ms: i64) -> Option<MicrostructureState> {
@@ -252,13 +278,15 @@ async fn run_supervisor(
             symbols.clone(),
         ));
     }
-    run_dynamic_connection(
-        StreamRoute::Public,
-        route_url(&base_url, StreamRoute::Public),
-        state,
-        symbols,
-    )
-    .await;
+    for shard in 0..PUBLIC_STREAM_SHARDS {
+        tokio::spawn(run_dynamic_connection(
+            StreamRoute::Public(shard),
+            route_url(&base_url, StreamRoute::Public(shard)),
+            Arc::clone(&state),
+            symbols.clone(),
+        ));
+    }
+    std::future::pending::<()>().await;
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -266,7 +294,7 @@ enum StreamRoute {
     Radar,
     Market,
     Trade(usize),
-    Public,
+    Public(usize),
 }
 
 async fn run_connection(route: StreamRoute, url: String, state: Arc<RwLock<StreamState>>) {
@@ -497,7 +525,7 @@ fn route_url(base: &str, route: StreamRoute) -> String {
     let path = match route {
         StreamRoute::Market => "market/ws",
         StreamRoute::Trade(_) => "market/ws",
-        StreamRoute::Public => "public/ws",
+        StreamRoute::Public(_) => "public/ws",
         StreamRoute::Radar => "market/ws",
     };
     format!("{}/{path}", base.trim_end_matches('/'))
@@ -507,7 +535,7 @@ fn route_streams(route: StreamRoute, symbols: &[String]) -> BTreeSet<String> {
     match route {
         StreamRoute::Market => market_streams(symbols),
         StreamRoute::Trade(shard) => trade_streams_shard(symbols, shard),
-        StreamRoute::Public => public_streams(symbols),
+        StreamRoute::Public(shard) => public_streams_shard(symbols, shard),
         StreamRoute::Radar => BTreeSet::from(["!ticker@arr".into()]),
     }
 }
@@ -548,6 +576,13 @@ fn public_streams(symbols: &[String]) -> BTreeSet<String> {
     symbols
         .iter()
         .map(|symbol| format!("{}@depth20@500ms", symbol.to_lowercase()))
+        .collect()
+}
+
+fn public_streams_shard(symbols: &[String], shard: usize) -> BTreeSet<String> {
+    public_streams(symbols)
+        .into_iter()
+        .filter(|stream| symbol_shard(stream, PUBLIC_STREAM_SHARDS) == shard)
         .collect()
 }
 
@@ -871,7 +906,19 @@ fn set_connected(
             state.telemetry.trade_connected =
                 state.telemetry.trade_shards_connected == TRADE_STREAM_SHARDS;
         }
-        StreamRoute::Public => state.telemetry.public_connected = connected,
+        StreamRoute::Public(shard) => {
+            if let Some(value) = state.public_connections.get_mut(shard) {
+                *value = connected;
+            }
+            state.telemetry.public_shards_total = PUBLIC_STREAM_SHARDS;
+            state.telemetry.public_shards_connected = state
+                .public_connections
+                .iter()
+                .filter(|value| **value)
+                .count();
+            state.telemetry.public_connected =
+                state.telemetry.public_shards_connected == PUBLIC_STREAM_SHARDS;
+        }
     }
     if let Some(error) = error {
         state.telemetry.last_error = Some(error);
@@ -900,7 +947,7 @@ fn record_message(state: &Arc<RwLock<StreamState>>, route: StreamRoute, now_ms: 
             state.telemetry.trade_messages += 1;
             state.telemetry.last_trade_message_ms = Some(now_ms);
         }
-        StreamRoute::Public => {
+        StreamRoute::Public(_) => {
             state.telemetry.public_messages += 1;
             state.telemetry.last_public_message_ms = Some(now_ms);
         }
@@ -1024,7 +1071,7 @@ mod tests {
         .unwrap();
         handle_payload(
             &state,
-            StreamRoute::Public,
+            StreamRoute::Public(0),
             serde_json::json!({"data":{"E":10,"s":"YBUSDT","b":[["1.9","100"]],"a":[["2.1","100"]]}}),
             10,
         )
@@ -1045,7 +1092,7 @@ mod tests {
             "wss://fstream.binance.com/market/ws"
         );
         assert_eq!(
-            route_url("wss://fstream.binance.com", StreamRoute::Public),
+            route_url("wss://fstream.binance.com", StreamRoute::Public(0)),
             "wss://fstream.binance.com/public/ws"
         );
         assert_eq!(
@@ -1074,6 +1121,24 @@ mod tests {
         let mut combined = BTreeSet::new();
         for shard in 0..TRADE_STREAM_SHARDS {
             let streams = trade_streams_shard(&symbols, shard);
+            assert!(combined.is_disjoint(&streams));
+            combined.extend(streams);
+        }
+        assert_eq!(combined, expected);
+    }
+
+    #[test]
+    fn public_stream_shards_are_disjoint_and_complete() {
+        let symbols = vec![
+            "BTCUSDT".to_string(),
+            "ETHUSDT".to_string(),
+            "SOLUSDT".to_string(),
+            "YBUSDT".to_string(),
+        ];
+        let expected = public_streams(&symbols);
+        let mut combined = BTreeSet::new();
+        for shard in 0..PUBLIC_STREAM_SHARDS {
+            let streams = public_streams_shard(&symbols, shard);
             assert!(combined.is_disjoint(&streams));
             combined.extend(streams);
         }

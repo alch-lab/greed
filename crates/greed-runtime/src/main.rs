@@ -14,9 +14,59 @@ use greed_kernel::{AccountFrame, Artifact, GraphEvaluation, Verdict};
 use greed_strategy::{build_graph, StrategyConfig};
 use journal::{Journal, SampleRecorder, StatusWriter};
 use source::BinanceMarketSource;
-use std::time::Duration;
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    time::Duration,
+};
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
+
+const UNIVERSE_MISS_THRESHOLD: u8 = 4;
+const UNIVERSE_MAX_REPLACEMENTS: usize = 2;
+
+fn stabilize_universe(
+    current: &[String],
+    desired_ranked: &[String],
+    pinned: &[String],
+    max_symbols: usize,
+    misses: &mut BTreeMap<String, u8>,
+) -> Vec<String> {
+    let desired: BTreeSet<_> = desired_ranked.iter().cloned().collect();
+    let pinned: BTreeSet<_> = pinned.iter().cloned().collect();
+    for symbol in current {
+        if desired.contains(symbol) || pinned.contains(symbol) {
+            misses.remove(symbol);
+        } else {
+            let value = misses.entry(symbol.clone()).or_default();
+            *value = value.saturating_add(1);
+        }
+    }
+
+    let mut result: BTreeSet<String> = pinned.clone();
+    let mut evictions = 0usize;
+    for symbol in current {
+        let expired = misses
+            .get(symbol)
+            .is_some_and(|count| *count >= UNIVERSE_MISS_THRESHOLD);
+        if expired && !pinned.contains(symbol) && evictions < UNIVERSE_MAX_REPLACEMENTS {
+            evictions += 1;
+            continue;
+        }
+        result.insert(symbol.clone());
+    }
+
+    let mut additions = 0usize;
+    for symbol in desired_ranked {
+        if result.len() >= max_symbols || additions >= UNIVERSE_MAX_REPLACEMENTS {
+            break;
+        }
+        if result.insert(symbol.clone()) {
+            additions += 1;
+        }
+    }
+    misses.retain(|symbol, _| result.contains(symbol));
+    result.into_iter().take(max_symbols).collect()
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -350,6 +400,8 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
     let mut active_strategy = config.strategy.clone();
     let mut graph = build_graph(&active_strategy)?;
     let mut last_universe_refresh_ms = 0i64;
+    let mut universe_initialized = false;
+    let mut universe_misses = BTreeMap::new();
     let mut universe_status = serde_json::json!({
         "as_of_ms": started_ms,
         "symbols": active_strategy.symbols.clone(),
@@ -404,7 +456,18 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                             .max_symbols
                             .saturating_sub(position_symbols.len()),
                     );
-                    discovery.symbols.extend(position_symbols);
+                    discovery.symbols.extend(position_symbols.iter().cloned());
+                    if universe_initialized {
+                        discovery.symbols = stabilize_universe(
+                            &active_strategy.symbols,
+                            &discovery.symbols,
+                            &position_symbols,
+                            config.strategy.universe.max_symbols,
+                            &mut universe_misses,
+                        );
+                    } else {
+                        universe_initialized = true;
+                    }
                     discovery.symbols.sort();
                     if !discovery.symbols.is_empty() && discovery.symbols != active_strategy.symbols
                     {
@@ -497,5 +560,35 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
             return Ok(());
         }
         tokio::time::sleep(Duration::from_secs(config.runtime.poll_seconds)).await;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_universe_requires_repeated_misses_and_limits_churn() {
+        let current = vec!["BTCUSDT", "ETHUSDT", "OLD1USDT", "OLD2USDT"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let desired = vec!["BTCUSDT", "ETHUSDT", "NEW1USDT", "NEW2USDT"]
+            .into_iter()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        let pinned = vec!["BTCUSDT".to_string()];
+        let mut misses = BTreeMap::new();
+
+        for _ in 0..UNIVERSE_MISS_THRESHOLD - 1 {
+            let stable = stabilize_universe(&current, &desired, &pinned, 4, &mut misses);
+            assert!(stable.contains(&"OLD1USDT".to_string()));
+            assert!(stable.contains(&"OLD2USDT".to_string()));
+        }
+        let stable = stabilize_universe(&current, &desired, &pinned, 4, &mut misses);
+        assert_eq!(stable.len(), 4);
+        assert!(stable.contains(&"BTCUSDT".to_string()));
+        assert!(stable.contains(&"NEW1USDT".to_string()));
+        assert!(stable.contains(&"NEW2USDT".to_string()));
     }
 }

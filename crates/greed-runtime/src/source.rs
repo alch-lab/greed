@@ -673,7 +673,11 @@ impl BinanceMarketSource {
                 .stream
                 .as_ref()
                 .and_then(|stream| stream.book(symbol, now));
-            if book.as_ref().is_none_or(|value| !value.meta.usable_at(now)) {
+            let warming = self
+                .stream
+                .as_ref()
+                .is_some_and(|stream| stream.symbol_is_warming(symbol, now));
+            if !warming && book.as_ref().is_none_or(|value| !value.meta.usable_at(now)) {
                 warnings.push(format!("websocket depth stale or missing {symbol}"));
             }
             let microstructure = self
