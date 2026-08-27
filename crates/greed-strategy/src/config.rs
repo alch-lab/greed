@@ -68,6 +68,8 @@ pub struct LaneConfig {
     pub trend_min_flow_imbalance: f64,
     pub trend_max_age_bars: usize,
     pub trend_max_signal_age_seconds: u32,
+    pub trend_limit_offset_atr: f64,
+    pub trend_entry_timeout_seconds: u32,
     pub ignition_min_return_5m: f64,
     pub ignition_min_volume_ratio: f64,
     pub ignition_min_flow_imbalance: f64,
@@ -106,6 +108,8 @@ impl Default for LaneConfig {
             trend_min_flow_imbalance: 0.0,
             trend_max_age_bars: 2,
             trend_max_signal_age_seconds: 300,
+            trend_limit_offset_atr: 0.30,
+            trend_entry_timeout_seconds: 60,
             ignition_min_return_5m: 0.010,
             ignition_min_volume_ratio: 3.0,
             ignition_min_flow_imbalance: 0.20,
@@ -159,12 +163,12 @@ impl Default for RiskConfig {
             max_notional_per_trade_multiple: 1.50,
             max_total_gross_multiple: 4.0,
             max_positions: 3,
-            initial_stop_pct: 0.010,
+            initial_stop_pct: 0.0125,
             first_take_profit_r: 2.0,
             first_take_profit_fraction: 0.40,
             runner_take_profit_r: 0.0,
             break_even_buffer_pct: 0.0018,
-            profit_shield_activation_r: 1.0,
+            profit_shield_activation_r: 0.5,
             trailing_distance_pct: 0.005,
             max_hold_minutes: 0,
             daily_loss_limit_pct: 0.025,
@@ -211,6 +215,8 @@ impl StrategyConfig {
             || lanes.trend_min_hour_volume_ratio <= 0.0
             || !(-0.50..=0.50).contains(&lanes.trend_min_flow_imbalance)
             || !(1..=8).contains(&lanes.trend_max_age_bars)
+            || !(0.0..=0.5).contains(&lanes.trend_limit_offset_atr)
+            || !(5..=120).contains(&lanes.trend_entry_timeout_seconds)
             || lanes.max_spread_bps <= 0.0
             || lanes.min_depth_usd <= 0.0
             || !(0.003..=0.03).contains(&lanes.ignition_min_return_5m)

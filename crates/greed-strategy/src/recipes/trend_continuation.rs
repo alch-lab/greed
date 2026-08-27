@@ -44,6 +44,15 @@ fn trend_age_bars(values: &[&Candle], end: usize, sign: f64, threshold: f64) -> 
     age
 }
 
+fn passive_pullback_limit(close: f64, atr: f64, sign: f64, offset_atr: f64, book: f64) -> f64 {
+    let desired = close - sign * offset_atr * atr;
+    if sign > 0.0 {
+        desired.min(book)
+    } else {
+        desired.max(book)
+    }
+}
+
 impl StrategyNode for TrendContinuationNode {
     fn id(&self) -> &str {
         &self.id
@@ -249,18 +258,31 @@ impl StrategyNode for TrendContinuationNode {
             ]);
             if verdict == Verdict::Pass {
                 if let Some(book) = instrument.book.as_ref() {
-                    tags.insert(
-                        "entry_limit".into(),
+                    // A fresh 15m reclaim is the signal, not the executable
+                    // price. Rest one level deeper for a brief retest and do
+                    // not chase when the continuation leaves without us.
+                    let passive_limit = passive_pullback_limit(
+                        bar.close,
+                        atr,
+                        sign,
+                        self.config.trend_limit_offset_atr,
                         if side == Side::Buy {
                             book.bid
                         } else {
                             book.ask
-                        }
-                        .to_string(),
+                        },
                     );
-                    tags.insert("entry_timeout_ms".into(), "30000".into());
-                    tags.insert("taker_fallback".into(), "true".into());
-                    tags.insert("max_entry_adverse_bps".into(), "12".into());
+                    tags.insert("entry_limit".into(), passive_limit.to_string());
+                    tags.insert(
+                        "entry_timeout_ms".into(),
+                        (i64::from(self.config.trend_entry_timeout_seconds) * 1_000).to_string(),
+                    );
+                    tags.insert("taker_fallback".into(), "false".into());
+                    tags.insert("max_entry_adverse_bps".into(), "0".into());
+                    tags.insert(
+                        "entry_offset_atr".into(),
+                        self.config.trend_limit_offset_atr.to_string(),
+                    );
                 }
             }
             let candidate = TradeCandidate {
@@ -399,5 +421,13 @@ mod tests {
         let references: Vec<_> = values.iter().collect();
         assert_eq!(trend_age_bars(&references, 19, 1.0, 0.06), 3);
         assert_eq!(trend_age_bars(&references, 19, -1.0, 0.06), 0);
+    }
+
+    #[test]
+    fn pullback_limit_is_deeper_and_never_crosses_the_book() {
+        assert_eq!(passive_pullback_limit(100.0, 2.0, 1.0, 0.30, 99.9), 99.4);
+        assert_eq!(passive_pullback_limit(100.0, 2.0, -1.0, 0.30, 100.1), 100.6);
+        assert_eq!(passive_pullback_limit(100.0, 2.0, 1.0, 0.0, 99.9), 99.9);
+        assert_eq!(passive_pullback_limit(100.0, 2.0, -1.0, 0.0, 100.1), 100.1);
     }
 }

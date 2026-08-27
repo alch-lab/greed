@@ -66,6 +66,10 @@ trend_min_flow_imbalance = 0.0
 # Later pullbacks belong to a mature move and must not be presented as fresh.
 trend_max_age_bars = 2
 trend_max_signal_age_seconds = 300
+# Rest 0.30 ATR behind the completed reclaim for one minute. If it does not
+# retest, cancel instead of turning a good signal into a late taker entry.
+trend_limit_offset_atr = 0.30
+trend_entry_timeout_seconds = 60
 ignition_min_return_5m = 0.010
 ignition_min_volume_ratio = 3.0
 ignition_min_flow_imbalance = 0.20
@@ -87,14 +91,15 @@ high_confidence_threshold = 0.85
 max_notional_per_trade_multiple = 1.50
 max_total_gross_multiple = 4.00
 max_positions = 3
-initial_stop_pct = 0.010
+initial_stop_pct = 0.0125
 first_take_profit_r = 2.0
 first_take_profit_fraction = 0.40
 runner_take_profit_r = 0.0
 break_even_buffer_pct = 0.0018
-# With the fresh-trend gate, lock estimated round-trip costs at +1R.
-profit_shield_activation_r = 1.00
-trailing_distance_pct = 0.003
+# Protect estimated round-trip costs once price reaches +0.5R. The first 40%
+# still exits at 2R; the runner then trails at 0.5% to preserve trend upside.
+profit_shield_activation_r = 0.50
+trailing_distance_pct = 0.005
 # Zero disables time-based exits. Hard stop, cost shield, and trailing protection remain exchange-side.
 max_hold_minutes = 0
 daily_loss_limit_pct = 0.025
@@ -105,5 +110,5 @@ rolling_pf_floor = 1.00
 rolling_pf_cooldown_minutes = 360
 loss_cooldown_minutes = 180
 rolling_pf_probe_size_multiplier = 1.00
-# Epoch 11 starts the fresh-trend age gate with a clean PF window.
-rolling_pf_epoch = 11
+# Epoch 12 starts the executable pullback-entry/risk geometry with a clean PF window.
+rolling_pf_epoch = 12
