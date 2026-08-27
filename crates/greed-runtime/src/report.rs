@@ -282,6 +282,9 @@ pub fn build(path: &str) -> Result<Value> {
                     stream_observations += 1;
                     if !stream["radar_connected"].as_bool().unwrap_or(false)
                         || !stream["market_connected"].as_bool().unwrap_or(false)
+                        || stream
+                            .get("trade_connected")
+                            .is_some_and(|value| !value.as_bool().unwrap_or(false))
                         || !stream["public_connected"].as_bool().unwrap_or(false)
                     {
                         stream_offline_observations += 1;
@@ -294,6 +297,7 @@ pub fn build(path: &str) -> Result<Value> {
                         for key in [
                             "last_radar_message_ms",
                             "last_market_message_ms",
+                            "last_trade_message_ms",
                             "last_public_message_ms",
                         ] {
                             if let Some(message_ms) = stream[key].as_i64() {

@@ -141,6 +141,7 @@ pub struct RiskConfig {
     pub runner_take_profit_r: f64,
     pub break_even_buffer_pct: f64,
     pub profit_shield_activation_r: f64,
+    pub pre_tp_trailing_activation_r: f64,
     pub trailing_distance_pct: f64,
     pub max_hold_minutes: u32,
     pub daily_loss_limit_pct: f64,
@@ -169,6 +170,7 @@ impl Default for RiskConfig {
             runner_take_profit_r: 0.0,
             break_even_buffer_pct: 0.0018,
             profit_shield_activation_r: 0.5,
+            pre_tp_trailing_activation_r: 0.8,
             trailing_distance_pct: 0.005,
             max_hold_minutes: 0,
             daily_loss_limit_pct: 0.025,
@@ -245,6 +247,8 @@ impl StrategyConfig {
             || risk.first_take_profit_r <= 0.0
             || (risk.profit_shield_activation_r != 0.0
                 && !(0.5..risk.first_take_profit_r).contains(&risk.profit_shield_activation_r))
+            || !(risk.profit_shield_activation_r..risk.first_take_profit_r)
+                .contains(&risk.pre_tp_trailing_activation_r)
             || (risk.runner_take_profit_r > 0.0
                 && risk.runner_take_profit_r <= risk.first_take_profit_r)
             || !(0.1..=0.9).contains(&risk.first_take_profit_fraction)

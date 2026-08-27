@@ -171,7 +171,11 @@ impl StrategyNode for PositionPlannerNode {
                 profit_shield_activation_pct: (take_fraction < 1.0
                     && self.config.profit_shield_activation_r > 0.0)
                     .then_some(stop_pct * self.config.profit_shield_activation_r),
-                trailing_activation_pct: (take_fraction < 1.0).then_some(stop_pct * target_r),
+                // Start locking profit before TP1. Waiting until TP1 meant a
+                // position could reach roughly +1R, miss the 2R partial, and
+                // surrender almost all open profit back to the cost shield.
+                trailing_activation_pct: (take_fraction < 1.0)
+                    .then_some(stop_pct * self.config.pre_tp_trailing_activation_r),
                 trailing_distance_pct: (take_fraction < 1.0)
                     .then_some(self.config.trailing_distance_pct),
                 max_hold_ms: tag_i64(c, "max_hold_ms")

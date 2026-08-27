@@ -96,9 +96,13 @@ first_take_profit_r = 2.0
 first_take_profit_fraction = 0.40
 runner_take_profit_r = 0.0
 break_even_buffer_pct = 0.0018
-# Protect estimated round-trip costs once price reaches +0.5R. The first 40%
-# still exits at 2R; the runner then trails at 0.5% to preserve trend upside.
+# Protect estimated round-trip costs once price reaches +0.5R. At +0.8R the
+# full position begins trailing; the first 40% still exits at 2R and the
+# remaining runner keeps the same trailing protection.
 profit_shield_activation_r = 0.50
+# Once open profit reaches 0.8R, trail the full position by 0.5%. This locks a
+# meaningful pre-TP1 gain without moving the stop during an ordinary early pullback.
+pre_tp_trailing_activation_r = 0.80
 trailing_distance_pct = 0.005
 # Zero disables time-based exits. Hard stop, cost shield, and trailing protection remain exchange-side.
 max_hold_minutes = 0
@@ -111,4 +115,4 @@ rolling_pf_cooldown_minutes = 360
 loss_cooldown_minutes = 180
 rolling_pf_probe_size_multiplier = 1.00
 # Epoch 12 starts the executable pullback-entry/risk geometry with a clean PF window.
-rolling_pf_epoch = 12
+rolling_pf_epoch = 13

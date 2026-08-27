@@ -8,7 +8,7 @@ use serde_json::Value;
 use std::{
     collections::{BTreeMap, BTreeSet, VecDeque},
     sync::{Arc, RwLock},
-    time::Duration,
+    time::{Duration, Instant},
 };
 use tokio::sync::watch;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
@@ -48,12 +48,15 @@ impl StreamTicker {
 pub struct StreamTelemetry {
     pub radar_connected: bool,
     pub market_connected: bool,
+    pub trade_connected: bool,
     pub public_connected: bool,
     pub last_radar_message_ms: Option<i64>,
     pub last_market_message_ms: Option<i64>,
+    pub last_trade_message_ms: Option<i64>,
     pub last_public_message_ms: Option<i64>,
     pub radar_messages: u64,
     pub market_messages: u64,
+    pub trade_messages: u64,
     pub public_messages: u64,
     pub reconnects: u64,
     pub parse_errors: u64,
@@ -235,6 +238,12 @@ async fn run_supervisor(
         Arc::clone(&state),
         symbols.clone(),
     ));
+    tokio::spawn(run_dynamic_connection(
+        StreamRoute::Trade,
+        route_url(&base_url, StreamRoute::Trade),
+        Arc::clone(&state),
+        symbols.clone(),
+    ));
     run_dynamic_connection(
         StreamRoute::Public,
         route_url(&base_url, StreamRoute::Public),
@@ -244,16 +253,18 @@ async fn run_supervisor(
     .await;
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 enum StreamRoute {
     Radar,
     Market,
+    Trade,
     Public,
 }
 
 async fn run_connection(route: StreamRoute, url: String, state: Arc<RwLock<StreamState>>) {
     let mut backoff = 1u64;
     loop {
+        let mut stable_connection = false;
         match tokio::time::timeout(Duration::from_secs(10), connect_async(&url)).await {
             Err(_) => {
                 set_connected(
@@ -266,30 +277,41 @@ async fn run_connection(route: StreamRoute, url: String, state: Arc<RwLock<Strea
             }
             Ok(Ok((stream, _))) => {
                 set_connected(&state, route, true, None);
-                backoff = 1;
+                let connected_at = Instant::now();
                 let (mut writer, mut reader) = stream.split();
-                while let Some(message) = reader.next().await {
-                    match message {
-                        Ok(Message::Text(text)) => {
-                            let now_ms = chrono::Utc::now().timestamp_millis();
-                            match serde_json::from_str::<Value>(&text)
-                                .map_err(anyhow::Error::from)
-                                .and_then(|value| handle_payload(&state, route, value, now_ms))
-                            {
-                                Ok(()) => record_message(&state, route, now_ms),
-                                Err(error) => record_parse_error(&state, error.to_string()),
+                let disconnect_reason = loop {
+                    match reader.next().await {
+                        Some(message) => match message {
+                            Ok(Message::Text(text)) => {
+                                let now_ms = chrono::Utc::now().timestamp_millis();
+                                match serde_json::from_str::<Value>(&text)
+                                    .map_err(anyhow::Error::from)
+                                    .and_then(|value| handle_payload(&state, route, value, now_ms))
+                                {
+                                    Ok(()) => record_message(&state, route, now_ms),
+                                    Err(error) => record_parse_error(&state, error.to_string()),
+                                }
                             }
-                        }
-                        Ok(Message::Ping(payload)) => {
-                            if writer.send(Message::Pong(payload)).await.is_err() {
-                                break;
+                            Ok(Message::Ping(payload)) => {
+                                if writer.send(Message::Pong(payload)).await.is_err() {
+                                    break "pong write failed".to_string();
+                                }
                             }
-                        }
-                        Ok(Message::Close(_)) | Err(_) => break,
-                        _ => {}
+                            Ok(Message::Close(frame)) => {
+                                break format!("server close: {frame:?}");
+                            }
+                            Err(error) => {
+                                break format!("websocket read failed: {error}");
+                            }
+                            _ => {}
+                        },
+                        None => break "websocket stream ended".to_string(),
                     }
-                }
-                set_connected(&state, route, false, Some("websocket disconnected".into()));
+                };
+                stable_connection = connected_at.elapsed() >= Duration::from_secs(60);
+                let detail = format!("{route:?} {disconnect_reason}");
+                set_connected(&state, route, false, Some(detail.clone()));
+                warn!(route=?route, connected_seconds=connected_at.elapsed().as_secs(), reason=%detail, "Binance websocket disconnected");
             }
             Ok(Err(error)) => {
                 set_connected(&state, route, false, Some(error.to_string()));
@@ -301,7 +323,11 @@ async fn run_connection(route: StreamRoute, url: String, state: Arc<RwLock<Strea
             state.telemetry.reconnects += 1;
         }
         tokio::time::sleep(Duration::from_secs(backoff)).await;
-        backoff = (backoff * 2).min(30);
+        backoff = if stable_connection {
+            1
+        } else {
+            (backoff * 2).min(30)
+        };
     }
 }
 
@@ -320,6 +346,7 @@ async fn run_dynamic_connection(
             }
             continue;
         }
+        let mut stable_connection = false;
         match tokio::time::timeout(Duration::from_secs(10), connect_async(&url)).await {
             Err(_) => {
                 set_connected(
@@ -336,7 +363,7 @@ async fn run_dynamic_connection(
             }
             Ok(Ok((stream, _))) => {
                 set_connected(&state, route, true, None);
-                backoff = 1;
+                let connected_at = Instant::now();
                 let (mut writer, mut reader) = stream.split();
                 let desired = route_streams(route, &symbols.borrow());
                 if send_subscription_change(
@@ -357,7 +384,7 @@ async fn run_dynamic_connection(
                 } else {
                     request_id += 1;
                     let mut active = desired;
-                    loop {
+                    let disconnect_reason = loop {
                         tokio::select! {
                             changed = symbols.changed() => {
                                 if changed.is_err() { return; }
@@ -370,7 +397,7 @@ async fn run_dynamic_connection(
                                         "SUBSCRIBE",
                                         additions,
                                         request_id,
-                                    ).await.is_err() { break; }
+                                    ).await.is_err() { break "subscribe write failed".to_string(); }
                                     request_id += 1;
                                 }
                                 if !removals.is_empty() {
@@ -379,7 +406,7 @@ async fn run_dynamic_connection(
                                         "UNSUBSCRIBE",
                                         removals,
                                         request_id,
-                                    ).await.is_err() { break; }
+                                    ).await.is_err() { break "unsubscribe write failed".to_string(); }
                                     request_id += 1;
                                 }
                                 active = desired;
@@ -394,7 +421,7 @@ async fn run_dynamic_connection(
                                                 &state,
                                                 format!("Binance websocket subscription rejected: {}", parsed.expect("checked above")),
                                             );
-                                            break;
+                                            break "subscription rejected by Binance".to_string();
                                         }
                                         match parsed.map_err(anyhow::Error::from).and_then(|value| {
                                             handle_payload(&state, route, value, now_ms)
@@ -404,15 +431,20 @@ async fn run_dynamic_connection(
                                         }
                                     }
                                     Some(Ok(Message::Ping(payload))) => {
-                                        if writer.send(Message::Pong(payload)).await.is_err() { break; }
+                                        if writer.send(Message::Pong(payload)).await.is_err() { break "pong write failed".to_string(); }
                                     }
-                                    Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                                    Some(Ok(Message::Close(frame))) => break format!("server close: {frame:?}"),
+                                    Some(Err(error)) => break format!("websocket read failed: {error}"),
+                                    None => break "websocket stream ended".to_string(),
                                     _ => {}
                                 }
                             }
                         }
-                    }
-                    set_connected(&state, route, false, Some("websocket disconnected".into()));
+                    };
+                    stable_connection = connected_at.elapsed() >= Duration::from_secs(60);
+                    let detail = format!("{route:?} {disconnect_reason}");
+                    set_connected(&state, route, false, Some(detail.clone()));
+                    warn!(route=?route, connected_seconds=connected_at.elapsed().as_secs(), reason=%detail, "Binance dynamic websocket disconnected");
                 }
             }
         }
@@ -422,7 +454,11 @@ async fn run_dynamic_connection(
             .telemetry
             .reconnects += 1;
         tokio::time::sleep(Duration::from_secs(backoff)).await;
-        backoff = (backoff * 2).min(30);
+        backoff = if stable_connection {
+            1
+        } else {
+            (backoff * 2).min(30)
+        };
     }
 }
 
@@ -452,6 +488,7 @@ where
 fn route_url(base: &str, route: StreamRoute) -> String {
     let path = match route {
         StreamRoute::Market => "market/ws",
+        StreamRoute::Trade => "market/ws",
         StreamRoute::Public => "public/ws",
         StreamRoute::Radar => "market/ws",
     };
@@ -461,6 +498,7 @@ fn route_url(base: &str, route: StreamRoute) -> String {
 fn route_streams(route: StreamRoute, symbols: &[String]) -> BTreeSet<String> {
     match route {
         StreamRoute::Market => market_streams(symbols),
+        StreamRoute::Trade => trade_streams(symbols),
         StreamRoute::Public => public_streams(symbols),
         StreamRoute::Radar => BTreeSet::from(["!ticker@arr".into()]),
     }
@@ -473,9 +511,15 @@ fn market_streams(symbols: &[String]) -> BTreeSet<String> {
         streams.insert(format!("{symbol}@kline_15m"));
         streams.insert(format!("{symbol}@kline_5m"));
         streams.insert(format!("{symbol}@kline_1m"));
-        streams.insert(format!("{symbol}@aggTrade"));
     }
     streams
+}
+
+fn trade_streams(symbols: &[String]) -> BTreeSet<String> {
+    symbols
+        .iter()
+        .map(|symbol| format!("{}@aggTrade", symbol.to_lowercase()))
+        .collect()
 }
 
 fn public_streams(symbols: &[String]) -> BTreeSet<String> {
@@ -792,6 +836,7 @@ fn set_connected(
     match route {
         StreamRoute::Radar => state.telemetry.radar_connected = connected,
         StreamRoute::Market => state.telemetry.market_connected = connected,
+        StreamRoute::Trade => state.telemetry.trade_connected = connected,
         StreamRoute::Public => state.telemetry.public_connected = connected,
     }
     if let Some(error) = error {
@@ -799,6 +844,7 @@ fn set_connected(
     } else if connected
         && state.telemetry.radar_connected
         && state.telemetry.market_connected
+        && state.telemetry.trade_connected
         && state.telemetry.public_connected
     {
         state.telemetry.last_error = None;
@@ -815,6 +861,10 @@ fn record_message(state: &Arc<RwLock<StreamState>>, route: StreamRoute, now_ms: 
         StreamRoute::Market => {
             state.telemetry.market_messages += 1;
             state.telemetry.last_market_message_ms = Some(now_ms);
+        }
+        StreamRoute::Trade => {
+            state.telemetry.trade_messages += 1;
+            state.telemetry.last_trade_message_ms = Some(now_ms);
         }
         StreamRoute::Public => {
             state.telemetry.public_messages += 1;
@@ -964,11 +1014,16 @@ mod tests {
             route_url("wss://fstream.binance.com", StreamRoute::Public),
             "wss://fstream.binance.com/public/ws"
         );
+        assert_eq!(
+            route_url("wss://fstream.binance.com", StreamRoute::Trade),
+            "wss://fstream.binance.com/market/ws"
+        );
         assert!(!market.contains("!ticker@arr"));
         assert!(market.contains("ybusdt@kline_5m"));
         assert!(market.contains("ybusdt@kline_1m"));
         assert!(market.contains("btcusdt@kline_5m"));
-        assert!(market.contains("btcusdt@aggTrade"));
+        assert!(!market.contains("btcusdt@aggTrade"));
+        assert!(trade_streams(&symbols).contains("btcusdt@aggTrade"));
         assert!(!market.contains("btcusdt@forceOrder"));
         assert!(public.contains("btcusdt@depth20@500ms"));
     }
@@ -981,9 +1036,9 @@ mod tests {
         let desired = market_streams(&after);
         let additions: Vec<_> = desired.difference(&active).cloned().collect();
         let removals: Vec<_> = active.difference(&desired).cloned().collect();
-        assert_eq!(additions.len(), 4);
+        assert_eq!(additions.len(), 3);
         assert!(additions.iter().all(|value| value.starts_with("solusdt@")));
-        assert_eq!(removals.len(), 4);
+        assert_eq!(removals.len(), 3);
         assert!(removals.iter().all(|value| value.starts_with("ethusdt@")));
     }
 
@@ -1013,7 +1068,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(initial["method"], "SUBSCRIBE");
-        assert_eq!(initial["params"].as_array().unwrap().len(), 4);
+        assert_eq!(initial["params"].as_array().unwrap().len(), 3);
 
         sender
             .send(vec!["BTCUSDT".to_string(), "SOLUSDT".to_string()])

@@ -47,6 +47,11 @@ copy_if_present "${RUNTIME_DIR}/alpha-status.json" "${WORK_DIR}/runtime/alpha-st
 copy_if_present "${RUNTIME_DIR}/alpha-history.jsonl" "${WORK_DIR}/runtime/alpha-history.jsonl"
 copy_if_present "${RUNTIME_DIR}/binance-alpha-state.json" "${WORK_DIR}/runtime/binance-alpha-state.json"
 copy_jsonl_tail "${RUNTIME_DIR}/alpha-events.jsonl" "${WORK_DIR}/runtime/alpha-events.recent.jsonl"
+for rotation in 1 2 3 4; do
+  copy_jsonl_tail \
+    "${RUNTIME_DIR}/alpha-events.jsonl.${rotation}" \
+    "${WORK_DIR}/runtime/alpha-events.${rotation}.recent.jsonl"
+done
 
 if [[ -x "target/release/greed" && -f "${RUNTIME_DIR}/alpha-events.jsonl" ]]; then
   timeout 90 target/release/greed report \

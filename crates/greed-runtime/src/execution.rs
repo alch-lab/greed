@@ -89,6 +89,8 @@ struct ExecutionMeta {
     #[serde(default)]
     stop_algo_id: Option<i64>,
     #[serde(default)]
+    stop_reason: Option<String>,
+    #[serde(default)]
     take_profit_order_ids: Vec<i64>,
 }
 
@@ -172,6 +174,7 @@ struct TradeSummary {
     exit_quantity: f64,
     last_exit_price: f64,
     last_exit_quantity: f64,
+    last_exit_order_id: Option<i64>,
     fees_usd: f64,
     net_pnl_usd: f64,
     maker_fills: usize,
@@ -653,6 +656,7 @@ impl BinanceDemoExecution {
                                 meta.stop_price = desired;
                                 meta.break_even_armed = true;
                                 meta.stop_algo_id = Some(stop_algo_id);
+                                meta.stop_reason = Some(reason.into());
                             }
                             events.push(ExchangeEvent {
                                 kind: "exchange_protection_updated".into(),
@@ -739,13 +743,13 @@ impl BinanceDemoExecution {
                     .collect();
                 for symbol in disappeared {
                     if let Some(meta) = self.state.positions.remove(&symbol) {
-                        let (exit_reason, exit_order_id, exit_order_status) =
-                            self.attribute_exit(&symbol, &meta).await;
-                        self.cancel_all(&symbol).await.ok();
                         let summary = self
                             .trade_summary(&symbol, meta.entry_ms, meta.side)
                             .await
                             .ok();
+                        let (exit_reason, exit_order_id, exit_order_status) =
+                            self.attribute_exit(&symbol, &meta, summary.as_ref()).await;
+                        self.cancel_all(&symbol).await.ok();
                         if let Some(summary) = summary.as_ref() {
                             let outcome = ExecutionOutcome {
                                 exit_ms: now_ms,
@@ -1106,6 +1110,7 @@ impl BinanceDemoExecution {
                             exit_requested: false,
                             pending_exit_reason: None,
                             stop_algo_id: Some(fill.stop_algo_id),
+                            stop_reason: Some("initial_stop".into()),
                             take_profit_order_ids: fill.take_profit_order_ids.clone(),
                         },
                     );
@@ -1512,6 +1517,7 @@ impl BinanceDemoExecution {
         &self,
         symbol: &str,
         meta: &ExecutionMeta,
+        summary: Option<&TradeSummary>,
     ) -> (String, Option<i64>, Option<String>) {
         if let Some(reason) = meta.pending_exit_reason.clone() {
             return (reason, None, Some("requested".into()));
@@ -1531,11 +1537,7 @@ impl BinanceDemoExecution {
                     .unwrap_or_default()
                     .to_string();
                 if matches!(status.as_str(), "FINISHED" | "TRIGGERED" | "FILLED") {
-                    let reason = if meta.break_even_armed {
-                        "trailing_or_protected_stop"
-                    } else {
-                        "initial_stop"
-                    };
+                    let reason = protective_exit_reason(meta);
                     return (reason.into(), Some(algo_id), Some(status));
                 }
             }
@@ -1565,6 +1567,20 @@ impl BinanceDemoExecution {
                     }
                 }
             }
+        }
+        // Binance Demo can remove a finished algo order before the next
+        // reconciliation query exposes it. The fills remain authoritative.
+        // If the last exit fill is at/through the active stop (with a small
+        // allowance for stop-market slippage), preserve the strategy reason
+        // instead of incorrectly labelling it as a manual close.
+        if let Some(summary) = summary
+            .filter(|value| exit_matches_stop(meta.side, meta.stop_price, value.last_exit_price))
+        {
+            return (
+                protective_exit_reason(meta).into(),
+                summary.last_exit_order_id,
+                Some("INFERRED_FROM_EXIT_FILL".into()),
+            );
         }
         ("external_or_manual_close".into(), None, None)
     }
@@ -2057,10 +2073,11 @@ fn summarize_trades(rows: &[Value], position_side: Side) -> TradeSummary {
     } else {
         0.0
     };
-    let (_, last_exit_notional, last_exit_quantity) = exit_orders
-        .into_values()
-        .max_by_key(|value| value.0)
-        .unwrap_or_default();
+    let (last_exit_order_id, (_, last_exit_notional, last_exit_quantity)) = exit_orders
+        .into_iter()
+        .max_by_key(|(_, value)| value.0)
+        .map(|(order_id, value)| (Some(order_id), value))
+        .unwrap_or((None, (0, 0.0, 0.0)));
     let last_exit_price = if last_exit_quantity > f64::EPSILON {
         last_exit_notional / last_exit_quantity
     } else {
@@ -2077,12 +2094,36 @@ fn summarize_trades(rows: &[Value], position_side: Side) -> TradeSummary {
         exit_quantity,
         last_exit_price,
         last_exit_quantity,
+        last_exit_order_id,
         fees_usd: fees,
         net_pnl_usd: realized - fees,
         maker_fills,
         taker_fills,
         maker_notional_usd: maker_notional,
         taker_notional_usd: taker_notional,
+    }
+}
+
+fn protective_exit_reason(meta: &ExecutionMeta) -> &str {
+    match meta.stop_reason.as_deref() {
+        Some("pre_tp_profit_shield") => "profit_shield_stop",
+        Some("trailing_protection") => "trailing_protection",
+        Some("risk_shield") => "risk_shield_stop",
+        Some("initial_stop") => "initial_stop",
+        Some(reason) => reason,
+        None if meta.break_even_armed => "trailing_or_protected_stop",
+        None => "initial_stop",
+    }
+}
+
+fn exit_matches_stop(side: Side, stop_price: f64, exit_price: f64) -> bool {
+    if stop_price <= 0.0 || exit_price <= 0.0 {
+        return false;
+    }
+    const STOP_MARKET_TOLERANCE_PCT: f64 = 0.0025;
+    match side {
+        Side::Buy => exit_price <= stop_price * (1.0 + STOP_MARKET_TOLERANCE_PCT),
+        Side::Sell => exit_price >= stop_price * (1.0 - STOP_MARKET_TOLERANCE_PCT),
     }
 }
 
@@ -2298,7 +2339,18 @@ mod tests {
         assert_eq!(summary.exit_quantity, 10.0);
         assert!((summary.last_exit_price - 104.5).abs() < 1e-9);
         assert_eq!(summary.last_exit_quantity, 6.0);
+        assert_eq!(summary.last_exit_order_id, Some(3));
         assert!((summary.net_pnl_usd - 54.1).abs() < 1e-9);
+    }
+
+    #[test]
+    fn stop_fill_matching_allows_slippage_but_not_favorable_distance() {
+        assert!(exit_matches_stop(Side::Buy, 100.0, 99.8));
+        assert!(exit_matches_stop(Side::Buy, 100.0, 100.2));
+        assert!(!exit_matches_stop(Side::Buy, 100.0, 100.3));
+        assert!(exit_matches_stop(Side::Sell, 100.0, 100.2));
+        assert!(exit_matches_stop(Side::Sell, 100.0, 99.8));
+        assert!(!exit_matches_stop(Side::Sell, 100.0, 99.7));
     }
 
     #[test]
