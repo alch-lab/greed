@@ -1,0 +1,2637 @@
+{
+  "strategy": "maker_timeout_pullback_reentry_v1",
+  "selection": "recovery selected on train+validation only; locked/recent untouched",
+  "cost_model": {
+    "maker_bps": 2,
+    "taker_bps": 5,
+    "exit_bps": 5,
+    "stop_slippage_bps": 3
+  },
+  "baseline": {
+    "train": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2053.8693384898847,
+        "return_pct": 0.026934669244942366,
+        "max_dd_pct": 0.06378743918101959,
+        "trades": 17,
+        "trades_per_day": 0.32075471698113206,
+        "win_rate": 0.29411764705882354,
+        "pf": 1.4076228541224491,
+        "average_pnl_usd": 3.16878461705201,
+        "average_mfe_r": 1.1589358414376558,
+        "average_giveback_r": 0.9932701759962693,
+        "exit_reasons": {
+          "trailing_stop": 5,
+          "cost_shield": 6,
+          "initial_stop": 6
+        }
+      },
+      "maker_misses": 40,
+      "recovered": 0
+    },
+    "validation": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2042.4765394306762,
+        "return_pct": 0.021238269715338154,
+        "max_dd_pct": 0.02147742479100012,
+        "trades": 5,
+        "trades_per_day": 0.22727272727272727,
+        "win_rate": 0.4,
+        "pf": 1.9851272604020367,
+        "average_pnl_usd": 8.4953078861352,
+        "average_mfe_r": 1.348070825552047,
+        "average_giveback_r": 0.9161640760726621,
+        "exit_reasons": {
+          "initial_stop": 2,
+          "trailing_stop": 2,
+          "cost_shield": 1
+        }
+      },
+      "maker_misses": 4,
+      "recovered": 0
+    },
+    "locked_test": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2003.3667554518233,
+        "return_pct": 0.001683377725911761,
+        "max_dd_pct": 0.024021162543211072,
+        "trades": 12,
+        "trades_per_day": 1.5,
+        "win_rate": 0.25,
+        "pf": 1.0306242541348416,
+        "average_pnl_usd": 0.2805629543186198,
+        "average_mfe_r": 0.8631535630114773,
+        "average_giveback_r": 0.8440037763060244,
+        "exit_reasons": {
+          "trailing_stop": 3,
+          "cost_shield": 4,
+          "initial_stop": 5
+        }
+      },
+      "maker_misses": 10,
+      "recovered": 0
+    },
+    "recent": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2043.8285854697713,
+        "return_pct": 0.021914292734885654,
+        "max_dd_pct": 0.00024062869669638776,
+        "trades": 5,
+        "trades_per_day": 1.6666666666666667,
+        "win_rate": 0.2,
+        "pf": 68.92830504688436,
+        "average_pnl_usd": 8.7657170939543,
+        "average_mfe_r": 1.4037053831578645,
+        "average_giveback_r": 0.9652775829733482,
+        "exit_reasons": {
+          "cost_shield": 4,
+          "trailing_stop": 1
+        }
+      },
+      "maker_misses": 9,
+      "recovered": 0
+    }
+  },
+  "direct_chase": {
+    "train": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2009.122402765162,
+        "return_pct": 0.004561201382580871,
+        "max_dd_pct": 0.10586565477678322,
+        "trades": 31,
+        "trades_per_day": 0.5849056603773585,
+        "win_rate": 0.1935483870967742,
+        "pf": 1.0382423401572507,
+        "average_pnl_usd": 0.29427105694069794,
+        "average_mfe_r": 1.1949154367082089,
+        "average_giveback_r": 1.1694506135643274,
+        "exit_reasons": {
+          "trailing_stop": 6,
+          "cost_shield": 15,
+          "initial_stop": 10
+        }
+      },
+      "maker_misses": 40,
+      "recovered": 0
+    },
+    "validation": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2047.9737767773354,
+        "return_pct": 0.023986888388667804,
+        "max_dd_pct": 0.032277378453581806,
+        "trades": 8,
+        "trades_per_day": 0.36363636363636365,
+        "win_rate": 0.375,
+        "pf": 1.5477975948737348,
+        "average_pnl_usd": 5.9967220971668835,
+        "average_mfe_r": 1.336456930584923,
+        "average_giveback_r": 1.0274806438257276,
+        "exit_reasons": {
+          "initial_stop": 4,
+          "trailing_stop": 3,
+          "cost_shield": 1
+        }
+      },
+      "maker_misses": 4,
+      "recovered": 0
+    },
+    "locked_test": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2060.1173212658523,
+        "return_pct": 0.03005866063292606,
+        "max_dd_pct": 0.021634545724320775,
+        "trades": 20,
+        "trades_per_day": 2.5,
+        "win_rate": 0.2,
+        "pf": 1.6669190926852782,
+        "average_pnl_usd": 3.005866063292617,
+        "average_mfe_r": 1.0247411904759984,
+        "average_giveback_r": 0.8720559304369554,
+        "exit_reasons": {
+          "trailing_stop": 4,
+          "cost_shield": 12,
+          "initial_stop": 4
+        }
+      },
+      "maker_misses": 10,
+      "recovered": 0
+    },
+    "recent": {
+      "summary": {
+        "start": 2000.0,
+        "end": 1988.9540741539001,
+        "return_pct": -0.005522962923049879,
+        "max_dd_pct": 0.022428711801387946,
+        "trades": 12,
+        "trades_per_day": 4.0,
+        "win_rate": 0.08333333333333333,
+        "pf": 0.7974440087169226,
+        "average_pnl_usd": -0.920493820508296,
+        "average_mfe_r": 0.8454866369801305,
+        "average_giveback_r": 0.8884851486399933,
+        "exit_reasons": {
+          "cost_shield": 8,
+          "initial_stop": 2,
+          "trailing_stop": 1,
+          "window_mark": 1
+        }
+      },
+      "maker_misses": 9,
+      "recovered": 0
+    }
+  },
+  "immediate_reverse": {
+    "train": {
+      "summary": {
+        "start": 2000.0,
+        "end": 1841.1527811206217,
+        "return_pct": -0.07942360943968918,
+        "max_dd_pct": 0.10032227517205383,
+        "trades": 40,
+        "trades_per_day": 0.7547169811320755,
+        "win_rate": 0.15,
+        "pf": 0.5722045903122571,
+        "average_pnl_usd": -3.971180471984456,
+        "average_mfe_r": 0.8185010187630737,
+        "average_giveback_r": 1.0185735921839292,
+        "exit_reasons": {
+          "trailing_stop": 6,
+          "initial_stop": 17,
+          "cost_shield": 17
+        }
+      },
+      "maker_misses": 40,
+      "recovered": 0
+    },
+    "validation": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2054.8685715180354,
+        "return_pct": 0.02743428575901774,
+        "max_dd_pct": 0.021555424782515042,
+        "trades": 8,
+        "trades_per_day": 0.36363636363636365,
+        "win_rate": 0.375,
+        "pf": 1.8399595734384067,
+        "average_pnl_usd": 6.858571439754395,
+        "average_mfe_r": 1.2485168869062062,
+        "average_giveback_r": 0.9003322864077743,
+        "exit_reasons": {
+          "cost_shield": 2,
+          "initial_stop": 3,
+          "trailing_stop": 3
+        }
+      },
+      "maker_misses": 4,
+      "recovered": 0
+    },
+    "locked_test": {
+      "summary": {
+        "start": 2000.0,
+        "end": 1915.5065517674475,
+        "return_pct": -0.04224672411627628,
+        "max_dd_pct": 0.060073368559674045,
+        "trades": 21,
+        "trades_per_day": 2.625,
+        "win_rate": 0.14285714285714285,
+        "pf": 0.5674056643237093,
+        "average_pnl_usd": -4.023497534883468,
+        "average_mfe_r": 0.7368882256053472,
+        "average_giveback_r": 0.9393318522498506,
+        "exit_reasons": {
+          "trailing_stop": 3,
+          "initial_stop": 9,
+          "cost_shield": 9
+        }
+      },
+      "maker_misses": 10,
+      "recovered": 0
+    },
+    "recent": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2137.9231476168256,
+        "return_pct": 0.06896157380841283,
+        "max_dd_pct": 0.0004802702585211538,
+        "trades": 12,
+        "trades_per_day": 4.0,
+        "win_rate": 0.3333333333333333,
+        "pf": 106.97693904141083,
+        "average_pnl_usd": 11.49359563473547,
+        "average_mfe_r": 1.4492070543846483,
+        "average_giveback_r": 0.8875872227636907,
+        "exit_reasons": {
+          "cost_shield": 8,
+          "trailing_stop": 3,
+          "window_mark": 1
+        }
+      },
+      "maker_misses": 9,
+      "recovered": 0
+    }
+  },
+  "selected_confirmed_chase": {
+    "score": -0.0010873339980187018,
+    "config": {
+      "max_extension_bps": 6.0,
+      "min_flow": 0.0,
+      "min_close_location": 0.65
+    },
+    "train": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2053.8693384898847,
+        "return_pct": 0.026934669244942366,
+        "max_dd_pct": 0.06378743918101959,
+        "trades": 17,
+        "trades_per_day": 0.32075471698113206,
+        "win_rate": 0.29411764705882354,
+        "pf": 1.4076228541224491,
+        "average_pnl_usd": 3.16878461705201,
+        "average_mfe_r": 1.1589358414376558,
+        "average_giveback_r": 0.9932701759962693,
+        "exit_reasons": {
+          "trailing_stop": 5,
+          "cost_shield": 6,
+          "initial_stop": 6
+        }
+      },
+      "maker_misses": 40,
+      "recovered": 0
+    },
+    "validation": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2042.4765394306762,
+        "return_pct": 0.021238269715338154,
+        "max_dd_pct": 0.02147742479100012,
+        "trades": 5,
+        "trades_per_day": 0.22727272727272727,
+        "win_rate": 0.4,
+        "pf": 1.9851272604020367,
+        "average_pnl_usd": 8.4953078861352,
+        "average_mfe_r": 1.348070825552047,
+        "average_giveback_r": 0.9161640760726621,
+        "exit_reasons": {
+          "initial_stop": 2,
+          "trailing_stop": 2,
+          "cost_shield": 1
+        }
+      },
+      "maker_misses": 4,
+      "recovered": 0
+    },
+    "locked_test": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2003.3667554518233,
+        "return_pct": 0.001683377725911761,
+        "max_dd_pct": 0.024021162543211072,
+        "trades": 12,
+        "trades_per_day": 1.5,
+        "win_rate": 0.25,
+        "pf": 1.0306242541348416,
+        "average_pnl_usd": 0.2805629543186198,
+        "average_mfe_r": 0.8631535630114773,
+        "average_giveback_r": 0.8440037763060244,
+        "exit_reasons": {
+          "trailing_stop": 3,
+          "cost_shield": 4,
+          "initial_stop": 5
+        }
+      },
+      "maker_misses": 10,
+      "recovered": 0
+    },
+    "recent": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2043.8285854697713,
+        "return_pct": 0.021914292734885654,
+        "max_dd_pct": 0.00024062869669638776,
+        "trades": 5,
+        "trades_per_day": 1.6666666666666667,
+        "win_rate": 0.2,
+        "pf": 68.92830504688436,
+        "average_pnl_usd": 8.7657170939543,
+        "average_mfe_r": 1.4037053831578645,
+        "average_giveback_r": 0.9652775829733482,
+        "exit_reasons": {
+          "cost_shield": 4,
+          "trailing_stop": 1
+        }
+      },
+      "maker_misses": 9,
+      "recovered": 0
+    }
+  },
+  "selected_recovery": {
+    "score": -0.0902666160886221,
+    "config": {
+      "min_escape_bps": 8.0,
+      "min_pullback_bps": 5.0,
+      "max_extension_bps": 50.0,
+      "min_flow": 0.1,
+      "wait_minutes": 5
+    },
+    "train": {
+      "summary": {
+        "start": 2000.0,
+        "end": 1892.102671073795,
+        "return_pct": -0.053948664463102536,
+        "max_dd_pct": 0.10376557607291303,
+        "trades": 19,
+        "trades_per_day": 0.3584905660377358,
+        "win_rate": 0.15789473684210525,
+        "pf": 0.5074681563125569,
+        "average_pnl_usd": -5.67880678558972,
+        "average_mfe_r": 0.7758009880428196,
+        "average_giveback_r": 1.0594719343755288,
+        "exit_reasons": {
+          "trailing_stop": 3,
+          "cost_shield": 6,
+          "initial_stop": 10
+        }
+      },
+      "maker_misses": 40,
+      "recovered": 8
+    },
+    "validation": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2069.720916374294,
+        "return_pct": 0.034860458187147,
+        "max_dd_pct": 0.02147742479100012,
+        "trades": 7,
+        "trades_per_day": 0.3181818181818182,
+        "win_rate": 0.42857142857142855,
+        "pf": 2.0609995517644486,
+        "average_pnl_usd": 9.960130910613405,
+        "average_mfe_r": 1.432866691024695,
+        "average_giveback_r": 0.930042826340959,
+        "exit_reasons": {
+          "initial_stop": 3,
+          "trailing_stop": 3,
+          "cost_shield": 1
+        }
+      },
+      "maker_misses": 4,
+      "recovered": 2
+    },
+    "locked_test": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2002.4771302962072,
+        "return_pct": 0.0012385651481034987,
+        "max_dd_pct": 0.032042533035531506,
+        "trades": 15,
+        "trades_per_day": 1.875,
+        "win_rate": 0.2,
+        "pf": 1.0223557974473683,
+        "average_pnl_usd": 0.16514201974712486,
+        "average_mfe_r": 0.9375244863692882,
+        "average_giveback_r": 0.9238060970049283,
+        "exit_reasons": {
+          "trailing_stop": 3,
+          "cost_shield": 7,
+          "initial_stop": 5
+        }
+      },
+      "maker_misses": 10,
+      "recovered": 4
+    },
+    "recent": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2065.1359932856562,
+        "return_pct": 0.032567996642828057,
+        "max_dd_pct": 0.01104102918488592,
+        "trades": 7,
+        "trades_per_day": 2.3333333333333335,
+        "win_rate": 0.2857142857142857,
+        "pf": 3.927759252789347,
+        "average_pnl_usd": 9.305141897950909,
+        "average_mfe_r": 1.437318590931885,
+        "average_giveback_r": 0.9719119437412641,
+        "exit_reasons": {
+          "initial_stop": 1,
+          "cost_shield": 4,
+          "trailing_stop": 2
+        }
+      },
+      "maker_misses": 9,
+      "recovered": 2
+    }
+  },
+  "top_recovery_grid": [
+    {
+      "viable": false,
+      "score": 0.004609065531585511,
+      "config": {
+        "min_escape_bps": 20.0,
+        "min_pullback_bps": 5.0,
+        "max_extension_bps": 50.0,
+        "min_flow": 0.2,
+        "wait_minutes": 5
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 1
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2088.758826036823,
+          "return_pct": 0.04437941301841142,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 6,
+          "trades_per_day": 0.2727272727272727,
+          "win_rate": 0.5,
+          "pf": 3.0583421375926574,
+          "average_pnl_usd": 14.793137672803748,
+          "average_mfe_r": 1.6142513578824034,
+          "average_giveback_r": 0.876664291292707,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 3,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 1
+      }
+    },
+    {
+      "viable": false,
+      "score": 0.004609065531585511,
+      "config": {
+        "min_escape_bps": 20.0,
+        "min_pullback_bps": 10.0,
+        "max_extension_bps": 50.0,
+        "min_flow": 0.2,
+        "wait_minutes": 5
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 1
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2088.758826036823,
+          "return_pct": 0.04437941301841142,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 6,
+          "trades_per_day": 0.2727272727272727,
+          "win_rate": 0.5,
+          "pf": 3.0583421375926574,
+          "average_pnl_usd": 14.793137672803748,
+          "average_mfe_r": 1.6142513578824034,
+          "average_giveback_r": 0.876664291292707,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 3,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 1
+      }
+    },
+    {
+      "viable": false,
+      "score": 0.004609065531585511,
+      "config": {
+        "min_escape_bps": 20.0,
+        "min_pullback_bps": 15.0,
+        "max_extension_bps": 50.0,
+        "min_flow": 0.2,
+        "wait_minutes": 5
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 1
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2088.758826036823,
+          "return_pct": 0.04437941301841142,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 6,
+          "trades_per_day": 0.2727272727272727,
+          "win_rate": 0.5,
+          "pf": 3.0583421375926574,
+          "average_pnl_usd": 14.793137672803748,
+          "average_mfe_r": 1.6142513578824034,
+          "average_giveback_r": 0.876664291292707,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 3,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 1
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "min_escape_bps": 20.0,
+        "min_pullback_bps": 5.0,
+        "max_extension_bps": 20.0,
+        "min_flow": 0.0,
+        "wait_minutes": 3
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "min_escape_bps": 20.0,
+        "min_pullback_bps": 5.0,
+        "max_extension_bps": 20.0,
+        "min_flow": 0.1,
+        "wait_minutes": 3
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "min_escape_bps": 20.0,
+        "min_pullback_bps": 5.0,
+        "max_extension_bps": 20.0,
+        "min_flow": 0.2,
+        "wait_minutes": 3
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "min_escape_bps": 20.0,
+        "min_pullback_bps": 5.0,
+        "max_extension_bps": 20.0,
+        "min_flow": 0.2,
+        "wait_minutes": 5
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "min_escape_bps": 20.0,
+        "min_pullback_bps": 5.0,
+        "max_extension_bps": 30.0,
+        "min_flow": 0.1,
+        "wait_minutes": 3
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "min_escape_bps": 20.0,
+        "min_pullback_bps": 5.0,
+        "max_extension_bps": 30.0,
+        "min_flow": 0.2,
+        "wait_minutes": 3
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "min_escape_bps": 20.0,
+        "min_pullback_bps": 5.0,
+        "max_extension_bps": 30.0,
+        "min_flow": 0.2,
+        "wait_minutes": 5
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "min_escape_bps": 20.0,
+        "min_pullback_bps": 5.0,
+        "max_extension_bps": 50.0,
+        "min_flow": 0.2,
+        "wait_minutes": 3
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "min_escape_bps": 20.0,
+        "min_pullback_bps": 10.0,
+        "max_extension_bps": 20.0,
+        "min_flow": 0.0,
+        "wait_minutes": 3
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "min_escape_bps": 20.0,
+        "min_pullback_bps": 10.0,
+        "max_extension_bps": 20.0,
+        "min_flow": 0.1,
+        "wait_minutes": 3
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "min_escape_bps": 20.0,
+        "min_pullback_bps": 10.0,
+        "max_extension_bps": 20.0,
+        "min_flow": 0.2,
+        "wait_minutes": 3
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "min_escape_bps": 20.0,
+        "min_pullback_bps": 10.0,
+        "max_extension_bps": 20.0,
+        "min_flow": 0.2,
+        "wait_minutes": 5
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "min_escape_bps": 20.0,
+        "min_pullback_bps": 10.0,
+        "max_extension_bps": 30.0,
+        "min_flow": 0.1,
+        "wait_minutes": 3
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "min_escape_bps": 20.0,
+        "min_pullback_bps": 10.0,
+        "max_extension_bps": 30.0,
+        "min_flow": 0.2,
+        "wait_minutes": 3
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "min_escape_bps": 20.0,
+        "min_pullback_bps": 10.0,
+        "max_extension_bps": 30.0,
+        "min_flow": 0.2,
+        "wait_minutes": 5
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "min_escape_bps": 20.0,
+        "min_pullback_bps": 10.0,
+        "max_extension_bps": 50.0,
+        "min_flow": 0.2,
+        "wait_minutes": 3
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "min_escape_bps": 20.0,
+        "min_pullback_bps": 15.0,
+        "max_extension_bps": 20.0,
+        "min_flow": 0.0,
+        "wait_minutes": 3
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    }
+  ],
+  "top_confirmed_chase_grid": [
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_extension_bps": 6.0,
+        "min_flow": 0.0,
+        "min_close_location": 0.65
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_extension_bps": 6.0,
+        "min_flow": 0.0,
+        "min_close_location": 0.7
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_extension_bps": 6.0,
+        "min_flow": 0.1,
+        "min_close_location": 0.55
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_extension_bps": 6.0,
+        "min_flow": 0.1,
+        "min_close_location": 0.6
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_extension_bps": 6.0,
+        "min_flow": 0.1,
+        "min_close_location": 0.65
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_extension_bps": 6.0,
+        "min_flow": 0.1,
+        "min_close_location": 0.7
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_extension_bps": 6.0,
+        "min_flow": 0.2,
+        "min_close_location": 0.55
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_extension_bps": 6.0,
+        "min_flow": 0.2,
+        "min_close_location": 0.6
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_extension_bps": 6.0,
+        "min_flow": 0.2,
+        "min_close_location": 0.65
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_extension_bps": 6.0,
+        "min_flow": 0.2,
+        "min_close_location": 0.7
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_extension_bps": 6.0,
+        "min_flow": 0.3,
+        "min_close_location": 0.55
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_extension_bps": 6.0,
+        "min_flow": 0.3,
+        "min_close_location": 0.6
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_extension_bps": 6.0,
+        "min_flow": 0.3,
+        "min_close_location": 0.65
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_extension_bps": 6.0,
+        "min_flow": 0.3,
+        "min_close_location": 0.7
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_extension_bps": 8.0,
+        "min_flow": 0.1,
+        "min_close_location": 0.55
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_extension_bps": 8.0,
+        "min_flow": 0.1,
+        "min_close_location": 0.6
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_extension_bps": 8.0,
+        "min_flow": 0.1,
+        "min_close_location": 0.65
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_extension_bps": 8.0,
+        "min_flow": 0.1,
+        "min_close_location": 0.7
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_extension_bps": 8.0,
+        "min_flow": 0.2,
+        "min_close_location": 0.55
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_extension_bps": 8.0,
+        "min_flow": 0.2,
+        "min_close_location": 0.6
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "maker_misses": 40,
+        "recovered": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "maker_misses": 4,
+        "recovered": 0
+      }
+    }
+  ]
+}
