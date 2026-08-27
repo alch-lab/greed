@@ -10,6 +10,7 @@ use axum::{
 use serde::Deserialize;
 use serde_json::{json, Value};
 use std::{
+    collections::BTreeMap,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
@@ -77,7 +78,70 @@ async fn health(State(state): State<ApiState>) -> Json<Value> {
 }
 
 async fn status(State(state): State<ApiState>) -> Response {
-    json_file(&state.status_path)
+    match read_json(&state.status_path) {
+        Ok(mut value) => {
+            reconcile_closed_positions(&mut value, &state.history_path);
+            Json(value).into_response()
+        }
+        Err(error)
+            if error
+                .downcast_ref::<std::io::Error>()
+                .is_some_and(|value| value.kind() == std::io::ErrorKind::NotFound) =>
+        {
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(json!({"error":"paper status is not ready"})),
+            )
+                .into_response()
+        }
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error":error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+fn reconcile_closed_positions(status: &mut Value, history_path: &Path) {
+    let status_ms = status["as_of_ms"].as_i64().unwrap_or_default();
+    let Ok((events, _)) = reverse_jsonl_page(history_path, 500, None, is_trade_event) else {
+        return;
+    };
+    let mut latest = BTreeMap::<String, &Value>::new();
+    for event in &events {
+        let event_ms = event["payload"]["ts_ms"]
+            .as_i64()
+            .or_else(|| event["recorded_ms"].as_i64())
+            .unwrap_or_default();
+        if event_ms <= status_ms {
+            continue;
+        }
+        if !matches!(
+            event["kind"].as_str(),
+            Some("exchange_entry" | "exchange_exit")
+        ) {
+            continue;
+        }
+        if let Some(symbol) = event["payload"]["symbol"].as_str() {
+            latest.entry(symbol.to_string()).or_insert(event);
+        }
+    }
+    let Some(positions) = status["positions"].as_object_mut() else {
+        return;
+    };
+    for (symbol, event) in latest {
+        if event["kind"].as_str() == Some("exchange_exit") {
+            positions.remove(&symbol);
+        }
+    }
+    let open_positions = positions.len();
+    let gross_exposure = positions
+        .values()
+        .filter_map(|position| position["current_notional_usd"].as_f64())
+        .map(f64::abs)
+        .sum::<f64>();
+    status["account"]["open_positions"] = json!(open_positions);
+    status["account"]["gross_exposure_usd"] = json!(gross_exposure);
 }
 
 async fn events(State(state): State<ApiState>, Query(query): Query<EventQuery>) -> Response {
@@ -209,28 +273,6 @@ fn jsonl_response(path: &Path, limit: usize, max_bytes: u64) -> Response {
         Err(error) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(json!({"error": error.to_string()})),
-        )
-            .into_response(),
-    }
-}
-
-fn json_file(path: &Path) -> Response {
-    match read_json(path) {
-        Ok(value) => Json(value).into_response(),
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|value| value.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            (
-                StatusCode::SERVICE_UNAVAILABLE,
-                Json(json!({"error":"paper status is not ready"})),
-            )
-                .into_response()
-        }
-        Err(error) => (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(json!({"error":error.to_string()})),
         )
             .into_response(),
     }
@@ -401,5 +443,31 @@ mod tests {
         assert_eq!(sampled.len(), 500);
         assert_eq!(sampled.first(), Some(&json!(0)));
         assert_eq!(sampled.last(), Some(&json!(1_999)));
+    }
+
+    #[test]
+    fn status_reconciliation_removes_a_position_closed_after_snapshot() {
+        let path = std::env::temp_dir().join(format!(
+            "greed-monitor-reconcile-{}.jsonl",
+            std::process::id()
+        ));
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"recorded_ms\":110,\"kind\":\"exchange_entry\",\"payload\":{\"ts_ms\":110,\"symbol\":\"VETUSDT\"}}\n",
+                "{\"recorded_ms\":120,\"kind\":\"exchange_exit\",\"payload\":{\"ts_ms\":120,\"symbol\":\"VETUSDT\"}}\n"
+            ),
+        )
+        .unwrap();
+        let mut status = json!({
+            "as_of_ms":100,
+            "positions":{"VETUSDT":{"current_notional_usd":61.0}},
+            "account":{"open_positions":1,"gross_exposure_usd":61.0}
+        });
+        reconcile_closed_positions(&mut status, &path);
+        assert!(status["positions"].as_object().unwrap().is_empty());
+        assert_eq!(status["account"]["open_positions"], 0);
+        assert_eq!(status["account"]["gross_exposure_usd"], 0.0);
+        std::fs::remove_file(path).unwrap();
     }
 }

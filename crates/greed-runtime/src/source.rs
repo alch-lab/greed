@@ -53,6 +53,7 @@ pub struct BinanceMarketSource {
     eligible_contracts: BTreeSet<String>,
     stream: Option<MarketStreamHub>,
     candle_cache: BTreeMap<(String, String), CandleSeries>,
+    candle_bootstrap_retry_after: BTreeMap<(String, String), i64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -91,6 +92,12 @@ type DiscoveryRow = (
 // changed in that update. A quiet but liquid contract must not fall out of the
 // universe merely because it was absent from a few one-second arrays.
 const DISCOVERY_TICKER_TTL_MS: i64 = 60_000;
+// Newly discovered contracts need REST history before websocket candle updates
+// can extend them. Bound that cold-start work so a slow Binance edge cannot
+// freeze account reconciliation and status publication for minutes.
+const MAX_KLINE_BOOTSTRAP_SYMBOLS_PER_FRAME: usize = 2;
+const KLINE_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5);
+const KLINE_BOOTSTRAP_RETRY_DELAY_MS: i64 = 60_000;
 
 fn median_abs(values: impl Iterator<Item = Option<f64>>, floor: f64) -> f64 {
     let mut values: Vec<_> = values.flatten().map(f64::abs).collect();
@@ -121,6 +128,7 @@ impl BinanceMarketSource {
             eligible_contracts: BTreeSet::new(),
             stream: None,
             candle_cache: BTreeMap::new(),
+            candle_bootstrap_retry_after: BTreeMap::new(),
         })
     }
 
@@ -526,8 +534,18 @@ impl BinanceMarketSource {
     ) -> Result<CandleSeries> {
         let key = (symbol.to_string(), interval.to_string());
         if !self.candle_cache.contains_key(&key) {
-            let bootstrap = self
-                .klines_at_interval(
+            if self
+                .candle_bootstrap_retry_after
+                .get(&key)
+                .is_some_and(|retry_after| now < *retry_after)
+            {
+                return Err(anyhow!(
+                    "kline bootstrap cooling down after a recent failure"
+                ));
+            }
+            let bootstrap = match tokio::time::timeout(
+                KLINE_BOOTSTRAP_TIMEOUT,
+                self.klines_at_interval(
                     &self.futures_bases(),
                     "/fapi/v1/klines",
                     symbol,
@@ -536,8 +554,26 @@ impl BinanceMarketSource {
                     interval_ms,
                     limit,
                     now,
-                )
-                .await?;
+                ),
+            )
+            .await
+            {
+                Ok(Ok(value)) => value,
+                Ok(Err(error)) => {
+                    self.candle_bootstrap_retry_after
+                        .insert(key.clone(), now + KLINE_BOOTSTRAP_RETRY_DELAY_MS);
+                    return Err(error);
+                }
+                Err(_) => {
+                    self.candle_bootstrap_retry_after
+                        .insert(key.clone(), now + KLINE_BOOTSTRAP_RETRY_DELAY_MS);
+                    return Err(anyhow!(
+                        "kline bootstrap timed out after {}ms",
+                        KLINE_BOOTSTRAP_TIMEOUT.as_millis()
+                    ));
+                }
+            };
+            self.candle_bootstrap_retry_after.remove(&key);
             self.candle_cache.insert(key.clone(), bootstrap);
         }
         let (updates, updated_ms) = self
@@ -648,8 +684,24 @@ impl BinanceMarketSource {
     ) -> Result<MarketFrame> {
         let mut instruments = BTreeMap::new();
         let mut warnings = Vec::new();
+        let mut bootstrap_symbols = 0;
         self.set_stream_symbols(strategy);
         for symbol in &strategy.symbols {
+            let needs_bootstrap = ["15m", "5m"].iter().any(|interval| {
+                let key = (symbol.clone(), (*interval).to_string());
+                !self.candle_cache.contains_key(&key)
+                    && self
+                        .candle_bootstrap_retry_after
+                        .get(&key)
+                        .is_none_or(|retry_after| now >= *retry_after)
+            });
+            if needs_bootstrap {
+                if bootstrap_symbols >= MAX_KLINE_BOOTSTRAP_SYMBOLS_PER_FRAME {
+                    warnings.push(format!("kline bootstrap deferred {symbol}"));
+                    continue;
+                }
+                bootstrap_symbols += 1;
+            }
             let perpetual = match self
                 .streamed_klines(symbol, "15m", 900_000, self.config.candle_limit, now)
                 .await
