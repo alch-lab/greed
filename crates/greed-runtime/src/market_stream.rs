@@ -18,6 +18,7 @@ const STREAM_TTL_MS: i64 = 15_000;
 const CANDLE_CACHE_LIMIT: usize = 200;
 const TICKER_HISTORY_MS: i64 = 20 * 60_000;
 const BOOK_FLOW_HISTORY_MS: i64 = 2 * 60_000;
+const TRADE_STREAM_SHARDS: usize = 3;
 
 #[derive(Debug, Clone)]
 struct BookFlowObservation {
@@ -49,6 +50,8 @@ pub struct StreamTelemetry {
     pub radar_connected: bool,
     pub market_connected: bool,
     pub trade_connected: bool,
+    pub trade_shards_connected: usize,
+    pub trade_shards_total: usize,
     pub public_connected: bool,
     pub last_radar_message_ms: Option<i64>,
     pub last_market_message_ms: Option<i64>,
@@ -78,6 +81,7 @@ struct StreamState {
     book_flow: BTreeMap<String, VecDeque<BookFlowObservation>>,
     trades: BTreeMap<String, VecDeque<(i64, bool, f64)>>,
     desired_symbols: BTreeSet<String>,
+    trade_connections: [bool; TRADE_STREAM_SHARDS],
     telemetry: StreamTelemetry,
 }
 
@@ -89,7 +93,9 @@ pub struct MarketStreamHub {
 
 impl MarketStreamHub {
     pub fn start(base_url: String) -> Self {
-        let state = Arc::new(RwLock::new(StreamState::default()));
+        let mut initial_state = StreamState::default();
+        initial_state.telemetry.trade_shards_total = TRADE_STREAM_SHARDS;
+        let state = Arc::new(RwLock::new(initial_state));
         let (symbols, receiver) = watch::channel(Vec::new());
         tokio::spawn(run_supervisor(base_url, Arc::clone(&state), receiver));
         Self { state, symbols }
@@ -238,12 +244,14 @@ async fn run_supervisor(
         Arc::clone(&state),
         symbols.clone(),
     ));
-    tokio::spawn(run_dynamic_connection(
-        StreamRoute::Trade,
-        route_url(&base_url, StreamRoute::Trade),
-        Arc::clone(&state),
-        symbols.clone(),
-    ));
+    for shard in 0..TRADE_STREAM_SHARDS {
+        tokio::spawn(run_dynamic_connection(
+            StreamRoute::Trade(shard),
+            route_url(&base_url, StreamRoute::Trade(shard)),
+            Arc::clone(&state),
+            symbols.clone(),
+        ));
+    }
     run_dynamic_connection(
         StreamRoute::Public,
         route_url(&base_url, StreamRoute::Public),
@@ -257,7 +265,7 @@ async fn run_supervisor(
 enum StreamRoute {
     Radar,
     Market,
-    Trade,
+    Trade(usize),
     Public,
 }
 
@@ -488,7 +496,7 @@ where
 fn route_url(base: &str, route: StreamRoute) -> String {
     let path = match route {
         StreamRoute::Market => "market/ws",
-        StreamRoute::Trade => "market/ws",
+        StreamRoute::Trade(_) => "market/ws",
         StreamRoute::Public => "public/ws",
         StreamRoute::Radar => "market/ws",
     };
@@ -498,7 +506,7 @@ fn route_url(base: &str, route: StreamRoute) -> String {
 fn route_streams(route: StreamRoute, symbols: &[String]) -> BTreeSet<String> {
     match route {
         StreamRoute::Market => market_streams(symbols),
-        StreamRoute::Trade => trade_streams(symbols),
+        StreamRoute::Trade(shard) => trade_streams_shard(symbols, shard),
         StreamRoute::Public => public_streams(symbols),
         StreamRoute::Radar => BTreeSet::from(["!ticker@arr".into()]),
     }
@@ -520,6 +528,20 @@ fn trade_streams(symbols: &[String]) -> BTreeSet<String> {
         .iter()
         .map(|symbol| format!("{}@aggTrade", symbol.to_lowercase()))
         .collect()
+}
+
+fn trade_streams_shard(symbols: &[String], shard: usize) -> BTreeSet<String> {
+    trade_streams(symbols)
+        .into_iter()
+        .filter(|stream| symbol_shard(stream, TRADE_STREAM_SHARDS) == shard)
+        .collect()
+}
+
+fn symbol_shard(symbol: &str, shard_count: usize) -> usize {
+    let hash = symbol.bytes().fold(2_166_136_261_u32, |hash, byte| {
+        (hash ^ u32::from(byte)).wrapping_mul(16_777_619)
+    });
+    hash as usize % shard_count.max(1)
 }
 
 fn public_streams(symbols: &[String]) -> BTreeSet<String> {
@@ -836,7 +858,19 @@ fn set_connected(
     match route {
         StreamRoute::Radar => state.telemetry.radar_connected = connected,
         StreamRoute::Market => state.telemetry.market_connected = connected,
-        StreamRoute::Trade => state.telemetry.trade_connected = connected,
+        StreamRoute::Trade(shard) => {
+            if let Some(value) = state.trade_connections.get_mut(shard) {
+                *value = connected;
+            }
+            state.telemetry.trade_shards_total = TRADE_STREAM_SHARDS;
+            state.telemetry.trade_shards_connected = state
+                .trade_connections
+                .iter()
+                .filter(|value| **value)
+                .count();
+            state.telemetry.trade_connected =
+                state.telemetry.trade_shards_connected == TRADE_STREAM_SHARDS;
+        }
         StreamRoute::Public => state.telemetry.public_connected = connected,
     }
     if let Some(error) = error {
@@ -862,7 +896,7 @@ fn record_message(state: &Arc<RwLock<StreamState>>, route: StreamRoute, now_ms: 
             state.telemetry.market_messages += 1;
             state.telemetry.last_market_message_ms = Some(now_ms);
         }
-        StreamRoute::Trade => {
+        StreamRoute::Trade(_) => {
             state.telemetry.trade_messages += 1;
             state.telemetry.last_trade_message_ms = Some(now_ms);
         }
@@ -1015,7 +1049,7 @@ mod tests {
             "wss://fstream.binance.com/public/ws"
         );
         assert_eq!(
-            route_url("wss://fstream.binance.com", StreamRoute::Trade),
+            route_url("wss://fstream.binance.com", StreamRoute::Trade(0)),
             "wss://fstream.binance.com/market/ws"
         );
         assert!(!market.contains("!ticker@arr"));
@@ -1026,6 +1060,24 @@ mod tests {
         assert!(trade_streams(&symbols).contains("btcusdt@aggTrade"));
         assert!(!market.contains("btcusdt@forceOrder"));
         assert!(public.contains("btcusdt@depth20@500ms"));
+    }
+
+    #[test]
+    fn trade_stream_shards_are_disjoint_and_complete() {
+        let symbols = vec![
+            "BTCUSDT".to_string(),
+            "ETHUSDT".to_string(),
+            "SOLUSDT".to_string(),
+            "YBUSDT".to_string(),
+        ];
+        let expected = trade_streams(&symbols);
+        let mut combined = BTreeSet::new();
+        for shard in 0..TRADE_STREAM_SHARDS {
+            let streams = trade_streams_shard(&symbols, shard);
+            assert!(combined.is_disjoint(&streams));
+            combined.extend(streams);
+        }
+        assert_eq!(combined, expected);
     }
 
     #[test]

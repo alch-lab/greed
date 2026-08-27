@@ -66,10 +66,13 @@ trend_min_flow_imbalance = 0.0
 # Later pullbacks belong to a mature move and must not be presented as fresh.
 trend_max_age_bars = 2
 trend_max_signal_age_seconds = 300
-# Rest 0.30 ATR behind the completed reclaim for one minute. If it does not
-# retest, cancel instead of turning a good signal into a late taker entry.
+# Start 0.30 ATR behind the completed reclaim, then move the post-only order
+# toward the live passive book every 15 seconds while the signal is still fresh.
 trend_limit_offset_atr = 0.30
 trend_entry_timeout_seconds = 60
+# Reprice the passive maker order toward the live book, but never chase farther
+# than this distance beyond the signal reference price.
+trend_max_entry_adverse_bps = 8.0
 ignition_min_return_5m = 0.010
 ignition_min_volume_ratio = 3.0
 ignition_min_flow_imbalance = 0.20
@@ -114,5 +117,5 @@ rolling_pf_floor = 1.00
 rolling_pf_cooldown_minutes = 360
 loss_cooldown_minutes = 180
 rolling_pf_probe_size_multiplier = 1.00
-# Epoch 12 starts the executable pullback-entry/risk geometry with a clean PF window.
-rolling_pf_epoch = 13
+# Epoch 14 starts adaptive bounded-maker execution with a clean PF window.
+rolling_pf_epoch = 14
