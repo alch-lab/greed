@@ -258,13 +258,45 @@ fn runtime_identity(config: &AppConfig, started_ms: i64) -> serde_json::Value {
         hash ^= u64::from(byte);
         hash = hash.wrapping_mul(0x100000001b3);
     }
+    let previous = std::fs::read_to_string(&config.runtime.status_path)
+        .ok()
+        .and_then(|text| serde_json::from_str::<serde_json::Value>(&text).ok());
+    let (run_id, session_started_ms) = continued_session_identity(
+        previous.as_ref(),
+        config.strategy.risk.rolling_pf_epoch,
+        started_ms,
+    );
     serde_json::json!({
-        "run_id": format!("{}-{}", started_ms, std::process::id()),
-        "started_ms": started_ms,
+        "run_id": run_id,
+        "started_ms": session_started_ms,
+        "process_started_ms": started_ms,
         "version": env!("CARGO_PKG_VERSION"),
         "git_commit": git_commit(),
         "config_hash": format!("{hash:016x}"),
     })
+}
+
+fn continued_session_identity(
+    previous: Option<&serde_json::Value>,
+    performance_epoch: u32,
+    process_started_ms: i64,
+) -> (String, i64) {
+    let reusable = previous.filter(|value| {
+        value["execution"]["performance_epoch"].as_u64() == Some(u64::from(performance_epoch))
+    });
+    let previous_run_id = reusable
+        .and_then(|value| value["runtime"]["run_id"].as_str())
+        .filter(|value| !value.is_empty());
+    let previous_started_ms = reusable
+        .and_then(|value| value["runtime"]["started_ms"].as_i64())
+        .filter(|value| *value > 0);
+    match (previous_run_id, previous_started_ms) {
+        (Some(run_id), Some(started_ms)) => (run_id.to_string(), started_ms),
+        _ => (
+            format!("{}-{}", process_started_ms, std::process::id()),
+            process_started_ms,
+        ),
+    }
 }
 
 fn git_commit() -> Option<String> {
@@ -590,5 +622,20 @@ mod tests {
         assert!(stable.contains(&"BTCUSDT".to_string()));
         assert!(stable.contains(&"NEW1USDT".to_string()));
         assert!(stable.contains(&"NEW2USDT".to_string()));
+    }
+
+    #[test]
+    fn deployment_restart_continues_the_same_performance_session() {
+        let previous = serde_json::json!({
+            "execution":{"performance_epoch":13},
+            "runtime":{"run_id":"paper-session-1","started_ms":1_000}
+        });
+        assert_eq!(
+            continued_session_identity(Some(&previous), 13, 2_000),
+            ("paper-session-1".to_string(), 1_000)
+        );
+        let reset = continued_session_identity(Some(&previous), 14, 2_000);
+        assert_ne!(reset.0, "paper-session-1");
+        assert_eq!(reset.1, 2_000);
     }
 }
