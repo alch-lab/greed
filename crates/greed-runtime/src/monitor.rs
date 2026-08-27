@@ -108,12 +108,44 @@ async fn trades(State(state): State<ApiState>, Query(query): Query<PageQuery>) -
 }
 
 async fn equity(State(state): State<ApiState>, Query(query): Query<PageQuery>) -> Response {
-    paged_jsonl_response(
+    match reverse_jsonl_page(
         &state.history_path,
         query.limit.clamp(2, 2_000),
         query.before,
         |value| value["kind"].as_str() == Some("exchange_equity"),
-    )
+    ) {
+        Ok((events, next_cursor)) => {
+            let events: Vec<_> = events.into_iter().map(compact_equity_event).collect();
+            Json(json!({
+                "events": events,
+                "next_cursor": next_cursor,
+                "has_more": next_cursor.is_some(),
+            }))
+            .into_response()
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Json(json!({
+            "events": [],
+            "next_cursor": null,
+            "has_more": false,
+        }))
+        .into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(json!({"error": error.to_string()})),
+        )
+            .into_response(),
+    }
+}
+
+fn compact_equity_event(value: Value) -> Value {
+    json!({
+        "recorded_ms": value["recorded_ms"],
+        "kind": "exchange_equity",
+        "payload": {
+            "ts_ms": value["payload"]["ts_ms"],
+            "equity_usd": value["payload"]["equity_usd"],
+        }
+    })
 }
 
 fn is_trade_event(value: &Value) -> bool {
@@ -332,5 +364,22 @@ mod tests {
         );
         assert!(cursor.is_none());
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn equity_response_omits_large_runtime_payloads() {
+        let compact = compact_equity_event(json!({
+            "recorded_ms": 10,
+            "kind": "exchange_equity",
+            "payload": {
+                "ts_ms": 9,
+                "equity_usd": 2042.06,
+                "execution": {"large": [1,2,3]},
+                "runtime": {"run_id": "session"}
+            }
+        }));
+        assert_eq!(compact["payload"]["equity_usd"], 2042.06);
+        assert!(compact["payload"].get("execution").is_none());
+        assert!(compact["payload"].get("runtime").is_none());
     }
 }
