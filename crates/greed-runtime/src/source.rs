@@ -1,6 +1,7 @@
 use crate::config::RuntimeConfig;
 use crate::market_stream::MarketStreamHub;
 use anyhow::{anyhow, Result};
+use futures_util::{stream, StreamExt};
 use greed_kernel::{
     AccountFrame, Candle, CandleSeries, DataQuality, InstrumentFrame, MarketFrame, MarketKind,
     ObservationMeta,
@@ -54,6 +55,8 @@ pub struct BinanceMarketSource {
     stream: Option<MarketStreamHub>,
     candle_cache: BTreeMap<(String, String), CandleSeries>,
     candle_bootstrap_retry_after: BTreeMap<(String, String), i64>,
+    candle_bootstrap_pending: usize,
+    candle_bootstrap_last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -95,7 +98,8 @@ const DISCOVERY_TICKER_TTL_MS: i64 = 60_000;
 // Newly discovered contracts need REST history before websocket candle updates
 // can extend them. Bound that cold-start work so a slow Binance edge cannot
 // freeze account reconciliation and status publication for minutes.
-const MAX_KLINE_BOOTSTRAP_SYMBOLS_PER_FRAME: usize = 2;
+const MAX_KLINE_BOOTSTRAP_REQUESTS_PER_FRAME: usize = 8;
+const KLINE_BOOTSTRAP_CONCURRENCY: usize = 4;
 const KLINE_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5);
 const KLINE_BOOTSTRAP_RETRY_DELAY_MS: i64 = 60_000;
 
@@ -129,6 +133,8 @@ impl BinanceMarketSource {
             stream: None,
             candle_cache: BTreeMap::new(),
             candle_bootstrap_retry_after: BTreeMap::new(),
+            candle_bootstrap_pending: 0,
+            candle_bootstrap_last_error: None,
         })
     }
 
@@ -328,7 +334,19 @@ impl BinanceMarketSource {
         let average_latency_ms = (telemetry.requests > 0)
             .then_some(telemetry.total_latency_ms as f64 / telemetry.requests as f64);
         let stream = self.stream.as_ref().map(MarketStreamHub::telemetry);
-        serde_json::json!({"last_success_ms":self.last_success_ms,"last_error":self.last_error,"paper_only":true,"transport":"websocket_primary","stream":stream,"telemetry":telemetry,"average_latency_ms":average_latency_ms})
+        serde_json::json!({
+            "last_success_ms":self.last_success_ms,
+            "last_error":self.last_error,
+            "paper_only":true,
+            "transport":"websocket_primary",
+            "stream":stream,
+            "bootstrap":{
+                "pending_requests":self.candle_bootstrap_pending,
+                "last_error":self.candle_bootstrap_last_error,
+            },
+            "telemetry":telemetry,
+            "average_latency_ms":average_latency_ms
+        })
     }
     fn endpoint_key(url: &str) -> String {
         reqwest::Url::parse(url)
@@ -524,57 +542,122 @@ impl BinanceMarketSource {
         })
     }
 
+    async fn bootstrap_missing_klines(&mut self, strategy: &StrategyConfig, now: i64) {
+        let mut symbols = strategy.symbols.clone();
+        symbols.sort_by_key(|symbol| match symbol.as_str() {
+            "BTCUSDT" => 0,
+            "ETHUSDT" => 1,
+            "BNBUSDT" => 2,
+            "SOLUSDT" => 3,
+            _ => 4,
+        });
+        let intervals = [
+            ("15m", 900_000, self.config.candle_limit),
+            ("5m", 300_000, 120),
+        ];
+        let mut requests = Vec::new();
+        for symbol in &symbols {
+            for (interval, interval_ms, limit) in intervals {
+                let key = (symbol.clone(), interval.to_string());
+                if self.candle_cache.contains_key(&key)
+                    || self
+                        .candle_bootstrap_retry_after
+                        .get(&key)
+                        .is_some_and(|retry_after| now < *retry_after)
+                {
+                    continue;
+                }
+                if requests.len() < MAX_KLINE_BOOTSTRAP_REQUESTS_PER_FRAME {
+                    requests.push((symbol.clone(), interval, interval_ms, limit));
+                }
+            }
+        }
+        self.candle_bootstrap_pending = strategy
+            .symbols
+            .iter()
+            .flat_map(|symbol| ["15m", "5m"].map(move |interval| (symbol, interval)))
+            .filter(|(symbol, interval)| {
+                !self
+                    .candle_cache
+                    .contains_key(&(String::from(symbol.as_str()), String::from(*interval)))
+            })
+            .count();
+        if requests.is_empty() {
+            return;
+        }
+
+        let bases = self.futures_bases();
+        let source = &*self;
+        let results = stream::iter(requests)
+            .map(|(symbol, interval, interval_ms, limit)| {
+                let bases = bases.clone();
+                async move {
+                    let result = match tokio::time::timeout(
+                        KLINE_BOOTSTRAP_TIMEOUT,
+                        source.klines_at_interval(
+                            &bases,
+                            "/fapi/v1/klines",
+                            &symbol,
+                            MarketKind::Perpetual,
+                            interval,
+                            interval_ms,
+                            limit,
+                            now,
+                        ),
+                    )
+                    .await
+                    {
+                        Ok(result) => result,
+                        Err(_) => Err(anyhow!(
+                            "timed out after {}ms",
+                            KLINE_BOOTSTRAP_TIMEOUT.as_millis()
+                        )),
+                    };
+                    ((symbol, interval.to_string()), result)
+                }
+            })
+            .buffer_unordered(KLINE_BOOTSTRAP_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+
+        self.candle_bootstrap_last_error = None;
+        for (key, result) in results {
+            match result {
+                Ok(series) => {
+                    self.candle_bootstrap_retry_after.remove(&key);
+                    self.candle_cache.insert(key, series);
+                }
+                Err(error) => {
+                    tracing::warn!(symbol = %key.0, interval = %key.1, error = %error, "kline history bootstrap failed");
+                    self.candle_bootstrap_retry_after
+                        .insert(key.clone(), now + KLINE_BOOTSTRAP_RETRY_DELAY_MS);
+                    self.candle_bootstrap_last_error =
+                        Some(format!("{} {}: {error}", key.0, key.1));
+                }
+            }
+        }
+        self.candle_bootstrap_pending = strategy
+            .symbols
+            .iter()
+            .flat_map(|symbol| ["15m", "5m"].map(move |interval| (symbol, interval)))
+            .filter(|(symbol, interval)| {
+                !self
+                    .candle_cache
+                    .contains_key(&(String::from(symbol.as_str()), String::from(*interval)))
+            })
+            .count();
+    }
+
     async fn streamed_klines(
         &mut self,
         symbol: &str,
         interval: &str,
-        interval_ms: i64,
         limit: usize,
         now: i64,
     ) -> Result<CandleSeries> {
         let key = (symbol.to_string(), interval.to_string());
         if !self.candle_cache.contains_key(&key) {
-            if self
-                .candle_bootstrap_retry_after
-                .get(&key)
-                .is_some_and(|retry_after| now < *retry_after)
-            {
-                return Err(anyhow!(
-                    "kline bootstrap cooling down after a recent failure"
-                ));
-            }
-            let bootstrap = match tokio::time::timeout(
-                KLINE_BOOTSTRAP_TIMEOUT,
-                self.klines_at_interval(
-                    &self.futures_bases(),
-                    "/fapi/v1/klines",
-                    symbol,
-                    MarketKind::Perpetual,
-                    interval,
-                    interval_ms,
-                    limit,
-                    now,
-                ),
-            )
-            .await
-            {
-                Ok(Ok(value)) => value,
-                Ok(Err(error)) => {
-                    self.candle_bootstrap_retry_after
-                        .insert(key.clone(), now + KLINE_BOOTSTRAP_RETRY_DELAY_MS);
-                    return Err(error);
-                }
-                Err(_) => {
-                    self.candle_bootstrap_retry_after
-                        .insert(key.clone(), now + KLINE_BOOTSTRAP_RETRY_DELAY_MS);
-                    return Err(anyhow!(
-                        "kline bootstrap timed out after {}ms",
-                        KLINE_BOOTSTRAP_TIMEOUT.as_millis()
-                    ));
-                }
-            };
-            self.candle_bootstrap_retry_after.remove(&key);
-            self.candle_cache.insert(key.clone(), bootstrap);
+            return Err(anyhow!("kline history is still warming"));
         }
         let (updates, updated_ms) = self
             .stream
@@ -684,26 +767,17 @@ impl BinanceMarketSource {
     ) -> Result<MarketFrame> {
         let mut instruments = BTreeMap::new();
         let mut warnings = Vec::new();
-        let mut bootstrap_symbols = 0;
         self.set_stream_symbols(strategy);
+        self.bootstrap_missing_klines(strategy, now).await;
         for symbol in &strategy.symbols {
-            let needs_bootstrap = ["15m", "5m"].iter().any(|interval| {
-                let key = (symbol.clone(), (*interval).to_string());
-                !self.candle_cache.contains_key(&key)
-                    && self
-                        .candle_bootstrap_retry_after
-                        .get(&key)
-                        .is_none_or(|retry_after| now >= *retry_after)
-            });
-            if needs_bootstrap {
-                if bootstrap_symbols >= MAX_KLINE_BOOTSTRAP_SYMBOLS_PER_FRAME {
-                    warnings.push(format!("kline bootstrap deferred {symbol}"));
-                    continue;
-                }
-                bootstrap_symbols += 1;
+            if !self
+                .candle_cache
+                .contains_key(&(symbol.clone(), "15m".to_string()))
+            {
+                continue;
             }
             let perpetual = match self
-                .streamed_klines(symbol, "15m", 900_000, self.config.candle_limit, now)
+                .streamed_klines(symbol, "15m", self.config.candle_limit, now)
                 .await
             {
                 Ok(series) => series,
@@ -713,12 +787,19 @@ impl BinanceMarketSource {
                 }
             };
             let price = perpetual.values.last().map(|bar| bar.close).unwrap_or(0.0);
-            let fast_perpetual = match self.streamed_klines(symbol, "5m", 300_000, 120, now).await {
-                Ok(value) => Some(value),
-                Err(error) => {
-                    warnings.push(format!("fast perpetual klines {symbol}: {error}"));
-                    None
+            let fast_perpetual = if self
+                .candle_cache
+                .contains_key(&(symbol.clone(), "5m".to_string()))
+            {
+                match self.streamed_klines(symbol, "5m", 120, now).await {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        warnings.push(format!("fast perpetual klines {symbol}: {error}"));
+                        None
+                    }
                 }
+            } else {
+                None
             };
             let micro_perpetual = self.stream_observation_klines(symbol, "1m", 60_000, now);
             let book = self
