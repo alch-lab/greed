@@ -116,6 +116,7 @@ async fn equity(State(state): State<ApiState>, Query(query): Query<PageQuery>) -
     ) {
         Ok((events, next_cursor)) => {
             let events: Vec<_> = events.into_iter().map(compact_equity_event).collect();
+            let events = downsample_newest_first(events, 500);
             Json(json!({
                 "events": events,
                 "next_cursor": next_cursor,
@@ -146,6 +147,16 @@ fn compact_equity_event(value: Value) -> Value {
             "equity_usd": value["payload"]["equity_usd"],
         }
     })
+}
+
+fn downsample_newest_first(values: Vec<Value>, limit: usize) -> Vec<Value> {
+    if values.len() <= limit || limit < 2 {
+        return values;
+    }
+    let last = values.len() - 1;
+    (0..limit)
+        .map(|index| values[index * last / (limit - 1)].clone())
+        .collect()
 }
 
 fn is_trade_event(value: &Value) -> bool {
@@ -381,5 +392,14 @@ mod tests {
         assert_eq!(compact["payload"]["equity_usd"], 2042.06);
         assert!(compact["payload"].get("execution").is_none());
         assert!(compact["payload"].get("runtime").is_none());
+    }
+
+    #[test]
+    fn equity_downsampling_preserves_newest_and_oldest_points() {
+        let values = (0..2_000).map(|value| json!(value)).collect::<Vec<_>>();
+        let sampled = downsample_newest_first(values, 500);
+        assert_eq!(sampled.len(), 500);
+        assert_eq!(sampled.first(), Some(&json!(0)));
+        assert_eq!(sampled.last(), Some(&json!(1_999)));
     }
 }
