@@ -920,6 +920,14 @@ impl BinanceDemoExecution {
         )
     }
 
+    fn latest_symbol_exit_ms(&self, symbol: &str) -> Option<i64> {
+        self.state
+            .symbol_outcomes
+            .get(symbol)
+            .and_then(|values| values.last())
+            .map(|outcome| outcome.exit_ms)
+    }
+
     pub fn recipe_gate_snapshots(&self, now_ms: i64) -> BTreeMap<String, RecipeGateStatus> {
         ["sfp_reversal", "trend_continuation", "ignition_sprint"]
             .into_iter()
@@ -1047,6 +1055,20 @@ impl BinanceDemoExecution {
                 continue;
             }
             let performance_key = gate_key(&recipe, plan.side);
+            // A candle that predates this symbol's latest exit belongs to the
+            // same episode we just traded. Reusing it caused an immediate PROM
+            // re-entry after a profitable trailing exit.
+            if candidate.is_some_and(|value| {
+                self.latest_symbol_exit_ms(&plan.symbol)
+                    .is_some_and(|exit_ms| value.signal_ms <= exit_ms)
+            }) {
+                self.state.seen.insert(plan.candidate_id.clone());
+                events.push(ExchangeEvent {
+                    kind: "exchange_plan_rejected".into(),
+                    payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"symbol":plan.symbol,"side":plan.side,"reason":"signal_precedes_latest_symbol_exit","signal_ms":candidate.map(|value| value.signal_ms),"latest_symbol_exit_ms":self.latest_symbol_exit_ms(&plan.symbol),"venue":"binance_demo","paper_only":true}),
+                });
+                continue;
+            }
             if self
                 .symbol_loss_cooldown_until(&plan.symbol)
                 .is_some_and(|until_ms| frame.as_of_ms < until_ms)
@@ -1137,9 +1159,12 @@ impl BinanceDemoExecution {
                     let discovery_latency_ms = candidate
                         .and_then(|value| value.tags.get("discovery_latency_ms"))
                         .and_then(|value| value.parse::<i64>().ok());
+                    let planned_notional_usd = plan.notional_usd * size_multiplier;
+                    let actual_notional_usd = fill.entry_price * fill.quantity;
+                    let fill_ratio = actual_notional_usd / planned_notional_usd.max(f64::EPSILON);
                     events.push(ExchangeEvent {
                         kind: "exchange_entry".into(),
-                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"entry_mode":fill.entry_mode,"entry_price_source":fill.entry_price_source,"maker_attempted":fill.maker_attempted,"maker_wait_ms":fill.maker_wait_ms,"maker_reprices":fill.maker_reprices,"requested_limit":plan.entry_limit,"final_maker_limit":fill.final_maker_limit,"entry_price":fill.entry_price,"quantity":fill.quantity,"notional_usd":plan.notional_usd * size_multiplier,"probe_size_multiplier":size_multiplier,"order_id":fill.order_id,"stop_algo_id":fill.stop_algo_id,"take_profit_order_ids":fill.take_profit_order_ids,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
+                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"entry_mode":fill.entry_mode,"entry_price_source":fill.entry_price_source,"maker_attempted":fill.maker_attempted,"maker_wait_ms":fill.maker_wait_ms,"maker_reprices":fill.maker_reprices,"requested_limit":plan.entry_limit,"final_maker_limit":fill.final_maker_limit,"entry_price":fill.entry_price,"quantity":fill.quantity,"notional_usd":actual_notional_usd,"actual_notional_usd":actual_notional_usd,"planned_notional_usd":planned_notional_usd,"fill_ratio":fill_ratio,"partial_fill":fill_ratio < 0.999,"probe_size_multiplier":size_multiplier,"order_id":fill.order_id,"stop_algo_id":fill.stop_algo_id,"take_profit_order_ids":fill.take_profit_order_ids,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
                     });
                 }
                 Err(error) => {
@@ -1751,6 +1776,28 @@ impl BinanceDemoExecution {
                 });
             }
             if now_ms >= next_reprice_ms && reprice_attempt < MAX_MAKER_REPRICES {
+                // Once a maker order has started filling, keep the remainder at
+                // the same queue position until the deadline. Canceling on the
+                // first partial fill turned 3-5% probes into complete trades and
+                // threw away the remaining minute of fill opportunity.
+                if parse_f64(&order, "executedQty").unwrap_or_default() > f64::EPSILON {
+                    next_reprice_ms = deadline.saturating_add(1);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    if let Ok(value) = self
+                        .signed(
+                            Method::GET,
+                            "/fapi/v1/order",
+                            vec![
+                                ("symbol".into(), plan.symbol.clone()),
+                                ("origClientOrderId".into(), active_client_id.clone()),
+                            ],
+                        )
+                        .await
+                    {
+                        order = value;
+                    }
+                    continue;
+                }
                 let ticker = self
                     .public_get_params(
                         "/fapi/v1/ticker/bookTicker",

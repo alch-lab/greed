@@ -53,6 +53,25 @@ fn passive_pullback_limit(close: f64, atr: f64, sign: f64, offset_atr: f64, book
     }
 }
 
+fn post_signal_extension_bps(side: Side, signal_close: f64, live_price: f64) -> f64 {
+    side.sign() * (live_price / signal_close.max(f64::EPSILON) - 1.0) * 10_000.0
+}
+
+fn strong_opposing_microstructure(
+    side: Side,
+    trade_imbalance: Option<f64>,
+    mid_return_bps: Option<f64>,
+    max_opposing_flow: f64,
+    max_opposing_return_bps: f64,
+) -> bool {
+    trade_imbalance
+        .zip(mid_return_bps)
+        .is_some_and(|(flow, mid_return)| {
+            side.sign() * flow < -max_opposing_flow
+                && side.sign() * mid_return < -max_opposing_return_bps
+        })
+}
+
 impl StrategyNode for TrendContinuationNode {
     fn id(&self) -> &str {
         &self.id
@@ -145,6 +164,23 @@ impl StrategyNode for TrendContinuationNode {
                 .sum::<f64>()
                 / 24.0;
             let volume_ratio = hour_volume / baseline.max(1.0);
+            let post_signal_extension_bps =
+                post_signal_extension_bps(side, bar.close, instrument.price);
+            let live_trade_imbalance = instrument
+                .microstructure
+                .as_ref()
+                .and_then(|value| value.trade_imbalance());
+            let live_mid_return_bps = instrument
+                .microstructure
+                .as_ref()
+                .and_then(|value| value.mid_return_bps_10s);
+            let strong_live_reversal = strong_opposing_microstructure(
+                side,
+                live_trade_imbalance,
+                live_mid_return_bps,
+                self.config.trend_max_opposing_micro_flow,
+                self.config.trend_max_opposing_micro_return_bps,
+            );
             let mut blockers = Vec::new();
             if age > i64::from(self.config.trend_max_signal_age_seconds) * 1_000 {
                 blockers
@@ -161,6 +197,19 @@ impl StrategyNode for TrendContinuationNode {
                 blockers.push(format!(
                     "trend is {trend_age_bars} bars old / max {} bars for a fresh entry",
                     self.config.trend_max_age_bars
+                ));
+            }
+            if post_signal_extension_bps > self.config.trend_max_post_signal_extension_bps {
+                blockers.push(format!(
+                    "price extended {post_signal_extension_bps:.1} bps after the signal / max {:.1} bps",
+                    self.config.trend_max_post_signal_extension_bps
+                ));
+            }
+            if strong_live_reversal {
+                blockers.push(format!(
+                    "live flow {:.0}% and 10s price response {:.1} bps oppose the entry",
+                    live_trade_imbalance.unwrap_or_default() * 100.0,
+                    live_mid_return_bps.unwrap_or_default()
                 ));
             }
             if sign * return_12h <= 0.0 {
@@ -239,7 +288,7 @@ impl StrategyNode for TrendContinuationNode {
             trend_hits += u64::from(trend_ready);
             reclaim_hits += u64::from(trend_ready && touched && reclaimed);
             let score = return_4h.abs() * efficiency * volume_ratio;
-            let progress = (11usize.saturating_sub(blockers.len()).min(11) as f64) / 11.0;
+            let progress = (13usize.saturating_sub(blockers.len()).min(13) as f64) / 13.0;
             let verdict = if blockers.is_empty() {
                 Verdict::Pass
             } else {
@@ -254,6 +303,18 @@ impl StrategyNode for TrendContinuationNode {
                 (
                     "trend_reclaim_body_atr".into(),
                     reclaim_body_atr.to_string(),
+                ),
+                (
+                    "post_signal_extension_bps".into(),
+                    post_signal_extension_bps.to_string(),
+                ),
+                (
+                    "live_trade_imbalance".into(),
+                    live_trade_imbalance.unwrap_or_default().to_string(),
+                ),
+                (
+                    "live_mid_return_bps_10s".into(),
+                    live_mid_return_bps.unwrap_or_default().to_string(),
                 ),
             ]);
             if verdict == Verdict::Pass {
@@ -307,6 +368,7 @@ impl StrategyNode for TrendContinuationNode {
                 blockers,
                 evidence: vec![
                     format!("{symbol}.binance_15m_trend"),
+                    format!("{symbol}.binance_ws_microstructure"),
                     format!("{symbol}.book"),
                 ],
                 tags,
@@ -432,5 +494,37 @@ mod tests {
         assert_eq!(passive_pullback_limit(100.0, 2.0, -1.0, 0.30, 100.1), 100.6);
         assert_eq!(passive_pullback_limit(100.0, 2.0, 1.0, 0.0, 99.9), 99.9);
         assert_eq!(passive_pullback_limit(100.0, 2.0, -1.0, 0.0, 100.1), 100.1);
+    }
+
+    #[test]
+    fn post_signal_extension_is_directional() {
+        assert!((post_signal_extension_bps(Side::Buy, 100.0, 100.12) - 12.0).abs() < 1e-9);
+        assert!((post_signal_extension_bps(Side::Sell, 100.0, 99.88) - 12.0).abs() < 1e-9);
+        assert!(post_signal_extension_bps(Side::Buy, 100.0, 99.9) < 0.0);
+    }
+
+    #[test]
+    fn microstructure_veto_requires_two_opposing_observations() {
+        assert!(strong_opposing_microstructure(
+            Side::Buy,
+            Some(-0.40),
+            Some(-8.0),
+            0.15,
+            3.0
+        ));
+        assert!(!strong_opposing_microstructure(
+            Side::Buy,
+            Some(-0.40),
+            Some(2.0),
+            0.15,
+            3.0
+        ));
+        assert!(!strong_opposing_microstructure(
+            Side::Sell,
+            None,
+            Some(8.0),
+            0.15,
+            3.0
+        ));
     }
 }

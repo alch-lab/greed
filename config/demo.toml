@@ -73,6 +73,14 @@ trend_entry_timeout_seconds = 60
 # Reprice the passive maker order toward the live book, but never chase farther
 # than this distance beyond the signal reference price.
 trend_max_entry_adverse_bps = 8.0
+# Do not chase a continuation after price has already run away from the
+# completed 15m reclaim. This avoided the late STX loss in the 2026-08-27
+# Demo counterfactual while preserving the profitable CYS entry.
+trend_max_post_signal_extension_bps = 12.0
+# Veto only when live trade flow and the 10s price response both strongly
+# oppose the completed 15m signal.
+trend_max_opposing_micro_flow = 0.15
+trend_max_opposing_micro_return_bps = 3.0
 ignition_min_return_5m = 0.010
 ignition_min_volume_ratio = 3.0
 ignition_min_flow_imbalance = 0.20
