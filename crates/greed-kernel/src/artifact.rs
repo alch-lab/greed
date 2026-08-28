@@ -72,6 +72,16 @@ pub struct PositionPlan {
     pub taker_fallback_max_adverse_bps: f64,
     #[serde(default = "default_entry_size_multiplier")]
     pub taker_fallback_size_multiplier: f64,
+    /// Cancel a resting entry when the strategy-market midpoint overshoots the
+    /// intended pullback limit by more than this many basis points.
+    #[serde(default)]
+    pub entry_invalidation_bps: f64,
+    /// While a trend maker order rests, the same live-flow veto used to build
+    /// the candidate must remain valid. Zero disables the runtime guard.
+    #[serde(default)]
+    pub entry_guard_max_opposing_flow: f64,
+    #[serde(default)]
+    pub entry_guard_max_opposing_return_bps: f64,
     pub stop_price: f64,
     pub take_profit_prices: Vec<(f64, f64)>,
     pub break_even_after_fraction: Option<f64>,

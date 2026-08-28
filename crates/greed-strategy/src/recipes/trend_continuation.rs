@@ -352,6 +352,18 @@ impl StrategyNode for TrendContinuationNode {
                         self.config.trend_taker_fallback_size_multiplier.to_string(),
                     );
                     tags.insert(
+                        "entry_invalidation_bps".into(),
+                        self.config.trend_entry_invalidation_bps.to_string(),
+                    );
+                    tags.insert(
+                        "entry_guard_max_opposing_flow".into(),
+                        self.config.trend_max_opposing_micro_flow.to_string(),
+                    );
+                    tags.insert(
+                        "entry_guard_max_opposing_return_bps".into(),
+                        self.config.trend_max_opposing_micro_return_bps.to_string(),
+                    );
+                    tags.insert(
                         "entry_offset_atr".into(),
                         self.config.trend_limit_offset_atr.to_string(),
                     );

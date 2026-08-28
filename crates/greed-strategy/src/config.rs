@@ -74,6 +74,7 @@ pub struct LaneConfig {
     pub trend_max_entry_adverse_bps: f64,
     pub trend_taker_fallback_max_adverse_bps: f64,
     pub trend_taker_fallback_size_multiplier: f64,
+    pub trend_entry_invalidation_bps: f64,
     pub trend_max_post_signal_extension_bps: f64,
     pub trend_max_opposing_micro_flow: f64,
     pub trend_max_opposing_micro_return_bps: f64,
@@ -131,6 +132,7 @@ impl Default for LaneConfig {
             trend_max_entry_adverse_bps: 8.0,
             trend_taker_fallback_max_adverse_bps: 20.0,
             trend_taker_fallback_size_multiplier: 0.05,
+            trend_entry_invalidation_bps: 30.0,
             trend_max_post_signal_extension_bps: 12.0,
             trend_max_opposing_micro_flow: 0.15,
             trend_max_opposing_micro_return_bps: 3.0,
@@ -256,6 +258,7 @@ impl StrategyConfig {
             || !(0.0..=12.0).contains(&lanes.trend_max_entry_adverse_bps)
             || !(0.0..=50.0).contains(&lanes.trend_taker_fallback_max_adverse_bps)
             || !(0.01..=0.25).contains(&lanes.trend_taker_fallback_size_multiplier)
+            || !(5.0..=100.0).contains(&lanes.trend_entry_invalidation_bps)
             || !(0.0..=100.0).contains(&lanes.trend_max_post_signal_extension_bps)
             || !(0.0..=0.80).contains(&lanes.trend_max_opposing_micro_flow)
             || !(0.0..=25.0).contains(&lanes.trend_max_opposing_micro_return_bps)

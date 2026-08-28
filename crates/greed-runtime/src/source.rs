@@ -180,6 +180,13 @@ impl BinanceMarketSource {
         }
     }
 
+    /// Share the live mainnet websocket cache with the execution layer. This
+    /// lets a resting Demo order be canceled as soon as its original signal
+    /// fails, without adding REST polling or Binance request weight.
+    pub fn market_stream_handle(&self) -> Option<MarketStreamHub> {
+        self.stream.clone()
+    }
+
     pub async fn discover_universe(
         &mut self,
         strategy: &StrategyConfig,

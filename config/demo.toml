@@ -79,6 +79,10 @@ trend_max_entry_adverse_bps = 8.0
 # tests rejected both full-size fallback and wider/unbounded chasing.
 trend_taker_fallback_max_adverse_bps = 20.0
 trend_taker_fallback_size_multiplier = 0.05
+# A pullback that trades more than 30 bps through our intended maker limit is
+# no longer a retest. Cancel it immediately instead of filling a rebound after
+# the live signal has already failed.
+trend_entry_invalidation_bps = 30.0
 # Do not chase a continuation after price has already run away from the
 # completed 15m reclaim. This avoided the late STX loss in the 2026-08-27
 # Demo counterfactual while preserving the profitable CYS entry.

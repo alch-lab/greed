@@ -1,4 +1,7 @@
-use crate::config::{ExecutionConfig, PortfolioConfig};
+use crate::{
+    config::{ExecutionConfig, PortfolioConfig},
+    market_stream::MarketStreamHub,
+};
 use anyhow::{anyhow, Context, Result};
 use greed_kernel::{AccountFrame, Artifact, GraphEvaluation, MarketFrame, Side};
 use greed_strategy::RiskConfig;
@@ -18,6 +21,7 @@ type HmacSha256 = Hmac<Sha256>;
 
 const MAKER_REPRICE_INTERVAL_MS: i64 = 15_000;
 const MAX_MAKER_REPRICES: u8 = 3;
+const ENTRY_GUARD_STALE_GRACE_MS: i64 = 5_000;
 const MIN_PERFORMANCE_FILL_RATIO: f64 = 0.20;
 const PERFORMANCE_BASIS_VERSION: u32 = 1;
 
@@ -250,6 +254,22 @@ enum PostOnlyEntry {
     },
 }
 
+#[derive(Debug, Clone, PartialEq)]
+enum EntryGuardState {
+    Healthy,
+    Unavailable(String),
+    Invalidated(String),
+}
+
+struct PendingEntryAttempt<'a> {
+    order: &'a Value,
+    status: &'a str,
+    active_client_id: &'a str,
+    rules: &'a SymbolRules,
+    waited_ms: i64,
+    reprices: u8,
+}
+
 pub struct BinanceDemoExecution {
     client: Client,
     config: ExecutionConfig,
@@ -266,6 +286,10 @@ pub struct BinanceDemoExecution {
     last_sync_ms: Option<i64>,
     performance_epoch_reset: bool,
     performance_basis_reset: bool,
+    /// Mainnet websocket data is the strategy's source of truth. Demo order
+    /// books can diverge for thin contracts, so pending entries must continue
+    /// to be checked against this shared cache until they fill or are canceled.
+    market_stream: Option<MarketStreamHub>,
 }
 
 impl BinanceDemoExecution {
@@ -275,6 +299,7 @@ impl BinanceDemoExecution {
         risk: RiskConfig,
         state_path: String,
         proxy: Option<&str>,
+        market_stream: Option<MarketStreamHub>,
     ) -> Result<Self> {
         let api_key = env::var(&config.api_key_env)
             .with_context(|| format!("missing environment variable {}", config.api_key_env))?;
@@ -320,6 +345,7 @@ impl BinanceDemoExecution {
             last_sync_ms: None,
             performance_epoch_reset,
             performance_basis_reset,
+            market_stream,
         };
         value.initialize().await?;
         if value.performance_epoch_reset {
@@ -1244,7 +1270,7 @@ impl BinanceDemoExecution {
                         .and_then(|value| value.parse::<i64>().ok());
                     events.push(ExchangeEvent {
                         kind: "exchange_entry".into(),
-                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"entry_mode":fill.entry_mode,"entry_price_source":fill.entry_price_source,"maker_attempted":fill.maker_attempted,"maker_wait_ms":fill.maker_wait_ms,"maker_reprices":fill.maker_reprices,"requested_limit":plan.entry_limit,"final_maker_limit":fill.final_maker_limit,"entry_price":fill.entry_price,"quantity":fill.quantity,"notional_usd":actual_notional_usd,"actual_notional_usd":actual_notional_usd,"planned_notional_usd":planned_notional_usd,"fill_ratio":fill_ratio,"partial_fill":fill_ratio < 0.999,"probe_size_multiplier":size_multiplier,"entry_size_multiplier":fill.size_multiplier,"spread_bps":cost.spread_bps,"expected_exit_slippage_bps":cost.expected_exit_slippage_bps,"estimated_round_trip_cost_bps":cost.estimated_round_trip_cost_bps,"gross_target_bps":cost.gross_target_bps,"target_to_cost_ratio":cost.target_to_cost_ratio,"order_id":fill.order_id,"stop_algo_id":fill.stop_algo_id,"take_profit_order_ids":fill.take_profit_order_ids,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
+                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"entry_mode":fill.entry_mode,"entry_price_source":fill.entry_price_source,"maker_attempted":fill.maker_attempted,"maker_wait_ms":fill.maker_wait_ms,"maker_reprices":fill.maker_reprices,"requested_limit":plan.entry_limit,"final_maker_limit":fill.final_maker_limit,"entry_price":fill.entry_price,"quantity":fill.quantity,"notional_usd":actual_notional_usd,"actual_notional_usd":actual_notional_usd,"planned_notional_usd":planned_notional_usd,"fill_ratio":fill_ratio,"partial_fill":fill_ratio < 0.999,"probe_size_multiplier":size_multiplier,"entry_size_multiplier":fill.size_multiplier,"entry_guard":{"invalidation_bps":plan.entry_invalidation_bps,"max_opposing_flow":plan.entry_guard_max_opposing_flow,"max_opposing_return_bps":plan.entry_guard_max_opposing_return_bps},"spread_bps":cost.spread_bps,"expected_exit_slippage_bps":cost.expected_exit_slippage_bps,"estimated_round_trip_cost_bps":cost.estimated_round_trip_cost_bps,"gross_target_bps":cost.gross_target_bps,"target_to_cost_ratio":cost.target_to_cost_ratio,"order_id":fill.order_id,"stop_algo_id":fill.stop_algo_id,"take_profit_order_ids":fill.take_profit_order_ids,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
                     });
                 }
                 Err(error) => {
@@ -1281,6 +1307,9 @@ impl BinanceDemoExecution {
                             "taker_fallback":plan.taker_fallback,
                             "taker_fallback_max_adverse_bps":plan.taker_fallback_max_adverse_bps,
                             "taker_fallback_size_multiplier":plan.taker_fallback_size_multiplier,
+                            "entry_invalidation_bps":plan.entry_invalidation_bps,
+                            "entry_guard_max_opposing_flow":plan.entry_guard_max_opposing_flow,
+                            "entry_guard_max_opposing_return_bps":plan.entry_guard_max_opposing_return_bps,
                             "spread_bps":cost.spread_bps,
                             "expected_exit_slippage_bps":cost.expected_exit_slippage_bps,
                             "estimated_round_trip_cost_bps":cost.estimated_round_trip_cost_bps,
@@ -1773,6 +1802,96 @@ impl BinanceDemoExecution {
         ("external_or_manual_close".into(), None, None)
     }
 
+    fn pending_entry_guard(
+        &self,
+        plan: &greed_kernel::PositionPlan,
+        now_ms: i64,
+    ) -> EntryGuardState {
+        if plan.entry_invalidation_bps <= 0.0
+            && plan.entry_guard_max_opposing_flow <= 0.0
+            && plan.entry_guard_max_opposing_return_bps <= 0.0
+        {
+            return EntryGuardState::Healthy;
+        }
+        let Some(stream) = &self.market_stream else {
+            return EntryGuardState::Unavailable("mainnet websocket guard is unavailable".into());
+        };
+        let Some(book) = stream.book(&plan.symbol, now_ms) else {
+            return EntryGuardState::Unavailable(format!(
+                "mainnet order book is missing for {}",
+                plan.symbol
+            ));
+        };
+        if now_ms > book.meta.expires_ms || book.bid <= 0.0 || book.ask <= 0.0 {
+            return EntryGuardState::Unavailable(format!(
+                "mainnet order book is stale for {}",
+                plan.symbol
+            ));
+        }
+        let signal_mid = (book.bid + book.ask) * 0.5;
+        let micro = stream
+            .microstructure(&plan.symbol, now_ms)
+            .filter(|value| now_ms <= value.meta.expires_ms);
+        pending_entry_guard_state(
+            plan,
+            signal_mid,
+            micro.as_ref().and_then(|value| value.trade_imbalance()),
+            micro.as_ref().and_then(|value| value.mid_return_bps_10s),
+        )
+    }
+
+    async fn abort_invalidated_entry(
+        &self,
+        plan: &greed_kernel::PositionPlan,
+        attempt: PendingEntryAttempt<'_>,
+        reason: &str,
+    ) -> Result<PostOnlyEntry> {
+        let reconciled = if attempt.status == "FILLED" {
+            attempt.order.clone()
+        } else {
+            self.cancel_or_reconcile_entry(&plan.symbol, attempt.active_client_id)
+                .await?
+        };
+        let executed = parse_f64(&reconciled, "executedQty")
+            .or_else(|| parse_f64(attempt.order, "executedQty"))
+            .unwrap_or_default();
+        if executed > f64::EPSILON {
+            let guard_client_id = client_order_id("guard", &plan.candidate_id);
+            self.submit_or_lookup(
+                &plan.symbol,
+                &guard_client_id,
+                vec![
+                    ("symbol".into(), plan.symbol.clone()),
+                    ("side".into(), side_name(plan.side.opposite()).into()),
+                    ("type".into(), "MARKET".into()),
+                    (
+                        "quantity".into(),
+                        decimal(executed, attempt.rules.quantity_step),
+                    ),
+                    ("reduceOnly".into(), "true".into()),
+                    ("newClientOrderId".into(), guard_client_id.clone()),
+                ],
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "pending entry signal invalidated ({reason}); emergency close of {executed} {} failed",
+                    plan.symbol
+                )
+            })?;
+            return Err(anyhow!(
+                "pending entry signal invalidated after {}ms ({} reprices): {reason}; {executed} filled quantity was immediately closed",
+                attempt.waited_ms,
+                attempt.reprices
+            ));
+        }
+        Err(anyhow!(
+            "pending entry signal invalidated after {}ms ({} reprices): {reason}; maker order canceled without fill",
+            attempt.waited_ms,
+            attempt.reprices
+        ))
+    }
+
     async fn place_post_only_entry(
         &self,
         plan: &greed_kernel::PositionPlan,
@@ -1844,18 +1963,9 @@ impl BinanceDemoExecution {
         let started_ms = chrono::Utc::now().timestamp_millis();
         let deadline = started_ms + plan.entry_timeout_ms.clamp(5_000, 120_000);
         let mut next_reprice_ms = started_ms + MAKER_REPRICE_INTERVAL_MS;
+        let mut guard_unavailable_since_ms = None;
         loop {
             let status = order.get("status").and_then(Value::as_str).unwrap_or("NEW");
-            if status == "FILLED" {
-                return Ok(PostOnlyEntry::Filled {
-                    order,
-                    waited_ms: chrono::Utc::now()
-                        .timestamp_millis()
-                        .saturating_sub(started_ms),
-                    reprices: reprice_attempt,
-                    final_limit: passive_price,
-                });
-            }
             if matches!(status, "CANCELED" | "EXPIRED" | "REJECTED") {
                 let executed = parse_f64(&order, "executedQty").unwrap_or_default();
                 if executed > f64::EPSILON {
@@ -1871,6 +1981,49 @@ impl BinanceDemoExecution {
                 return Err(anyhow!("post-only entry ended with status {status}"));
             }
             let now_ms = chrono::Utc::now().timestamp_millis();
+            let invalidation = match self.pending_entry_guard(plan, now_ms) {
+                EntryGuardState::Healthy => {
+                    guard_unavailable_since_ms = None;
+                    None
+                }
+                EntryGuardState::Invalidated(reason) => Some(reason),
+                EntryGuardState::Unavailable(reason) => {
+                    let missing_since = *guard_unavailable_since_ms.get_or_insert(now_ms);
+                    (now_ms - missing_since >= ENTRY_GUARD_STALE_GRACE_MS).then(|| {
+                        format!(
+                            "{reason} for {}ms (max {}ms)",
+                            now_ms - missing_since,
+                            ENTRY_GUARD_STALE_GRACE_MS
+                        )
+                    })
+                }
+            };
+            if let Some(reason) = invalidation {
+                return self
+                    .abort_invalidated_entry(
+                        plan,
+                        PendingEntryAttempt {
+                            order: &order,
+                            status,
+                            active_client_id: &active_client_id,
+                            rules,
+                            waited_ms: now_ms.saturating_sub(started_ms),
+                            reprices: reprice_attempt,
+                        },
+                        &reason,
+                    )
+                    .await;
+            }
+            if status == "FILLED" {
+                return Ok(PostOnlyEntry::Filled {
+                    order,
+                    waited_ms: chrono::Utc::now()
+                        .timestamp_millis()
+                        .saturating_sub(started_ms),
+                    reprices: reprice_attempt,
+                    final_limit: passive_price,
+                });
+            }
             if now_ms >= deadline {
                 let canceled = self
                     .cancel_or_reconcile_entry(&plan.symbol, &active_client_id)
@@ -2638,6 +2791,37 @@ fn passive_price_improves(side: Side, current: f64, proposed: f64, tick: f64) ->
 fn entry_adverse_bps(side: Side, executable: f64, reference: f64) -> f64 {
     side.sign() * (executable / reference.max(f64::EPSILON) - 1.0) * 10_000.0
 }
+fn pending_entry_guard_state(
+    plan: &greed_kernel::PositionPlan,
+    signal_mid: f64,
+    trade_imbalance: Option<f64>,
+    mid_return_bps_10s: Option<f64>,
+) -> EntryGuardState {
+    if let Some(limit) = plan.entry_limit.filter(|value| *value > f64::EPSILON) {
+        let overshoot_bps = -plan.side.sign() * (signal_mid / limit - 1.0) * 10_000.0;
+        if plan.entry_invalidation_bps > 0.0 && overshoot_bps > plan.entry_invalidation_bps {
+            return EntryGuardState::Invalidated(format!(
+                "strategy midpoint {signal_mid} overshot entry limit {limit} by {overshoot_bps:.1} bps against the setup (max {:.1})",
+                plan.entry_invalidation_bps
+            ));
+        }
+    }
+    if let (Some(flow), Some(response)) = (trade_imbalance, mid_return_bps_10s) {
+        let directional_flow = plan.side.sign() * flow;
+        let directional_response = plan.side.sign() * response;
+        if plan.entry_guard_max_opposing_flow > 0.0
+            && plan.entry_guard_max_opposing_return_bps > 0.0
+            && directional_flow < -plan.entry_guard_max_opposing_flow
+            && directional_response < -plan.entry_guard_max_opposing_return_bps
+        {
+            return EntryGuardState::Invalidated(format!(
+                "live flow {:.0}% and 10s strategy-market response {response:.1} bps reversed against the pending entry",
+                flow * 100.0
+            ));
+        }
+    }
+    EntryGuardState::Healthy
+}
 fn bounded_fallback_quantity(quantity: f64, multiplier: f64, step: f64) -> f64 {
     floor_step(quantity * multiplier.clamp(0.01, 1.0), step)
 }
@@ -2662,6 +2846,33 @@ fn hex_bytes(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn guarded_plan(side: Side) -> greed_kernel::PositionPlan {
+        greed_kernel::PositionPlan {
+            candidate_id: "trend_continuation:TESTUSDT:1".into(),
+            symbol: "TESTUSDT".into(),
+            side,
+            reference_price: 100.0,
+            notional_usd: 1_000.0,
+            entry_limit: Some(99.0),
+            entry_timeout_ms: 60_000,
+            taker_fallback: true,
+            max_entry_adverse_bps: 8.0,
+            taker_fallback_max_adverse_bps: 20.0,
+            taker_fallback_size_multiplier: 0.05,
+            entry_invalidation_bps: 30.0,
+            entry_guard_max_opposing_flow: 0.15,
+            entry_guard_max_opposing_return_bps: 3.0,
+            stop_price: 98.75,
+            take_profit_prices: vec![(102.5, 0.4)],
+            break_even_after_fraction: Some(0.4),
+            break_even_buffer_pct: 0.0018,
+            profit_shield_activation_pct: Some(0.00625),
+            trailing_activation_pct: Some(0.01),
+            trailing_distance_pct: Some(0.005),
+            max_hold_ms: 0,
+        }
+    }
 
     #[test]
     fn exchange_quantization_never_rounds_quantity_up() {
@@ -2764,6 +2975,58 @@ mod tests {
         assert!((entry_adverse_bps(Side::Buy, 100.20, 100.0) - 20.0).abs() < 1e-9);
         assert!((entry_adverse_bps(Side::Sell, 99.80, 100.0) - 20.0).abs() < 1e-9);
         assert!(entry_adverse_bps(Side::Buy, 99.0, 100.0) < 0.0);
+    }
+
+    #[test]
+    fn pending_buy_is_canceled_after_it_falls_through_the_pullback_limit() {
+        let plan = guarded_plan(Side::Buy);
+        assert_eq!(
+            pending_entry_guard_state(&plan, 99.0, Some(0.0), Some(0.0)),
+            EntryGuardState::Healthy
+        );
+        let guard = pending_entry_guard_state(&plan, 98.60, Some(0.0), Some(0.0));
+        assert!(
+            matches!(guard, EntryGuardState::Invalidated(reason) if reason.contains("40.4 bps"))
+        );
+    }
+
+    #[test]
+    fn prom_regression_cancels_the_stale_rebound_entry() {
+        let mut plan = guarded_plan(Side::Buy);
+        plan.symbol = "PROMUSDT".into();
+        plan.reference_price = 5.381;
+        plan.entry_limit = Some(5.34747);
+        let guard = pending_entry_guard_state(&plan, 5.219, Some(-0.19), Some(-14.4));
+        assert!(
+            matches!(guard, EntryGuardState::Invalidated(reason) if reason.contains("overshot entry limit"))
+        );
+    }
+
+    #[test]
+    fn pending_sell_uses_the_same_directional_overshoot_guard() {
+        let mut plan = guarded_plan(Side::Sell);
+        plan.entry_limit = Some(101.0);
+        assert_eq!(
+            pending_entry_guard_state(&plan, 101.0, Some(0.0), Some(0.0)),
+            EntryGuardState::Healthy
+        );
+        assert!(matches!(
+            pending_entry_guard_state(&plan, 101.40, Some(0.0), Some(0.0)),
+            EntryGuardState::Invalidated(_)
+        ));
+    }
+
+    #[test]
+    fn pending_entry_requires_flow_and_price_to_reverse_together() {
+        let plan = guarded_plan(Side::Buy);
+        assert_eq!(
+            pending_entry_guard_state(&plan, 99.0, Some(-0.20), Some(2.0)),
+            EntryGuardState::Healthy
+        );
+        assert!(matches!(
+            pending_entry_guard_state(&plan, 99.0, Some(-0.20), Some(-4.0)),
+            EntryGuardState::Invalidated(reason) if reason.contains("live flow")
+        ));
     }
 
     #[test]

@@ -172,6 +172,14 @@ impl StrategyNode for PositionPlannerNode {
                     .unwrap_or_default(),
                 taker_fallback_size_multiplier: tag_f64(c, "taker_fallback_size_multiplier")
                     .unwrap_or(1.0),
+                entry_invalidation_bps: tag_f64(c, "entry_invalidation_bps").unwrap_or_default(),
+                entry_guard_max_opposing_flow: tag_f64(c, "entry_guard_max_opposing_flow")
+                    .unwrap_or_default(),
+                entry_guard_max_opposing_return_bps: tag_f64(
+                    c,
+                    "entry_guard_max_opposing_return_bps",
+                )
+                .unwrap_or_default(),
                 stop_price: stop,
                 take_profit_prices,
                 break_even_after_fraction: (take_fraction < 1.0).then_some(take_fraction),

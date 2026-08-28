@@ -417,6 +417,7 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
         config.strategy.risk.clone(),
         config.runtime.execution_state_path.clone(),
         config.runtime.proxy.as_deref(),
+        source.market_stream_handle(),
     )
     .await
     .context("Binance demo execution initialization failed; trading runtime cannot start")?;
