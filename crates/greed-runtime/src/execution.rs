@@ -23,7 +23,7 @@ const MAKER_REPRICE_INTERVAL_MS: i64 = 15_000;
 const MAX_MAKER_REPRICES: u8 = 3;
 const ENTRY_GUARD_STALE_GRACE_MS: i64 = 5_000;
 const MIN_PERFORMANCE_FILL_RATIO: f64 = 0.20;
-const PERFORMANCE_BASIS_VERSION: u32 = 1;
+const PERFORMANCE_BASIS_VERSION: u32 = 2;
 
 pub struct ExchangeEvent {
     pub kind: String,
@@ -99,6 +99,12 @@ struct ExecutionMeta {
     trailing_activation_pct: Option<f64>,
     #[serde(default)]
     trailing_distance_pct: Option<f64>,
+    #[serde(default)]
+    early_failure_after_ms: i64,
+    #[serde(default)]
+    early_failure_adverse_pct: f64,
+    #[serde(default)]
+    early_failure_max_favorable_pct: f64,
     max_hold_ms: i64,
     #[serde(default)]
     exit_requested: bool,
@@ -168,6 +174,9 @@ pub struct DemoPositionSnapshot {
     pub extreme_price: Option<f64>,
     pub trailing_activation_pct: Option<f64>,
     pub trailing_distance_pct: Option<f64>,
+    pub early_failure_after_ms: i64,
+    pub early_failure_adverse_pct: f64,
+    pub early_failure_max_favorable_pct: f64,
     pub current_price: Option<f64>,
     pub current_notional_usd: Option<f64>,
     pub unrealized_pnl_usd: Option<f64>,
@@ -633,6 +642,7 @@ impl BinanceDemoExecution {
                         }
                     }
                 }
+                let mut early_failures = Vec::new();
                 for (symbol, position) in &account.positions {
                     let Some(meta) = self.state.positions.get_mut(symbol) else {
                         continue;
@@ -661,6 +671,23 @@ impl BinanceDemoExecution {
                         .is_some_and(|threshold| closed_fraction + 1e-6 >= threshold);
                     let favorable = meta.side.sign()
                         * (meta.extreme_price / meta.entry_price.max(f64::EPSILON) - 1.0);
+                    if !meta.exit_requested
+                        && early_failure_triggered(
+                            meta.side,
+                            meta.entry_price,
+                            meta.extreme_price,
+                            position.mark_price,
+                            now_ms.saturating_sub(meta.entry_ms),
+                            (
+                                meta.early_failure_after_ms,
+                                meta.early_failure_adverse_pct,
+                                meta.early_failure_max_favorable_pct,
+                            ),
+                        )
+                    {
+                        early_failures.push((symbol.clone(), position.clone()));
+                        continue;
+                    }
                     let profit_shield_hit = meta
                         .profit_shield_activation_pct
                         .is_some_and(|activation| favorable >= activation);
@@ -708,6 +735,35 @@ impl BinanceDemoExecution {
                                 stop_orders.get(symbol).copied(),
                             ));
                         }
+                    }
+                }
+                for (symbol, position) in early_failures {
+                    match self.close_market(&position).await {
+                        Ok(()) => {
+                            if let Some(meta) = self.state.positions.get_mut(&symbol) {
+                                meta.exit_requested = true;
+                                meta.pending_exit_reason = Some("early_failure".into());
+                            }
+                            events.push(ExchangeEvent {
+                                kind: "exchange_exit_requested".into(),
+                                payload: serde_json::json!({
+                                    "ts_ms":now_ms,
+                                    "symbol":symbol,
+                                    "reason":"early_failure",
+                                    "mark_price":position.mark_price,
+                                    "venue":"binance_demo"
+                                }),
+                            });
+                        }
+                        Err(error) => events.push(ExchangeEvent {
+                            kind: "exchange_order_rejected".into(),
+                            payload: serde_json::json!({
+                                "ts_ms":now_ms,
+                                "symbol":symbol,
+                                "reason":format!("early-failure close failed: {error}"),
+                                "venue":"binance_demo"
+                            }),
+                        }),
                     }
                 }
                 for (symbol, desired, reason, position, stop_order_id) in protection_updates {
@@ -1097,6 +1153,15 @@ impl BinanceDemoExecution {
                         trailing_activation_pct: meta
                             .and_then(|value| value.trailing_activation_pct),
                         trailing_distance_pct: meta.and_then(|value| value.trailing_distance_pct),
+                        early_failure_after_ms: meta
+                            .map(|value| value.early_failure_after_ms)
+                            .unwrap_or_default(),
+                        early_failure_adverse_pct: meta
+                            .map(|value| value.early_failure_adverse_pct)
+                            .unwrap_or_default(),
+                        early_failure_max_favorable_pct: meta
+                            .map(|value| value.early_failure_max_favorable_pct)
+                            .unwrap_or_default(),
                         current_price: Some(position.mark_price),
                         current_notional_usd: Some(notional),
                         unrealized_pnl_usd: Some(position.unrealized_pnl),
@@ -1253,6 +1318,9 @@ impl BinanceDemoExecution {
                             adverse_price: fill.entry_price,
                             trailing_activation_pct: plan.trailing_activation_pct,
                             trailing_distance_pct: plan.trailing_distance_pct,
+                            early_failure_after_ms: plan.early_failure_after_ms,
+                            early_failure_adverse_pct: plan.early_failure_adverse_pct,
+                            early_failure_max_favorable_pct: plan.early_failure_max_favorable_pct,
                             max_hold_ms: plan.max_hold_ms,
                             exit_requested: false,
                             pending_exit_reason: None,
@@ -1270,7 +1338,7 @@ impl BinanceDemoExecution {
                         .and_then(|value| value.parse::<i64>().ok());
                     events.push(ExchangeEvent {
                         kind: "exchange_entry".into(),
-                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"entry_mode":fill.entry_mode,"entry_price_source":fill.entry_price_source,"maker_attempted":fill.maker_attempted,"maker_wait_ms":fill.maker_wait_ms,"maker_reprices":fill.maker_reprices,"requested_limit":plan.entry_limit,"final_maker_limit":fill.final_maker_limit,"entry_price":fill.entry_price,"quantity":fill.quantity,"notional_usd":actual_notional_usd,"actual_notional_usd":actual_notional_usd,"planned_notional_usd":planned_notional_usd,"fill_ratio":fill_ratio,"partial_fill":fill_ratio < 0.999,"probe_size_multiplier":size_multiplier,"entry_size_multiplier":fill.size_multiplier,"entry_guard":{"invalidation_bps":plan.entry_invalidation_bps,"max_opposing_flow":plan.entry_guard_max_opposing_flow,"max_opposing_return_bps":plan.entry_guard_max_opposing_return_bps},"spread_bps":cost.spread_bps,"expected_exit_slippage_bps":cost.expected_exit_slippage_bps,"estimated_round_trip_cost_bps":cost.estimated_round_trip_cost_bps,"gross_target_bps":cost.gross_target_bps,"target_to_cost_ratio":cost.target_to_cost_ratio,"order_id":fill.order_id,"stop_algo_id":fill.stop_algo_id,"take_profit_order_ids":fill.take_profit_order_ids,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
+                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"entry_mode":fill.entry_mode,"entry_price_source":fill.entry_price_source,"maker_attempted":fill.maker_attempted,"maker_wait_ms":fill.maker_wait_ms,"maker_reprices":fill.maker_reprices,"requested_limit":plan.entry_limit,"final_maker_limit":fill.final_maker_limit,"entry_price":fill.entry_price,"quantity":fill.quantity,"notional_usd":actual_notional_usd,"actual_notional_usd":actual_notional_usd,"planned_notional_usd":planned_notional_usd,"fill_ratio":fill_ratio,"partial_fill":fill_ratio < 0.999,"probe_size_multiplier":size_multiplier,"entry_size_multiplier":fill.size_multiplier,"entry_guard":{"invalidation_bps":plan.entry_invalidation_bps,"max_opposing_flow":plan.entry_guard_max_opposing_flow,"max_opposing_return_bps":plan.entry_guard_max_opposing_return_bps},"early_failure":{"after_ms":plan.early_failure_after_ms,"adverse_pct":plan.early_failure_adverse_pct,"max_favorable_pct":plan.early_failure_max_favorable_pct},"spread_bps":cost.spread_bps,"expected_exit_slippage_bps":cost.expected_exit_slippage_bps,"estimated_round_trip_cost_bps":cost.estimated_round_trip_cost_bps,"gross_target_bps":cost.gross_target_bps,"target_to_cost_ratio":cost.target_to_cost_ratio,"order_id":fill.order_id,"stop_algo_id":fill.stop_algo_id,"take_profit_order_ids":fill.take_profit_order_ids,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
                     });
                 }
                 Err(error) => {
@@ -2551,6 +2619,23 @@ fn protective_exit_reason(meta: &ExecutionMeta) -> &str {
     }
 }
 
+fn early_failure_triggered(
+    side: Side,
+    entry_price: f64,
+    extreme_price: f64,
+    mark_price: f64,
+    elapsed_ms: i64,
+    thresholds: (i64, f64, f64),
+) -> bool {
+    let (after_ms, adverse_pct, max_favorable_pct) = thresholds;
+    if after_ms <= 0 || adverse_pct <= 0.0 || entry_price <= f64::EPSILON || elapsed_ms < after_ms {
+        return false;
+    }
+    let favorable = side.sign() * (extreme_price / entry_price - 1.0);
+    let current = side.sign() * (mark_price / entry_price - 1.0);
+    favorable < max_favorable_pct && current <= -adverse_pct
+}
+
 fn exit_matches_stop(side: Side, stop_price: f64, exit_price: f64) -> bool {
     if stop_price <= 0.0 || exit_price <= 0.0 {
         return false;
@@ -2870,6 +2955,9 @@ mod tests {
             profit_shield_activation_pct: Some(0.00625),
             trailing_activation_pct: Some(0.01),
             trailing_distance_pct: Some(0.005),
+            early_failure_after_ms: 180_000,
+            early_failure_adverse_pct: 0.00625,
+            early_failure_max_favorable_pct: 0.0025,
             max_hold_ms: 0,
         }
     }
@@ -2917,6 +3005,42 @@ mod tests {
         assert!(exit_matches_stop(Side::Sell, 100.0, 100.2));
         assert!(exit_matches_stop(Side::Sell, 100.0, 99.8));
         assert!(!exit_matches_stop(Side::Sell, 100.0, 99.7));
+    }
+
+    #[test]
+    fn early_failure_requires_time_adversity_and_no_prior_follow_through() {
+        assert!(early_failure_triggered(
+            Side::Buy,
+            100.0,
+            100.10,
+            99.30,
+            180_000,
+            (180_000, 0.00625, 0.0025),
+        ));
+        assert!(!early_failure_triggered(
+            Side::Buy,
+            100.0,
+            100.40,
+            99.30,
+            180_000,
+            (180_000, 0.00625, 0.0025),
+        ));
+        assert!(!early_failure_triggered(
+            Side::Sell,
+            100.0,
+            99.90,
+            100.70,
+            120_000,
+            (180_000, 0.00625, 0.0025),
+        ));
+        assert!(early_failure_triggered(
+            Side::Sell,
+            100.0,
+            99.90,
+            100.70,
+            180_000,
+            (180_000, 0.00625, 0.0025),
+        ));
     }
 
     #[test]

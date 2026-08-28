@@ -91,6 +91,18 @@ trend_max_post_signal_extension_bps = 12.0
 # oppose the completed 15m signal.
 trend_max_opposing_micro_flow = 0.15
 trend_max_opposing_micro_return_bps = 3.0
+# Walk-forward selected 0.6% account risk for this lane. On a 2,000 USDT
+# account the planned full-stop loss is about $12 before gap/slippage, instead
+# of the previous $20 risk budget that produced a $26.37 PROM loss.
+trend_risk_per_trade_pct = 0.006
+# Do not tighten the pre-TP trail until +1R. This preserved validation and
+# locked-window expectancy while the cost shield still activates at +0.5R.
+trend_pre_tp_trailing_activation_r = 1.0
+# A continuation that cannot reach +0.2R and closes at least -0.5R after three
+# minutes has failed to continue; flatten it rather than waiting for -1R.
+trend_early_failure_seconds = 180
+trend_early_failure_adverse_r = 0.50
+trend_early_failure_max_mfe_r = 0.20
 # Tactical short: underperform BTC, break the prior 1h low with sell flow, and
 # exit within 30 minutes. Selected on train/validation; locked and recent were
 # positive after conservative 8 bps per-side execution costs.

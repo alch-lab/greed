@@ -90,6 +90,12 @@ pub struct PositionPlan {
     pub profit_shield_activation_pct: Option<f64>,
     pub trailing_activation_pct: Option<f64>,
     pub trailing_distance_pct: Option<f64>,
+    #[serde(default)]
+    pub early_failure_after_ms: i64,
+    #[serde(default)]
+    pub early_failure_adverse_pct: f64,
+    #[serde(default)]
+    pub early_failure_max_favorable_pct: f64,
     pub max_hold_ms: i64,
 }
 

@@ -132,6 +132,15 @@ impl StrategyNode for PositionPlannerNode {
             let take_fraction = tag_f64(c, "take_profit_fraction")
                 .unwrap_or(self.config.first_take_profit_fraction)
                 .clamp(0.1, 1.0);
+            let profit_shield_activation_r = tag_f64(c, "profit_shield_activation_r")
+                .unwrap_or(self.config.profit_shield_activation_r);
+            let trailing_activation_r = tag_f64(c, "pre_tp_trailing_activation_r")
+                .unwrap_or(self.config.pre_tp_trailing_activation_r);
+            let trailing_distance_pct =
+                tag_f64(c, "trailing_distance_pct").unwrap_or(self.config.trailing_distance_pct);
+            let early_failure_after_ms = tag_i64(c, "early_failure_after_ms").unwrap_or_default();
+            let early_failure_adverse_r = tag_f64(c, "early_failure_adverse_r").unwrap_or_default();
+            let early_failure_max_mfe_r = tag_f64(c, "early_failure_max_mfe_r").unwrap_or_default();
             let notional = (a.equity_usd * risk_pct / stop_pct).min(
                 a.equity_usd
                     * tag_f64(c, "max_notional_multiple")
@@ -185,15 +194,17 @@ impl StrategyNode for PositionPlannerNode {
                 break_even_after_fraction: (take_fraction < 1.0).then_some(take_fraction),
                 break_even_buffer_pct: self.config.break_even_buffer_pct,
                 profit_shield_activation_pct: (take_fraction < 1.0
-                    && self.config.profit_shield_activation_r > 0.0)
-                    .then_some(stop_pct * self.config.profit_shield_activation_r),
+                    && profit_shield_activation_r > 0.0)
+                    .then_some(stop_pct * profit_shield_activation_r),
                 // Start locking profit before TP1. Waiting until TP1 meant a
                 // position could reach roughly +1R, miss the 2R partial, and
                 // surrender almost all open profit back to the cost shield.
                 trailing_activation_pct: (take_fraction < 1.0)
-                    .then_some(stop_pct * self.config.pre_tp_trailing_activation_r),
-                trailing_distance_pct: (take_fraction < 1.0)
-                    .then_some(self.config.trailing_distance_pct),
+                    .then_some(stop_pct * trailing_activation_r),
+                trailing_distance_pct: (take_fraction < 1.0).then_some(trailing_distance_pct),
+                early_failure_after_ms,
+                early_failure_adverse_pct: stop_pct * early_failure_adverse_r,
+                early_failure_max_favorable_pct: stop_pct * early_failure_max_mfe_r,
                 max_hold_ms: tag_i64(c, "max_hold_ms")
                     .unwrap_or_else(|| i64::from(self.config.max_hold_minutes) * 60_000),
             };

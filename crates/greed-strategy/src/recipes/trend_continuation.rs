@@ -367,6 +367,26 @@ impl StrategyNode for TrendContinuationNode {
                         "entry_offset_atr".into(),
                         self.config.trend_limit_offset_atr.to_string(),
                     );
+                    tags.insert(
+                        "risk_per_trade_pct".into(),
+                        self.config.trend_risk_per_trade_pct.to_string(),
+                    );
+                    tags.insert(
+                        "pre_tp_trailing_activation_r".into(),
+                        self.config.trend_pre_tp_trailing_activation_r.to_string(),
+                    );
+                    tags.insert(
+                        "early_failure_after_ms".into(),
+                        (i64::from(self.config.trend_early_failure_seconds) * 1_000).to_string(),
+                    );
+                    tags.insert(
+                        "early_failure_adverse_r".into(),
+                        self.config.trend_early_failure_adverse_r.to_string(),
+                    );
+                    tags.insert(
+                        "early_failure_max_mfe_r".into(),
+                        self.config.trend_early_failure_max_mfe_r.to_string(),
+                    );
                 }
             }
             let candidate = TradeCandidate {

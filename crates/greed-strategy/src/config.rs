@@ -78,6 +78,11 @@ pub struct LaneConfig {
     pub trend_max_post_signal_extension_bps: f64,
     pub trend_max_opposing_micro_flow: f64,
     pub trend_max_opposing_micro_return_bps: f64,
+    pub trend_risk_per_trade_pct: f64,
+    pub trend_pre_tp_trailing_activation_r: f64,
+    pub trend_early_failure_seconds: u32,
+    pub trend_early_failure_adverse_r: f64,
+    pub trend_early_failure_max_mfe_r: f64,
     pub weakness_max_relative_1h: f64,
     pub weakness_max_relative_4h: f64,
     pub weakness_max_flow: f64,
@@ -136,6 +141,11 @@ impl Default for LaneConfig {
             trend_max_post_signal_extension_bps: 12.0,
             trend_max_opposing_micro_flow: 0.15,
             trend_max_opposing_micro_return_bps: 3.0,
+            trend_risk_per_trade_pct: 0.006,
+            trend_pre_tp_trailing_activation_r: 1.0,
+            trend_early_failure_seconds: 180,
+            trend_early_failure_adverse_r: 0.50,
+            trend_early_failure_max_mfe_r: 0.20,
             weakness_max_relative_1h: -0.005,
             weakness_max_relative_4h: -0.010,
             weakness_max_flow: -0.05,
@@ -262,6 +272,11 @@ impl StrategyConfig {
             || !(0.0..=100.0).contains(&lanes.trend_max_post_signal_extension_bps)
             || !(0.0..=0.80).contains(&lanes.trend_max_opposing_micro_flow)
             || !(0.0..=25.0).contains(&lanes.trend_max_opposing_micro_return_bps)
+            || !(0.001..=0.01).contains(&lanes.trend_risk_per_trade_pct)
+            || !(0.5..=2.0).contains(&lanes.trend_pre_tp_trailing_activation_r)
+            || !(60..=900).contains(&lanes.trend_early_failure_seconds)
+            || !(0.1..=0.9).contains(&lanes.trend_early_failure_adverse_r)
+            || !(0.0..=0.5).contains(&lanes.trend_early_failure_max_mfe_r)
             || !(-0.05..=-0.001).contains(&lanes.weakness_max_relative_1h)
             || !(-0.10..=-0.002).contains(&lanes.weakness_max_relative_4h)
             || !(-0.80..=0.0).contains(&lanes.weakness_max_flow)
