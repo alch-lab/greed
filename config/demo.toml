@@ -73,6 +73,11 @@ trend_entry_timeout_seconds = 60
 # Reprice the passive maker order toward the live book, but never chase farther
 # than this distance beyond the signal reference price.
 trend_max_entry_adverse_bps = 8.0
+# If the full-size maker order never fills, take only a 5% probe when the
+# executable price remains within 20 bps of the original signal. Walk-forward
+# tests rejected both full-size fallback and wider/unbounded chasing.
+trend_taker_fallback_max_adverse_bps = 20.0
+trend_taker_fallback_size_multiplier = 0.05
 # Do not chase a continuation after price has already run away from the
 # completed 15m reclaim. This avoided the late STX loss in the 2026-08-27
 # Demo counterfactual while preserving the profitable CYS entry.

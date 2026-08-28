@@ -191,11 +191,13 @@ struct RemoteAccount {
 #[derive(Debug)]
 struct EntryExecution {
     order: Value,
+    requested_quantity: f64,
     mode: &'static str,
     maker_attempted: bool,
     maker_wait_ms: i64,
     maker_reprices: u8,
     final_maker_limit: Option<f64>,
+    size_multiplier: f64,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -230,6 +232,7 @@ struct BracketExecution {
     maker_wait_ms: i64,
     maker_reprices: u8,
     final_maker_limit: Option<f64>,
+    size_multiplier: f64,
 }
 
 #[derive(Debug)]
@@ -1171,7 +1174,8 @@ impl BinanceDemoExecution {
             let attempt_started_ms = chrono::Utc::now().timestamp_millis();
             match self.place_bracket(plan, size_multiplier).await {
                 Ok(fill) => {
-                    let planned_notional_usd = plan.notional_usd * size_multiplier;
+                    let planned_notional_usd =
+                        plan.notional_usd * size_multiplier * fill.size_multiplier;
                     let actual_notional_usd = fill.entry_price * fill.quantity;
                     let fill_ratio = actual_notional_usd / planned_notional_usd.max(f64::EPSILON);
                     self.state.positions.insert(
@@ -1235,7 +1239,7 @@ impl BinanceDemoExecution {
                         .and_then(|value| value.parse::<i64>().ok());
                     events.push(ExchangeEvent {
                         kind: "exchange_entry".into(),
-                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"entry_mode":fill.entry_mode,"entry_price_source":fill.entry_price_source,"maker_attempted":fill.maker_attempted,"maker_wait_ms":fill.maker_wait_ms,"maker_reprices":fill.maker_reprices,"requested_limit":plan.entry_limit,"final_maker_limit":fill.final_maker_limit,"entry_price":fill.entry_price,"quantity":fill.quantity,"notional_usd":actual_notional_usd,"actual_notional_usd":actual_notional_usd,"planned_notional_usd":planned_notional_usd,"fill_ratio":fill_ratio,"partial_fill":fill_ratio < 0.999,"probe_size_multiplier":size_multiplier,"spread_bps":cost.spread_bps,"expected_exit_slippage_bps":cost.expected_exit_slippage_bps,"estimated_round_trip_cost_bps":cost.estimated_round_trip_cost_bps,"gross_target_bps":cost.gross_target_bps,"target_to_cost_ratio":cost.target_to_cost_ratio,"order_id":fill.order_id,"stop_algo_id":fill.stop_algo_id,"take_profit_order_ids":fill.take_profit_order_ids,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
+                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"entry_mode":fill.entry_mode,"entry_price_source":fill.entry_price_source,"maker_attempted":fill.maker_attempted,"maker_wait_ms":fill.maker_wait_ms,"maker_reprices":fill.maker_reprices,"requested_limit":plan.entry_limit,"final_maker_limit":fill.final_maker_limit,"entry_price":fill.entry_price,"quantity":fill.quantity,"notional_usd":actual_notional_usd,"actual_notional_usd":actual_notional_usd,"planned_notional_usd":planned_notional_usd,"fill_ratio":fill_ratio,"partial_fill":fill_ratio < 0.999,"probe_size_multiplier":size_multiplier,"entry_size_multiplier":fill.size_multiplier,"spread_bps":cost.spread_bps,"expected_exit_slippage_bps":cost.expected_exit_slippage_bps,"estimated_round_trip_cost_bps":cost.estimated_round_trip_cost_bps,"gross_target_bps":cost.gross_target_bps,"target_to_cost_ratio":cost.target_to_cost_ratio,"order_id":fill.order_id,"stop_algo_id":fill.stop_algo_id,"take_profit_order_ids":fill.take_profit_order_ids,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
                     });
                 }
                 Err(error) => {
@@ -1269,6 +1273,9 @@ impl BinanceDemoExecution {
                             "reference_price":plan.reference_price,
                             "requested_limit":plan.entry_limit,
                             "max_entry_adverse_bps":plan.max_entry_adverse_bps,
+                            "taker_fallback":plan.taker_fallback,
+                            "taker_fallback_max_adverse_bps":plan.taker_fallback_max_adverse_bps,
+                            "taker_fallback_size_multiplier":plan.taker_fallback_size_multiplier,
                             "spread_bps":cost.spread_bps,
                             "expected_exit_slippage_bps":cost.expected_exit_slippage_bps,
                             "estimated_round_trip_cost_bps":cost.estimated_round_trip_cost_bps,
@@ -1359,6 +1366,7 @@ impl BinanceDemoExecution {
                     final_limit,
                 } => EntryExecution {
                     order,
+                    requested_quantity: quantity,
                     mode: if reprices > 0 {
                         "adaptive_maker_limit"
                     } else {
@@ -1368,6 +1376,7 @@ impl BinanceDemoExecution {
                     maker_wait_ms: waited_ms,
                     maker_reprices: reprices,
                     final_maker_limit: Some(final_limit),
+                    size_multiplier: 1.0,
                 },
                 PostOnlyEntry::Unfilled {
                     waited_ms,
@@ -1386,14 +1395,35 @@ impl BinanceDemoExecution {
                         parse_f64(&ticker, "bidPrice")
                     }
                     .ok_or_else(|| anyhow!("book ticker is missing an executable price"))?;
-                    let adverse_bps = plan.side.sign()
-                        * (executable / plan.reference_price.max(f64::EPSILON) - 1.0)
-                        * 10_000.0;
-                    if adverse_bps > plan.max_entry_adverse_bps {
+                    let adverse_bps =
+                        entry_adverse_bps(plan.side, executable, plan.reference_price);
+                    if adverse_bps > plan.taker_fallback_max_adverse_bps {
                         return Err(anyhow!(
                             "maker entry expired and price drifted {adverse_bps:.1} bps against the signal (max {:.1})",
-                            plan.max_entry_adverse_bps
+                            plan.taker_fallback_max_adverse_bps
                         ));
+                    }
+                    let fallback_size = plan.taker_fallback_size_multiplier.clamp(0.01, 1.0);
+                    let fallback_quantity =
+                        bounded_fallback_quantity(quantity, fallback_size, rules.quantity_step);
+                    if fallback_quantity < rules.min_quantity
+                        || fallback_quantity * executable < rules.min_notional
+                    {
+                        return Err(anyhow!(
+                            "bounded fallback probe is below Binance quantity or notional minimum"
+                        ));
+                    }
+                    for (_, fraction) in &plan.take_profit_prices {
+                        if *fraction >= 1.0 - f64::EPSILON {
+                            continue;
+                        }
+                        let partial = floor_step(fallback_quantity * fraction, rules.quantity_step);
+                        if partial < rules.min_quantity || partial * executable < rules.min_notional
+                        {
+                            return Err(anyhow!(
+                                "bounded fallback take profit is below Binance quantity or notional minimum"
+                            ));
+                        }
                     }
                     let fallback_id = client_order_id("fallback", &plan.candidate_id);
                     let order = self
@@ -1404,7 +1434,10 @@ impl BinanceDemoExecution {
                                 ("symbol".into(), plan.symbol.clone()),
                                 ("side".into(), side_name(plan.side).into()),
                                 ("type".into(), "MARKET".into()),
-                                ("quantity".into(), decimal(quantity, rules.quantity_step)),
+                                (
+                                    "quantity".into(),
+                                    decimal(fallback_quantity, rules.quantity_step),
+                                ),
                                 ("newClientOrderId".into(), fallback_id.clone()),
                                 ("newOrderRespType".into(), "RESULT".into()),
                             ],
@@ -1412,11 +1445,13 @@ impl BinanceDemoExecution {
                         .await?;
                     EntryExecution {
                         order,
+                        requested_quantity: fallback_quantity,
                         mode: "maker_timeout_taker_fallback",
                         maker_attempted: true,
                         maker_wait_ms: waited_ms,
                         maker_reprices: reprices,
                         final_maker_limit: Some(final_limit),
+                        size_multiplier: fallback_size,
                     }
                 }
                 PostOnlyEntry::Unfilled {
@@ -1445,14 +1480,16 @@ impl BinanceDemoExecution {
                         ],
                     )
                     .await?,
+                requested_quantity: quantity,
                 mode: "taker_market",
                 maker_attempted: false,
                 maker_wait_ms: 0,
                 maker_reprices: 0,
                 final_maker_limit: None,
+                size_multiplier: 1.0,
             }
         };
-        let executed = parse_f64(&entry.order, "executedQty").unwrap_or(quantity);
+        let executed = parse_f64(&entry.order, "executedQty").unwrap_or(entry.requested_quantity);
         if executed <= f64::EPSILON {
             return Err(anyhow!("entry order completed without a fill"));
         }
@@ -1543,6 +1580,7 @@ impl BinanceDemoExecution {
             maker_wait_ms: entry.maker_wait_ms,
             maker_reprices: entry.maker_reprices,
             final_maker_limit: entry.final_maker_limit,
+            size_multiplier: entry.size_multiplier,
         })
     }
 
@@ -2592,6 +2630,12 @@ fn passive_price_improves(side: Side, current: f64, proposed: f64, tick: f64) ->
         Side::Sell => proposed <= current - tick * 0.5,
     }
 }
+fn entry_adverse_bps(side: Side, executable: f64, reference: f64) -> f64 {
+    side.sign() * (executable / reference.max(f64::EPSILON) - 1.0) * 10_000.0
+}
+fn bounded_fallback_quantity(quantity: f64, multiplier: f64, step: f64) -> f64 {
+    floor_step(quantity * multiplier.clamp(0.01, 1.0), step)
+}
 fn reprice_client_id(base: &str, attempt: u8) -> String {
     format!("{}-r{attempt}", &base[..base.len().min(32)])
 }
@@ -2707,6 +2751,14 @@ mod tests {
         assert!((capped_sell - 99.92).abs() < 1e-12);
         assert!(passive_price_improves(Side::Buy, 99.0, 99.5, 0.01));
         assert!(!passive_price_improves(Side::Buy, 99.5, 99.0, 0.01));
+    }
+
+    #[test]
+    fn bounded_fallback_uses_only_the_configured_probe_and_directional_cap() {
+        assert_eq!(bounded_fallback_quantity(1_000.0, 0.05, 0.1), 50.0);
+        assert!((entry_adverse_bps(Side::Buy, 100.20, 100.0) - 20.0).abs() < 1e-9);
+        assert!((entry_adverse_bps(Side::Sell, 99.80, 100.0) - 20.0).abs() < 1e-9);
+        assert!(entry_adverse_bps(Side::Buy, 99.0, 100.0) < 0.0);
     }
 
     #[test]

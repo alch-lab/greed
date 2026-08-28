@@ -164,6 +164,10 @@ impl StrategyNode for PositionPlannerNode {
                     .get("taker_fallback")
                     .is_some_and(|value| value == "true"),
                 max_entry_adverse_bps: tag_f64(c, "max_entry_adverse_bps").unwrap_or_default(),
+                taker_fallback_max_adverse_bps: tag_f64(c, "taker_fallback_max_adverse_bps")
+                    .unwrap_or_default(),
+                taker_fallback_size_multiplier: tag_f64(c, "taker_fallback_size_multiplier")
+                    .unwrap_or(1.0),
                 stop_price: stop,
                 take_profit_prices,
                 break_even_after_fraction: (take_fraction < 1.0).then_some(take_fraction),

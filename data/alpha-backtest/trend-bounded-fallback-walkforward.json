@@ -1,0 +1,3791 @@
+{
+  "strategy": "confirmed_bounded_taker_fallback_v1",
+  "selection": "parameters selected on train+validation; locked/recent untouched",
+  "cost_model": {
+    "maker_entry_bps": 2,
+    "fallback_fee_bps": 5,
+    "fallback_slippage_bps": 3.0,
+    "exit_bps": 5,
+    "stop_slippage_bps": 3
+  },
+  "baseline": {
+    "train": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2053.8693384898847,
+        "return_pct": 0.026934669244942366,
+        "max_dd_pct": 0.06378743918101959,
+        "trades": 17,
+        "trades_per_day": 0.32075471698113206,
+        "win_rate": 0.29411764705882354,
+        "pf": 1.4076228541224491,
+        "average_pnl_usd": 3.16878461705201,
+        "average_mfe_r": 1.1589358414376558,
+        "average_giveback_r": 0.9932701759962693,
+        "exit_reasons": {
+          "trailing_stop": 5,
+          "cost_shield": 6,
+          "initial_stop": 6
+        }
+      },
+      "signals": {
+        "maker": 46,
+        "fallback": 0,
+        "missed": 40,
+        "unavailable": 0
+      },
+      "portfolio_fallback_trades": 0
+    },
+    "validation": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2042.4765394306762,
+        "return_pct": 0.021238269715338154,
+        "max_dd_pct": 0.02147742479100012,
+        "trades": 5,
+        "trades_per_day": 0.22727272727272727,
+        "win_rate": 0.4,
+        "pf": 1.9851272604020367,
+        "average_pnl_usd": 8.4953078861352,
+        "average_mfe_r": 1.348070825552047,
+        "average_giveback_r": 0.9161640760726621,
+        "exit_reasons": {
+          "initial_stop": 2,
+          "trailing_stop": 2,
+          "cost_shield": 1
+        }
+      },
+      "signals": {
+        "maker": 5,
+        "fallback": 0,
+        "missed": 4,
+        "unavailable": 0
+      },
+      "portfolio_fallback_trades": 0
+    },
+    "locked_test": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2003.3667554518233,
+        "return_pct": 0.001683377725911761,
+        "max_dd_pct": 0.024021162543211072,
+        "trades": 12,
+        "trades_per_day": 1.5,
+        "win_rate": 0.25,
+        "pf": 1.0306242541348416,
+        "average_pnl_usd": 0.2805629543186198,
+        "average_mfe_r": 0.8631535630114773,
+        "average_giveback_r": 0.8440037763060244,
+        "exit_reasons": {
+          "trailing_stop": 3,
+          "cost_shield": 4,
+          "initial_stop": 5
+        }
+      },
+      "signals": {
+        "maker": 17,
+        "fallback": 0,
+        "missed": 10,
+        "unavailable": 0
+      },
+      "portfolio_fallback_trades": 0
+    },
+    "recent": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2043.8285854697713,
+        "return_pct": 0.021914292734885654,
+        "max_dd_pct": 0.00024062869669638776,
+        "trades": 5,
+        "trades_per_day": 1.6666666666666667,
+        "win_rate": 0.2,
+        "pf": 68.92830504688436,
+        "average_pnl_usd": 8.7657170939543,
+        "average_mfe_r": 1.4037053831578645,
+        "average_giveback_r": 0.9652775829733482,
+        "exit_reasons": {
+          "cost_shield": 4,
+          "trailing_stop": 1
+        }
+      },
+      "signals": {
+        "maker": 5,
+        "fallback": 0,
+        "missed": 9,
+        "unavailable": 0
+      },
+      "portfolio_fallback_trades": 0
+    }
+  },
+  "selected": {
+    "viable": true,
+    "score": -0.002186708371523658,
+    "config": {
+      "max_adverse_bps": 20.0,
+      "min_flow": 0.0,
+      "min_close_location": 0.0,
+      "require_confirmation": false,
+      "size_multiplier": 0.05
+    },
+    "train": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2046.2910079819496,
+        "return_pct": 0.023145503990974925,
+        "max_dd_pct": 0.06897204957371317,
+        "trades": 38,
+        "trades_per_day": 0.7169811320754716,
+        "win_rate": 0.18421052631578946,
+        "pf": 1.3233600612362177,
+        "average_pnl_usd": 1.2181844205775854,
+        "average_mfe_r": 0.5390505280701392,
+        "average_giveback_r": 0.47465535802282877,
+        "exit_reasons": {
+          "trailing_stop": 7,
+          "cost_shield": 15,
+          "initial_stop": 16
+        }
+      },
+      "signals": {
+        "maker": 46,
+        "fallback": 22,
+        "missed": 18,
+        "unavailable": 0
+      },
+      "portfolio_fallback_trades": 21
+    },
+    "validation": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2043.9070179585517,
+        "return_pct": 0.02195350897927595,
+        "max_dd_pct": 0.02147742479100012,
+        "trades": 7,
+        "trades_per_day": 0.3181818181818182,
+        "win_rate": 0.42857142857142855,
+        "pf": 1.9923257647034114,
+        "average_pnl_usd": 6.27243113693591,
+        "average_mfe_r": 0.9879013314334399,
+        "average_giveback_r": 0.6693814225884239,
+        "exit_reasons": {
+          "initial_stop": 3,
+          "trailing_stop": 3,
+          "cost_shield": 1
+        }
+      },
+      "signals": {
+        "maker": 5,
+        "fallback": 3,
+        "missed": 1,
+        "unavailable": 0
+      },
+      "portfolio_fallback_trades": 2
+    },
+    "locked_test": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2024.781771742469,
+        "return_pct": 0.012390885871234492,
+        "max_dd_pct": 0.02148528113728254,
+        "trades": 15,
+        "trades_per_day": 1.875,
+        "win_rate": 0.2,
+        "pf": 1.2787235345450256,
+        "average_pnl_usd": 1.6521181161645746,
+        "average_mfe_r": 0.706912382022763,
+        "average_giveback_r": 0.6197196033250675,
+        "exit_reasons": {
+          "trailing_stop": 3,
+          "cost_shield": 8,
+          "initial_stop": 4
+        }
+      },
+      "signals": {
+        "maker": 17,
+        "fallback": 5,
+        "missed": 5,
+        "unavailable": 0
+      },
+      "portfolio_fallback_trades": 4
+    },
+    "recent": {
+      "summary": {
+        "start": 2000.0,
+        "end": 2041.0620605748961,
+        "return_pct": 0.02053103028744796,
+        "max_dd_pct": 0.001344102647617973,
+        "trades": 9,
+        "trades_per_day": 3.0,
+        "win_rate": 0.1111111111111111,
+        "pf": 13.21119979443692,
+        "average_pnl_usd": 4.562451174988471,
+        "average_mfe_r": 0.7904037045261266,
+        "average_giveback_r": 0.5618786689474242,
+        "exit_reasons": {
+          "initial_stop": 2,
+          "cost_shield": 5,
+          "trailing_stop": 1,
+          "window_mark": 1
+        }
+      },
+      "signals": {
+        "maker": 5,
+        "fallback": 4,
+        "missed": 5,
+        "unavailable": 0
+      },
+      "portfolio_fallback_trades": 4
+    }
+  },
+  "top_grid": [
+    {
+      "viable": false,
+      "score": -0.0005344469366189743,
+      "config": {
+        "max_adverse_bps": -8.0,
+        "min_flow": 0.0,
+        "min_close_location": 0.0,
+        "require_confirmation": false,
+        "size_multiplier": 0.05
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2049.314816360446,
+          "return_pct": 0.024657408180223106,
+          "max_dd_pct": 0.06586352101650961,
+          "trades": 24,
+          "trades_per_day": 0.4528301886792453,
+          "win_rate": 0.20833333333333334,
+          "pf": 1.3614116168914898,
+          "average_pnl_usd": 2.054784015018576,
+          "average_mfe_r": 0.8302395689660839,
+          "average_giveback_r": 0.7221404959451018,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 9,
+            "initial_stop": 10
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 7,
+          "missed": 33,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 7
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2045.0355708383188,
+          "return_pct": 0.022517785419159386,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 6,
+          "trades_per_day": 0.2727272727272727,
+          "win_rate": 0.5,
+          "pf": 2.0444720549383404,
+          "average_pnl_usd": 7.505928473053082,
+          "average_mfe_r": 1.1515801985825813,
+          "average_giveback_r": 0.770776138263396,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 3,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 1,
+          "missed": 3,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 1
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.7006081830536,
+          "return_pct": 0.02135030409152683,
+          "max_dd_pct": 0.0007923901658480892,
+          "trades": 6,
+          "trades_per_day": 2.0,
+          "win_rate": 0.16666666666666666,
+          "pf": 25.419174734874353,
+          "average_pnl_usd": 7.116768030508996,
+          "average_mfe_r": 1.1720900171895776,
+          "average_giveback_r": 0.815931017035814,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "initial_stop": 1,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 1,
+          "missed": 8,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 1
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0007161754261098378,
+      "config": {
+        "max_adverse_bps": -4.0,
+        "min_flow": 0.0,
+        "min_close_location": 0.0,
+        "require_confirmation": false,
+        "size_multiplier": 0.05
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2048.1757387372772,
+          "return_pct": 0.024087869368638604,
+          "max_dd_pct": 0.06638274527219779,
+          "trades": 26,
+          "trades_per_day": 0.49056603773584906,
+          "win_rate": 0.19230769230769232,
+          "pf": 1.3503055607286476,
+          "average_pnl_usd": 1.8529130283568302,
+          "average_mfe_r": 0.7692284493373098,
+          "average_giveback_r": 0.6715825188564033,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 10,
+            "initial_stop": 11
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 9,
+          "missed": 31,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 9
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2045.0355708383188,
+          "return_pct": 0.022517785419159386,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 6,
+          "trades_per_day": 0.2727272727272727,
+          "win_rate": 0.5,
+          "pf": 2.0444720549383404,
+          "average_pnl_usd": 7.505928473053082,
+          "average_mfe_r": 1.1515801985825813,
+          "average_giveback_r": 0.770776138263396,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 3,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 1,
+          "missed": 3,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 1
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.7006081830536,
+          "return_pct": 0.02135030409152683,
+          "max_dd_pct": 0.0007923901658480892,
+          "trades": 6,
+          "trades_per_day": 2.0,
+          "win_rate": 0.16666666666666666,
+          "pf": 25.419174734874353,
+          "average_pnl_usd": 7.116768030508996,
+          "average_mfe_r": 1.1720900171895776,
+          "average_giveback_r": 0.815931017035814,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "initial_stop": 1,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 1,
+          "missed": 8,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 1
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0008965992946290517,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": 0.0,
+        "min_close_location": 0.0,
+        "require_confirmation": false,
+        "size_multiplier": 0.05
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2047.0366208463345,
+          "return_pct": 0.02351831042316732,
+          "max_dd_pct": 0.06689824203939554,
+          "trades": 28,
+          "trades_per_day": 0.5283018867924528,
+          "win_rate": 0.17857142857142858,
+          "pf": 1.3393716396685793,
+          "average_pnl_usd": 1.6798793159405043,
+          "average_mfe_r": 0.7175007939104222,
+          "average_giveback_r": 0.6288158741781519,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 11,
+            "initial_stop": 12
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 11,
+          "missed": 29,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 11
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2045.0355708383188,
+          "return_pct": 0.022517785419159386,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 6,
+          "trades_per_day": 0.2727272727272727,
+          "win_rate": 0.5,
+          "pf": 2.0444720549383404,
+          "average_pnl_usd": 7.505928473053082,
+          "average_mfe_r": 1.1515801985825813,
+          "average_giveback_r": 0.770776138263396,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 3,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 1,
+          "missed": 3,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 1
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3506708531027,
+          "return_pct": 0.0016753354265512943,
+          "max_dd_pct": 0.024028998466372964,
+          "trades": 14,
+          "trades_per_day": 1.75,
+          "win_rate": 0.21428571428571427,
+          "pf": 1.030473613347433,
+          "average_pnl_usd": 0.23933363236445546,
+          "average_mfe_r": 0.7479143111651871,
+          "average_giveback_r": 0.7315575568462275,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 6,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 2,
+          "missed": 8,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 2
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.7006081830536,
+          "return_pct": 0.02135030409152683,
+          "max_dd_pct": 0.0007923901658480892,
+          "trades": 6,
+          "trades_per_day": 2.0,
+          "win_rate": 0.16666666666666666,
+          "pf": 25.419174734874353,
+          "average_pnl_usd": 7.116768030508996,
+          "average_mfe_r": 1.1720900171895776,
+          "average_giveback_r": 0.815931017035814,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "initial_stop": 1,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 1,
+          "missed": 8,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 1
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": -0.1,
+        "min_close_location": 0.55,
+        "require_confirmation": true,
+        "size_multiplier": 0.25
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": -0.1,
+        "min_close_location": 0.55,
+        "require_confirmation": true,
+        "size_multiplier": 0.5
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": -0.1,
+        "min_close_location": 0.55,
+        "require_confirmation": true,
+        "size_multiplier": 1.0
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": -0.1,
+        "min_close_location": 0.6,
+        "require_confirmation": true,
+        "size_multiplier": 0.25
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": -0.1,
+        "min_close_location": 0.6,
+        "require_confirmation": true,
+        "size_multiplier": 0.5
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": -0.1,
+        "min_close_location": 0.6,
+        "require_confirmation": true,
+        "size_multiplier": 1.0
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": -0.1,
+        "min_close_location": 0.65,
+        "require_confirmation": true,
+        "size_multiplier": 0.25
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": -0.1,
+        "min_close_location": 0.65,
+        "require_confirmation": true,
+        "size_multiplier": 0.5
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": -0.1,
+        "min_close_location": 0.65,
+        "require_confirmation": true,
+        "size_multiplier": 1.0
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": -0.1,
+        "min_close_location": 0.7,
+        "require_confirmation": true,
+        "size_multiplier": 0.25
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": -0.1,
+        "min_close_location": 0.7,
+        "require_confirmation": true,
+        "size_multiplier": 0.5
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": -0.1,
+        "min_close_location": 0.7,
+        "require_confirmation": true,
+        "size_multiplier": 1.0
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": 0.0,
+        "min_close_location": 0.55,
+        "require_confirmation": true,
+        "size_multiplier": 0.25
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": 0.0,
+        "min_close_location": 0.55,
+        "require_confirmation": true,
+        "size_multiplier": 0.5
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": 0.0,
+        "min_close_location": 0.55,
+        "require_confirmation": true,
+        "size_multiplier": 1.0
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": 0.0,
+        "min_close_location": 0.6,
+        "require_confirmation": true,
+        "size_multiplier": 0.25
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": 0.0,
+        "min_close_location": 0.6,
+        "require_confirmation": true,
+        "size_multiplier": 0.5
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": 0.0,
+        "min_close_location": 0.6,
+        "require_confirmation": true,
+        "size_multiplier": 1.0
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": 0.0,
+        "min_close_location": 0.65,
+        "require_confirmation": true,
+        "size_multiplier": 0.25
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": 0.0,
+        "min_close_location": 0.65,
+        "require_confirmation": true,
+        "size_multiplier": 0.5
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": 0.0,
+        "min_close_location": 0.65,
+        "require_confirmation": true,
+        "size_multiplier": 1.0
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": 0.0,
+        "min_close_location": 0.7,
+        "require_confirmation": true,
+        "size_multiplier": 0.25
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": 0.0,
+        "min_close_location": 0.7,
+        "require_confirmation": true,
+        "size_multiplier": 0.5
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": 0.0,
+        "min_close_location": 0.7,
+        "require_confirmation": true,
+        "size_multiplier": 1.0
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": 0.1,
+        "min_close_location": 0.55,
+        "require_confirmation": true,
+        "size_multiplier": 0.25
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": 0.1,
+        "min_close_location": 0.55,
+        "require_confirmation": true,
+        "size_multiplier": 0.5
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    },
+    {
+      "viable": false,
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_adverse_bps": 0.0,
+        "min_flow": 0.1,
+        "min_close_location": 0.55,
+        "require_confirmation": true,
+        "size_multiplier": 1.0
+      },
+      "train": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2053.8693384898847,
+          "return_pct": 0.026934669244942366,
+          "max_dd_pct": 0.06378743918101959,
+          "trades": 17,
+          "trades_per_day": 0.32075471698113206,
+          "win_rate": 0.29411764705882354,
+          "pf": 1.4076228541224491,
+          "average_pnl_usd": 3.16878461705201,
+          "average_mfe_r": 1.1589358414376558,
+          "average_giveback_r": 0.9932701759962693,
+          "exit_reasons": {
+            "trailing_stop": 5,
+            "cost_shield": 6,
+            "initial_stop": 6
+          }
+        },
+        "signals": {
+          "maker": 46,
+          "fallback": 0,
+          "missed": 40,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "validation": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2042.4765394306762,
+          "return_pct": 0.021238269715338154,
+          "max_dd_pct": 0.02147742479100012,
+          "trades": 5,
+          "trades_per_day": 0.22727272727272727,
+          "win_rate": 0.4,
+          "pf": 1.9851272604020367,
+          "average_pnl_usd": 8.4953078861352,
+          "average_mfe_r": 1.348070825552047,
+          "average_giveback_r": 0.9161640760726621,
+          "exit_reasons": {
+            "initial_stop": 2,
+            "trailing_stop": 2,
+            "cost_shield": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 4,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "locked_test": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2003.3667554518233,
+          "return_pct": 0.001683377725911761,
+          "max_dd_pct": 0.024021162543211072,
+          "trades": 12,
+          "trades_per_day": 1.5,
+          "win_rate": 0.25,
+          "pf": 1.0306242541348416,
+          "average_pnl_usd": 0.2805629543186198,
+          "average_mfe_r": 0.8631535630114773,
+          "average_giveback_r": 0.8440037763060244,
+          "exit_reasons": {
+            "trailing_stop": 3,
+            "cost_shield": 4,
+            "initial_stop": 5
+          }
+        },
+        "signals": {
+          "maker": 17,
+          "fallback": 0,
+          "missed": 10,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      },
+      "recent": {
+        "summary": {
+          "start": 2000.0,
+          "end": 2043.8285854697713,
+          "return_pct": 0.021914292734885654,
+          "max_dd_pct": 0.00024062869669638776,
+          "trades": 5,
+          "trades_per_day": 1.6666666666666667,
+          "win_rate": 0.2,
+          "pf": 68.92830504688436,
+          "average_pnl_usd": 8.7657170939543,
+          "average_mfe_r": 1.4037053831578645,
+          "average_giveback_r": 0.9652775829733482,
+          "exit_reasons": {
+            "cost_shield": 4,
+            "trailing_stop": 1
+          }
+        },
+        "signals": {
+          "maker": 5,
+          "fallback": 0,
+          "missed": 9,
+          "unavailable": 0
+        },
+        "portfolio_fallback_trades": 0
+      }
+    }
+  ],
+  "locked_comparison": {
+    "return_delta_pct_points": 1.070750814532273,
+    "max_dd_delta_pct_points": -0.25358814059285306,
+    "trade_delta": 3
+  },
+  "decision": "deploy_small_bounded_fallback"
+}

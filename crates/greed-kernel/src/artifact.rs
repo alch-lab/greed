@@ -68,6 +68,10 @@ pub struct PositionPlan {
     pub taker_fallback: bool,
     #[serde(default)]
     pub max_entry_adverse_bps: f64,
+    #[serde(default)]
+    pub taker_fallback_max_adverse_bps: f64,
+    #[serde(default = "default_entry_size_multiplier")]
+    pub taker_fallback_size_multiplier: f64,
     pub stop_price: f64,
     pub take_profit_prices: Vec<(f64, f64)>,
     pub break_even_after_fraction: Option<f64>,
@@ -77,6 +81,10 @@ pub struct PositionPlan {
     pub trailing_activation_pct: Option<f64>,
     pub trailing_distance_pct: Option<f64>,
     pub max_hold_ms: i64,
+}
+
+fn default_entry_size_multiplier() -> f64 {
+    1.0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
