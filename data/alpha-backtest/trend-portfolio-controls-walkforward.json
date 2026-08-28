@@ -1,0 +1,769 @@
+{
+  "strategy": "trend_portfolio_controls_v1",
+  "selection": "train+validation only; locked test untouched",
+  "periods": {
+    "train": {
+      "start_ms": 1780272000000,
+      "end_ms": 1784851200000
+    },
+    "validation": {
+      "start_ms": 1784851200000,
+      "end_ms": 1786752000000
+    },
+    "locked_test": {
+      "start_ms": 1786752000000,
+      "end_ms": 1787443200000
+    }
+  },
+  "baseline": {
+    "train": {
+      "start": 2000.0,
+      "end": 2053.8693384898847,
+      "return_pct": 0.026934669244942366,
+      "max_dd_pct": 0.06378743918101959,
+      "trades": 17,
+      "trades_per_day": 0.32075471698113206,
+      "win_rate": 0.29411764705882354,
+      "pf": 1.4076228541224491,
+      "average_pnl_usd": 3.16878461705201,
+      "reduced_size_trades": 0
+    },
+    "validation": {
+      "start": 2000.0,
+      "end": 2042.4765394306762,
+      "return_pct": 0.021238269715338154,
+      "max_dd_pct": 0.02147742479100012,
+      "trades": 5,
+      "trades_per_day": 0.22727272727272727,
+      "win_rate": 0.4,
+      "pf": 1.9851272604020367,
+      "average_pnl_usd": 8.495307886135198,
+      "reduced_size_trades": 0
+    },
+    "locked_test": {
+      "start": 2000.0,
+      "end": 2003.3667554518233,
+      "return_pct": 0.001683377725911761,
+      "max_dd_pct": 0.024021162543211072,
+      "trades": 12,
+      "trades_per_day": 1.5,
+      "win_rate": 0.25,
+      "pf": 1.0306242541348416,
+      "average_pnl_usd": 0.2805629543186198,
+      "reduced_size_trades": 0
+    }
+  },
+  "selected": {
+    "score": 0.008057720580800488,
+    "config": {
+      "max_same_side": 1,
+      "second_same_side_multiplier": 1.0,
+      "soft_pf_enabled": true,
+      "soft_pf_multiplier": 0.5,
+      "soft_pf_trades": 4,
+      "soft_pf_floor": 0.8
+    },
+    "train": {
+      "start": 2000.0,
+      "end": 2068.9043384953757,
+      "return_pct": 0.03445216924768779,
+      "max_dd_pct": 0.03765871181296476,
+      "trades": 15,
+      "trades_per_day": 0.2830188679245283,
+      "win_rate": 0.3333333333333333,
+      "pf": 1.8832949767324954,
+      "average_pnl_usd": 4.5936225663583405,
+      "reduced_size_trades": 4
+    },
+    "validation": {
+      "start": 2000.0,
+      "end": 2042.4765394306762,
+      "return_pct": 0.021238269715338154,
+      "max_dd_pct": 0.02147742479100012,
+      "trades": 5,
+      "trades_per_day": 0.22727272727272727,
+      "win_rate": 0.4,
+      "pf": 1.9851272604020367,
+      "average_pnl_usd": 8.495307886135198,
+      "reduced_size_trades": 0
+    },
+    "locked_test": {
+      "start": 2000.0,
+      "end": 2001.0515252868122,
+      "return_pct": 0.0005257626434060914,
+      "max_dd_pct": 0.021684063203461057,
+      "trades": 10,
+      "trades_per_day": 1.25,
+      "win_rate": 0.2,
+      "pf": 1.0190726402457202,
+      "average_pnl_usd": 0.10515252868119847,
+      "reduced_size_trades": 5
+    }
+  },
+  "locked_comparison": {
+    "return_delta_pct_points": -0.11576150825056697,
+    "max_dd_delta_pct_points": -0.2337099339750015,
+    "trade_delta": -2
+  },
+  "decision": "reject_controls_locked_test_return_and_trade_count_worse",
+  "grid": [
+    {
+      "score": 0.008057720580800488,
+      "config": {
+        "max_same_side": 1,
+        "second_same_side_multiplier": 1.0,
+        "soft_pf_enabled": true,
+        "soft_pf_multiplier": 0.5,
+        "soft_pf_trades": 4,
+        "soft_pf_floor": 0.8
+      },
+      "train": {
+        "start": 2000.0,
+        "end": 2068.9043384953757,
+        "return_pct": 0.03445216924768779,
+        "max_dd_pct": 0.03765871181296476,
+        "trades": 15,
+        "trades_per_day": 0.2830188679245283,
+        "win_rate": 0.3333333333333333,
+        "pf": 1.8832949767324954,
+        "average_pnl_usd": 4.5936225663583405,
+        "reduced_size_trades": 4
+      },
+      "validation": {
+        "start": 2000.0,
+        "end": 2042.4765394306762,
+        "return_pct": 0.021238269715338154,
+        "max_dd_pct": 0.02147742479100012,
+        "trades": 5,
+        "trades_per_day": 0.22727272727272727,
+        "win_rate": 0.4,
+        "pf": 1.9851272604020367,
+        "average_pnl_usd": 8.495307886135198,
+        "reduced_size_trades": 0
+      },
+      "locked_test": {
+        "start": 2000.0,
+        "end": 2001.0515252868122,
+        "return_pct": 0.0005257626434060914,
+        "max_dd_pct": 0.021684063203461057,
+        "trades": 10,
+        "trades_per_day": 1.25,
+        "win_rate": 0.2,
+        "pf": 1.0190726402457202,
+        "average_pnl_usd": 0.10515252868119847,
+        "reduced_size_trades": 5
+      }
+    },
+    {
+      "score": 0.006229531295446329,
+      "config": {
+        "max_same_side": 1,
+        "second_same_side_multiplier": 1.0,
+        "soft_pf_enabled": false,
+        "soft_pf_multiplier": 0.5,
+        "soft_pf_trades": 4,
+        "soft_pf_floor": 0.8
+      },
+      "train": {
+        "start": 2000.0,
+        "end": 2099.7315890972304,
+        "return_pct": 0.04986579454861517,
+        "max_dd_pct": 0.0428821097711195,
+        "trades": 15,
+        "trades_per_day": 0.2830188679245283,
+        "win_rate": 0.3333333333333333,
+        "pf": 2.121855230827786,
+        "average_pnl_usd": 6.648772606481981,
+        "reduced_size_trades": 0
+      },
+      "validation": {
+        "start": 2000.0,
+        "end": 2042.4765394306762,
+        "return_pct": 0.021238269715338154,
+        "max_dd_pct": 0.02147742479100012,
+        "trades": 5,
+        "trades_per_day": 0.22727272727272727,
+        "win_rate": 0.4,
+        "pf": 1.9851272604020367,
+        "average_pnl_usd": 8.495307886135198,
+        "reduced_size_trades": 0
+      },
+      "locked_test": {
+        "start": 2000.0,
+        "end": 1950.7069488740678,
+        "return_pct": -0.024646525562966093,
+        "max_dd_pct": 0.04280076218447837,
+        "trades": 9,
+        "trades_per_day": 1.125,
+        "win_rate": 0.1111111111111111,
+        "pf": 0.4348750117321857,
+        "average_pnl_usd": -5.477005680659113,
+        "reduced_size_trades": 0
+      }
+    },
+    {
+      "score": 0.0062185214487269335,
+      "config": {
+        "max_same_side": 2,
+        "second_same_side_multiplier": 0.5,
+        "soft_pf_enabled": true,
+        "soft_pf_multiplier": 0.5,
+        "soft_pf_trades": 4,
+        "soft_pf_floor": 0.8
+      },
+      "train": {
+        "start": 2000.0,
+        "end": 2057.607107727002,
+        "return_pct": 0.028803553863500975,
+        "max_dd_pct": 0.04291356647603206,
+        "trades": 16,
+        "trades_per_day": 0.3018867924528302,
+        "win_rate": 0.3125,
+        "pf": 1.648131807469693,
+        "average_pnl_usd": 3.6004442329376007,
+        "reduced_size_trades": 5
+      },
+      "validation": {
+        "start": 2000.0,
+        "end": 2042.4765394306762,
+        "return_pct": 0.021238269715338154,
+        "max_dd_pct": 0.02147742479100012,
+        "trades": 5,
+        "trades_per_day": 0.22727272727272727,
+        "win_rate": 0.4,
+        "pf": 1.9851272604020367,
+        "average_pnl_usd": 8.495307886135198,
+        "reduced_size_trades": 0
+      },
+      "locked_test": {
+        "start": 2000.0,
+        "end": 1978.3447678138475,
+        "return_pct": -0.010827616093076253,
+        "max_dd_pct": 0.029239063827218748,
+        "trades": 12,
+        "trades_per_day": 1.5,
+        "win_rate": 0.25,
+        "pf": 0.7525769922000434,
+        "average_pnl_usd": -1.8046026821793764,
+        "reduced_size_trades": 6
+      }
+    },
+    {
+      "score": 0.005482841795897465,
+      "config": {
+        "max_same_side": 2,
+        "second_same_side_multiplier": 0.7,
+        "soft_pf_enabled": true,
+        "soft_pf_multiplier": 0.5,
+        "soft_pf_trades": 4,
+        "soft_pf_floor": 0.8
+      },
+      "train": {
+        "start": 2000.0,
+        "end": 2053.088215419653,
+        "return_pct": 0.026544107709826514,
+        "max_dd_pct": 0.045015508341259114,
+        "trades": 16,
+        "trades_per_day": 0.3018867924528302,
+        "win_rate": 0.3125,
+        "pf": 1.5694256034500385,
+        "average_pnl_usd": 3.318013463728263,
+        "reduced_size_trades": 5
+      },
+      "validation": {
+        "start": 2000.0,
+        "end": 2042.4765394306762,
+        "return_pct": 0.021238269715338154,
+        "max_dd_pct": 0.02147742479100012,
+        "trades": 5,
+        "trades_per_day": 0.22727272727272727,
+        "win_rate": 0.4,
+        "pf": 1.9851272604020367,
+        "average_pnl_usd": 8.495307886135198,
+        "reduced_size_trades": 0
+      },
+      "locked_test": {
+        "start": 2000.0,
+        "end": 1977.8347233666934,
+        "return_pct": -0.011082638316653237,
+        "max_dd_pct": 0.029489339326749686,
+        "trades": 12,
+        "trades_per_day": 1.5,
+        "win_rate": 0.25,
+        "pf": 0.7588513987680395,
+        "average_pnl_usd": -1.8471063861088604,
+        "reduced_size_trades": 6
+      }
+    },
+    {
+      "score": 0.004400314972080061,
+      "config": {
+        "max_same_side": 2,
+        "second_same_side_multiplier": 0.5,
+        "soft_pf_enabled": false,
+        "soft_pf_multiplier": 0.5,
+        "soft_pf_trades": 4,
+        "soft_pf_floor": 0.8
+      },
+      "train": {
+        "start": 2000.0,
+        "end": 2088.2660264453934,
+        "return_pct": 0.04413301322269669,
+        "max_dd_pct": 0.04810844212359455,
+        "trades": 16,
+        "trades_per_day": 0.3018867924528302,
+        "win_rate": 0.3125,
+        "pf": 1.8852024164499548,
+        "average_pnl_usd": 5.516626652837077,
+        "reduced_size_trades": 1
+      },
+      "validation": {
+        "start": 2000.0,
+        "end": 2042.4765394306762,
+        "return_pct": 0.021238269715338154,
+        "max_dd_pct": 0.02147742479100012,
+        "trades": 5,
+        "trades_per_day": 0.22727272727272727,
+        "win_rate": 0.4,
+        "pf": 1.9851272604020367,
+        "average_pnl_usd": 8.495307886135198,
+        "reduced_size_trades": 0
+      },
+      "locked_test": {
+        "start": 2000.0,
+        "end": 1995.080318443151,
+        "return_pct": -0.002459840778424427,
+        "max_dd_pct": 0.028058060498303283,
+        "trades": 12,
+        "trades_per_day": 1.5,
+        "win_rate": 0.25,
+        "pf": 0.950156661151708,
+        "average_pnl_usd": -0.40997346307072474,
+        "reduced_size_trades": 3
+      }
+    },
+    {
+      "score": 0.00437932231665334,
+      "config": {
+        "max_same_side": 2,
+        "second_same_side_multiplier": 1.0,
+        "soft_pf_enabled": true,
+        "soft_pf_multiplier": 0.5,
+        "soft_pf_trades": 4,
+        "soft_pf_floor": 0.8
+      },
+      "train": {
+        "start": 2000.0,
+        "end": 2046.3098769586288,
+        "return_pct": 0.02315493847931438,
+        "max_dd_pct": 0.04816842113909947,
+        "trades": 16,
+        "trades_per_day": 0.3018867924528302,
+        "win_rate": 0.3125,
+        "pf": 1.464234947000963,
+        "average_pnl_usd": 2.8943673099142564,
+        "reduced_size_trades": 4
+      },
+      "validation": {
+        "start": 2000.0,
+        "end": 2042.4765394306762,
+        "return_pct": 0.021238269715338154,
+        "max_dd_pct": 0.02147742479100012,
+        "trades": 5,
+        "trades_per_day": 0.22727272727272727,
+        "win_rate": 0.4,
+        "pf": 1.9851272604020367,
+        "average_pnl_usd": 8.495307886135198,
+        "reduced_size_trades": 0
+      },
+      "locked_test": {
+        "start": 2000.0,
+        "end": 1977.0382714753398,
+        "return_pct": -0.011480864262330082,
+        "max_dd_pct": 0.02988015310008474,
+        "trades": 12,
+        "trades_per_day": 1.5,
+        "win_rate": 0.25,
+        "pf": 0.7668927778325179,
+        "average_pnl_usd": -1.9134773770550453,
+        "reduced_size_trades": 4
+      }
+    },
+    {
+      "score": 0.00437932231665334,
+      "config": {
+        "max_same_side": 3,
+        "second_same_side_multiplier": 0.5,
+        "soft_pf_enabled": true,
+        "soft_pf_multiplier": 0.5,
+        "soft_pf_trades": 4,
+        "soft_pf_floor": 0.8
+      },
+      "train": {
+        "start": 2000.0,
+        "end": 2046.3098769586288,
+        "return_pct": 0.02315493847931438,
+        "max_dd_pct": 0.04816842113909947,
+        "trades": 17,
+        "trades_per_day": 0.32075471698113206,
+        "win_rate": 0.29411764705882354,
+        "pf": 1.4642349470009657,
+        "average_pnl_usd": 2.7241104093310753,
+        "reduced_size_trades": 6
+      },
+      "validation": {
+        "start": 2000.0,
+        "end": 2042.4765394306762,
+        "return_pct": 0.021238269715338154,
+        "max_dd_pct": 0.02147742479100012,
+        "trades": 5,
+        "trades_per_day": 0.22727272727272727,
+        "win_rate": 0.4,
+        "pf": 1.9851272604020367,
+        "average_pnl_usd": 8.495307886135198,
+        "reduced_size_trades": 0
+      },
+      "locked_test": {
+        "start": 2000.0,
+        "end": 1978.3447614135907,
+        "return_pct": -0.010827619293204638,
+        "max_dd_pct": 0.02923906696778311,
+        "trades": 12,
+        "trades_per_day": 1.5,
+        "win_rate": 0.25,
+        "pf": 0.7525769369112533,
+        "average_pnl_usd": -1.8046032155341185,
+        "reduced_size_trades": 6
+      }
+    },
+    {
+      "score": 0.003668628442733548,
+      "config": {
+        "max_same_side": 2,
+        "second_same_side_multiplier": 0.7,
+        "soft_pf_enabled": false,
+        "soft_pf_multiplier": 0.5,
+        "soft_pf_trades": 4,
+        "soft_pf_floor": 0.8
+      },
+      "train": {
+        "start": 2000.0,
+        "end": 2083.679801384659,
+        "return_pct": 0.04183990069232957,
+        "max_dd_pct": 0.050198975064584594,
+        "trades": 16,
+        "trades_per_day": 0.3018867924528302,
+        "win_rate": 0.3125,
+        "pf": 1.8043163284688204,
+        "average_pnl_usd": 5.229987586541165,
+        "reduced_size_trades": 1
+      },
+      "validation": {
+        "start": 2000.0,
+        "end": 2042.4765394306762,
+        "return_pct": 0.021238269715338154,
+        "max_dd_pct": 0.02147742479100012,
+        "trades": 5,
+        "trades_per_day": 0.22727272727272727,
+        "win_rate": 0.4,
+        "pf": 1.9851272604020367,
+        "average_pnl_usd": 8.495307886135198,
+        "reduced_size_trades": 0
+      },
+      "locked_test": {
+        "start": 2000.0,
+        "end": 1998.42023339406,
+        "return_pct": -0.0007898833029700292,
+        "max_dd_pct": 0.026430956373648007,
+        "trades": 12,
+        "trades_per_day": 1.5,
+        "win_rate": 0.25,
+        "pf": 0.9846918249296502,
+        "average_pnl_usd": -0.13164721716163855,
+        "reduced_size_trades": 3
+      }
+    },
+    {
+      "score": 0.0025710986487137953,
+      "config": {
+        "max_same_side": 2,
+        "second_same_side_multiplier": 1.0,
+        "soft_pf_enabled": false,
+        "soft_pf_multiplier": 0.5,
+        "soft_pf_trades": 4,
+        "soft_pf_floor": 0.8
+      },
+      "train": {
+        "start": 2000.0,
+        "end": 2076.8004637935574,
+        "return_pct": 0.03840023189677866,
+        "max_dd_pct": 0.0533347744760696,
+        "trades": 16,
+        "trades_per_day": 0.3018867924528302,
+        "win_rate": 0.3125,
+        "pf": 1.694858112529739,
+        "average_pnl_usd": 4.8000289870972965,
+        "reduced_size_trades": 0
+      },
+      "validation": {
+        "start": 2000.0,
+        "end": 2042.4765394306762,
+        "return_pct": 0.021238269715338154,
+        "max_dd_pct": 0.02147742479100012,
+        "trades": 5,
+        "trades_per_day": 0.22727272727272727,
+        "win_rate": 0.4,
+        "pf": 1.9851272604020367,
+        "average_pnl_usd": 8.495307886135198,
+        "reduced_size_trades": 0
+      },
+      "locked_test": {
+        "start": 2000.0,
+        "end": 2003.366768485516,
+        "return_pct": 0.001683384242758157,
+        "max_dd_pct": 0.024021156193595905,
+        "trades": 12,
+        "trades_per_day": 1.5,
+        "win_rate": 0.25,
+        "pf": 1.0306243761843523,
+        "average_pnl_usd": 0.28056404045966243,
+        "reduced_size_trades": 0
+      }
+    },
+    {
+      "score": 0.0025710986487137953,
+      "config": {
+        "max_same_side": 3,
+        "second_same_side_multiplier": 0.5,
+        "soft_pf_enabled": false,
+        "soft_pf_multiplier": 0.5,
+        "soft_pf_trades": 4,
+        "soft_pf_floor": 0.8
+      },
+      "train": {
+        "start": 2000.0,
+        "end": 2076.8004637935574,
+        "return_pct": 0.03840023189677866,
+        "max_dd_pct": 0.0533347744760696,
+        "trades": 17,
+        "trades_per_day": 0.32075471698113206,
+        "win_rate": 0.29411764705882354,
+        "pf": 1.694858112529742,
+        "average_pnl_usd": 4.517674340797466,
+        "reduced_size_trades": 2
+      },
+      "validation": {
+        "start": 2000.0,
+        "end": 2042.4765394306762,
+        "return_pct": 0.021238269715338154,
+        "max_dd_pct": 0.02147742479100012,
+        "trades": 5,
+        "trades_per_day": 0.22727272727272727,
+        "win_rate": 0.4,
+        "pf": 1.9851272604020367,
+        "average_pnl_usd": 8.495307886135198,
+        "reduced_size_trades": 0
+      },
+      "locked_test": {
+        "start": 2000.0,
+        "end": 1995.0803119887523,
+        "return_pct": -0.0024598440056238235,
+        "max_dd_pct": 0.02805806364268837,
+        "trades": 12,
+        "trades_per_day": 1.5,
+        "win_rate": 0.25,
+        "pf": 0.9501565989276339,
+        "average_pnl_usd": -0.40997400093731146,
+        "reduced_size_trades": 3
+      }
+    },
+    {
+      "score": 0.0011077255900208034,
+      "config": {
+        "max_same_side": 3,
+        "second_same_side_multiplier": 0.7,
+        "soft_pf_enabled": false,
+        "soft_pf_multiplier": 0.5,
+        "soft_pf_trades": 4,
+        "soft_pf_floor": 0.8
+      },
+      "train": {
+        "start": 2000.0,
+        "end": 2067.6280136720884,
+        "return_pct": 0.033814006836044186,
+        "max_dd_pct": 0.057515840358049575,
+        "trades": 17,
+        "trades_per_day": 0.32075471698113206,
+        "win_rate": 0.29411764705882354,
+        "pf": 1.5674536549878033,
+        "average_pnl_usd": 3.9781184512992844,
+        "reduced_size_trades": 2
+      },
+      "validation": {
+        "start": 2000.0,
+        "end": 2042.4765394306762,
+        "return_pct": 0.021238269715338154,
+        "max_dd_pct": 0.02147742479100012,
+        "trades": 5,
+        "trades_per_day": 0.22727272727272727,
+        "win_rate": 0.4,
+        "pf": 1.9851272604020367,
+        "average_pnl_usd": 8.495307886135198,
+        "reduced_size_trades": 0
+      },
+      "locked_test": {
+        "start": 2000.0,
+        "end": 1998.4202243229313,
+        "return_pct": -0.0007898878385343977,
+        "max_dd_pct": 0.02643096079282381,
+        "trades": 12,
+        "trades_per_day": 1.5,
+        "win_rate": 0.25,
+        "pf": 0.9846917383317739,
+        "average_pnl_usd": -0.13164797308906337,
+        "reduced_size_trades": 3
+      }
+    },
+    {
+      "score": 0.0003057394676213819,
+      "config": {
+        "max_same_side": 3,
+        "second_same_side_multiplier": 0.7,
+        "soft_pf_enabled": true,
+        "soft_pf_multiplier": 0.5,
+        "soft_pf_trades": 4,
+        "soft_pf_floor": 0.8
+      },
+      "train": {
+        "start": 2000.0,
+        "end": 2037.27209234393,
+        "return_pct": 0.018636046171965015,
+        "max_dd_pct": 0.05237230486955324,
+        "trades": 17,
+        "trades_per_day": 0.32075471698113206,
+        "win_rate": 0.29411764705882354,
+        "pf": 1.343667158183316,
+        "average_pnl_usd": 2.1924760202311497,
+        "reduced_size_trades": 6
+      },
+      "validation": {
+        "start": 2000.0,
+        "end": 2042.4765394306762,
+        "return_pct": 0.021238269715338154,
+        "max_dd_pct": 0.02147742479100012,
+        "trades": 5,
+        "trades_per_day": 0.22727272727272727,
+        "win_rate": 0.4,
+        "pf": 1.9851272604020367,
+        "average_pnl_usd": 8.495307886135198,
+        "reduced_size_trades": 0
+      },
+      "locked_test": {
+        "start": 2000.0,
+        "end": 1977.834714389005,
+        "return_pct": -0.011082642805497422,
+        "max_dd_pct": 0.02948934373204304,
+        "trades": 12,
+        "trades_per_day": 1.5,
+        "win_rate": 0.25,
+        "pf": 0.7588513242695641,
+        "average_pnl_usd": -1.8471071342495586,
+        "reduced_size_trades": 6
+      }
+    },
+    {
+      "score": -0.0010873339980187018,
+      "config": {
+        "max_same_side": 3,
+        "second_same_side_multiplier": 1.0,
+        "soft_pf_enabled": false,
+        "soft_pf_multiplier": 0.5,
+        "soft_pf_trades": 4,
+        "soft_pf_floor": 0.8
+      },
+      "train": {
+        "start": 2000.0,
+        "end": 2053.8693384898847,
+        "return_pct": 0.026934669244942366,
+        "max_dd_pct": 0.06378743918101959,
+        "trades": 17,
+        "trades_per_day": 0.32075471698113206,
+        "win_rate": 0.29411764705882354,
+        "pf": 1.4076228541224491,
+        "average_pnl_usd": 3.16878461705201,
+        "reduced_size_trades": 0
+      },
+      "validation": {
+        "start": 2000.0,
+        "end": 2042.4765394306762,
+        "return_pct": 0.021238269715338154,
+        "max_dd_pct": 0.02147742479100012,
+        "trades": 5,
+        "trades_per_day": 0.22727272727272727,
+        "win_rate": 0.4,
+        "pf": 1.9851272604020367,
+        "average_pnl_usd": 8.495307886135198,
+        "reduced_size_trades": 0
+      },
+      "locked_test": {
+        "start": 2000.0,
+        "end": 2003.3667554518233,
+        "return_pct": 0.001683377725911761,
+        "max_dd_pct": 0.024021162543211072,
+        "trades": 12,
+        "trades_per_day": 1.5,
+        "win_rate": 0.25,
+        "pf": 1.0306242541348416,
+        "average_pnl_usd": 0.2805629543186198,
+        "reduced_size_trades": 0
+      }
+    },
+    {
+      "score": -0.008679637951890955,
+      "config": {
+        "max_same_side": 3,
+        "second_same_side_multiplier": 1.0,
+        "soft_pf_enabled": true,
+        "soft_pf_multiplier": 0.5,
+        "soft_pf_trades": 4,
+        "soft_pf_floor": 0.8
+      },
+      "train": {
+        "start": 2000.0,
+        "end": 2023.7154154218817,
+        "return_pct": 0.011857707710940968,
+        "max_dd_pct": 0.05867813046523407,
+        "trades": 17,
+        "trades_per_day": 0.32075471698113206,
+        "win_rate": 0.29411764705882354,
+        "pf": 1.1951850421575159,
+        "average_pnl_usd": 1.3950244365812612,
+        "reduced_size_trades": 4
+      },
+      "validation": {
+        "start": 2000.0,
+        "end": 2042.4765394306762,
+        "return_pct": 0.021238269715338154,
+        "max_dd_pct": 0.02147742479100012,
+        "trades": 5,
+        "trades_per_day": 0.22727272727272727,
+        "win_rate": 0.4,
+        "pf": 1.9851272604020367,
+        "average_pnl_usd": 8.495307886135198,
+        "reduced_size_trades": 0
+      },
+      "locked_test": {
+        "start": 2000.0,
+        "end": 1977.0382586129374,
+        "return_pct": -0.01148087069353132,
+        "max_dd_pct": 0.029880159411582063,
+        "trades": 12,
+        "trades_per_day": 1.5,
+        "win_rate": 0.25,
+        "pf": 0.7668926771134248,
+        "average_pnl_usd": -1.9134784489218857,
+        "reduced_size_trades": 4
+      }
+    }
+  ]
+}

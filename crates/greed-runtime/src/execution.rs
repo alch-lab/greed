@@ -18,6 +18,8 @@ type HmacSha256 = Hmac<Sha256>;
 
 const MAKER_REPRICE_INTERVAL_MS: i64 = 15_000;
 const MAX_MAKER_REPRICES: u8 = 3;
+const MIN_PERFORMANCE_FILL_RATIO: f64 = 0.20;
+const PERFORMANCE_BASIS_VERSION: u32 = 1;
 
 pub struct ExchangeEvent {
     pub kind: String,
@@ -28,6 +30,7 @@ pub struct ExchangeEvent {
 pub struct RecipeGateStatus {
     pub allowed: bool,
     pub completed_trades: usize,
+    pub excluded_partial_trades: usize,
     pub rolling_profit_factor: Option<f64>,
     pub rolling_net_pnl_usd: f64,
     pub next_probe_ms: Option<i64>,
@@ -63,6 +66,14 @@ struct ExecutionMeta {
     cumulative_reported_fee_usd: f64,
     #[serde(default)]
     cumulative_reported_pnl_usd: f64,
+    /// Planned/actual exposure is persisted so a tiny maker partial does not
+    /// count as a full statistical sample in the rolling performance gate.
+    #[serde(default)]
+    planned_notional_usd: Option<f64>,
+    #[serde(default)]
+    fill_ratio: Option<f64>,
+    #[serde(default)]
+    initial_risk_usd: Option<f64>,
     stop_price: f64,
     #[serde(default)]
     take_profit_price: f64,
@@ -109,6 +120,7 @@ struct DemoState {
     recipe_outcomes: BTreeMap<String, Vec<ExecutionOutcome>>,
     symbol_outcomes: BTreeMap<String, Vec<ExecutionOutcome>>,
     performance_epoch: u32,
+    performance_basis_version: u32,
     execution_halt_reason: Option<String>,
 }
 
@@ -116,6 +128,21 @@ struct DemoState {
 struct ExecutionOutcome {
     exit_ms: i64,
     pnl_usd: f64,
+    #[serde(default)]
+    pnl_r: Option<f64>,
+    #[serde(default)]
+    fill_ratio: Option<f64>,
+}
+
+impl ExecutionOutcome {
+    fn performance_eligible(&self) -> bool {
+        self.fill_ratio
+            .is_none_or(|value| value >= MIN_PERFORMANCE_FILL_RATIO)
+    }
+
+    fn performance_value(&self) -> f64 {
+        self.pnl_r.unwrap_or(self.pnl_usd)
+    }
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -235,6 +262,7 @@ pub struct BinanceDemoExecution {
     last_error: Option<String>,
     last_sync_ms: Option<i64>,
     performance_epoch_reset: bool,
+    performance_basis_reset: bool,
 }
 
 impl BinanceDemoExecution {
@@ -265,6 +293,14 @@ impl BinanceDemoExecution {
             state.performance_epoch = risk.rolling_pf_epoch;
             state.execution_halt_reason = None;
         }
+        let performance_basis_reset = state.performance_basis_version != PERFORMANCE_BASIS_VERSION;
+        if performance_basis_reset {
+            // Dollar PF and risk-normalized R PF cannot share one rolling
+            // window. Reset only the internal recipe sample window; account
+            // baseline, run history, PnL curve, symbol cooldowns and exits stay.
+            state.recipe_outcomes.clear();
+            state.performance_basis_version = PERFORMANCE_BASIS_VERSION;
+        }
         let mut value = Self {
             client,
             config,
@@ -280,6 +316,7 @@ impl BinanceDemoExecution {
             last_error: None,
             last_sync_ms: None,
             performance_epoch_reset,
+            performance_basis_reset,
         };
         value.initialize().await?;
         if value.performance_epoch_reset {
@@ -302,6 +339,8 @@ impl BinanceDemoExecution {
             value.state.risk_day = chrono::Utc::now().format("%Y-%m-%d").to_string();
             value.state.risk_day_start_equity_usd = Some(value.portfolio.initial_equity_usd);
             value.state.seen.clear();
+            value.save()?;
+        } else if value.performance_basis_reset {
             value.save()?;
         }
         Ok(value)
@@ -766,10 +805,28 @@ impl BinanceDemoExecution {
                         let (exit_reason, exit_order_id, exit_order_status) =
                             self.attribute_exit(&symbol, &meta, summary.as_ref()).await;
                         self.cancel_all(&symbol).await.ok();
+                        let pnl_r = summary.as_ref().and_then(|value| {
+                            meta.initial_risk_usd
+                                .filter(|risk| *risk > f64::EPSILON)
+                                .map(|risk| value.net_pnl_usd / risk)
+                        });
+                        // Positions restored from the previous state schema do
+                        // not have an initial-risk basis. Reconcile and report
+                        // them normally, but do not mix their dollar PnL into
+                        // the new R-multiple performance window.
+                        let statistical_fill_ratio = meta
+                            .initial_risk_usd
+                            .is_some()
+                            .then_some(meta.fill_ratio.unwrap_or_default());
+                        let performance_sample = statistical_fill_ratio
+                            .is_some_and(|value| value >= MIN_PERFORMANCE_FILL_RATIO);
                         if let Some(summary) = summary.as_ref() {
+                            let trade_pnl_usd = summary.net_pnl_usd;
                             let outcome = ExecutionOutcome {
                                 exit_ms: now_ms,
-                                pnl_usd: summary.net_pnl_usd,
+                                pnl_usd: trade_pnl_usd,
+                                pnl_r,
+                                fill_ratio: statistical_fill_ratio.or(Some(0.0)),
                             };
                             self.state
                                 .recipe_outcomes
@@ -804,6 +861,9 @@ impl BinanceDemoExecution {
                                 "fee_usd": summary.as_ref().map(|value| value.fees_usd - meta.cumulative_reported_fee_usd),
                                 "pnl_usd": summary.as_ref().map(|value| value.net_pnl_usd - meta.cumulative_reported_pnl_usd),
                                 "trade_net_pnl_usd": summary.as_ref().map(|value| value.net_pnl_usd),
+                                "pnl_r": pnl_r,
+                                "fill_ratio": meta.fill_ratio,
+                                "performance_sample": performance_sample,
                                 "maker_fills":summary.as_ref().map(|value| value.maker_fills),
                                 "taker_fills":summary.as_ref().map(|value| value.taker_fills),
                                 "maker_notional_usd":summary.as_ref().map(|value| value.maker_notional_usd),
@@ -877,17 +937,21 @@ impl BinanceDemoExecution {
             .get(recipe)
             .map(Vec::as_slice)
             .unwrap_or_default();
-        let start = outcomes.len().saturating_sub(self.risk.rolling_pf_window);
-        let window = &outcomes[start..];
+        let eligible: Vec<_> = outcomes
+            .iter()
+            .filter(|outcome| outcome.performance_eligible())
+            .collect();
+        let start = eligible.len().saturating_sub(self.risk.rolling_pf_window);
+        let window = &eligible[start..];
         let profit: f64 = window
             .iter()
-            .filter(|outcome| outcome.pnl_usd > 0.0)
-            .map(|outcome| outcome.pnl_usd)
+            .map(|outcome| outcome.performance_value())
+            .filter(|value| *value > 0.0)
             .sum();
         let loss: f64 = -window
             .iter()
-            .filter(|outcome| outcome.pnl_usd < 0.0)
-            .map(|outcome| outcome.pnl_usd)
+            .map(|outcome| outcome.performance_value())
+            .filter(|value| *value < 0.0)
             .sum::<f64>();
         let rolling_profit_factor = (loss > f64::EPSILON).then_some(profit / loss);
         let failed = window.len() >= self.risk.rolling_pf_min_trades
@@ -903,6 +967,7 @@ impl BinanceDemoExecution {
         RecipeGateStatus {
             allowed: !failed || next_probe_ms.is_some_and(|value| now_ms >= value),
             completed_trades: window.len(),
+            excluded_partial_trades: outcomes.len().saturating_sub(eligible.len()),
             rolling_profit_factor,
             rolling_net_pnl_usd: window.iter().map(|outcome| outcome.pnl_usd).sum(),
             next_probe_ms,
@@ -1096,6 +1161,7 @@ impl BinanceDemoExecution {
             } else {
                 1.0
             };
+            let cost = plan_cost_diagnostics(frame, plan);
             // Claim the candidate before touching the exchange. At-most-once is the
             // safe failure mode: an entry can fill even when a later protection or
             // reconciliation request fails. Retrying the same signal would open and
@@ -1105,6 +1171,9 @@ impl BinanceDemoExecution {
             let attempt_started_ms = chrono::Utc::now().timestamp_millis();
             match self.place_bracket(plan, size_multiplier).await {
                 Ok(fill) => {
+                    let planned_notional_usd = plan.notional_usd * size_multiplier;
+                    let actual_notional_usd = fill.entry_price * fill.quantity;
+                    let fill_ratio = actual_notional_usd / planned_notional_usd.max(f64::EPSILON);
                     self.state.positions.insert(
                         plan.symbol.clone(),
                         ExecutionMeta {
@@ -1117,6 +1186,11 @@ impl BinanceDemoExecution {
                             last_observed_quantity: fill.quantity,
                             cumulative_reported_fee_usd: 0.0,
                             cumulative_reported_pnl_usd: 0.0,
+                            planned_notional_usd: Some(planned_notional_usd),
+                            fill_ratio: Some(fill_ratio),
+                            initial_risk_usd: Some(
+                                fill.quantity * (fill.entry_price - fill.stop_price).abs(),
+                            ),
                             stop_price: fill.stop_price,
                             take_profit_price: fill
                                 .take_profit_prices
@@ -1159,12 +1233,9 @@ impl BinanceDemoExecution {
                     let discovery_latency_ms = candidate
                         .and_then(|value| value.tags.get("discovery_latency_ms"))
                         .and_then(|value| value.parse::<i64>().ok());
-                    let planned_notional_usd = plan.notional_usd * size_multiplier;
-                    let actual_notional_usd = fill.entry_price * fill.quantity;
-                    let fill_ratio = actual_notional_usd / planned_notional_usd.max(f64::EPSILON);
                     events.push(ExchangeEvent {
                         kind: "exchange_entry".into(),
-                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"entry_mode":fill.entry_mode,"entry_price_source":fill.entry_price_source,"maker_attempted":fill.maker_attempted,"maker_wait_ms":fill.maker_wait_ms,"maker_reprices":fill.maker_reprices,"requested_limit":plan.entry_limit,"final_maker_limit":fill.final_maker_limit,"entry_price":fill.entry_price,"quantity":fill.quantity,"notional_usd":actual_notional_usd,"actual_notional_usd":actual_notional_usd,"planned_notional_usd":planned_notional_usd,"fill_ratio":fill_ratio,"partial_fill":fill_ratio < 0.999,"probe_size_multiplier":size_multiplier,"order_id":fill.order_id,"stop_algo_id":fill.stop_algo_id,"take_profit_order_ids":fill.take_profit_order_ids,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
+                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"entry_mode":fill.entry_mode,"entry_price_source":fill.entry_price_source,"maker_attempted":fill.maker_attempted,"maker_wait_ms":fill.maker_wait_ms,"maker_reprices":fill.maker_reprices,"requested_limit":plan.entry_limit,"final_maker_limit":fill.final_maker_limit,"entry_price":fill.entry_price,"quantity":fill.quantity,"notional_usd":actual_notional_usd,"actual_notional_usd":actual_notional_usd,"planned_notional_usd":planned_notional_usd,"fill_ratio":fill_ratio,"partial_fill":fill_ratio < 0.999,"probe_size_multiplier":size_multiplier,"spread_bps":cost.spread_bps,"expected_exit_slippage_bps":cost.expected_exit_slippage_bps,"estimated_round_trip_cost_bps":cost.estimated_round_trip_cost_bps,"gross_target_bps":cost.gross_target_bps,"target_to_cost_ratio":cost.target_to_cost_ratio,"order_id":fill.order_id,"stop_algo_id":fill.stop_algo_id,"take_profit_order_ids":fill.take_profit_order_ids,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
                     });
                 }
                 Err(error) => {
@@ -1198,6 +1269,11 @@ impl BinanceDemoExecution {
                             "reference_price":plan.reference_price,
                             "requested_limit":plan.entry_limit,
                             "max_entry_adverse_bps":plan.max_entry_adverse_bps,
+                            "spread_bps":cost.spread_bps,
+                            "expected_exit_slippage_bps":cost.expected_exit_slippage_bps,
+                            "estimated_round_trip_cost_bps":cost.estimated_round_trip_cost_bps,
+                            "gross_target_bps":cost.gross_target_bps,
+                            "target_to_cost_ratio":cost.target_to_cost_ratio,
                             "reason":error.to_string(),
                             "attempt_exit_price":attempt.as_ref().map(|value| value.exit_price),
                             "attempt_exit_quantity":attempt.as_ref().map(|value| value.exit_quantity),
@@ -2175,6 +2251,8 @@ impl BinanceDemoExecution {
             "leverage": self.config.leverage,
             "performance_epoch": self.state.performance_epoch,
             "performance_epoch_reset": self.performance_epoch_reset,
+            "performance_basis":"risk_r_v1",
+            "performance_basis_reset":self.performance_basis_reset,
         })
     }
 }
@@ -2397,6 +2475,51 @@ fn loss_cooldown_until(
         .filter(|outcome| outcome.pnl_usd < 0.0)
         .map(|outcome| outcome.exit_ms + i64::from(cooldown_minutes) * 60_000)
 }
+
+#[derive(Debug, Clone, Copy, Default)]
+struct PlanCostDiagnostics {
+    spread_bps: Option<f64>,
+    expected_exit_slippage_bps: Option<f64>,
+    estimated_round_trip_cost_bps: Option<f64>,
+    gross_target_bps: Option<f64>,
+    target_to_cost_ratio: Option<f64>,
+}
+
+fn plan_cost_diagnostics(
+    frame: &MarketFrame,
+    plan: &greed_kernel::PositionPlan,
+) -> PlanCostDiagnostics {
+    let Some(book) = frame
+        .instrument(&plan.symbol)
+        .and_then(|instrument| instrument.book.as_ref())
+    else {
+        return PlanCostDiagnostics::default();
+    };
+    let mid = (book.bid + book.ask) * 0.5;
+    let spread_bps = (mid > f64::EPSILON).then_some((book.ask - book.bid) / mid * 10_000.0);
+    let expected_exit_slippage_bps = match plan.side {
+        Side::Buy => book.expected_sell_slippage_bps,
+        Side::Sell => book.expected_buy_slippage_bps,
+    };
+    // Binance futures maker entry plus taker/protective exit is 7 bps in the
+    // conservative research model. Crossing half the spread and the measured
+    // depth slippage are added for a comparable per-candidate cost budget.
+    let estimated_round_trip_cost_bps = spread_bps
+        .map(|spread| 7.0 + spread * 0.5 + expected_exit_slippage_bps.unwrap_or_default());
+    let gross_target_bps = plan.take_profit_prices.first().map(|(target, _)| {
+        plan.side.sign() * (target / plan.reference_price.max(f64::EPSILON) - 1.0) * 10_000.0
+    });
+    let target_to_cost_ratio = gross_target_bps
+        .zip(estimated_round_trip_cost_bps)
+        .and_then(|(target, cost)| (cost > f64::EPSILON).then_some(target / cost));
+    PlanCostDiagnostics {
+        spread_bps,
+        expected_exit_slippage_bps,
+        estimated_round_trip_cost_bps,
+        gross_target_bps,
+        target_to_cost_ratio,
+    }
+}
 fn floor_step(value: f64, step: f64) -> f64 {
     (value / step).floor() * step
 }
@@ -2611,18 +2734,64 @@ mod tests {
         let loss = ExecutionOutcome {
             exit_ms: 1_000,
             pnl_usd: -2.0,
+            pnl_r: Some(-1.0),
+            fill_ratio: Some(1.0),
         };
         assert_eq!(loss_cooldown_until(Some(&[loss]), 180), Some(10_801_000));
         let recovered = [
             ExecutionOutcome {
                 exit_ms: 1_000,
                 pnl_usd: -2.0,
+                pnl_r: Some(-1.0),
+                fill_ratio: Some(1.0),
             },
             ExecutionOutcome {
                 exit_ms: 2_000,
                 pnl_usd: 1.0,
+                pnl_r: Some(0.5),
+                fill_ratio: Some(1.0),
             },
         ];
         assert_eq!(loss_cooldown_until(Some(&recovered), 180), None);
+    }
+
+    #[test]
+    fn performance_gate_uses_r_and_excludes_tiny_partial_fills() {
+        let full = ExecutionOutcome {
+            exit_ms: 1_000,
+            pnl_usd: 20.0,
+            pnl_r: Some(1.0),
+            fill_ratio: Some(0.95),
+        };
+        let tiny = ExecutionOutcome {
+            exit_ms: 2_000,
+            pnl_usd: -0.50,
+            pnl_r: Some(-1.0),
+            fill_ratio: Some(0.05),
+        };
+        let legacy = ExecutionOutcome {
+            exit_ms: 3_000,
+            pnl_usd: -4.0,
+            pnl_r: None,
+            fill_ratio: None,
+        };
+        assert!(full.performance_eligible());
+        assert!(!tiny.performance_eligible());
+        assert!(legacy.performance_eligible());
+        assert_eq!(full.performance_value(), 1.0);
+        assert_eq!(legacy.performance_value(), -4.0);
+    }
+
+    #[test]
+    fn legacy_outcome_schema_remains_readable() {
+        let outcome: ExecutionOutcome = serde_json::from_value(serde_json::json!({
+            "exit_ms": 1_000,
+            "pnl_usd": 2.5
+        }))
+        .expect("legacy outcome should deserialize");
+        assert_eq!(outcome.pnl_r, None);
+        assert_eq!(outcome.fill_ratio, None);
+        assert!(outcome.performance_eligible());
+        assert_eq!(outcome.performance_value(), 2.5);
     }
 }
