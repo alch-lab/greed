@@ -997,16 +997,21 @@ impl BinanceDemoExecution {
     }
 
     pub fn recipe_gate_snapshots(&self, now_ms: i64) -> BTreeMap<String, RecipeGateStatus> {
-        ["sfp_reversal", "trend_continuation", "ignition_sprint"]
-            .into_iter()
-            .flat_map(|recipe| {
-                [Side::Buy, Side::Sell].into_iter().map(move |side| {
-                    let key = gate_key(recipe, side);
-                    let status = self.recipe_gate_status(&key, now_ms);
-                    (key, status)
-                })
+        [
+            "sfp_reversal",
+            "trend_continuation",
+            "ignition_sprint",
+            "relative_weakness_short",
+        ]
+        .into_iter()
+        .flat_map(|recipe| {
+            [Side::Buy, Side::Sell].into_iter().map(move |side| {
+                let key = gate_key(recipe, side);
+                let status = self.recipe_gate_status(&key, now_ms);
+                (key, status)
             })
-            .collect()
+        })
+        .collect()
     }
 
     pub fn position_symbols(&self) -> impl Iterator<Item = &String> {

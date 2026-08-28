@@ -448,6 +448,7 @@ fn record_diagnostics(
         "lane.sfp_reversal.status",
         "lane.trend_continuation.status",
         "lane.ignition_sprint.status",
+        "lane.relative_weakness_short.status",
         "portfolio.risk",
     ] {
         let Some(value) = artifacts
@@ -514,6 +515,8 @@ fn recipe_from_id(id: &str) -> &'static str {
         "trend_continuation"
     } else if id.contains("ignition_sprint") {
         "ignition_sprint"
+    } else if id.contains("relative_weakness_short") {
+        "relative_weakness_short"
     } else {
         "unknown"
     }
@@ -524,6 +527,7 @@ fn lane_for_recipe(recipe: &str) -> &'static str {
         "sfp_reversal" => "sfp_reversal",
         "trend_continuation" => "trend_continuation",
         "ignition_sprint" => "ignition_sprint",
+        "relative_weakness_short" => "relative_weakness_short",
         _ => "unknown",
     }
 }

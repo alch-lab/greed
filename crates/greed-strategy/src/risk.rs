@@ -132,8 +132,12 @@ impl StrategyNode for PositionPlannerNode {
             let take_fraction = tag_f64(c, "take_profit_fraction")
                 .unwrap_or(self.config.first_take_profit_fraction)
                 .clamp(0.1, 1.0);
-            let notional = (a.equity_usd * risk_pct / stop_pct)
-                .min(a.equity_usd * self.config.max_notional_per_trade_multiple);
+            let notional = (a.equity_usd * risk_pct / stop_pct).min(
+                a.equity_usd
+                    * tag_f64(c, "max_notional_multiple")
+                        .unwrap_or(self.config.max_notional_per_trade_multiple)
+                        .clamp(0.20, self.config.max_notional_per_trade_multiple),
+            );
             let multiple = notional / a.equity_usd.max(1.0);
             if planned_gross + multiple > self.config.max_total_gross_multiple + f64::EPSILON {
                 planned_symbols.remove(&c.symbol);

@@ -45,6 +45,7 @@ refresh_seconds = 15
 sfp_reversal_enabled = true
 trend_continuation_enabled = true
 ignition_sprint_enabled = false
+relative_weakness_short_enabled = true
 max_candidates_per_lane = 2
 max_spread_bps = 6.0
 # Ten times the standard 2,000 USDT trend notional; spread remains capped at 6 bps.
@@ -86,6 +87,19 @@ trend_max_post_signal_extension_bps = 12.0
 # oppose the completed 15m signal.
 trend_max_opposing_micro_flow = 0.15
 trend_max_opposing_micro_return_bps = 3.0
+# Tactical short: underperform BTC, break the prior 1h low with sell flow, and
+# exit within 30 minutes. Selected on train/validation; locked and recent were
+# positive after conservative 8 bps per-side execution costs.
+weakness_max_relative_1h = -0.005
+weakness_max_relative_4h = -0.010
+weakness_max_flow = -0.05
+weakness_min_hour_volume_ratio = 0.80
+weakness_breakdown_bars = 4
+weakness_max_signal_age_seconds = 120
+weakness_target_r = 0.75
+weakness_max_hold_minutes = 30
+weakness_risk_per_trade_pct = 0.0015
+weakness_max_notional_multiple = 1.0
 ignition_min_return_5m = 0.010
 ignition_min_volume_ratio = 3.0
 ignition_min_flow_imbalance = 0.20

@@ -50,6 +50,7 @@ pub struct LaneConfig {
     pub sfp_reversal_enabled: bool,
     pub trend_continuation_enabled: bool,
     pub ignition_sprint_enabled: bool,
+    pub relative_weakness_short_enabled: bool,
     pub max_candidates_per_lane: usize,
     pub max_spread_bps: f64,
     pub min_depth_usd: f64,
@@ -76,6 +77,16 @@ pub struct LaneConfig {
     pub trend_max_post_signal_extension_bps: f64,
     pub trend_max_opposing_micro_flow: f64,
     pub trend_max_opposing_micro_return_bps: f64,
+    pub weakness_max_relative_1h: f64,
+    pub weakness_max_relative_4h: f64,
+    pub weakness_max_flow: f64,
+    pub weakness_min_hour_volume_ratio: f64,
+    pub weakness_breakdown_bars: usize,
+    pub weakness_max_signal_age_seconds: u32,
+    pub weakness_target_r: f64,
+    pub weakness_max_hold_minutes: u32,
+    pub weakness_risk_per_trade_pct: f64,
+    pub weakness_max_notional_multiple: f64,
     pub ignition_min_return_5m: f64,
     pub ignition_min_volume_ratio: f64,
     pub ignition_min_flow_imbalance: f64,
@@ -96,6 +107,7 @@ impl Default for LaneConfig {
             sfp_reversal_enabled: true,
             trend_continuation_enabled: true,
             ignition_sprint_enabled: true,
+            relative_weakness_short_enabled: true,
             max_candidates_per_lane: 2,
             max_spread_bps: 6.0,
             min_depth_usd: 20_000.0,
@@ -122,6 +134,16 @@ impl Default for LaneConfig {
             trend_max_post_signal_extension_bps: 12.0,
             trend_max_opposing_micro_flow: 0.15,
             trend_max_opposing_micro_return_bps: 3.0,
+            weakness_max_relative_1h: -0.005,
+            weakness_max_relative_4h: -0.010,
+            weakness_max_flow: -0.05,
+            weakness_min_hour_volume_ratio: 0.80,
+            weakness_breakdown_bars: 4,
+            weakness_max_signal_age_seconds: 120,
+            weakness_target_r: 0.75,
+            weakness_max_hold_minutes: 30,
+            weakness_risk_per_trade_pct: 0.0015,
+            weakness_max_notional_multiple: 1.0,
             ignition_min_return_5m: 0.010,
             ignition_min_volume_ratio: 3.0,
             ignition_min_flow_imbalance: 0.20,
@@ -237,6 +259,16 @@ impl StrategyConfig {
             || !(0.0..=100.0).contains(&lanes.trend_max_post_signal_extension_bps)
             || !(0.0..=0.80).contains(&lanes.trend_max_opposing_micro_flow)
             || !(0.0..=25.0).contains(&lanes.trend_max_opposing_micro_return_bps)
+            || !(-0.05..=-0.001).contains(&lanes.weakness_max_relative_1h)
+            || !(-0.10..=-0.002).contains(&lanes.weakness_max_relative_4h)
+            || !(-0.80..=0.0).contains(&lanes.weakness_max_flow)
+            || !(0.5..=3.0).contains(&lanes.weakness_min_hour_volume_ratio)
+            || !(2..=12).contains(&lanes.weakness_breakdown_bars)
+            || !(30..=300).contains(&lanes.weakness_max_signal_age_seconds)
+            || !(0.5..=2.0).contains(&lanes.weakness_target_r)
+            || !(5..=30).contains(&lanes.weakness_max_hold_minutes)
+            || !(0.001..=0.003).contains(&lanes.weakness_risk_per_trade_pct)
+            || !(0.25..=1.0).contains(&lanes.weakness_max_notional_multiple)
             || lanes.max_spread_bps <= 0.0
             || lanes.min_depth_usd <= 0.0
             || !(0.003..=0.03).contains(&lanes.ignition_min_return_5m)
