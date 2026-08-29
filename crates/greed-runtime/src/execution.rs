@@ -1082,7 +1082,6 @@ impl BinanceDemoExecution {
         [
             "sfp_reversal",
             "trend_continuation",
-            "ignition_sprint",
             "relative_weakness_short",
         ]
         .into_iter()

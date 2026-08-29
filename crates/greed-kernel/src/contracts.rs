@@ -140,7 +140,7 @@ pub struct InstrumentFrame {
     pub perpetual: CandleSeries,
     /// Optional short-interval perpetual candles used for execution timing.
     pub fast_perpetual: Option<CandleSeries>,
-    /// One-minute websocket observations used by the ignition reclaim entry.
+    /// One-minute websocket observations used by short-horizon entry guards.
     pub micro_perpetual: Option<CandleSeries>,
     pub book: Option<BookState>,
     pub microstructure: Option<MicrostructureState>,

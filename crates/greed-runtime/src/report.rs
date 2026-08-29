@@ -447,7 +447,6 @@ fn record_diagnostics(
     for key in [
         "lane.sfp_reversal.status",
         "lane.trend_continuation.status",
-        "lane.ignition_sprint.status",
         "lane.relative_weakness_short.status",
         "portfolio.risk",
     ] {
@@ -513,8 +512,6 @@ fn recipe_from_id(id: &str) -> &'static str {
         "sfp_reversal"
     } else if id.contains("trend_continuation") {
         "trend_continuation"
-    } else if id.contains("ignition_sprint") {
-        "ignition_sprint"
     } else if id.contains("relative_weakness_short") {
         "relative_weakness_short"
     } else {
@@ -526,7 +523,6 @@ fn lane_for_recipe(recipe: &str) -> &'static str {
     match recipe {
         "sfp_reversal" => "sfp_reversal",
         "trend_continuation" => "trend_continuation",
-        "ignition_sprint" => "ignition_sprint",
         "relative_weakness_short" => "relative_weakness_short",
         _ => "unknown",
     }
@@ -704,7 +700,7 @@ mod tests {
             serde_json::json!({"recorded_ms":2,"kind":"data_health","payload":{"telemetry":{"requests":10,"successes":9,"failures":1,"rate_limits":1,"retries":1,"frames_requested":1,"frames_succeeded":1}}}),
             serde_json::json!({"recorded_ms":3,"kind":"exchange_entry","payload":{"ts_ms":3,"candidate_id":"trend_continuation:BTCUSDT:3","recipe":"trend_continuation","lane":"trend_continuation","symbol":"BTCUSDT","side":"buy","fee_usd":0.2}}),
             serde_json::json!({"recorded_ms":4,"kind":"exchange_exit","payload":{"ts_ms":64_000,"candidate_id":"trend_continuation:BTCUSDT:3","recipe":"trend_continuation","lane":"trend_continuation","symbol":"BTCUSDT","side":"buy","fee_usd":0.2,"pnl_usd":5.0}}),
-            serde_json::json!({"recorded_ms":5,"kind":"exchange_plan_rejected","payload":{"ts_ms":65_000,"candidate_id":"ignition_sprint:SOLUSDT:1","recipe":"ignition_sprint","lane":"ignition_sprint","symbol":"SOLUSDT","side":"buy","reason":"rolling_profit_factor_gate"}}),
+            serde_json::json!({"recorded_ms":5,"kind":"exchange_plan_rejected","payload":{"ts_ms":65_000,"candidate_id":"relative_weakness_short:SOLUSDT:1","recipe":"relative_weakness_short","lane":"relative_weakness_short","symbol":"SOLUSDT","side":"sell","reason":"rolling_profit_factor_gate"}}),
         ];
         std::fs::write(
             &path,
@@ -730,7 +726,7 @@ mod tests {
             1
         );
         assert_eq!(
-            value["funnel_by_recipe"]["ignition_sprint"]["plan_rejections"],
+            value["funnel_by_recipe"]["relative_weakness_short"]["plan_rejections"],
             1
         );
         std::fs::remove_file(path).unwrap();

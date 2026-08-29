@@ -1,7 +1,7 @@
 use crate::{
     recipes::{
-        ignition_sprint::IgnitionSprintNode, relative_weakness_short::RelativeWeaknessShortNode,
-        sfp_reversal::SfpReversalNode, trend_continuation::TrendContinuationNode,
+        relative_weakness_short::RelativeWeaknessShortNode, sfp_reversal::SfpReversalNode,
+        trend_continuation::TrendContinuationNode,
     },
     risk::PositionPlannerNode,
     StrategyConfig,
@@ -24,13 +24,6 @@ pub fn build_graph(config: &StrategyConfig) -> Result<StrategyGraph, GraphError>
             config.lanes.clone(),
         )));
         lanes.push("lane.trend_continuation".into());
-    }
-    if config.lanes.ignition_sprint_enabled {
-        nodes.push(Box::new(IgnitionSprintNode::new(
-            &config.symbols,
-            config.lanes.clone(),
-        )));
-        lanes.push("lane.ignition_sprint".into());
     }
     if config.lanes.relative_weakness_short_enabled {
         nodes.push(Box::new(RelativeWeaknessShortNode::new(

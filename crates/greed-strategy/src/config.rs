@@ -49,7 +49,6 @@ impl Default for UniverseConfig {
 pub struct LaneConfig {
     pub sfp_reversal_enabled: bool,
     pub trend_continuation_enabled: bool,
-    pub ignition_sprint_enabled: bool,
     pub relative_weakness_short_enabled: bool,
     pub max_candidates_per_lane: usize,
     pub max_spread_bps: f64,
@@ -95,22 +94,6 @@ pub struct LaneConfig {
     pub weakness_max_hold_minutes: u32,
     pub weakness_risk_per_trade_pct: f64,
     pub weakness_max_notional_multiple: f64,
-    pub ignition_min_return_15m: f64,
-    pub ignition_min_relative_15m: f64,
-    pub ignition_min_volume_ratio: f64,
-    pub ignition_min_flow_imbalance: f64,
-    pub ignition_reclaim_flow_imbalance: f64,
-    pub ignition_max_extension_60m: f64,
-    pub ignition_max_pre_birth_return: f64,
-    pub ignition_min_pullback_atr: f64,
-    pub ignition_max_pullback_atr: f64,
-    pub ignition_max_wait_seconds: u32,
-    pub ignition_limit_offset_atr: f64,
-    pub ignition_entry_timeout_seconds: u32,
-    pub ignition_stop_atr_multiple: f64,
-    pub ignition_target_r: f64,
-    pub ignition_max_hold_minutes: u32,
-    pub ignition_risk_per_trade_pct: f64,
 }
 
 impl Default for LaneConfig {
@@ -118,10 +101,6 @@ impl Default for LaneConfig {
         Self {
             sfp_reversal_enabled: true,
             trend_continuation_enabled: true,
-            // The rewritten first-pullback model remains research-only: its
-            // recent window reduced portfolio PnL, so absence of an explicit
-            // config flag must never enable it accidentally.
-            ignition_sprint_enabled: false,
             relative_weakness_short_enabled: true,
             max_candidates_per_lane: 2,
             max_spread_bps: 6.0,
@@ -167,22 +146,6 @@ impl Default for LaneConfig {
             weakness_max_hold_minutes: 30,
             weakness_risk_per_trade_pct: 0.0015,
             weakness_max_notional_multiple: 1.0,
-            ignition_min_return_15m: 0.018,
-            ignition_min_relative_15m: 0.006,
-            ignition_min_volume_ratio: 1.75,
-            ignition_min_flow_imbalance: 0.0,
-            ignition_reclaim_flow_imbalance: 0.0,
-            ignition_max_extension_60m: 0.09,
-            ignition_max_pre_birth_return: 0.025,
-            ignition_min_pullback_atr: 0.20,
-            ignition_max_pullback_atr: 1.50,
-            ignition_max_wait_seconds: 1_800,
-            ignition_limit_offset_atr: 0.05,
-            ignition_entry_timeout_seconds: 30,
-            ignition_stop_atr_multiple: 1.25,
-            ignition_target_r: 1.0,
-            ignition_max_hold_minutes: 30,
-            ignition_risk_per_trade_pct: 0.0025,
         }
     }
 }
@@ -306,23 +269,6 @@ impl StrategyConfig {
             || !(0.25..=1.0).contains(&lanes.weakness_max_notional_multiple)
             || lanes.max_spread_bps <= 0.0
             || lanes.min_depth_usd <= 0.0
-            || !(0.005..=0.05).contains(&lanes.ignition_min_return_15m)
-            || !(0.0..=0.03).contains(&lanes.ignition_min_relative_15m)
-            || !(1.0..=10.0).contains(&lanes.ignition_min_volume_ratio)
-            || !(0.0..=0.8).contains(&lanes.ignition_min_flow_imbalance)
-            || !(0.0..=0.8).contains(&lanes.ignition_reclaim_flow_imbalance)
-            || !(0.02..=0.15).contains(&lanes.ignition_max_extension_60m)
-            || !(0.0..=0.05).contains(&lanes.ignition_max_pre_birth_return)
-            || !(0.1..=1.0).contains(&lanes.ignition_min_pullback_atr)
-            || !(0.5..=3.0).contains(&lanes.ignition_max_pullback_atr)
-            || lanes.ignition_min_pullback_atr >= lanes.ignition_max_pullback_atr
-            || !(300..=3_600).contains(&lanes.ignition_max_wait_seconds)
-            || !(0.0..=0.5).contains(&lanes.ignition_limit_offset_atr)
-            || !(5..=120).contains(&lanes.ignition_entry_timeout_seconds)
-            || !(0.5..=3.0).contains(&lanes.ignition_stop_atr_multiple)
-            || !(0.5..=3.0).contains(&lanes.ignition_target_r)
-            || !(3..=30).contains(&lanes.ignition_max_hold_minutes)
-            || !(0.001..=0.005).contains(&lanes.ignition_risk_per_trade_pct)
         {
             return Err("alpha lane parameters are invalid".into());
         }
