@@ -635,7 +635,15 @@ impl BinanceMarketSource {
                     self.candle_cache.insert(key, series);
                 }
                 Err(error) => {
-                    tracing::warn!(symbol = %key.0, interval = %key.1, error = %error, "kline history bootstrap failed");
+                    if error.to_string().contains("timed out") {
+                        // The health snapshot already exposes the latest
+                        // pending bootstrap error. Dynamic newcomers are
+                        // retried automatically, so repeated timeouts do not
+                        // need one journal line per retry.
+                        tracing::debug!(symbol = %key.0, interval = %key.1, error = %error, "kline history bootstrap retry timed out");
+                    } else {
+                        tracing::warn!(symbol = %key.0, interval = %key.1, error = %error, "kline history bootstrap failed");
+                    }
                     self.candle_bootstrap_retry_after
                         .insert(key.clone(), now + KLINE_BOOTSTRAP_RETRY_DELAY_MS);
                     self.candle_bootstrap_last_error =

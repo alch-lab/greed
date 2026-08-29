@@ -12,7 +12,7 @@ use std::{
 };
 use tokio::sync::watch;
 use tokio_tungstenite::{connect_async, tungstenite::Message};
-use tracing::warn;
+use tracing::{debug, warn};
 
 const STREAM_TTL_MS: i64 = 15_000;
 const CANDLE_CACHE_LIMIT: usize = 200;
@@ -374,7 +374,7 @@ async fn run_connection(route: StreamRoute, url: String, state: Arc<RwLock<Strea
                 stable_connection = connected_at.elapsed() >= Duration::from_secs(60);
                 let detail = format!("{route:?} {disconnect_reason}");
                 set_connected(&state, route, false, Some(detail.clone()));
-                warn!(route=?route, connected_seconds=connected_at.elapsed().as_secs(), reason=%detail, "Binance websocket disconnected");
+                log_disconnect(route, connected_at.elapsed(), &detail, false);
             }
             Ok(Err(error)) => {
                 set_connected(&state, route, false, Some(error.to_string()));
@@ -427,6 +427,12 @@ async fn run_dynamic_connection(
             }
             Ok(Ok((stream, _))) => {
                 set_connected(&state, route, true, None);
+                mark_route_recovering(
+                    &state,
+                    route,
+                    &symbols.borrow(),
+                    chrono::Utc::now().timestamp_millis(),
+                );
                 let connected_at = Instant::now();
                 let (mut writer, mut reader) = stream.split();
                 let desired = route_streams(route, &symbols.borrow());
@@ -511,7 +517,7 @@ async fn run_dynamic_connection(
                     stable_connection = connected_at.elapsed() >= Duration::from_secs(60);
                     let detail = format!("{route:?} {disconnect_reason}");
                     set_connected(&state, route, false, Some(detail.clone()));
-                    warn!(route=?route, connected_seconds=connected_at.elapsed().as_secs(), reason=%detail, "Binance dynamic websocket disconnected");
+                    log_disconnect(route, connected_at.elapsed(), &detail, true);
                 }
             }
         }
@@ -522,6 +528,66 @@ async fn run_dynamic_connection(
         } else {
             (backoff * 2).min(30)
         };
+    }
+}
+
+/// A public-depth reconnect invalidates the short OFI window for only the
+/// symbols assigned to that shard. Keep those symbols in an explicit warm-up
+/// state until fresh snapshots arrive instead of reporting every old book as
+/// an independent data failure.
+fn mark_route_recovering(
+    state: &Arc<RwLock<StreamState>>,
+    route: StreamRoute,
+    symbols: &[String],
+    now_ms: i64,
+) {
+    let StreamRoute::Public(shard) = route else {
+        return;
+    };
+    let mut state = state.write().expect("stream state poisoned");
+    for symbol in symbols {
+        if symbol_shard(
+            &format!("{}@depth20@500ms", symbol.to_lowercase()),
+            PUBLIC_STREAM_SHARDS,
+        ) == shard
+        {
+            state
+                .symbol_admitted_ms
+                .insert(symbol.to_uppercase(), now_ms);
+            state.book_flow.remove(&symbol.to_uppercase());
+        }
+    }
+}
+
+fn log_disconnect(route: StreamRoute, connected_for: Duration, detail: &str, dynamic: bool) {
+    let seconds = connected_for.as_secs();
+    let transient_peer_close = detail.contains("Connection reset")
+        || detail.contains("connection without sending TLS close_notify")
+        || detail.contains("peer closed connection");
+    if transient_peer_close && seconds >= 15 {
+        // Peer resets are common on long-lived public market-data sockets.
+        // Recovery is represented in telemetry; keeping every successful
+        // auto-recovery at WARN/INFO floods journald without an operator
+        // action to take.
+        debug!(
+            route=?route,
+            connected_seconds=seconds,
+            "Binance websocket peer reset; reconnecting"
+        );
+    } else if dynamic {
+        warn!(
+            route=?route,
+            connected_seconds=seconds,
+            reason=%detail,
+            "Binance dynamic websocket disconnected"
+        );
+    } else {
+        warn!(
+            route=?route,
+            connected_seconds=seconds,
+            reason=%detail,
+            "Binance websocket disconnected"
+        );
     }
 }
 
@@ -1358,6 +1424,55 @@ mod tests {
         let ticker = state.read().unwrap().tickers["YBUSDT"].clone();
         assert!((ticker.return_1m.unwrap() - 0.10).abs() < 1e-9);
         assert!(ticker.return_5m.is_none());
+    }
+
+    #[test]
+    fn public_reconnect_only_rewarms_its_own_symbols() {
+        let symbols = vec![
+            "BTCUSDT".to_string(),
+            "ETHUSDT".to_string(),
+            "SOLUSDT".to_string(),
+            "XRPUSDT".to_string(),
+        ];
+        let recovered = &symbols[0];
+        let shard = symbol_shard(
+            &format!("{}@depth20@500ms", recovered.to_lowercase()),
+            PUBLIC_STREAM_SHARDS,
+        );
+        let unaffected = symbols
+            .iter()
+            .find(|symbol| {
+                symbol_shard(
+                    &format!("{}@depth20@500ms", symbol.to_lowercase()),
+                    PUBLIC_STREAM_SHARDS,
+                ) != shard
+            })
+            .expect("test symbols cover more than one shard")
+            .clone();
+        let state = Arc::new(RwLock::new(StreamState::default()));
+        {
+            let mut inner = state.write().unwrap();
+            for symbol in &symbols {
+                inner.symbol_admitted_ms.insert(symbol.clone(), 1_000);
+                inner.book_flow.insert(
+                    symbol.clone(),
+                    VecDeque::from([BookFlowObservation {
+                        received_ms: 1_000,
+                        raw_ofi_usd: 1.0,
+                        visible_top_usd: 10.0,
+                        mid: 1.0,
+                    }]),
+                );
+            }
+        }
+
+        mark_route_recovering(&state, StreamRoute::Public(shard), &symbols, 2_000);
+
+        let inner = state.read().unwrap();
+        assert_eq!(inner.symbol_admitted_ms[recovered], 2_000);
+        assert!(!inner.book_flow.contains_key(recovered));
+        assert_eq!(inner.symbol_admitted_ms[&unaffected], 1_000);
+        assert!(inner.book_flow.contains_key(&unaffected));
     }
 
     #[test]
