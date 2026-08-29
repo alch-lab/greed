@@ -90,6 +90,8 @@ pub struct LaneConfig {
     pub weakness_breakdown_bars: usize,
     pub weakness_max_signal_age_seconds: u32,
     pub weakness_target_r: f64,
+    pub weakness_profit_shield_activation_r: f64,
+    pub weakness_trailing_distance_r: f64,
     pub weakness_max_hold_minutes: u32,
     pub weakness_risk_per_trade_pct: f64,
     pub weakness_max_notional_multiple: f64,
@@ -152,7 +154,9 @@ impl Default for LaneConfig {
             weakness_min_hour_volume_ratio: 0.80,
             weakness_breakdown_bars: 4,
             weakness_max_signal_age_seconds: 120,
-            weakness_target_r: 0.75,
+            weakness_target_r: 1.0,
+            weakness_profit_shield_activation_r: 0.40,
+            weakness_trailing_distance_r: 0.15,
             weakness_max_hold_minutes: 30,
             weakness_risk_per_trade_pct: 0.0015,
             weakness_max_notional_multiple: 1.0,
@@ -284,6 +288,8 @@ impl StrategyConfig {
             || !(2..=12).contains(&lanes.weakness_breakdown_bars)
             || !(30..=300).contains(&lanes.weakness_max_signal_age_seconds)
             || !(0.5..=2.0).contains(&lanes.weakness_target_r)
+            || !(0.25..lanes.weakness_target_r).contains(&lanes.weakness_profit_shield_activation_r)
+            || !(0.05..=0.50).contains(&lanes.weakness_trailing_distance_r)
             || !(5..=30).contains(&lanes.weakness_max_hold_minutes)
             || !(0.001..=0.003).contains(&lanes.weakness_risk_per_trade_pct)
             || !(0.25..=1.0).contains(&lanes.weakness_max_notional_multiple)

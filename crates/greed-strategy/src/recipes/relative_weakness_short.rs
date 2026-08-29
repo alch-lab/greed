@@ -311,6 +311,18 @@ impl StrategyNode for RelativeWeaknessShortNode {
                     ("target_r".into(), self.config.weakness_target_r.to_string()),
                     ("take_profit_fraction".into(), "1.0".into()),
                     (
+                        "profit_shield_activation_r".into(),
+                        self.config.weakness_profit_shield_activation_r.to_string(),
+                    ),
+                    (
+                        "pre_tp_trailing_activation_r".into(),
+                        self.config.weakness_profit_shield_activation_r.to_string(),
+                    ),
+                    (
+                        "trailing_distance_pct".into(),
+                        (stop_pct * self.config.weakness_trailing_distance_r).to_string(),
+                    ),
+                    (
                         "max_notional_multiple".into(),
                         self.config.weakness_max_notional_multiple.to_string(),
                     ),

@@ -18,6 +18,8 @@ const STREAM_TTL_MS: i64 = 15_000;
 const CANDLE_CACHE_LIMIT: usize = 200;
 const TICKER_HISTORY_MS: i64 = 20 * 60_000;
 const BOOK_FLOW_HISTORY_MS: i64 = 2 * 60_000;
+const STREAM_IDLE_TIMEOUT_SECS: u64 = 45;
+const MARKET_STREAM_SHARDS: usize = 3;
 const TRADE_STREAM_SHARDS: usize = 3;
 const PUBLIC_STREAM_SHARDS: usize = 3;
 const SYMBOL_WARMUP_MS: i64 = 10_000;
@@ -51,6 +53,8 @@ impl StreamTicker {
 pub struct StreamTelemetry {
     pub radar_connected: bool,
     pub market_connected: bool,
+    pub market_shards_connected: usize,
+    pub market_shards_total: usize,
     pub trade_connected: bool,
     pub trade_shards_connected: usize,
     pub trade_shards_total: usize,
@@ -66,6 +70,10 @@ pub struct StreamTelemetry {
     pub trade_messages: u64,
     pub public_messages: u64,
     pub reconnects: u64,
+    pub radar_reconnects: u64,
+    pub market_reconnects: u64,
+    pub trade_reconnects: u64,
+    pub public_reconnects: u64,
     pub parse_errors: u64,
     pub last_error: Option<String>,
     pub subscribed_symbols: usize,
@@ -86,6 +94,7 @@ struct StreamState {
     trades: BTreeMap<String, VecDeque<(i64, bool, f64)>>,
     desired_symbols: BTreeSet<String>,
     symbol_admitted_ms: BTreeMap<String, i64>,
+    market_connections: [bool; MARKET_STREAM_SHARDS],
     trade_connections: [bool; TRADE_STREAM_SHARDS],
     public_connections: [bool; PUBLIC_STREAM_SHARDS],
     telemetry: StreamTelemetry,
@@ -100,6 +109,7 @@ pub struct MarketStreamHub {
 impl MarketStreamHub {
     pub fn start(base_url: String) -> Self {
         let mut initial_state = StreamState::default();
+        initial_state.telemetry.market_shards_total = MARKET_STREAM_SHARDS;
         initial_state.telemetry.trade_shards_total = TRADE_STREAM_SHARDS;
         initial_state.telemetry.public_shards_total = PUBLIC_STREAM_SHARDS;
         let state = Arc::new(RwLock::new(initial_state));
@@ -264,12 +274,14 @@ async fn run_supervisor(
         radar_url,
         Arc::clone(&state),
     ));
-    tokio::spawn(run_dynamic_connection(
-        StreamRoute::Market,
-        route_url(&base_url, StreamRoute::Market),
-        Arc::clone(&state),
-        symbols.clone(),
-    ));
+    for shard in 0..MARKET_STREAM_SHARDS {
+        tokio::spawn(run_dynamic_connection(
+            StreamRoute::Market(shard),
+            route_url(&base_url, StreamRoute::Market(shard)),
+            Arc::clone(&state),
+            symbols.clone(),
+        ));
+    }
     for shard in 0..TRADE_STREAM_SHARDS {
         tokio::spawn(run_dynamic_connection(
             StreamRoute::Trade(shard),
@@ -292,7 +304,7 @@ async fn run_supervisor(
 #[derive(Clone, Copy, Debug)]
 enum StreamRoute {
     Radar,
-    Market,
+    Market(usize),
     Trade(usize),
     Public(usize),
 }
@@ -316,7 +328,16 @@ async fn run_connection(route: StreamRoute, url: String, state: Arc<RwLock<Strea
                 let connected_at = Instant::now();
                 let (mut writer, mut reader) = stream.split();
                 let disconnect_reason = loop {
-                    match reader.next().await {
+                    let message = match tokio::time::timeout(
+                        Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS),
+                        reader.next(),
+                    )
+                    .await
+                    {
+                        Err(_) => break "websocket receive idle timeout".to_string(),
+                        Ok(message) => message,
+                    };
+                    match message {
                         Some(message) => match message {
                             Ok(Message::Text(text)) => {
                                 let now_ms = chrono::Utc::now().timestamp_millis();
@@ -354,11 +375,8 @@ async fn run_connection(route: StreamRoute, url: String, state: Arc<RwLock<Strea
                 warn!(error=%error, "Binance market websocket connection failed");
             }
         }
-        {
-            let mut state = state.write().expect("stream state poisoned");
-            state.telemetry.reconnects += 1;
-        }
-        tokio::time::sleep(Duration::from_secs(backoff)).await;
+        record_reconnect(&state, route);
+        tokio::time::sleep(reconnect_delay(backoff, route)).await;
         backoff = if stable_connection {
             1
         } else {
@@ -475,6 +493,9 @@ async fn run_dynamic_connection(
                                     _ => {}
                                 }
                             }
+                            _ = tokio::time::sleep(Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS)) => {
+                                break "websocket receive idle timeout".to_string();
+                            }
                         }
                     };
                     stable_connection = connected_at.elapsed() >= Duration::from_secs(60);
@@ -484,17 +505,34 @@ async fn run_dynamic_connection(
                 }
             }
         }
-        state
-            .write()
-            .expect("stream state poisoned")
-            .telemetry
-            .reconnects += 1;
-        tokio::time::sleep(Duration::from_secs(backoff)).await;
+        record_reconnect(&state, route);
+        tokio::time::sleep(reconnect_delay(backoff, route)).await;
         backoff = if stable_connection {
             1
         } else {
             (backoff * 2).min(30)
         };
+    }
+}
+
+fn reconnect_delay(backoff_seconds: u64, route: StreamRoute) -> Duration {
+    let slot = match route {
+        StreamRoute::Radar => 0,
+        StreamRoute::Market(shard) => 1 + shard,
+        StreamRoute::Trade(shard) => 1 + MARKET_STREAM_SHARDS + shard,
+        StreamRoute::Public(shard) => 1 + MARKET_STREAM_SHARDS + TRADE_STREAM_SHARDS + shard,
+    };
+    Duration::from_millis(backoff_seconds * 1_000 + slot as u64 * 125)
+}
+
+fn record_reconnect(state: &Arc<RwLock<StreamState>>, route: StreamRoute) {
+    let mut state = state.write().expect("stream state poisoned");
+    state.telemetry.reconnects += 1;
+    match route {
+        StreamRoute::Radar => state.telemetry.radar_reconnects += 1,
+        StreamRoute::Market(_) => state.telemetry.market_reconnects += 1,
+        StreamRoute::Trade(_) => state.telemetry.trade_reconnects += 1,
+        StreamRoute::Public(_) => state.telemetry.public_reconnects += 1,
     }
 }
 
@@ -523,7 +561,7 @@ where
 
 fn route_url(base: &str, route: StreamRoute) -> String {
     let path = match route {
-        StreamRoute::Market => "market/ws",
+        StreamRoute::Market(_) => "market/ws",
         StreamRoute::Trade(_) => "market/ws",
         StreamRoute::Public(_) => "public/ws",
         StreamRoute::Radar => "market/ws",
@@ -533,7 +571,7 @@ fn route_url(base: &str, route: StreamRoute) -> String {
 
 fn route_streams(route: StreamRoute, symbols: &[String]) -> BTreeSet<String> {
     match route {
-        StreamRoute::Market => market_streams(symbols),
+        StreamRoute::Market(shard) => market_streams_shard(symbols, shard),
         StreamRoute::Trade(shard) => trade_streams_shard(symbols, shard),
         StreamRoute::Public(shard) => public_streams_shard(symbols, shard),
         StreamRoute::Radar => BTreeSet::from(["!ticker@arr".into()]),
@@ -549,6 +587,21 @@ fn market_streams(symbols: &[String]) -> BTreeSet<String> {
         streams.insert(format!("{symbol}@kline_1m"));
     }
     streams
+}
+
+fn market_streams_shard(symbols: &[String], shard: usize) -> BTreeSet<String> {
+    market_streams(symbols)
+        .into_iter()
+        // Keep all kline intervals for one symbol on the same connection. If
+        // one shard is recovering, only that shard's coins warm up instead of
+        // leaving every coin with an incomplete interval set.
+        .filter(|stream| {
+            symbol_shard(
+                stream.split('@').next().unwrap_or(stream),
+                MARKET_STREAM_SHARDS,
+            ) == shard
+        })
+        .collect()
 }
 
 fn trade_streams(symbols: &[String]) -> BTreeSet<String> {
@@ -892,7 +945,19 @@ fn set_connected(
     let mut state = state.write().expect("stream state poisoned");
     match route {
         StreamRoute::Radar => state.telemetry.radar_connected = connected,
-        StreamRoute::Market => state.telemetry.market_connected = connected,
+        StreamRoute::Market(shard) => {
+            if let Some(value) = state.market_connections.get_mut(shard) {
+                *value = connected;
+            }
+            state.telemetry.market_shards_total = MARKET_STREAM_SHARDS;
+            state.telemetry.market_shards_connected = state
+                .market_connections
+                .iter()
+                .filter(|value| **value)
+                .count();
+            state.telemetry.market_connected =
+                state.telemetry.market_shards_connected == MARKET_STREAM_SHARDS;
+        }
         StreamRoute::Trade(shard) => {
             if let Some(value) = state.trade_connections.get_mut(shard) {
                 *value = connected;
@@ -939,7 +1004,7 @@ fn record_message(state: &Arc<RwLock<StreamState>>, route: StreamRoute, now_ms: 
             state.telemetry.radar_messages += 1;
             state.telemetry.last_radar_message_ms = Some(now_ms);
         }
-        StreamRoute::Market => {
+        StreamRoute::Market(_) => {
             state.telemetry.market_messages += 1;
             state.telemetry.last_market_message_ms = Some(now_ms);
         }
@@ -1057,14 +1122,14 @@ mod tests {
         let state = Arc::new(RwLock::new(StreamState::default()));
         handle_payload(
             &state,
-            StreamRoute::Market,
+            StreamRoute::Market(0),
             serde_json::json!({"stream":"!ticker@arr","data":[{"e":"24hrTicker","E":10,"s":"YBUSDT","c":"2","o":"1","q":"30000000","st":1},{"e":"24hrTicker","s":"BTCUSD_PERP","c":"2","o":"1","q":"1","st":2}]}),
             10,
         )
         .unwrap();
         handle_payload(
             &state,
-            StreamRoute::Market,
+            StreamRoute::Market(0),
             serde_json::json!({"data":{"e":"kline","s":"YBUSDT","k":{"t":1,"T":2,"s":"YBUSDT","i":"5m","o":"1","c":"2","h":"2","l":"1","q":"100","Q":"60","x":true}}}),
             10,
         )
@@ -1088,7 +1153,7 @@ mod tests {
         let market = market_streams(&symbols);
         let public = public_streams(&symbols);
         assert_eq!(
-            route_url("wss://fstream.binance.com", StreamRoute::Market),
+            route_url("wss://fstream.binance.com", StreamRoute::Market(0)),
             "wss://fstream.binance.com/market/ws"
         );
         assert_eq!(
@@ -1128,6 +1193,35 @@ mod tests {
     }
 
     #[test]
+    fn market_stream_shards_are_disjoint_and_complete() {
+        let symbols = vec![
+            "BTCUSDT".to_string(),
+            "ETHUSDT".to_string(),
+            "SOLUSDT".to_string(),
+            "YBUSDT".to_string(),
+        ];
+        let expected = market_streams(&symbols);
+        let mut combined = BTreeSet::new();
+        for shard in 0..MARKET_STREAM_SHARDS {
+            let streams = market_streams_shard(&symbols, shard);
+            assert!(combined.is_disjoint(&streams));
+            combined.extend(streams);
+        }
+        assert_eq!(combined, expected);
+        for symbol in &symbols {
+            let prefix = symbol.to_lowercase();
+            let owning_shards = (0..MARKET_STREAM_SHARDS)
+                .filter(|shard| {
+                    market_streams_shard(&symbols, *shard)
+                        .iter()
+                        .any(|stream| stream.starts_with(&prefix))
+                })
+                .count();
+            assert_eq!(owning_shards, 1);
+        }
+    }
+
+    #[test]
     fn public_stream_shards_are_disjoint_and_complete() {
         let symbols = vec![
             "BTCUSDT".to_string(),
@@ -1143,6 +1237,20 @@ mod tests {
             combined.extend(streams);
         }
         assert_eq!(combined, expected);
+    }
+
+    #[test]
+    fn reconnects_are_staggered_across_routes() {
+        let delays = [
+            StreamRoute::Radar,
+            StreamRoute::Market(0),
+            StreamRoute::Market(1),
+            StreamRoute::Market(2),
+            StreamRoute::Trade(0),
+            StreamRoute::Public(2),
+        ]
+        .map(|route| reconnect_delay(1, route));
+        assert!(delays.windows(2).all(|pair| pair[0] < pair[1]));
     }
 
     #[test]
@@ -1164,9 +1272,14 @@ mod tests {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let address = listener.local_addr().unwrap();
         let state = Arc::new(RwLock::new(StreamState::default()));
+        let shard = symbol_shard("btcusdt", MARKET_STREAM_SHARDS);
+        let added_symbol = ["ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"]
+            .into_iter()
+            .find(|symbol| symbol_shard(&symbol.to_lowercase(), MARKET_STREAM_SHARDS) == shard)
+            .expect("test symbols should include one in BTC's market shard");
         let (sender, receiver) = watch::channel(vec!["BTCUSDT".to_string()]);
         let task = tokio::spawn(run_dynamic_connection(
-            StreamRoute::Market,
+            StreamRoute::Market(shard),
             format!("ws://{address}/market/ws"),
             Arc::clone(&state),
             receiver,
@@ -1188,7 +1301,7 @@ mod tests {
         assert_eq!(initial["params"].as_array().unwrap().len(), 3);
 
         sender
-            .send(vec!["BTCUSDT".to_string(), "SOLUSDT".to_string()])
+            .send(vec!["BTCUSDT".to_string(), added_symbol.to_string()])
             .unwrap();
         let addition = read_control(
             tokio::time::timeout(Duration::from_secs(1), server.next())
@@ -1198,12 +1311,14 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(addition["method"], "SUBSCRIBE");
-        assert!(addition["params"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .all(|value| value.as_str().unwrap().starts_with("solusdt@")));
-        assert!(state.read().unwrap().telemetry.market_connected);
+        assert!(addition["params"].as_array().unwrap().iter().all(|value| {
+            value
+                .as_str()
+                .unwrap()
+                .starts_with(&added_symbol.to_lowercase())
+        }));
+        assert_eq!(state.read().unwrap().telemetry.market_shards_connected, 1);
+        assert!(!state.read().unwrap().telemetry.market_connected);
         assert_eq!(state.read().unwrap().telemetry.reconnects, 0);
         task.abort();
     }

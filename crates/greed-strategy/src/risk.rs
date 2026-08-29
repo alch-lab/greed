@@ -138,6 +138,9 @@ impl StrategyNode for PositionPlannerNode {
                 .unwrap_or(self.config.pre_tp_trailing_activation_r);
             let trailing_distance_pct =
                 tag_f64(c, "trailing_distance_pct").unwrap_or(self.config.trailing_distance_pct);
+            let explicit_profit_protection = c.tags.contains_key("profit_shield_activation_r")
+                || c.tags.contains_key("pre_tp_trailing_activation_r")
+                || c.tags.contains_key("trailing_distance_pct");
             let early_failure_after_ms = tag_i64(c, "early_failure_after_ms").unwrap_or_default();
             let early_failure_adverse_r = tag_f64(c, "early_failure_adverse_r").unwrap_or_default();
             let early_failure_max_mfe_r = tag_f64(c, "early_failure_max_mfe_r").unwrap_or_default();
@@ -193,15 +196,16 @@ impl StrategyNode for PositionPlannerNode {
                 take_profit_prices,
                 break_even_after_fraction: (take_fraction < 1.0).then_some(take_fraction),
                 break_even_buffer_pct: self.config.break_even_buffer_pct,
-                profit_shield_activation_pct: (take_fraction < 1.0
+                profit_shield_activation_pct: ((take_fraction < 1.0 || explicit_profit_protection)
                     && profit_shield_activation_r > 0.0)
                     .then_some(stop_pct * profit_shield_activation_r),
                 // Start locking profit before TP1. Waiting until TP1 meant a
                 // position could reach roughly +1R, miss the 2R partial, and
                 // surrender almost all open profit back to the cost shield.
-                trailing_activation_pct: (take_fraction < 1.0)
+                trailing_activation_pct: (take_fraction < 1.0 || explicit_profit_protection)
                     .then_some(stop_pct * trailing_activation_r),
-                trailing_distance_pct: (take_fraction < 1.0).then_some(trailing_distance_pct),
+                trailing_distance_pct: (take_fraction < 1.0 || explicit_profit_protection)
+                    .then_some(trailing_distance_pct),
                 early_failure_after_ms,
                 early_failure_adverse_pct: stop_pct * early_failure_adverse_r,
                 early_failure_max_favorable_pct: stop_pct * early_failure_max_mfe_r,
