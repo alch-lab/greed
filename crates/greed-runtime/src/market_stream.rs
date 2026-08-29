@@ -18,7 +18,11 @@ const STREAM_TTL_MS: i64 = 15_000;
 const CANDLE_CACHE_LIMIT: usize = 200;
 const TICKER_HISTORY_MS: i64 = 20 * 60_000;
 const BOOK_FLOW_HISTORY_MS: i64 = 2 * 60_000;
-const STREAM_IDLE_TIMEOUT_SECS: u64 = 45;
+// Binance sends a protocol ping every three minutes. A 45-second watchdog
+// treated quiet, low-volume shards as dead and created its own reconnect
+// storm. Five minutes still detects a wedged reader while allowing the
+// exchange heartbeat to prove the socket is alive.
+const STREAM_IDLE_TIMEOUT_SECS: u64 = 5 * 60;
 const MARKET_STREAM_SHARDS: usize = 3;
 const TRADE_STREAM_SHARDS: usize = 3;
 const PUBLIC_STREAM_SHARDS: usize = 3;
@@ -26,7 +30,7 @@ const SYMBOL_WARMUP_MS: i64 = 10_000;
 
 #[derive(Debug, Clone)]
 struct BookFlowObservation {
-    event_ms: i64,
+    received_ms: i64,
     raw_ofi_usd: f64,
     visible_top_usd: f64,
     mid: f64,
@@ -74,6 +78,8 @@ pub struct StreamTelemetry {
     pub market_reconnects: u64,
     pub trade_reconnects: u64,
     pub public_reconnects: u64,
+    pub last_disconnect_ms: Option<i64>,
+    pub last_disconnect_reason: Option<String>,
     pub parse_errors: u64,
     pub last_error: Option<String>,
     pub subscribed_symbols: usize,
@@ -394,7 +400,11 @@ async fn run_dynamic_connection(
     let mut backoff = 1u64;
     let mut request_id = 1u64;
     loop {
-        if symbols.borrow().is_empty() {
+        if route_streams(route, &symbols.borrow()).is_empty() {
+            // A small dynamic universe can leave a deterministic shard with
+            // no assigned symbols. It is healthy without a socket and should
+            // not reconnect forever merely to hold an empty subscription.
+            set_connected(&state, route, true, None);
             if symbols.changed().await.is_err() {
                 return;
             }
@@ -842,7 +852,7 @@ fn update_depth(state: &Arc<RwLock<StreamState>>, value: &Value, received_ms: i6
             values.push_back(observation);
             while values
                 .front()
-                .is_some_and(|value| value.event_ms < received_ms - BOOK_FLOW_HISTORY_MS)
+                .is_some_and(|value| value.received_ms < received_ms - BOOK_FLOW_HISTORY_MS)
             {
                 values.pop_front();
             }
@@ -888,7 +898,10 @@ fn book_flow_observation(previous: &BookState, current: &BookState) -> Option<Bo
         previous_ask_usd
     };
     Some(BookFlowObservation {
-        event_ms: current.meta.event_ms,
+        // Window local order-book changes by arrival time. Exchange event
+        // time can differ from the runtime clock enough to make every OFI
+        // observation appear old even though depth messages are current.
+        received_ms: current.meta.received_ms,
         raw_ofi_usd: bid_flow + ask_flow,
         visible_top_usd: ((previous_bid_usd
             + current_bid_usd
@@ -913,7 +926,9 @@ fn aggregate_book_flow(
 ) -> Option<BookFlowAggregate> {
     let selected: Vec<_> = values
         .iter()
-        .filter(|value| value.event_ms >= now_ms - window_ms && value.event_ms <= now_ms + 1_000)
+        .filter(|value| {
+            value.received_ms >= now_ms - window_ms && value.received_ms <= now_ms + 1_000
+        })
         .collect();
     if selected.len() < 2 {
         return None;
@@ -986,6 +1001,8 @@ fn set_connected(
         }
     }
     if let Some(error) = error {
+        state.telemetry.last_disconnect_ms = Some(chrono::Utc::now().timestamp_millis());
+        state.telemetry.last_disconnect_reason = Some(error.clone());
         state.telemetry.last_error = Some(error);
     } else if connected
         && state.telemetry.radar_connected
@@ -1346,9 +1363,11 @@ mod tests {
     #[test]
     fn snapshot_ofi_is_positive_when_bid_queue_grows() {
         let previous = test_book(1_000, 99.0, 10.0, 101.0, 10.0);
-        let current = test_book(1_500, 99.0, 20.0, 101.0, 10.0);
+        let mut current = test_book(1_500, 99.0, 20.0, 101.0, 10.0);
+        current.meta.event_ms = 500;
         let observation = book_flow_observation(&previous, &current).unwrap();
         assert!(observation.raw_ofi_usd > 0.0);
+        assert_eq!(observation.received_ms, 1_500);
     }
 
     #[test]
@@ -1363,13 +1382,13 @@ mod tests {
     fn aggregates_snapshot_ofi_and_price_response() {
         let values = VecDeque::from([
             BookFlowObservation {
-                event_ms: 1_000,
+                received_ms: 1_000,
                 raw_ofi_usd: 1_000.0,
                 visible_top_usd: 10_000.0,
                 mid: 100.0,
             },
             BookFlowObservation {
-                event_ms: 1_500,
+                received_ms: 1_500,
                 raw_ofi_usd: 2_000.0,
                 visible_top_usd: 10_000.0,
                 mid: 100.1,
