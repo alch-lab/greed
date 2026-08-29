@@ -96,6 +96,7 @@ impl StrategyNode for PositionPlannerNode {
         let mut planned_gross = gross;
         let mut slots = self.config.max_positions.saturating_sub(a.open_positions);
         let mut planned_symbols = std::collections::BTreeSet::new();
+        let mut suppressed_symbol_conflicts = 0u64;
         for c in candidates {
             if slots == 0 {
                 break;
@@ -104,6 +105,7 @@ impl StrategyNode for PositionPlannerNode {
             // in the same frame.  Fund only the higher-priority interpretation
             // instead of submitting opposing plans for one contract.
             if !planned_symbols.insert(c.symbol.clone()) {
+                suppressed_symbol_conflicts += 1;
                 continue;
             }
             let Some(i) = ctx.frame.instrument(&c.symbol) else {
@@ -217,6 +219,16 @@ impl StrategyNode for PositionPlannerNode {
                 producer: self.id.clone(),
                 artifact: Artifact::PositionPlan(plan),
             });
+        }
+        if let Some(ArtifactRecord {
+            artifact: Artifact::State(state),
+            ..
+        }) = out.first_mut()
+        {
+            state.metrics.insert(
+                "suppressed_symbol_conflicts".into(),
+                suppressed_symbol_conflicts as f64,
+            );
         }
         Ok(out)
     }

@@ -296,6 +296,7 @@ impl StrategyNode for TrendContinuationNode {
             };
             let mut tags = BTreeMap::from([
                 ("lane".into(), "trend_continuation".into()),
+                ("priority".into(), "1".into()),
                 ("return_4h".into(), return_4h.to_string()),
                 ("trend_efficiency".into(), efficiency.to_string()),
                 ("trend_age_bars".into(), trend_age_bars.to_string()),

@@ -311,7 +311,9 @@ impl StrategyNode for SfpReversalNode {
                 ],
                 tags: BTreeMap::from([
                     ("lane".into(), "sfp_reversal".into()),
-                    ("priority".into(), "3".into()),
+                    // Failed-breakout structure overrides every directional
+                    // continuation interpretation for the same contract.
+                    ("priority".into(), "4".into()),
                     ("sfp_level".into(), setup.level.to_string()),
                     ("sfp_trigger".into(), setup.trigger.to_string()),
                     ("sfp_sweep_atr".into(), setup.sweep_atr.to_string()),

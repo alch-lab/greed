@@ -298,7 +298,9 @@ impl StrategyNode for RelativeWeaknessShortNode {
                 ],
                 tags: BTreeMap::from([
                     ("lane".into(), "relative_weakness_short".into()),
-                    ("priority".into(), "2".into()),
+                    // Confirmed downside structure owns counter-trend shorts;
+                    // ignition must never submit an opposing long first.
+                    ("priority".into(), "3".into()),
                     ("relative_return_1h".into(), relative_1h.to_string()),
                     ("relative_return_4h".into(), relative_4h.to_string()),
                     ("volume_ratio".into(), volume_ratio.to_string()),

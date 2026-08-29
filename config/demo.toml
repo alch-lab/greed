@@ -118,18 +118,25 @@ weakness_trailing_distance_r = 0.15
 weakness_max_hold_minutes = 30
 weakness_risk_per_trade_pct = 0.0015
 weakness_max_notional_multiple = 1.0
-ignition_min_return_5m = 0.010
-ignition_min_volume_ratio = 3.0
-ignition_min_flow_imbalance = 0.20
-ignition_reclaim_flow_imbalance = 0.10
-ignition_max_extension_30m = 0.03
-ignition_max_wait_seconds = 180
+# Research-only 15m trend birth -> first 5m pullback lane. It remains disabled
+# above because the recent portfolio replay fell from +$55.45 to +$38.70 when
+# these entries were included, despite passing older development windows.
+ignition_min_return_15m = 0.018
+ignition_min_relative_15m = 0.006
+ignition_min_volume_ratio = 1.75
+ignition_min_flow_imbalance = 0.0
+ignition_reclaim_flow_imbalance = 0.0
+ignition_max_extension_60m = 0.09
+ignition_max_pre_birth_return = 0.025
+ignition_min_pullback_atr = 0.20
+ignition_max_pullback_atr = 1.50
+ignition_max_wait_seconds = 1800
 ignition_limit_offset_atr = 0.05
-# The walk-forward models two subsequent one-minute bars for the passive touch.
+# Keep the passive order short-lived once the completed 5m reclaim arrives.
 ignition_entry_timeout_seconds = 120
-ignition_stop_atr_multiple = 1.0
-ignition_target_r = 1.25
-ignition_max_hold_minutes = 10
+ignition_stop_atr_multiple = 1.25
+ignition_target_r = 1.0
+ignition_max_hold_minutes = 30
 ignition_risk_per_trade_pct = 0.0025
 
 [strategy.risk]
