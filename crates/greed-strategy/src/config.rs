@@ -112,6 +112,8 @@ pub struct LaneConfig {
     pub burst_min_reversal_return: f64,
     pub burst_min_opposing_flow: f64,
     pub burst_max_signal_age_seconds: u32,
+    pub burst_max_live_opposing_flow: f64,
+    pub burst_max_live_opposing_return_bps: f64,
     pub burst_target_r: f64,
     pub burst_take_profit_fraction: f64,
     pub burst_profit_shield_activation_r: f64,
@@ -188,7 +190,9 @@ impl Default for LaneConfig {
             burst_min_volume_ratio: 2.0,
             burst_min_reversal_return: 0.006,
             burst_min_opposing_flow: 0.08,
-            burst_max_signal_age_seconds: 120,
+            burst_max_signal_age_seconds: 15,
+            burst_max_live_opposing_flow: 0.10,
+            burst_max_live_opposing_return_bps: 3.0,
             burst_target_r: 0.5,
             burst_take_profit_fraction: 0.33,
             burst_profit_shield_activation_r: 0.35,
@@ -332,7 +336,9 @@ impl StrategyConfig {
             || !(1.0..=5.0).contains(&lanes.burst_min_volume_ratio)
             || !(0.003..=0.02).contains(&lanes.burst_min_reversal_return)
             || !(0.03..=0.30).contains(&lanes.burst_min_opposing_flow)
-            || !(30..=300).contains(&lanes.burst_max_signal_age_seconds)
+            || !(5..=120).contains(&lanes.burst_max_signal_age_seconds)
+            || !(0.05..=0.50).contains(&lanes.burst_max_live_opposing_flow)
+            || !(1.0..=20.0).contains(&lanes.burst_max_live_opposing_return_bps)
             || !(0.5..=2.0).contains(&lanes.burst_target_r)
             || !(0.1..=0.9).contains(&lanes.burst_take_profit_fraction)
             || !(0.2..lanes.burst_target_r).contains(&lanes.burst_profit_shield_activation_r)

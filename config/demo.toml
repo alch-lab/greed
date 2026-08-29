@@ -139,7 +139,13 @@ burst_min_return_30m = 0.025
 burst_min_volume_ratio = 2.0
 burst_min_reversal_return = 0.006
 burst_min_opposing_flow = 0.08
-burst_max_signal_age_seconds = 120
+# A completed 5m reversal is perishable. PROM entered 28.4 seconds after the
+# close, after the burst had already started reclaiming. Admit only the first
+# 15 seconds and veto the entry when both 60s aggressor flow and the 10s price
+# response have turned against the intended reversal.
+burst_max_signal_age_seconds = 15
+burst_max_live_opposing_flow = 0.10
+burst_max_live_opposing_return_bps = 3.0
 # Monetize the first reversal leg instead of waiting for a full structural R:
 # sell 33% at +0.5R, protect round-trip cost after +0.35R, then trail the
 # remainder after +0.8R by 0.30R. The 30-minute cap remains the final fallback.

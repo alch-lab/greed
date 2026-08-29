@@ -44,6 +44,21 @@ fn flow(bar: &Candle) -> Option<f64> {
         .map(|buy| 2.0 * buy / bar.quote_volume.max(1.0) - 1.0)
 }
 
+fn live_reversal_invalidated(
+    side: Side,
+    trade_imbalance: Option<f64>,
+    mid_return_bps: Option<f64>,
+    max_opposing_flow: f64,
+    max_opposing_return_bps: f64,
+) -> bool {
+    trade_imbalance
+        .zip(mid_return_bps)
+        .is_some_and(|(flow, mid_return)| {
+            side.sign() * flow < -max_opposing_flow
+                && side.sign() * mid_return < -max_opposing_return_bps
+        })
+}
+
 fn setup(values: &[&Candle], reversal_index: usize, config: &LaneConfig) -> Option<Setup> {
     if reversal_index < 24 {
         return None;
@@ -160,6 +175,27 @@ impl StrategyNode for BurstExhaustionNode {
             let mut blockers = Vec::new();
             if age_ms < 0 || age_ms > i64::from(self.config.burst_max_signal_age_seconds) * 1_000 {
                 blockers.push("completed 5m reversal is outside the execution window".into());
+            }
+            let live_trade_imbalance = instrument
+                .microstructure
+                .as_ref()
+                .and_then(|value| value.trade_imbalance());
+            let live_mid_return_bps = instrument
+                .microstructure
+                .as_ref()
+                .and_then(|value| value.mid_return_bps_10s);
+            if live_reversal_invalidated(
+                value.side,
+                live_trade_imbalance,
+                live_mid_return_bps,
+                self.config.burst_max_live_opposing_flow,
+                self.config.burst_max_live_opposing_return_bps,
+            ) {
+                blockers.push(format!(
+                    "live flow/price reclaimed against exhaustion: flow {:+.1}% · 10s {:+.1} bps",
+                    live_trade_imbalance.unwrap_or_default() * 100.0,
+                    live_mid_return_bps.unwrap_or_default()
+                ));
             }
             if !(0.0025..=0.03).contains(&stop_pct) {
                 blockers.push(format!(
@@ -379,5 +415,30 @@ mod tests {
         assert!(config.burst_profit_shield_activation_r < config.burst_target_r);
         assert!(config.burst_trailing_activation_r >= config.burst_target_r);
         assert!(config.burst_trailing_distance_r < config.burst_trailing_activation_r);
+    }
+
+    #[test]
+    fn live_veto_requires_both_price_and_flow_to_reclaim() {
+        assert!(live_reversal_invalidated(
+            Side::Sell,
+            Some(0.20),
+            Some(5.0),
+            0.10,
+            3.0
+        ));
+        assert!(!live_reversal_invalidated(
+            Side::Sell,
+            Some(0.20),
+            Some(-5.0),
+            0.10,
+            3.0
+        ));
+        assert!(!live_reversal_invalidated(
+            Side::Sell,
+            Some(-0.20),
+            Some(5.0),
+            0.10,
+            3.0
+        ));
     }
 }
