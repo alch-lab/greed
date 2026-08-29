@@ -50,6 +50,8 @@ pub struct LaneConfig {
     pub sfp_reversal_enabled: bool,
     pub trend_continuation_enabled: bool,
     pub relative_weakness_short_enabled: bool,
+    pub intraday_sweep_reversal_enabled: bool,
+    pub burst_exhaustion_enabled: bool,
     pub max_candidates_per_lane: usize,
     pub max_spread_bps: f64,
     pub min_depth_usd: f64,
@@ -94,6 +96,25 @@ pub struct LaneConfig {
     pub weakness_max_hold_minutes: u32,
     pub weakness_risk_per_trade_pct: f64,
     pub weakness_max_notional_multiple: f64,
+    pub intraday_lookback_bars: usize,
+    pub intraday_min_sweep_atr: f64,
+    pub intraday_min_wick_body: f64,
+    pub intraday_min_volume_ratio: f64,
+    pub intraday_min_directional_flow: f64,
+    pub intraday_max_abs_return_4h: f64,
+    pub intraday_confirmation_minutes: u32,
+    pub intraday_max_signal_age_seconds: u32,
+    pub intraday_target_r: f64,
+    pub intraday_max_hold_minutes: u32,
+    pub intraday_risk_per_trade_pct: f64,
+    pub burst_min_return_30m: f64,
+    pub burst_min_volume_ratio: f64,
+    pub burst_min_reversal_return: f64,
+    pub burst_min_opposing_flow: f64,
+    pub burst_max_signal_age_seconds: u32,
+    pub burst_target_r: f64,
+    pub burst_max_hold_minutes: u32,
+    pub burst_risk_per_trade_pct: f64,
 }
 
 impl Default for LaneConfig {
@@ -102,6 +123,8 @@ impl Default for LaneConfig {
             sfp_reversal_enabled: true,
             trend_continuation_enabled: true,
             relative_weakness_short_enabled: true,
+            intraday_sweep_reversal_enabled: true,
+            burst_exhaustion_enabled: true,
             max_candidates_per_lane: 2,
             max_spread_bps: 6.0,
             min_depth_usd: 20_000.0,
@@ -146,6 +169,25 @@ impl Default for LaneConfig {
             weakness_max_hold_minutes: 30,
             weakness_risk_per_trade_pct: 0.0015,
             weakness_max_notional_multiple: 1.0,
+            intraday_lookback_bars: 8,
+            intraday_min_sweep_atr: 0.20,
+            intraday_min_wick_body: 1.20,
+            intraday_min_volume_ratio: 1.60,
+            intraday_min_directional_flow: 0.30,
+            intraday_max_abs_return_4h: 0.04,
+            intraday_confirmation_minutes: 30,
+            intraday_max_signal_age_seconds: 120,
+            intraday_target_r: 2.0,
+            intraday_max_hold_minutes: 120,
+            intraday_risk_per_trade_pct: 0.0025,
+            burst_min_return_30m: 0.025,
+            burst_min_volume_ratio: 2.0,
+            burst_min_reversal_return: 0.006,
+            burst_min_opposing_flow: 0.08,
+            burst_max_signal_age_seconds: 120,
+            burst_target_r: 1.0,
+            burst_max_hold_minutes: 30,
+            burst_risk_per_trade_pct: 0.002,
         }
     }
 }
@@ -267,6 +309,25 @@ impl StrategyConfig {
             || !(5..=30).contains(&lanes.weakness_max_hold_minutes)
             || !(0.001..=0.003).contains(&lanes.weakness_risk_per_trade_pct)
             || !(0.25..=1.0).contains(&lanes.weakness_max_notional_multiple)
+            || !(4..=32).contains(&lanes.intraday_lookback_bars)
+            || !(0.05..=1.0).contains(&lanes.intraday_min_sweep_atr)
+            || !(0.5..=4.0).contains(&lanes.intraday_min_wick_body)
+            || !(0.5..=5.0).contains(&lanes.intraday_min_volume_ratio)
+            || !(0.05..=0.80).contains(&lanes.intraday_min_directional_flow)
+            || !(0.01..=0.06).contains(&lanes.intraday_max_abs_return_4h)
+            || !(5..=60).contains(&lanes.intraday_confirmation_minutes)
+            || !(30..=300).contains(&lanes.intraday_max_signal_age_seconds)
+            || !(1.0..=3.0).contains(&lanes.intraday_target_r)
+            || !(30..=240).contains(&lanes.intraday_max_hold_minutes)
+            || !(0.001..=0.005).contains(&lanes.intraday_risk_per_trade_pct)
+            || !(0.015..=0.06).contains(&lanes.burst_min_return_30m)
+            || !(1.0..=5.0).contains(&lanes.burst_min_volume_ratio)
+            || !(0.003..=0.02).contains(&lanes.burst_min_reversal_return)
+            || !(0.03..=0.30).contains(&lanes.burst_min_opposing_flow)
+            || !(30..=300).contains(&lanes.burst_max_signal_age_seconds)
+            || !(0.5..=2.0).contains(&lanes.burst_target_r)
+            || !(10..=60).contains(&lanes.burst_max_hold_minutes)
+            || !(0.001..=0.005).contains(&lanes.burst_risk_per_trade_pct)
             || lanes.max_spread_bps <= 0.0
             || lanes.min_depth_usd <= 0.0
         {

@@ -45,6 +45,8 @@ refresh_seconds = 15
 sfp_reversal_enabled = true
 trend_continuation_enabled = true
 relative_weakness_short_enabled = true
+intraday_sweep_reversal_enabled = true
+burst_exhaustion_enabled = true
 max_candidates_per_lane = 2
 max_spread_bps = 6.0
 # Ten times the standard 2,000 USDT trend notional; spread remains capped at 6 bps.
@@ -117,6 +119,30 @@ weakness_trailing_distance_r = 0.15
 weakness_max_hold_minutes = 30
 weakness_risk_per_trade_pct = 0.0015
 weakness_max_notional_multiple = 1.0
+# Symmetric 15m local-liquidity rejection.  This lane is intentionally
+# disabled in strong 4h trends, leaving trend_continuation an isolated regime.
+intraday_lookback_bars = 8
+intraday_min_sweep_atr = 0.20
+intraday_min_wick_body = 1.20
+intraday_min_volume_ratio = 1.60
+intraday_min_directional_flow = 0.30
+intraday_max_abs_return_4h = 0.04
+intraday_confirmation_minutes = 30
+intraday_max_signal_age_seconds = 120
+intraday_target_r = 2.0
+intraday_max_hold_minutes = 120
+intraday_risk_per_trade_pct = 0.0025
+# Independent medium-frequency reversal lane selected on 2026-08-24..28.
+# It never chases the initial move: a 5m opposing candle and aggressor-flow
+# reversal must arrive after the 30m burst and volume climax.
+burst_min_return_30m = 0.025
+burst_min_volume_ratio = 2.0
+burst_min_reversal_return = 0.006
+burst_min_opposing_flow = 0.08
+burst_max_signal_age_seconds = 120
+burst_target_r = 1.0
+burst_max_hold_minutes = 30
+burst_risk_per_trade_pct = 0.002
 [strategy.risk]
 risk_per_trade_pct = 0.010
 high_confidence_risk_per_trade_pct = 0.010

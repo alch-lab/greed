@@ -448,6 +448,8 @@ fn record_diagnostics(
         "lane.sfp_reversal.status",
         "lane.trend_continuation.status",
         "lane.relative_weakness_short.status",
+        "lane.intraday_sweep_reversal.status",
+        "lane.burst_exhaustion.status",
         "portfolio.risk",
     ] {
         let Some(value) = artifacts
@@ -514,6 +516,10 @@ fn recipe_from_id(id: &str) -> &'static str {
         "trend_continuation"
     } else if id.contains("relative_weakness_short") {
         "relative_weakness_short"
+    } else if id.contains("intraday_sweep_reversal") {
+        "intraday_sweep_reversal"
+    } else if id.contains("burst_exhaustion") {
+        "burst_exhaustion"
     } else {
         "unknown"
     }
@@ -524,6 +530,8 @@ fn lane_for_recipe(recipe: &str) -> &'static str {
         "sfp_reversal" => "sfp_reversal",
         "trend_continuation" => "trend_continuation",
         "relative_weakness_short" => "relative_weakness_short",
+        "intraday_sweep_reversal" => "intraday_sweep_reversal",
+        "burst_exhaustion" => "burst_exhaustion",
         _ => "unknown",
     }
 }

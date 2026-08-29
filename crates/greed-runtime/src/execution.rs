@@ -1083,6 +1083,8 @@ impl BinanceDemoExecution {
             "sfp_reversal",
             "trend_continuation",
             "relative_weakness_short",
+            "intraday_sweep_reversal",
+            "burst_exhaustion",
         ]
         .into_iter()
         .flat_map(|recipe| {
