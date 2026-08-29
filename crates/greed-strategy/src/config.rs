@@ -113,6 +113,10 @@ pub struct LaneConfig {
     pub burst_min_opposing_flow: f64,
     pub burst_max_signal_age_seconds: u32,
     pub burst_target_r: f64,
+    pub burst_take_profit_fraction: f64,
+    pub burst_profit_shield_activation_r: f64,
+    pub burst_trailing_activation_r: f64,
+    pub burst_trailing_distance_r: f64,
     pub burst_max_hold_minutes: u32,
     pub burst_risk_per_trade_pct: f64,
 }
@@ -185,9 +189,13 @@ impl Default for LaneConfig {
             burst_min_reversal_return: 0.006,
             burst_min_opposing_flow: 0.08,
             burst_max_signal_age_seconds: 120,
-            burst_target_r: 1.0,
+            burst_target_r: 0.5,
+            burst_take_profit_fraction: 0.33,
+            burst_profit_shield_activation_r: 0.35,
+            burst_trailing_activation_r: 0.8,
+            burst_trailing_distance_r: 0.30,
             burst_max_hold_minutes: 30,
-            burst_risk_per_trade_pct: 0.002,
+            burst_risk_per_trade_pct: 0.0035,
         }
     }
 }
@@ -326,6 +334,10 @@ impl StrategyConfig {
             || !(0.03..=0.30).contains(&lanes.burst_min_opposing_flow)
             || !(30..=300).contains(&lanes.burst_max_signal_age_seconds)
             || !(0.5..=2.0).contains(&lanes.burst_target_r)
+            || !(0.1..=0.9).contains(&lanes.burst_take_profit_fraction)
+            || !(0.2..lanes.burst_target_r).contains(&lanes.burst_profit_shield_activation_r)
+            || !(lanes.burst_target_r..=2.0).contains(&lanes.burst_trailing_activation_r)
+            || !(0.1..=0.75).contains(&lanes.burst_trailing_distance_r)
             || !(10..=60).contains(&lanes.burst_max_hold_minutes)
             || !(0.001..=0.005).contains(&lanes.burst_risk_per_trade_pct)
             || lanes.max_spread_bps <= 0.0

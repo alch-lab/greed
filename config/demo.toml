@@ -140,9 +140,19 @@ burst_min_volume_ratio = 2.0
 burst_min_reversal_return = 0.006
 burst_min_opposing_flow = 0.08
 burst_max_signal_age_seconds = 120
-burst_target_r = 1.0
+# Monetize the first reversal leg instead of waiting for a full structural R:
+# sell 33% at +0.5R, protect round-trip cost after +0.35R, then trail the
+# remainder after +0.8R by 0.30R. The 30-minute cap remains the final fallback.
+burst_target_r = 0.5
+burst_take_profit_fraction = 0.33
+burst_profit_shield_activation_r = 0.35
+burst_trailing_activation_r = 0.8
+burst_trailing_distance_r = 0.30
 burst_max_hold_minutes = 30
-burst_risk_per_trade_pct = 0.002
+# Five-day 1m replay selected 0.35% equity risk as the middle point: materially
+# better capital efficiency than 0.20%, while remaining below the 0.50% variant's
+# approximately 2.5% lane drawdown.
+burst_risk_per_trade_pct = 0.0035
 [strategy.risk]
 risk_per_trade_pct = 0.010
 high_confidence_risk_per_trade_pct = 0.010

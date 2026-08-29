@@ -224,7 +224,22 @@ impl StrategyNode for BurstExhaustionNode {
                     ("reversal_flow".into(), value.reversal_flow.to_string()),
                     ("stop_pct".into(), stop_pct.to_string()),
                     ("target_r".into(), self.config.burst_target_r.to_string()),
-                    ("take_profit_fraction".into(), "1.0".into()),
+                    (
+                        "take_profit_fraction".into(),
+                        self.config.burst_take_profit_fraction.to_string(),
+                    ),
+                    (
+                        "profit_shield_activation_r".into(),
+                        self.config.burst_profit_shield_activation_r.to_string(),
+                    ),
+                    (
+                        "pre_tp_trailing_activation_r".into(),
+                        self.config.burst_trailing_activation_r.to_string(),
+                    ),
+                    (
+                        "trailing_distance_pct".into(),
+                        (stop_pct * self.config.burst_trailing_distance_r).to_string(),
+                    ),
                     (
                         "risk_per_trade_pct".into(),
                         self.config.burst_risk_per_trade_pct.to_string(),
@@ -354,5 +369,15 @@ mod tests {
         let values = exhaustion(-0.02);
         let refs = values.iter().collect::<Vec<_>>();
         assert!(setup(&refs, refs.len() - 1, &LaneConfig::default()).is_none());
+    }
+
+    #[test]
+    fn default_exit_geometry_locks_profit_before_the_time_exit() {
+        let config = LaneConfig::default();
+        assert_eq!(config.burst_target_r, 0.5);
+        assert_eq!(config.burst_take_profit_fraction, 0.33);
+        assert!(config.burst_profit_shield_activation_r < config.burst_target_r);
+        assert!(config.burst_trailing_activation_r >= config.burst_target_r);
+        assert!(config.burst_trailing_distance_r < config.burst_trailing_activation_r);
     }
 }
