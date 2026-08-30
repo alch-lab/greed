@@ -23,9 +23,14 @@ const BOOK_FLOW_HISTORY_MS: i64 = 2 * 60_000;
 // storm. Five minutes still detects a wedged reader while allowing the
 // exchange heartbeat to prove the socket is alive.
 const STREAM_IDLE_TIMEOUT_SECS: u64 = 5 * 60;
-const MARKET_STREAM_SHARDS: usize = 3;
-const TRADE_STREAM_SHARDS: usize = 3;
-const PUBLIC_STREAM_SHARDS: usize = 3;
+// Binance raised the per-connection subscription ceiling to 1,024 streams.
+// With the configured 46-symbol universe the largest route contains only
+// 184 kline streams, so extra shards add failure surfaces without buying us
+// any capacity. Keep radar, candles, trades and depth isolated by purpose,
+// but use one socket for each purpose (four sockets total).
+const MARKET_STREAM_SHARDS: usize = 1;
+const TRADE_STREAM_SHARDS: usize = 1;
+const PUBLIC_STREAM_SHARDS: usize = 1;
 const SYMBOL_WARMUP_MS: i64 = 10_000;
 
 #[derive(Debug, Clone)]
@@ -470,6 +475,9 @@ async fn run_dynamic_connection(
                 } else {
                     request_id += 1;
                     let mut active = desired;
+                    let idle_deadline =
+                        tokio::time::sleep(Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS));
+                    tokio::pin!(idle_deadline);
                     let disconnect_reason = loop {
                         tokio::select! {
                             changed = symbols.changed() => {
@@ -515,9 +523,17 @@ async fn run_dynamic_connection(
                                             Ok(()) => record_message(&state, route, now_ms),
                                             Err(error) => record_parse_error(&state, error.to_string()),
                                         }
+                                        idle_deadline.as_mut().reset(
+                                            tokio::time::Instant::now()
+                                                + Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS),
+                                        );
                                     }
                                     Some(Ok(Message::Ping(payload))) => {
                                         if writer.send(Message::Pong(payload)).await.is_err() { break "pong write failed".to_string(); }
+                                        idle_deadline.as_mut().reset(
+                                            tokio::time::Instant::now()
+                                                + Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS),
+                                        );
                                     }
                                     Some(Ok(Message::Close(frame))) => break format!("server close: {frame:?}"),
                                     Some(Err(error)) => break format!("websocket read failed: {error}"),
@@ -525,7 +541,7 @@ async fn run_dynamic_connection(
                                     _ => {}
                                 }
                             }
-                            _ = tokio::time::sleep(Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS)) => {
+                            _ = &mut idle_deadline => {
                                 break "websocket receive idle timeout".to_string();
                             }
                         }
@@ -1396,10 +1412,8 @@ mod tests {
         let delays = [
             StreamRoute::Radar,
             StreamRoute::Market(0),
-            StreamRoute::Market(1),
-            StreamRoute::Market(2),
             StreamRoute::Trade(0),
-            StreamRoute::Public(2),
+            StreamRoute::Public(0),
         ]
         .map(|route| reconnect_delay(1, route));
         assert!(delays.windows(2).all(|pair| pair[0] < pair[1]));
@@ -1470,7 +1484,7 @@ mod tests {
                 .starts_with(&added_symbol.to_lowercase())
         }));
         assert_eq!(state.read().unwrap().telemetry.market_shards_connected, 1);
-        assert!(!state.read().unwrap().telemetry.market_connected);
+        assert!(state.read().unwrap().telemetry.market_connected);
         assert_eq!(state.read().unwrap().telemetry.reconnects, 0);
         task.abort();
     }
@@ -1496,28 +1510,14 @@ mod tests {
     }
 
     #[test]
-    fn public_reconnect_only_rewarms_its_own_symbols() {
+    fn public_reconnect_rewarms_all_symbols_on_the_single_depth_route() {
         let symbols = vec![
             "BTCUSDT".to_string(),
             "ETHUSDT".to_string(),
             "SOLUSDT".to_string(),
             "XRPUSDT".to_string(),
         ];
-        let recovered = &symbols[0];
-        let shard = symbol_shard(
-            &format!("{}@depth20@500ms", recovered.to_lowercase()),
-            PUBLIC_STREAM_SHARDS,
-        );
-        let unaffected = symbols
-            .iter()
-            .find(|symbol| {
-                symbol_shard(
-                    &format!("{}@depth20@500ms", symbol.to_lowercase()),
-                    PUBLIC_STREAM_SHARDS,
-                ) != shard
-            })
-            .expect("test symbols cover more than one shard")
-            .clone();
+        let shard = 0;
         let state = Arc::new(RwLock::new(StreamState::default()));
         {
             let mut inner = state.write().unwrap();
@@ -1538,10 +1538,10 @@ mod tests {
         mark_route_recovering(&state, StreamRoute::Public(shard), &symbols, 2_000);
 
         let inner = state.read().unwrap();
-        assert_eq!(inner.symbol_admitted_ms[recovered], 2_000);
-        assert!(!inner.book_flow.contains_key(recovered));
-        assert_eq!(inner.symbol_admitted_ms[&unaffected], 1_000);
-        assert!(inner.book_flow.contains_key(&unaffected));
+        for symbol in &symbols {
+            assert_eq!(inner.symbol_admitted_ms[symbol], 2_000);
+            assert!(!inner.book_flow.contains_key(symbol));
+        }
     }
 
     #[test]
