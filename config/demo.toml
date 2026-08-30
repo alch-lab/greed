@@ -113,12 +113,21 @@ weakness_max_flow = -0.05
 weakness_min_hour_volume_ratio = 0.80
 weakness_breakdown_bars = 4
 weakness_max_signal_age_seconds = 120
-weakness_target_r = 1.0
-weakness_profit_shield_activation_r = 0.40
-weakness_trailing_distance_r = 0.15
+# The completed 15m breakdown is only context. Immediately before submission,
+# require the live flow and 10s price response not to have reversed together.
+weakness_max_live_opposing_flow = 0.12
+weakness_max_live_opposing_return_bps = 3.0
+weakness_target_r = 1.25
+weakness_profit_shield_activation_r = 0.60
+weakness_trailing_distance_r = 0.25
 weakness_max_hold_minutes = 30
 weakness_risk_per_trade_pct = 0.0015
 weakness_max_notional_multiple = 1.0
+# A breakdown that is already -0.35R adverse after two minutes without first
+# reaching +0.15R has failed; do not wait for the full structural stop.
+weakness_early_failure_seconds = 120
+weakness_early_failure_adverse_r = 0.35
+weakness_early_failure_max_mfe_r = 0.15
 # Symmetric 15m local-liquidity rejection.  This lane is intentionally
 # disabled in strong 4h trends, leaving trend_continuation an isolated regime.
 intraday_lookback_bars = 8
@@ -146,19 +155,21 @@ burst_min_opposing_flow = 0.08
 burst_max_signal_age_seconds = 15
 burst_max_live_opposing_flow = 0.10
 burst_max_live_opposing_return_bps = 3.0
-# Monetize the first reversal leg instead of waiting for a full structural R:
-# sell 33% at +0.5R, protect round-trip cost after +0.35R, then trail the
-# remainder after +0.8R by 0.30R. The 30-minute cap remains the final fallback.
-burst_target_r = 0.5
-burst_take_profit_fraction = 0.33
-burst_profit_shield_activation_r = 0.35
-burst_trailing_activation_r = 0.8
-burst_trailing_distance_r = 0.30
+# Preserve positive payoff geometry: take half at +1R, protect costs only after
+# +0.5R, and trail after +0.75R. The previous +0.5R/33% geometry banked about
+# +0.1R on winners while a full stop could lose more than -1R.
+burst_target_r = 1.0
+burst_take_profit_fraction = 0.50
+burst_profit_shield_activation_r = 0.50
+burst_trailing_activation_r = 0.75
+burst_trailing_distance_r = 0.25
 burst_max_hold_minutes = 30
-# Five-day 1m replay selected 0.35% equity risk as the middle point: materially
-# better capital efficiency than 0.20%, while remaining below the 0.50% variant's
-# approximately 2.5% lane drawdown.
-burst_risk_per_trade_pct = 0.0035
+# Until the repaired lane has a new forward sample, cap a full structural loss
+# at 0.25% of equity and flatten failed reversals early.
+burst_risk_per_trade_pct = 0.0025
+burst_early_failure_seconds = 90
+burst_early_failure_adverse_r = 0.35
+burst_early_failure_max_mfe_r = 0.15
 [strategy.risk]
 risk_per_trade_pct = 0.010
 high_confidence_risk_per_trade_pct = 0.010

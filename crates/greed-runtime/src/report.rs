@@ -77,6 +77,7 @@ struct FunnelStats {
     block: u64,
     plans: u64,
     entries: u64,
+    entry_cancellations: u64,
     plan_rejections: u64,
     blockers: BTreeMap<String, u64>,
     stopped_stages: BTreeMap<String, u64>,
@@ -360,6 +361,17 @@ pub fn build(path: &str) -> Result<Value> {
                     &mut recipe_sides,
                     &mut open_trades,
                 );
+            }
+            "exchange_entry_canceled" => {
+                let (sleeve, recipe) = classify(payload);
+                for stats in [
+                    sleeve_funnels.entry(sleeve).or_default(),
+                    recipe_funnels.entry(recipe).or_default(),
+                ] {
+                    stats.entry_cancellations += 1;
+                    let reason = payload["reason"].as_str().unwrap_or("unknown");
+                    *stats.blockers.entry(reason.into()).or_default() += 1;
+                }
             }
             "exchange_plan_rejected" | "exchange_order_rejected" => {
                 let (sleeve, recipe) = classify(payload);

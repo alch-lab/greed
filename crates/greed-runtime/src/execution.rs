@@ -929,6 +929,17 @@ impl BinanceDemoExecution {
                         let mae_pct = (-meta.side.sign()
                             * (meta.adverse_price / meta.entry_price.max(f64::EPSILON) - 1.0))
                             .max(0.0);
+                        let stop_slippage_bps = summary.as_ref().and_then(|value| {
+                            (meta.stop_price > f64::EPSILON && value.last_exit_price > f64::EPSILON)
+                                .then(|| match meta.side {
+                                    Side::Buy => {
+                                        (meta.stop_price / value.last_exit_price - 1.0) * 10_000.0
+                                    }
+                                    Side::Sell => {
+                                        (value.last_exit_price / meta.stop_price - 1.0) * 10_000.0
+                                    }
+                                })
+                        });
                         events.push(ExchangeEvent {
                             kind: "exchange_exit".into(),
                             payload: serde_json::json!({
@@ -957,6 +968,8 @@ impl BinanceDemoExecution {
                                 "mae_pct": mae_pct,
                                 "hold_ms": now_ms - meta.entry_ms,
                                 "reason": exit_reason,
+                                "planned_stop_price": meta.stop_price,
+                                "stop_slippage_bps": stop_slippage_bps,
                                 "exit_order_id": exit_order_id,
                                 "exit_order_status": exit_order_status,
                                 "venue": "binance_demo"
@@ -1361,8 +1374,9 @@ impl BinanceDemoExecution {
                         )
                         .await
                         .ok();
+                    let failure = error.to_string();
                     events.push(ExchangeEvent {
-                        kind: "exchange_order_rejected".into(),
+                        kind: entry_failure_event_kind(&failure).into(),
                         payload: serde_json::json!({
                             "ts_ms":frame.as_of_ms,
                             "candidate_id":plan.candidate_id,
@@ -1384,7 +1398,7 @@ impl BinanceDemoExecution {
                             "estimated_round_trip_cost_bps":cost.estimated_round_trip_cost_bps,
                             "gross_target_bps":cost.gross_target_bps,
                             "target_to_cost_ratio":cost.target_to_cost_ratio,
-                            "reason":error.to_string(),
+                            "reason":failure,
                             "attempt_exit_price":attempt.as_ref().map(|value| value.exit_price),
                             "attempt_exit_quantity":attempt.as_ref().map(|value| value.exit_quantity),
                             "attempt_fee_usd":attempt.as_ref().map(|value| value.fees_usd),
@@ -1437,6 +1451,23 @@ impl BinanceDemoExecution {
             if partial < rules.min_quantity || partial * plan.reference_price < rules.min_notional {
                 return Err(anyhow!(
                     "staged take profit is below Binance quantity or notional minimum"
+                ));
+            }
+        }
+        // Re-check live microstructure immediately before any exchange-side
+        // mutation. Candle evaluation and order submission are asynchronous;
+        // without this final gate a valid close can turn into a stale market
+        // entry while the request is being prepared.
+        match self.pending_entry_guard(plan, chrono::Utc::now().timestamp_millis()) {
+            EntryGuardState::Healthy => {}
+            EntryGuardState::Invalidated(reason) => {
+                return Err(anyhow!(
+                    "entry signal invalidated before submission: {reason}"
+                ));
+            }
+            EntryGuardState::Unavailable(reason) => {
+                return Err(anyhow!(
+                    "entry guard unavailable before submission: {reason}"
                 ));
             }
         }
@@ -1901,6 +1932,15 @@ impl BinanceDemoExecution {
         let micro = stream
             .microstructure(&plan.symbol, now_ms)
             .filter(|value| now_ms <= value.meta.expires_ms);
+        if (plan.entry_guard_max_opposing_flow > 0.0
+            || plan.entry_guard_max_opposing_return_bps > 0.0)
+            && micro.is_none()
+        {
+            return EntryGuardState::Unavailable(format!(
+                "mainnet microstructure is missing or stale for {}",
+                plan.symbol
+            ));
+        }
         pending_entry_guard_state(
             plan,
             signal_mid,
@@ -2266,7 +2306,10 @@ impl BinanceDemoExecution {
                     ),
                     ("closePosition".into(), "true".into()),
                     ("workingType".into(), "MARK_PRICE".into()),
-                    ("priceProtect".into(), "true".into()),
+                    // MARK_PRICE remains the trigger source. Disabling the
+                    // additional divergence filter prevents a hard stop from
+                    // waiting through an altcoin gap.
+                    ("priceProtect".into(), "false".into()),
                     ("clientAlgoId".into(), client_id.clone()),
                 ],
             )
@@ -2648,6 +2691,20 @@ fn exit_matches_stop(side: Side, stop_price: f64, exit_price: f64) -> bool {
     }
 }
 
+fn entry_failure_event_kind(reason: &str) -> &'static str {
+    let reason = reason.to_ascii_lowercase();
+    if reason.contains("entry signal invalidated")
+        || reason.contains("pending entry signal invalidated")
+        || reason.contains("entry guard unavailable")
+        || reason.contains("expired without fill")
+        || reason.contains("maker entry expired")
+    {
+        "exchange_entry_canceled"
+    } else {
+        "exchange_order_rejected"
+    }
+}
+
 fn parse_rules(value: &Value) -> Result<BTreeMap<String, SymbolRules>> {
     let symbols = value["symbols"]
         .as_array()
@@ -3006,6 +3063,22 @@ mod tests {
         assert!(exit_matches_stop(Side::Sell, 100.0, 100.2));
         assert!(exit_matches_stop(Side::Sell, 100.0, 99.8));
         assert!(!exit_matches_stop(Side::Sell, 100.0, 99.7));
+    }
+
+    #[test]
+    fn safety_cancels_are_not_reported_as_exchange_rejections() {
+        assert_eq!(
+            entry_failure_event_kind("entry signal invalidated before submission: flow reversed"),
+            "exchange_entry_canceled"
+        );
+        assert_eq!(
+            entry_failure_event_kind("adaptive maker entry expired without fill"),
+            "exchange_entry_canceled"
+        );
+        assert_eq!(
+            entry_failure_event_kind("Binance demo /fapi/v1/order returned 400"),
+            "exchange_order_rejected"
+        );
     }
 
     #[test]

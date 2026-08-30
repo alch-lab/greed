@@ -70,6 +70,22 @@ fn core_ready(input: CoreInputs, config: &LaneConfig) -> bool {
         && input.btc_return_4h >= -0.02
 }
 
+fn live_breakdown_invalidated(
+    trade_imbalance: Option<f64>,
+    mid_return_bps: Option<f64>,
+    max_opposing_flow: f64,
+    max_opposing_return_bps: f64,
+) -> bool {
+    trade_imbalance
+        .zip(mid_return_bps)
+        .is_some_and(|(flow, response)| {
+            // This lane is always short. Positive aggressor flow together
+            // with a positive 10s response means the completed breakdown has
+            // already been reclaimed before the order reaches Binance.
+            flow > max_opposing_flow && response > max_opposing_return_bps
+        })
+}
+
 impl StrategyNode for RelativeWeaknessShortNode {
     fn id(&self) -> &str {
         &self.id
@@ -219,6 +235,28 @@ impl StrategyNode for RelativeWeaknessShortNode {
             if btc_return_4h < -0.02 {
                 blockers.push("BTC is already in a 4h waterfall; use the trend lane".into());
             }
+            let live_trade_imbalance = instrument
+                .microstructure
+                .as_ref()
+                .and_then(|value| value.trade_imbalance());
+            let live_mid_return_bps = instrument
+                .microstructure
+                .as_ref()
+                .and_then(|value| value.mid_return_bps_10s);
+            if live_trade_imbalance.is_none() || live_mid_return_bps.is_none() {
+                blockers.push("live microstructure confirmation is not ready".into());
+            } else if live_breakdown_invalidated(
+                live_trade_imbalance,
+                live_mid_return_bps,
+                self.config.weakness_max_live_opposing_flow,
+                self.config.weakness_max_live_opposing_return_bps,
+            ) {
+                blockers.push(format!(
+                    "live flow/price reclaimed the breakdown: flow {:+.1}% · 10s {:+.1} bps",
+                    live_trade_imbalance.unwrap_or_default() * 100.0,
+                    live_mid_return_bps.unwrap_or_default()
+                ));
+            }
             match instrument.book.as_ref() {
                 None => blockers.push("order book is not ready".into()),
                 Some(book) if !book.meta.usable_at(ctx.frame.as_of_ms) => {
@@ -333,6 +371,28 @@ impl StrategyNode for RelativeWeaknessShortNode {
                         (i64::from(self.config.weakness_max_hold_minutes) * 60_000).to_string(),
                     ),
                     ("taker_fallback".into(), "false".into()),
+                    (
+                        "entry_guard_max_opposing_flow".into(),
+                        self.config.weakness_max_live_opposing_flow.to_string(),
+                    ),
+                    (
+                        "entry_guard_max_opposing_return_bps".into(),
+                        self.config
+                            .weakness_max_live_opposing_return_bps
+                            .to_string(),
+                    ),
+                    (
+                        "early_failure_after_ms".into(),
+                        (i64::from(self.config.weakness_early_failure_seconds) * 1_000).to_string(),
+                    ),
+                    (
+                        "early_failure_adverse_r".into(),
+                        self.config.weakness_early_failure_adverse_r.to_string(),
+                    ),
+                    (
+                        "early_failure_max_mfe_r".into(),
+                        self.config.weakness_early_failure_max_mfe_r.to_string(),
+                    ),
                 ]),
             };
             if ready {
@@ -470,6 +530,23 @@ mod tests {
                 ..valid
             },
             &config
+        ));
+    }
+
+    #[test]
+    fn live_breakdown_veto_requires_flow_and_price_to_reverse_together() {
+        assert!(live_breakdown_invalidated(Some(0.20), Some(5.0), 0.12, 3.0));
+        assert!(!live_breakdown_invalidated(
+            Some(0.20),
+            Some(-5.0),
+            0.12,
+            3.0
+        ));
+        assert!(!live_breakdown_invalidated(
+            Some(-0.20),
+            Some(5.0),
+            0.12,
+            3.0
         ));
     }
 }

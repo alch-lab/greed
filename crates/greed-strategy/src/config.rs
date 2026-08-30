@@ -90,12 +90,17 @@ pub struct LaneConfig {
     pub weakness_min_hour_volume_ratio: f64,
     pub weakness_breakdown_bars: usize,
     pub weakness_max_signal_age_seconds: u32,
+    pub weakness_max_live_opposing_flow: f64,
+    pub weakness_max_live_opposing_return_bps: f64,
     pub weakness_target_r: f64,
     pub weakness_profit_shield_activation_r: f64,
     pub weakness_trailing_distance_r: f64,
     pub weakness_max_hold_minutes: u32,
     pub weakness_risk_per_trade_pct: f64,
     pub weakness_max_notional_multiple: f64,
+    pub weakness_early_failure_seconds: u32,
+    pub weakness_early_failure_adverse_r: f64,
+    pub weakness_early_failure_max_mfe_r: f64,
     pub intraday_lookback_bars: usize,
     pub intraday_min_sweep_atr: f64,
     pub intraday_min_wick_body: f64,
@@ -121,6 +126,9 @@ pub struct LaneConfig {
     pub burst_trailing_distance_r: f64,
     pub burst_max_hold_minutes: u32,
     pub burst_risk_per_trade_pct: f64,
+    pub burst_early_failure_seconds: u32,
+    pub burst_early_failure_adverse_r: f64,
+    pub burst_early_failure_max_mfe_r: f64,
 }
 
 impl Default for LaneConfig {
@@ -169,12 +177,17 @@ impl Default for LaneConfig {
             weakness_min_hour_volume_ratio: 0.80,
             weakness_breakdown_bars: 4,
             weakness_max_signal_age_seconds: 120,
-            weakness_target_r: 1.0,
-            weakness_profit_shield_activation_r: 0.40,
-            weakness_trailing_distance_r: 0.15,
+            weakness_max_live_opposing_flow: 0.12,
+            weakness_max_live_opposing_return_bps: 3.0,
+            weakness_target_r: 1.25,
+            weakness_profit_shield_activation_r: 0.60,
+            weakness_trailing_distance_r: 0.25,
             weakness_max_hold_minutes: 30,
             weakness_risk_per_trade_pct: 0.0015,
             weakness_max_notional_multiple: 1.0,
+            weakness_early_failure_seconds: 120,
+            weakness_early_failure_adverse_r: 0.35,
+            weakness_early_failure_max_mfe_r: 0.15,
             intraday_lookback_bars: 8,
             intraday_min_sweep_atr: 0.20,
             intraday_min_wick_body: 1.20,
@@ -193,13 +206,16 @@ impl Default for LaneConfig {
             burst_max_signal_age_seconds: 15,
             burst_max_live_opposing_flow: 0.10,
             burst_max_live_opposing_return_bps: 3.0,
-            burst_target_r: 0.5,
-            burst_take_profit_fraction: 0.33,
-            burst_profit_shield_activation_r: 0.35,
-            burst_trailing_activation_r: 0.8,
-            burst_trailing_distance_r: 0.30,
+            burst_target_r: 1.0,
+            burst_take_profit_fraction: 0.50,
+            burst_profit_shield_activation_r: 0.50,
+            burst_trailing_activation_r: 0.75,
+            burst_trailing_distance_r: 0.25,
             burst_max_hold_minutes: 30,
-            burst_risk_per_trade_pct: 0.0035,
+            burst_risk_per_trade_pct: 0.0025,
+            burst_early_failure_seconds: 90,
+            burst_early_failure_adverse_r: 0.35,
+            burst_early_failure_max_mfe_r: 0.15,
         }
     }
 }
@@ -315,12 +331,17 @@ impl StrategyConfig {
             || !(0.5..=3.0).contains(&lanes.weakness_min_hour_volume_ratio)
             || !(2..=12).contains(&lanes.weakness_breakdown_bars)
             || !(30..=300).contains(&lanes.weakness_max_signal_age_seconds)
+            || !(0.05..=0.50).contains(&lanes.weakness_max_live_opposing_flow)
+            || !(1.0..=20.0).contains(&lanes.weakness_max_live_opposing_return_bps)
             || !(0.5..=2.0).contains(&lanes.weakness_target_r)
             || !(0.25..lanes.weakness_target_r).contains(&lanes.weakness_profit_shield_activation_r)
             || !(0.05..=0.50).contains(&lanes.weakness_trailing_distance_r)
             || !(5..=30).contains(&lanes.weakness_max_hold_minutes)
             || !(0.001..=0.003).contains(&lanes.weakness_risk_per_trade_pct)
             || !(0.25..=1.0).contains(&lanes.weakness_max_notional_multiple)
+            || !(30..=300).contains(&lanes.weakness_early_failure_seconds)
+            || !(0.1..=0.9).contains(&lanes.weakness_early_failure_adverse_r)
+            || !(0.0..=0.5).contains(&lanes.weakness_early_failure_max_mfe_r)
             || !(4..=32).contains(&lanes.intraday_lookback_bars)
             || !(0.05..=1.0).contains(&lanes.intraday_min_sweep_atr)
             || !(0.5..=4.0).contains(&lanes.intraday_min_wick_body)
@@ -342,10 +363,14 @@ impl StrategyConfig {
             || !(0.5..=2.0).contains(&lanes.burst_target_r)
             || !(0.1..=0.9).contains(&lanes.burst_take_profit_fraction)
             || !(0.2..lanes.burst_target_r).contains(&lanes.burst_profit_shield_activation_r)
-            || !(lanes.burst_target_r..=2.0).contains(&lanes.burst_trailing_activation_r)
+            || !(lanes.burst_profit_shield_activation_r..lanes.burst_target_r)
+                .contains(&lanes.burst_trailing_activation_r)
             || !(0.1..=0.75).contains(&lanes.burst_trailing_distance_r)
             || !(10..=60).contains(&lanes.burst_max_hold_minutes)
             || !(0.001..=0.005).contains(&lanes.burst_risk_per_trade_pct)
+            || !(30..=300).contains(&lanes.burst_early_failure_seconds)
+            || !(0.1..=0.9).contains(&lanes.burst_early_failure_adverse_r)
+            || !(0.0..=0.5).contains(&lanes.burst_early_failure_max_mfe_r)
             || lanes.max_spread_bps <= 0.0
             || lanes.min_depth_usd <= 0.0
         {

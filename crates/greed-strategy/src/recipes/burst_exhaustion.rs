@@ -68,7 +68,7 @@ fn setup(values: &[&Candle], reversal_index: usize, config: &LaneConfig) -> Opti
     // An impulse may complete one to six 5m bars before the reversal. Select
     // the strongest qualifying event; all inputs are closed before signaling.
     (reversal_index.saturating_sub(6)..reversal_index)
-        .filter(|&impulse_index| impulse_index >= 18 && impulse_index >= 5)
+        .filter(|&impulse_index| impulse_index >= 18)
         .filter_map(|impulse_index| {
             let impulse = values[impulse_index];
             let impulse_return = impulse.close / values[impulse_index - 5].open - 1.0;
@@ -280,6 +280,26 @@ impl StrategyNode for BurstExhaustionNode {
                         "risk_per_trade_pct".into(),
                         self.config.burst_risk_per_trade_pct.to_string(),
                     ),
+                    (
+                        "entry_guard_max_opposing_flow".into(),
+                        self.config.burst_max_live_opposing_flow.to_string(),
+                    ),
+                    (
+                        "entry_guard_max_opposing_return_bps".into(),
+                        self.config.burst_max_live_opposing_return_bps.to_string(),
+                    ),
+                    (
+                        "early_failure_after_ms".into(),
+                        (i64::from(self.config.burst_early_failure_seconds) * 1_000).to_string(),
+                    ),
+                    (
+                        "early_failure_adverse_r".into(),
+                        self.config.burst_early_failure_adverse_r.to_string(),
+                    ),
+                    (
+                        "early_failure_max_mfe_r".into(),
+                        self.config.burst_early_failure_max_mfe_r.to_string(),
+                    ),
                     ("max_notional_multiple".into(), "1.0".into()),
                     (
                         "max_hold_ms".into(),
@@ -410,11 +430,12 @@ mod tests {
     #[test]
     fn default_exit_geometry_locks_profit_before_the_time_exit() {
         let config = LaneConfig::default();
-        assert_eq!(config.burst_target_r, 0.5);
-        assert_eq!(config.burst_take_profit_fraction, 0.33);
+        assert_eq!(config.burst_target_r, 1.0);
+        assert_eq!(config.burst_take_profit_fraction, 0.50);
         assert!(config.burst_profit_shield_activation_r < config.burst_target_r);
-        assert!(config.burst_trailing_activation_r >= config.burst_target_r);
+        assert!(config.burst_trailing_activation_r < config.burst_target_r);
         assert!(config.burst_trailing_distance_r < config.burst_trailing_activation_r);
+        assert!(config.burst_early_failure_adverse_r < 1.0);
     }
 
     #[test]
