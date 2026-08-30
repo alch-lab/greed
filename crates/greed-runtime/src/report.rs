@@ -459,9 +459,7 @@ fn record_diagnostics(
     for key in [
         "lane.sfp_reversal.status",
         "lane.trend_continuation.status",
-        "lane.relative_weakness_short.status",
         "lane.intraday_sweep_reversal.status",
-        "lane.burst_exhaustion.status",
         "portfolio.risk",
     ] {
         let Some(value) = artifacts

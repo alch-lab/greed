@@ -1,7 +1,6 @@
 use crate::{
     recipes::{
-        burst_exhaustion::BurstExhaustionNode, intraday_sweep_reversal::IntradaySweepReversalNode,
-        relative_weakness_short::RelativeWeaknessShortNode, sfp_reversal::SfpReversalNode,
+        intraday_sweep_reversal::IntradaySweepReversalNode, sfp_reversal::SfpReversalNode,
         trend_continuation::TrendContinuationNode,
     },
     risk::PositionPlannerNode,
@@ -26,26 +25,12 @@ pub fn build_graph(config: &StrategyConfig) -> Result<StrategyGraph, GraphError>
         )));
         lanes.push("lane.trend_continuation".into());
     }
-    if config.lanes.relative_weakness_short_enabled {
-        nodes.push(Box::new(RelativeWeaknessShortNode::new(
-            &config.symbols,
-            config.lanes.clone(),
-        )));
-        lanes.push("lane.relative_weakness_short".into());
-    }
     if config.lanes.intraday_sweep_reversal_enabled {
         nodes.push(Box::new(IntradaySweepReversalNode::new(
             &config.symbols,
             config.lanes.clone(),
         )));
         lanes.push("lane.intraday_sweep_reversal".into());
-    }
-    if config.lanes.burst_exhaustion_enabled {
-        nodes.push(Box::new(BurstExhaustionNode::new(
-            &config.symbols,
-            config.lanes.clone(),
-        )));
-        lanes.push("lane.burst_exhaustion".into());
     }
     nodes.push(Box::new(PositionPlannerNode::new(
         lanes,
