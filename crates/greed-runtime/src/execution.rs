@@ -1093,6 +1093,7 @@ impl BinanceDemoExecution {
 
     pub fn recipe_gate_snapshots(&self, now_ms: i64) -> BTreeMap<String, RecipeGateStatus> {
         [
+            "breadth_momentum",
             "sfp_reversal",
             "trend_continuation",
             "intraday_sweep_reversal",
@@ -1190,7 +1191,7 @@ impl BinanceDemoExecution {
         frame: &MarketFrame,
         evaluation: &GraphEvaluation,
     ) -> Vec<ExchangeEvent> {
-        let mut events = Vec::new();
+        let mut events = self.apply_exit_intents(frame, evaluation).await;
         if self.state.execution_halt_reason.is_some() {
             return events;
         }
@@ -1416,6 +1417,75 @@ impl BinanceDemoExecution {
                     }
                 }
             }
+        }
+        events
+    }
+
+    async fn apply_exit_intents(
+        &mut self,
+        frame: &MarketFrame,
+        evaluation: &GraphEvaluation,
+    ) -> Vec<ExchangeEvent> {
+        let intents: Vec<_> = evaluation
+            .artifacts
+            .values()
+            .filter_map(|record| match &record.artifact {
+                Artifact::PositionExitIntent(value) => Some(value.clone()),
+                _ => None,
+            })
+            .collect();
+        if intents.is_empty() {
+            return Vec::new();
+        }
+        let positions: Vec<_> = self
+            .account
+            .as_ref()
+            .into_iter()
+            .flat_map(|account| account.positions.values())
+            .filter(|position| {
+                self.state
+                    .positions
+                    .get(&position.symbol)
+                    .is_some_and(|meta| {
+                        !meta.exit_requested
+                            && intents.iter().any(|intent| {
+                                meta.recipe == intent.recipe && meta.side == intent.side
+                            })
+                    })
+            })
+            .cloned()
+            .collect();
+        let mut events = Vec::new();
+        let mut state_changed = false;
+        for position in positions {
+            let Some(intent) = intents.iter().find(|intent| {
+                self.state
+                    .positions
+                    .get(&position.symbol)
+                    .is_some_and(|meta| meta.recipe == intent.recipe && meta.side == intent.side)
+            }) else {
+                continue;
+            };
+            match self.close_market(&position).await {
+                Ok(()) => {
+                    if let Some(meta) = self.state.positions.get_mut(&position.symbol) {
+                        meta.exit_requested = true;
+                        meta.pending_exit_reason = Some(intent.reason.clone());
+                        state_changed = true;
+                    }
+                    events.push(ExchangeEvent {
+                        kind: "exchange_exit_requested".into(),
+                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"symbol":position.symbol,"recipe":intent.recipe,"side":intent.side,"reason":intent.reason,"venue":"binance_demo"}),
+                    });
+                }
+                Err(error) => events.push(ExchangeEvent {
+                    kind: "exchange_order_rejected".into(),
+                    payload: serde_json::json!({"ts_ms":frame.as_of_ms,"symbol":position.symbol,"recipe":intent.recipe,"side":intent.side,"reason":format!("breadth exit failed: {error}"),"venue":"binance_demo"}),
+                }),
+            }
+        }
+        if state_changed {
+            self.save().ok();
         }
         events
     }

@@ -126,10 +126,12 @@ impl StrategyNode for PositionPlannerNode {
             } else {
                 self.config.risk_per_trade_pct
             };
-            let risk_pct = tag_f64(c, "risk_per_trade_pct").unwrap_or(default_risk_pct);
+            let risk_pct = tag_f64(c, "risk_per_trade_pct")
+                .unwrap_or(default_risk_pct)
+                .clamp(0.001, 0.02);
             let stop_pct = tag_f64(c, "stop_pct")
                 .unwrap_or(self.config.initial_stop_pct)
-                .clamp(0.003, 0.03);
+                .clamp(0.003, 0.10);
             let target_r = tag_f64(c, "target_r").unwrap_or(self.config.first_take_profit_r);
             let take_fraction = tag_f64(c, "take_profit_fraction")
                 .unwrap_or(self.config.first_take_profit_fraction)
@@ -231,5 +233,122 @@ impl StrategyNode for PositionPlannerNode {
             );
         }
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use greed_kernel::{
+        AccountFrame, BookState, CandleSeries, InstrumentFrame, MarketFrame, MarketKind,
+        ObservationMeta, Side, TradeCandidate,
+    };
+
+    fn meta() -> ObservationMeta {
+        ObservationMeta {
+            event_ms: 1_000,
+            received_ms: 1_000,
+            expires_ms: 10_000,
+            source: "test".into(),
+            quality: DataQuality::Complete,
+        }
+    }
+
+    fn instrument(symbol: &str) -> InstrumentFrame {
+        InstrumentFrame {
+            symbol: symbol.into(),
+            price: 100.0,
+            perpetual: CandleSeries {
+                venue: "test".into(),
+                market: MarketKind::Perpetual,
+                interval_ms: 900_000,
+                meta: meta(),
+                values: vec![],
+            },
+            hourly_perpetual: None,
+            fast_perpetual: None,
+            micro_perpetual: None,
+            book: Some(BookState {
+                meta: meta(),
+                bid: 99.99,
+                ask: 100.01,
+                bid_depth_usd: 100_000.0,
+                ask_depth_usd: 100_000.0,
+                expected_buy_slippage_bps: Some(1.0),
+                expected_sell_slippage_bps: Some(1.0),
+                bids: vec![],
+                asks: vec![],
+            }),
+            microstructure: None,
+        }
+    }
+
+    fn candidate(id: &str, recipe: &str, symbol: &str, priority: u8) -> ArtifactRecord {
+        ArtifactRecord {
+            key: format!("candidate.{id}"),
+            producer: format!("lane.{recipe}"),
+            artifact: Artifact::Candidate(TradeCandidate {
+                id: id.into(),
+                recipe: recipe.into(),
+                symbol: symbol.into(),
+                side: Side::Buy,
+                signal_ms: 1_000,
+                expires_ms: 10_000,
+                reference_price: 100.0,
+                score: 1.0,
+                confidence: 0.8,
+                verdict: Verdict::Pass,
+                blockers: vec![],
+                evidence: vec![],
+                tags: BTreeMap::from([("priority".into(), priority.to_string())]),
+            }),
+        }
+    }
+
+    #[test]
+    fn one_symbol_gets_only_the_highest_priority_strategy_plan() {
+        let records = [
+            candidate("trend:BTC", "trend_continuation", "BTCUSDT", 1),
+            candidate("sfp:BTC", "sfp_reversal", "BTCUSDT", 4),
+            candidate("breadth:ETH", "breadth_momentum", "ETHUSDT", 2),
+        ];
+        let artifacts = records
+            .into_iter()
+            .map(|record| (record.key.clone(), record))
+            .collect();
+        let frame = MarketFrame {
+            as_of_ms: 2_000,
+            instruments: BTreeMap::from([
+                ("BTCUSDT".into(), instrument("BTCUSDT")),
+                ("ETHUSDT".into(), instrument("ETHUSDT")),
+            ]),
+            account: AccountFrame {
+                equity_usd: 2_000.0,
+                cash_usd: 2_000.0,
+                realized_pnl_usd: 0.0,
+                peak_equity_usd: 2_000.0,
+                risk_day_start_equity_usd: 2_000.0,
+                gross_exposure_usd: 0.0,
+                open_positions: 0,
+            },
+        };
+        let mut planner = PositionPlannerNode::new(vec![], RiskConfig::default());
+        let output = planner
+            .evaluate(&NodeContext {
+                frame: &frame,
+                artifacts: &artifacts,
+            })
+            .unwrap();
+        let plans: Vec<_> = output
+            .iter()
+            .filter_map(|record| match &record.artifact {
+                Artifact::PositionPlan(plan) => Some(plan),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(plans.len(), 2);
+        assert!(plans.iter().any(|plan| plan.candidate_id == "sfp:BTC"));
+        assert!(!plans.iter().any(|plan| plan.candidate_id == "trend:BTC"));
+        assert!(plans.iter().any(|plan| plan.candidate_id == "breadth:ETH"));
     }
 }

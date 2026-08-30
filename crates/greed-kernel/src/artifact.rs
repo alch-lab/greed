@@ -99,6 +99,16 @@ pub struct PositionPlan {
     pub max_hold_ms: i64,
 }
 
+/// A strategy-level request to flatten its positions when the market state
+/// that justified the entry has disappeared.  Keeping this in the graph makes
+/// replay and live execution use the same exit decision.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionExitIntent {
+    pub recipe: String,
+    pub side: Side,
+    pub reason: String,
+}
+
 fn default_entry_size_multiplier() -> f64 {
     1.0
 }
@@ -110,6 +120,7 @@ pub enum Artifact {
     State(StateArtifact),
     Candidate(TradeCandidate),
     PositionPlan(PositionPlan),
+    PositionExitIntent(PositionExitIntent),
 }
 
 impl Artifact {
