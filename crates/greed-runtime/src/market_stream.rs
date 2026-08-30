@@ -98,6 +98,10 @@ struct StreamState {
     books: BTreeMap<String, BookState>,
     book_flow: BTreeMap<String, VecDeque<BookFlowObservation>>,
     trades: BTreeMap<String, VecDeque<(i64, bool, f64)>>,
+    /// Binance liquidation stream snapshots. Binance publishes at most the
+    /// largest forced order per symbol in each 1s window, so these values are
+    /// useful event context but are not complete liquidation volume.
+    liquidations: BTreeMap<String, VecDeque<(i64, bool, f64)>>,
     desired_symbols: BTreeSet<String>,
     symbol_admitted_ms: BTreeMap<String, i64>,
     market_connections: [bool; MARKET_STREAM_SHARDS],
@@ -206,6 +210,18 @@ impl MarketStreamHub {
             }
         }
         let latest = trades.back().map(|value| value.0).unwrap_or_default();
+        let mut long_liquidations = 0.0;
+        let mut short_liquidations = 0.0;
+        if let Some(values) = state.liquidations.get(&symbol) {
+            for (_, is_long, notional) in values.iter().filter(|(ts, _, _)| *ts >= now_ms - 60_000)
+            {
+                if *is_long {
+                    long_liquidations += notional;
+                } else {
+                    short_liquidations += notional;
+                }
+            }
+        }
         let flow_10s = state
             .book_flow
             .get(&symbol)
@@ -219,7 +235,7 @@ impl MarketStreamHub {
                 event_ms: latest,
                 received_ms: latest,
                 expires_ms: latest + STREAM_TTL_MS,
-                source: "binance_ws_agg_trade_force_order".into(),
+                source: "binance_ws_agg_trade_force_order_snapshot".into(),
                 quality: if now_ms - latest <= STREAM_TTL_MS {
                     DataQuality::Complete
                 } else {
@@ -228,8 +244,8 @@ impl MarketStreamHub {
             },
             buy_notional_60s: buy,
             sell_notional_60s: sell,
-            long_liquidations_60s: 0.0,
-            short_liquidations_60s: 0.0,
+            long_liquidations_60s: long_liquidations,
+            short_liquidations_60s: short_liquidations,
             snapshot_ofi_10s: flow_10s.as_ref().map(|value| value.normalized_ofi),
             snapshot_ofi_60s: flow_60s.as_ref().map(|value| value.normalized_ofi),
             mid_return_bps_10s: flow_10s.as_ref().map(|value| value.mid_return_bps),
@@ -684,7 +700,10 @@ fn market_streams_shard(symbols: &[String], shard: usize) -> BTreeSet<String> {
 fn trade_streams(symbols: &[String]) -> BTreeSet<String> {
     symbols
         .iter()
-        .map(|symbol| format!("{}@aggTrade", symbol.to_lowercase()))
+        .flat_map(|symbol| {
+            let symbol = symbol.to_lowercase();
+            [format!("{symbol}@aggTrade"), format!("{symbol}@forceOrder")]
+        })
         .collect()
 }
 
@@ -754,6 +773,7 @@ fn handle_payload(
     match payload.get("e").and_then(Value::as_str) {
         Some("kline") => update_kline(state, payload, received_ms),
         Some("aggTrade") => update_trade(state, payload, received_ms),
+        Some("forceOrder") => update_liquidation(state, payload, received_ms),
         Some("24hrTicker") => update_ticker(state, payload, received_ms),
         _ if (payload.get("b").is_some() || payload.get("bids").is_some())
             && (payload.get("a").is_some() || payload.get("asks").is_some()) =>
@@ -762,6 +782,45 @@ fn handle_payload(
         }
         _ => Ok(()),
     }
+}
+
+fn update_liquidation(
+    state: &Arc<RwLock<StreamState>>,
+    value: &Value,
+    received_ms: i64,
+) -> Result<()> {
+    let order = value
+        .get("o")
+        .ok_or_else(|| anyhow!("missing force-order payload"))?;
+    let symbol = string(order, "s")?.to_uppercase();
+    let side = string(order, "S")?;
+    let price = optional_number(order, "ap")
+        .filter(|value| *value > 0.0)
+        .or_else(|| optional_number(order, "p"))
+        .unwrap_or_default();
+    let quantity = optional_number(order, "z")
+        .filter(|value| *value > 0.0)
+        .or_else(|| optional_number(order, "q"))
+        .unwrap_or_default();
+    if price <= 0.0 || quantity <= 0.0 {
+        return Err(anyhow!("invalid force-order notional for {symbol}"));
+    }
+    // A SELL forced order closes a long; BUY closes a short.
+    let is_long_liquidation = side == "SELL";
+    let event_ms = value
+        .get("E")
+        .and_then(Value::as_i64)
+        .unwrap_or(received_ms);
+    let mut state = state.write().expect("stream state poisoned");
+    let values = state.liquidations.entry(symbol).or_default();
+    values.push_back((event_ms, is_long_liquidation, price * quantity));
+    while values
+        .front()
+        .is_some_and(|(ts, _, _)| *ts < received_ms - 120_000)
+    {
+        values.pop_front();
+    }
+    Ok(())
 }
 
 fn update_trade(state: &Arc<RwLock<StreamState>>, value: &Value, received_ms: i64) -> Result<()> {
@@ -1225,10 +1284,18 @@ mod tests {
             10,
         )
         .unwrap();
+        handle_payload(
+            &state,
+            StreamRoute::Trade(0),
+            serde_json::json!({"data":{"e":"forceOrder","E":10,"o":{"s":"YBUSDT","S":"SELL","p":"2.0","ap":"2.1","q":"10","z":"8"}}}),
+            10,
+        )
+        .unwrap();
         let locked = state.read().unwrap();
         assert_eq!(locked.tickers.len(), 1);
         assert_eq!(locked.candles.len(), 1);
         assert_eq!(locked.books["YBUSDT"].bid, 1.9);
+        assert_eq!(locked.liquidations["YBUSDT"].back().unwrap().2, 16.8);
     }
 
     #[test]
@@ -1254,6 +1321,7 @@ mod tests {
         assert!(market.contains("btcusdt@kline_5m"));
         assert!(!market.contains("btcusdt@aggTrade"));
         assert!(trade_streams(&symbols).contains("btcusdt@aggTrade"));
+        assert!(trade_streams(&symbols).contains("btcusdt@forceOrder"));
         assert!(!market.contains("btcusdt@forceOrder"));
         assert!(public.contains("btcusdt@depth20@500ms"));
     }
