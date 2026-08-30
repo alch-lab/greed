@@ -659,6 +659,7 @@ fn market_streams(symbols: &[String]) -> BTreeSet<String> {
     for symbol in symbols {
         let symbol = symbol.to_lowercase();
         streams.insert(format!("{symbol}@kline_15m"));
+        streams.insert(format!("{symbol}@kline_1h"));
         streams.insert(format!("{symbol}@kline_5m"));
         streams.insert(format!("{symbol}@kline_1m"));
     }
@@ -1344,9 +1345,9 @@ mod tests {
         let desired = market_streams(&after);
         let additions: Vec<_> = desired.difference(&active).cloned().collect();
         let removals: Vec<_> = active.difference(&desired).cloned().collect();
-        assert_eq!(additions.len(), 3);
+        assert_eq!(additions.len(), 4);
         assert!(additions.iter().all(|value| value.starts_with("solusdt@")));
-        assert_eq!(removals.len(), 3);
+        assert_eq!(removals.len(), 4);
         assert!(removals.iter().all(|value| value.starts_with("ethusdt@")));
     }
 
@@ -1381,7 +1382,7 @@ mod tests {
                 .unwrap(),
         );
         assert_eq!(initial["method"], "SUBSCRIBE");
-        assert_eq!(initial["params"].as_array().unwrap().len(), 3);
+        assert_eq!(initial["params"].as_array().unwrap().len(), 4);
 
         sender
             .send(vec!["BTCUSDT".to_string(), added_symbol.to_string()])

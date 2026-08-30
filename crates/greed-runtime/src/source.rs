@@ -559,12 +559,23 @@ impl BinanceMarketSource {
             _ => 4,
         });
         let intervals = [
-            ("15m", 900_000, self.config.candle_limit),
-            ("5m", 300_000, 120),
+            (
+                "15m",
+                900_000,
+                self.config
+                    .research_backfill_15m_bars
+                    .max(self.config.candle_limit),
+            ),
+            ("1h", 3_600_000, self.config.research_backfill_1h_bars),
+            ("5m", 300_000, self.config.research_backfill_5m_bars),
+            ("1m", 60_000, self.config.research_backfill_1m_bars),
         ];
         let mut requests = Vec::new();
-        for symbol in &symbols {
-            for (interval, interval_ms, limit) in intervals {
+        // Warm the trading-critical 15m series for every symbol before the
+        // additional research horizons. A cold restart therefore resumes
+        // candidate evaluation quickly while 1h/5m/1m context fills in behind it.
+        for (interval, interval_ms, limit) in intervals {
+            for symbol in &symbols {
                 let key = (symbol.clone(), interval.to_string());
                 if self.candle_cache.contains_key(&key)
                     || self
@@ -582,7 +593,7 @@ impl BinanceMarketSource {
         self.candle_bootstrap_pending = strategy
             .symbols
             .iter()
-            .flat_map(|symbol| ["15m", "5m"].map(move |interval| (symbol, interval)))
+            .flat_map(|symbol| ["15m", "1h", "5m", "1m"].map(move |interval| (symbol, interval)))
             .filter(|(symbol, interval)| {
                 !self
                     .candle_cache
@@ -654,7 +665,7 @@ impl BinanceMarketSource {
         self.candle_bootstrap_pending = strategy
             .symbols
             .iter()
-            .flat_map(|symbol| ["15m", "5m"].map(move |interval| (symbol, interval)))
+            .flat_map(|symbol| ["15m", "1h", "5m", "1m"].map(move |interval| (symbol, interval)))
             .filter(|(symbol, interval)| {
                 !self
                     .candle_cache
@@ -802,11 +813,31 @@ impl BinanceMarketSource {
                 }
             };
             let price = perpetual.values.last().map(|bar| bar.close).unwrap_or(0.0);
+            let hourly_perpetual = if self
+                .candle_cache
+                .contains_key(&(symbol.clone(), "1h".to_string()))
+            {
+                match self
+                    .streamed_klines(symbol, "1h", self.config.research_backfill_1h_bars, now)
+                    .await
+                {
+                    Ok(value) => Some(value),
+                    Err(error) => {
+                        warnings.push(format!("hourly perpetual klines {symbol}: {error}"));
+                        None
+                    }
+                }
+            } else {
+                None
+            };
             let fast_perpetual = if self
                 .candle_cache
                 .contains_key(&(symbol.clone(), "5m".to_string()))
             {
-                match self.streamed_klines(symbol, "5m", 120, now).await {
+                match self
+                    .streamed_klines(symbol, "5m", self.config.research_backfill_5m_bars, now)
+                    .await
+                {
                     Ok(value) => Some(value),
                     Err(error) => {
                         warnings.push(format!("fast perpetual klines {symbol}: {error}"));
@@ -816,7 +847,16 @@ impl BinanceMarketSource {
             } else {
                 None
             };
-            let micro_perpetual = self.stream_observation_klines(symbol, "1m", 60_000, now);
+            let micro_perpetual = if self
+                .candle_cache
+                .contains_key(&(symbol.clone(), "1m".to_string()))
+            {
+                self.streamed_klines(symbol, "1m", self.config.research_backfill_1m_bars, now)
+                    .await
+                    .ok()
+            } else {
+                self.stream_observation_klines(symbol, "1m", 60_000, now)
+            };
             let book = self
                 .stream
                 .as_ref()
@@ -838,6 +878,7 @@ impl BinanceMarketSource {
                     symbol: symbol.clone(),
                     price,
                     perpetual,
+                    hourly_perpetual,
                     fast_perpetual,
                     micro_perpetual,
                     book,

@@ -138,6 +138,10 @@ pub struct InstrumentFrame {
     pub symbol: String,
     pub price: f64,
     pub perpetual: CandleSeries,
+    /// Hourly structural history used by research and higher-timeframe maps.
+    /// Trading recipes remain free to ignore it.
+    #[serde(default)]
+    pub hourly_perpetual: Option<CandleSeries>,
     /// Optional short-interval perpetual candles used for execution timing.
     pub fast_perpetual: Option<CandleSeries>,
     /// One-minute websocket observations used by short-horizon entry guards.

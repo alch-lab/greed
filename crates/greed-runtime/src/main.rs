@@ -442,7 +442,13 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
     let mut research_samples = ResearchRecorder::new(
         config.runtime.research_path.clone(),
         config.runtime.research_snapshot_seconds,
-        config.runtime.research_backfill_bars,
+        config.runtime.research_level_map_seconds,
+        BTreeMap::from([
+            (60_000, config.runtime.research_backfill_1m_bars),
+            (300_000, config.runtime.research_backfill_5m_bars),
+            (900_000, config.runtime.research_backfill_15m_bars),
+            (3_600_000, config.runtime.research_backfill_1h_bars),
+        ]),
         research_capacity_bytes,
     );
     let status = StatusWriter::new(&config.runtime.status_path);
@@ -461,7 +467,13 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                 "started_ms":started_ms,
                 "runtime":identity,
                 "snapshot_seconds":config.runtime.research_snapshot_seconds,
-                "backfill_bars":config.runtime.research_backfill_bars,
+                "level_map_seconds":config.runtime.research_level_map_seconds,
+                "backfill_bars":{
+                    "1m":config.runtime.research_backfill_1m_bars,
+                    "5m":config.runtime.research_backfill_5m_bars,
+                    "15m":config.runtime.research_backfill_15m_bars,
+                    "1h":config.runtime.research_backfill_1h_bars,
+                },
                 "forward_horizons_ms":[10000,30000,60000,180000,300000,900000],
             }),
         )?;
