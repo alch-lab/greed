@@ -12,7 +12,7 @@ use config::AppConfig;
 use execution::BinanceDemoExecution;
 use greed_kernel::{AccountFrame, Artifact, GraphEvaluation, Verdict};
 use greed_strategy::{build_graph, StrategyConfig};
-use journal::{Journal, SampleRecorder, StatusWriter};
+use journal::{Journal, ResearchRecorder, SampleRecorder, StatusWriter};
 use source::BinanceMarketSource;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -425,6 +425,26 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
     .context("Binance demo execution initialization failed; trading runtime cannot start")?;
     let journal = Journal::new(&config.runtime.journal_path)?;
     let history = Journal::new(&config.runtime.history_path)?;
+    let research_capacity_bytes = config
+        .runtime
+        .research_file_max_mb
+        .saturating_mul(1024 * 1024)
+        .saturating_mul(config.runtime.research_rotations as u64 + 1);
+    let research_journal = if config.runtime.research_enabled {
+        Some(Journal::bounded(
+            &config.runtime.research_path,
+            config.runtime.research_file_max_mb * 1024 * 1024,
+            config.runtime.research_rotations,
+        )?)
+    } else {
+        None
+    };
+    let mut research_samples = ResearchRecorder::new(
+        config.runtime.research_path.clone(),
+        config.runtime.research_snapshot_seconds,
+        config.runtime.research_backfill_bars,
+        research_capacity_bytes,
+    );
     let status = StatusWriter::new(&config.runtime.status_path);
     let start_payload = serde_json::json!({
         "paper_only": true,
@@ -434,6 +454,18 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
     });
     journal.append("runner_start", start_payload.clone())?;
     history.append("runner_start", start_payload)?;
+    if let Some(research_journal) = &research_journal {
+        research_journal.append(
+            "research_session_start",
+            serde_json::json!({
+                "started_ms":started_ms,
+                "runtime":identity,
+                "snapshot_seconds":config.runtime.research_snapshot_seconds,
+                "backfill_bars":config.runtime.research_backfill_bars,
+                "forward_horizons_ms":[10000,30000,60000,180000,300000,900000],
+            }),
+        )?;
+    }
     let mut active_strategy = config.strategy.clone();
     let mut graph = build_graph(&active_strategy)?;
     let mut last_universe_refresh_ms = 0i64;
@@ -532,6 +564,14 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                 samples.record(&journal, &frame)?;
                 let data_health = source.health();
                 journal.append("data_health", data_health.clone())?;
+                if let Some(research_journal) = &research_journal {
+                    research_samples.record(research_journal, &frame)?;
+                    research_samples.record_health(
+                        research_journal,
+                        frame.as_of_ms,
+                        data_health.clone(),
+                    )?;
+                }
                 frame.account = execution.account_frame()?;
                 let evaluation = graph.evaluate(&frame)?;
                 journal.append("graph_evaluation", serde_json::to_value(&evaluation)?)?;
@@ -575,6 +615,7 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                     "artifacts":evaluation.artifacts,
                     "universe":universe_status,
                     "data_health":data_health,
+                    "research":research_journal.as_ref().map(|journal|research_samples.status(journal)),
                     "execution":execution_health,
                     "runtime":identity,
                 }))?;

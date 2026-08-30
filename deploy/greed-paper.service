@@ -16,7 +16,7 @@ NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=true
 PrivateTmp=true
-ReadWritePaths=/opt/greed/data/runtime
+ReadWritePaths=/opt/greed/data
 User=greed
 Group=greed
 

@@ -53,6 +53,12 @@ pub struct RuntimeConfig {
     pub candle_limit: usize,
     pub journal_path: String,
     pub history_path: String,
+    pub research_enabled: bool,
+    pub research_path: String,
+    pub research_snapshot_seconds: u64,
+    pub research_backfill_bars: usize,
+    pub research_file_max_mb: u64,
+    pub research_rotations: usize,
     pub status_path: String,
     pub execution_state_path: String,
     pub http_listen: String,
@@ -74,6 +80,12 @@ impl Default for RuntimeConfig {
             candle_limit: 160,
             journal_path: "data/runtime/alpha-events.jsonl".into(),
             history_path: "data/runtime/alpha-history.jsonl".into(),
+            research_enabled: true,
+            research_path: "data/research/market-research.jsonl".into(),
+            research_snapshot_seconds: 15,
+            research_backfill_bars: 120,
+            research_file_max_mb: 256,
+            research_rotations: 8,
             status_path: "data/runtime/alpha-status.json".into(),
             execution_state_path: "data/runtime/binance-alpha-state.json".into(),
             http_listen: "127.0.0.1:8088".into(),
@@ -110,6 +122,18 @@ impl AppConfig {
         }
         if !(120..=1500).contains(&self.runtime.candle_limit) {
             return Err("candle_limit must be 120..=1500".into());
+        }
+        if !(5..=60).contains(&self.runtime.research_snapshot_seconds) {
+            return Err("research_snapshot_seconds must be 5..=60".into());
+        }
+        if !(60..=1500).contains(&self.runtime.research_backfill_bars) {
+            return Err("research_backfill_bars must be 60..=1500".into());
+        }
+        if !(64..=1024).contains(&self.runtime.research_file_max_mb) {
+            return Err("research_file_max_mb must be 64..=1024".into());
+        }
+        if !(1..=32).contains(&self.runtime.research_rotations) {
+            return Err("research_rotations must be 1..=32".into());
         }
         if self.portfolio.initial_equity_usd <= 0.0 {
             return Err("initial_equity_usd must be positive".into());

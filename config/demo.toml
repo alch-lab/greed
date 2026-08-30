@@ -11,6 +11,15 @@ request_timeout_seconds = 8
 candle_limit = 1200
 journal_path = "data/runtime/alpha-events.jsonl"
 history_path = "data/runtime/alpha-history.jsonl"
+# Compact research samples live outside the verbose strategy journal so market
+# history survives long enough for walk-forward alpha research. Nine bounded
+# 256 MiB files cap disk use at roughly 2.25 GiB without touching trade/PnL data.
+research_enabled = true
+research_path = "data/research/market-research.jsonl"
+research_snapshot_seconds = 15
+research_backfill_bars = 120
+research_file_max_mb = 256
+research_rotations = 8
 status_path = "data/runtime/alpha-status.json"
 execution_state_path = "data/runtime/binance-alpha-state.json"
 http_listen = "127.0.0.1:8088"

@@ -3,6 +3,7 @@ set -euo pipefail
 
 readonly APP_DIR="${1:-/opt/greed}"
 readonly RUNTIME_DIR="${APP_DIR}/data/runtime"
+readonly RESEARCH_DIR="${APP_DIR}/data/research"
 readonly STAMP="$(date '+%Y%m%d-%H%M%S')"
 readonly WORK_DIR="/tmp/greed-paper-diagnostics-${STAMP}"
 readonly ARCHIVE="/tmp/greed-paper-diagnostics-${STAMP}.tar.gz"
@@ -14,6 +15,7 @@ cleanup() {
 trap cleanup EXIT
 
 mkdir -p "${WORK_DIR}/runtime"
+mkdir -p "${WORK_DIR}/research"
 
 copy_if_present() {
   local source="$1"
@@ -53,6 +55,12 @@ for rotation in 1 2 3 4; do
     "${WORK_DIR}/runtime/alpha-events.${rotation}.recent.jsonl"
 done
 
+# Research samples are already compact, but diagnostics only need a recent
+# slice. The full bounded store remains on the server for longer-window studies.
+copy_jsonl_tail \
+  "${RESEARCH_DIR}/market-research.jsonl" \
+  "${WORK_DIR}/research/market-research.recent.jsonl"
+
 if [[ -x "target/release/greed" && -f "${RUNTIME_DIR}/alpha-events.jsonl" ]]; then
   timeout 90 target/release/greed report \
     --journal "${RUNTIME_DIR}/alpha-events.jsonl" \
@@ -78,6 +86,7 @@ curl -sS --max-time 10 http://127.0.0.1:8088/api/status \
   printf 'git_branch=%s\n' "$(git branch --show-current 2>/dev/null || printf unknown)"
   printf 'event_source_bytes=%s\n' "$(wc -c < "${RUNTIME_DIR}/alpha-events.jsonl" 2>/dev/null || printf 0)"
   printf 'history_source_bytes=%s\n' "$(wc -c < "${RUNTIME_DIR}/alpha-history.jsonl" 2>/dev/null || printf 0)"
+  printf 'research_source_bytes=%s\n' "$(wc -c < "${RESEARCH_DIR}/market-research.jsonl" 2>/dev/null || printf 0)"
 } > "${WORK_DIR}/manifest.txt"
 
 # API credentials are intentionally never read or copied by this script.
