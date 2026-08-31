@@ -113,7 +113,7 @@ impl Default for LaneConfig {
             sfp_target_r: 2.0,
             sfp_max_hold_minutes: 180,
             sfp_risk_per_trade_pct: 0.005,
-            trend_min_return_4h: 0.06,
+            trend_min_return_4h: 0.025,
             trend_min_efficiency: 0.45,
             trend_min_hour_volume_ratio: 0.65,
             trend_min_flow_imbalance: 0.0,
