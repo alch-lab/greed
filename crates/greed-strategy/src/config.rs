@@ -47,7 +47,6 @@ impl Default for UniverseConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LaneConfig {
-    pub breadth_momentum_enabled: bool,
     pub sfp_reversal_enabled: bool,
     pub trend_continuation_enabled: bool,
     pub intraday_sweep_reversal_enabled: bool,
@@ -94,23 +93,11 @@ pub struct LaneConfig {
     pub intraday_target_r: f64,
     pub intraday_max_hold_minutes: u32,
     pub intraday_risk_per_trade_pct: f64,
-    pub breadth_lookback_bars: usize,
-    pub breadth_entry_threshold: f64,
-    pub breadth_exit_threshold: f64,
-    pub breadth_min_abs_return: f64,
-    pub breadth_min_hour_volume_usd: f64,
-    pub breadth_min_hour_volume_ratio: f64,
-    pub breadth_max_candidates: usize,
-    pub breadth_risk_per_trade_pct: f64,
-    pub breadth_stop_pct: f64,
-    pub breadth_target_pct: f64,
-    pub breadth_max_hold_minutes: u32,
 }
 
 impl Default for LaneConfig {
     fn default() -> Self {
         Self {
-            breadth_momentum_enabled: true,
             sfp_reversal_enabled: true,
             trend_continuation_enabled: true,
             intraday_sweep_reversal_enabled: true,
@@ -157,17 +144,6 @@ impl Default for LaneConfig {
             intraday_target_r: 2.0,
             intraday_max_hold_minutes: 120,
             intraday_risk_per_trade_pct: 0.0025,
-            breadth_lookback_bars: 16,
-            breadth_entry_threshold: 0.75,
-            breadth_exit_threshold: 0.50,
-            breadth_min_abs_return: 0.015,
-            breadth_min_hour_volume_usd: 1_000_000.0,
-            breadth_min_hour_volume_ratio: 1.2,
-            breadth_max_candidates: 1,
-            breadth_risk_per_trade_pct: 0.02,
-            breadth_stop_pct: 0.08,
-            breadth_target_pct: 0.02,
-            breadth_max_hold_minutes: 60,
         }
     }
 }
@@ -288,18 +264,6 @@ impl StrategyConfig {
             || !(1.0..=3.0).contains(&lanes.intraday_target_r)
             || !(30..=240).contains(&lanes.intraday_max_hold_minutes)
             || !(0.001..=0.005).contains(&lanes.intraday_risk_per_trade_pct)
-            || !(4..=16).contains(&lanes.breadth_lookback_bars)
-            || !(0.60..=0.90).contains(&lanes.breadth_entry_threshold)
-            || !(0.45..=0.65).contains(&lanes.breadth_exit_threshold)
-            || lanes.breadth_exit_threshold >= lanes.breadth_entry_threshold
-            || !(0.01..=0.05).contains(&lanes.breadth_min_abs_return)
-            || lanes.breadth_min_hour_volume_usd < 100_000.0
-            || !(0.5..=3.0).contains(&lanes.breadth_min_hour_volume_ratio)
-            || !(1..=3).contains(&lanes.breadth_max_candidates)
-            || !(0.005..=0.02).contains(&lanes.breadth_risk_per_trade_pct)
-            || !(0.04..=0.10).contains(&lanes.breadth_stop_pct)
-            || !(0.02..=0.08).contains(&lanes.breadth_target_pct)
-            || !(60..=360).contains(&lanes.breadth_max_hold_minutes)
             || lanes.max_spread_bps <= 0.0
             || lanes.min_depth_usd <= 0.0
         {

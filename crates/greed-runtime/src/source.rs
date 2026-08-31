@@ -103,6 +103,14 @@ const KLINE_BOOTSTRAP_CONCURRENCY: usize = 4;
 const KLINE_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5);
 const KLINE_BOOTSTRAP_RETRY_DELAY_MS: i64 = 60_000;
 
+fn heal_elapsed_candle_closes(values: &mut [Candle], now_ms: i64) {
+    for candle in values {
+        if !candle.closed && candle.close_ms < now_ms {
+            candle.closed = true;
+        }
+    }
+}
+
 fn median_abs(values: impl Iterator<Item = Option<f64>>, floor: f64) -> f64 {
     let mut values: Vec<_> = values.flatten().map(f64::abs).collect();
     values.sort_by(f64::total_cmp);
@@ -705,6 +713,10 @@ impl BinanceMarketSource {
                 series.values.push(candle);
             }
         }
+        // Also recover missed terminal websocket updates by wall clock. This
+        // covers quiet symbols that have not emitted the first update of the
+        // next interval yet after a reconnect.
+        heal_elapsed_candle_closes(&mut series.values, now);
         series.values.sort_by_key(|value| value.open_ms);
         if series.values.len() > limit {
             series.values.drain(..series.values.len() - limit);
@@ -900,6 +912,39 @@ impl BinanceMarketSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn elapsed_candles_are_closed_after_a_missed_websocket_terminal_update() {
+        let mut values = vec![
+            Candle {
+                open_ms: 0,
+                close_ms: 899_999,
+                open: 1.0,
+                high: 2.0,
+                low: 1.0,
+                close: 2.0,
+                quote_volume: 100.0,
+                taker_buy_quote: Some(60.0),
+                closed: false,
+            },
+            Candle {
+                open_ms: 900_000,
+                close_ms: 1_799_999,
+                open: 2.0,
+                high: 2.0,
+                low: 1.5,
+                close: 1.8,
+                quote_volume: 50.0,
+                taker_buy_quote: Some(20.0),
+                closed: false,
+            },
+        ];
+
+        heal_elapsed_candle_closes(&mut values, 1_000_000);
+
+        assert!(values[0].closed);
+        assert!(!values[1].closed);
+    }
 
     #[test]
     fn telemetry_tracks_failures_rate_limits_and_latency() {

@@ -310,7 +310,7 @@ mod tests {
         let records = [
             candidate("trend:BTC", "trend_continuation", "BTCUSDT", 1),
             candidate("sfp:BTC", "sfp_reversal", "BTCUSDT", 4),
-            candidate("breadth:ETH", "breadth_momentum", "ETHUSDT", 2),
+            candidate("intraday:ETH", "intraday_sweep_reversal", "ETHUSDT", 2),
         ];
         let artifacts = records
             .into_iter()
@@ -349,6 +349,6 @@ mod tests {
         assert_eq!(plans.len(), 2);
         assert!(plans.iter().any(|plan| plan.candidate_id == "sfp:BTC"));
         assert!(!plans.iter().any(|plan| plan.candidate_id == "trend:BTC"));
-        assert!(plans.iter().any(|plan| plan.candidate_id == "breadth:ETH"));
+        assert!(plans.iter().any(|plan| plan.candidate_id == "intraday:ETH"));
     }
 }

@@ -922,6 +922,15 @@ fn update_kline(state: &Arc<RwLock<StreamState>>, value: &Value, received_ms: i6
     let key = (symbol, interval);
     state.candle_update_ms.insert(key.clone(), received_ms);
     let values = state.candles.entry(key).or_default();
+    // A reconnect can miss the final `x=true` update for a candle. Once a
+    // newer interval arrives, the older candle is definitively closed even if
+    // Binance's terminal update was lost. Heal that state here so strategies
+    // do not permanently discard otherwise complete history.
+    for previous in values.iter_mut().filter(|value| {
+        !value.closed && value.open_ms < candle.open_ms && value.close_ms < candle.open_ms
+    }) {
+        previous.closed = true;
+    }
     if values
         .back()
         .is_some_and(|value| value.open_ms == candle.open_ms)
@@ -1312,6 +1321,24 @@ mod tests {
         assert_eq!(locked.candles.len(), 1);
         assert_eq!(locked.books["YBUSDT"].bid, 1.9);
         assert_eq!(locked.liquidations["YBUSDT"].back().unwrap().2, 16.8);
+    }
+
+    #[test]
+    fn newer_kline_heals_a_missed_terminal_close_update() {
+        let state = Arc::new(RwLock::new(StreamState::default()));
+        let kline = |open_ms: i64, close_ms: i64, closed: bool| {
+            serde_json::json!({"k":{
+                "t":open_ms,"T":close_ms,"s":"YBUSDT","i":"15m",
+                "o":"1","c":"2","h":"2","l":"1","q":"100","Q":"60","x":closed
+            }})
+        };
+        update_kline(&state, &kline(0, 899_999, false), 899_000).unwrap();
+        update_kline(&state, &kline(900_000, 1_799_999, false), 900_100).unwrap();
+
+        let locked = state.read().unwrap();
+        let values = &locked.candles[&("YBUSDT".to_string(), "15m".to_string())];
+        assert!(values[0].closed);
+        assert!(!values[1].closed);
     }
 
     #[test]

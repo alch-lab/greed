@@ -22,6 +22,7 @@ type HmacSha256 = Hmac<Sha256>;
 const MAKER_REPRICE_INTERVAL_MS: i64 = 15_000;
 const MAX_MAKER_REPRICES: u8 = 3;
 const ENTRY_GUARD_STALE_GRACE_MS: i64 = 5_000;
+const ENTRY_GUARD_REVERSAL_CONFIRM_MS: i64 = 15_000;
 const MIN_PERFORMANCE_FILL_RATIO: f64 = 0.20;
 const PERFORMANCE_BASIS_VERSION: u32 = 2;
 
@@ -267,7 +268,8 @@ enum PostOnlyEntry {
 enum EntryGuardState {
     Healthy,
     Unavailable(String),
-    Invalidated(String),
+    StructuralInvalidation(String),
+    MicroReversal(String),
 }
 
 struct PendingEntryAttempt<'a> {
@@ -1093,7 +1095,6 @@ impl BinanceDemoExecution {
 
     pub fn recipe_gate_snapshots(&self, now_ms: i64) -> BTreeMap<String, RecipeGateStatus> {
         [
-            "breadth_momentum",
             "sfp_reversal",
             "trend_continuation",
             "intraday_sweep_reversal",
@@ -1527,8 +1528,11 @@ impl BinanceDemoExecution {
         // without this final gate a valid close can turn into a stale market
         // entry while the request is being prepared.
         match self.pending_entry_guard(plan, chrono::Utc::now().timestamp_millis()) {
-            EntryGuardState::Healthy => {}
-            EntryGuardState::Invalidated(reason) => {
+            // A single 10-second flow sample is too noisy to veto a completed
+            // 15-minute setup. The pending-order loop below requires the
+            // reversal to persist before it cancels the passive order.
+            EntryGuardState::Healthy | EntryGuardState::MicroReversal(_) => {}
+            EntryGuardState::StructuralInvalidation(reason) => {
                 return Err(anyhow!(
                     "entry signal invalidated before submission: {reason}"
                 ));
@@ -1997,18 +2001,13 @@ impl BinanceDemoExecution {
             ));
         }
         let signal_mid = (book.bid + book.ask) * 0.5;
+        // A quiet symbol may legitimately have no aggregate trade for longer
+        // than STREAM_TTL_MS even while its book websocket is healthy. Missing
+        // microstructure therefore disables only the optional flow veto; it
+        // must not cancel an already-resting maker order.
         let micro = stream
             .microstructure(&plan.symbol, now_ms)
             .filter(|value| now_ms <= value.meta.expires_ms);
-        if (plan.entry_guard_max_opposing_flow > 0.0
-            || plan.entry_guard_max_opposing_return_bps > 0.0)
-            && micro.is_none()
-        {
-            return EntryGuardState::Unavailable(format!(
-                "mainnet microstructure is missing or stale for {}",
-                plan.symbol
-            ));
-        }
         pending_entry_guard_state(
             plan,
             signal_mid,
@@ -2141,6 +2140,7 @@ impl BinanceDemoExecution {
         let deadline = started_ms + plan.entry_timeout_ms.clamp(5_000, 120_000);
         let mut next_reprice_ms = started_ms + MAKER_REPRICE_INTERVAL_MS;
         let mut guard_unavailable_since_ms = None;
+        let mut micro_reversal_since_ms = None;
         loop {
             let status = order.get("status").and_then(Value::as_str).unwrap_or("NEW");
             if matches!(status, "CANCELED" | "EXPIRED" | "REJECTED") {
@@ -2161,10 +2161,21 @@ impl BinanceDemoExecution {
             let invalidation = match self.pending_entry_guard(plan, now_ms) {
                 EntryGuardState::Healthy => {
                     guard_unavailable_since_ms = None;
+                    micro_reversal_since_ms = None;
                     None
                 }
-                EntryGuardState::Invalidated(reason) => Some(reason),
+                EntryGuardState::StructuralInvalidation(reason) => Some(reason),
+                EntryGuardState::MicroReversal(reason) => {
+                    guard_unavailable_since_ms = None;
+                    persistent_guard_reason(
+                        &mut micro_reversal_since_ms,
+                        now_ms,
+                        ENTRY_GUARD_REVERSAL_CONFIRM_MS,
+                        &reason,
+                    )
+                }
                 EntryGuardState::Unavailable(reason) => {
+                    micro_reversal_since_ms = None;
                     let missing_since = *guard_unavailable_since_ms.get_or_insert(now_ms);
                     (now_ms - missing_since >= ENTRY_GUARD_STALE_GRACE_MS).then(|| {
                         format!(
@@ -3011,7 +3022,7 @@ fn pending_entry_guard_state(
     if let Some(limit) = plan.entry_limit.filter(|value| *value > f64::EPSILON) {
         let overshoot_bps = -plan.side.sign() * (signal_mid / limit - 1.0) * 10_000.0;
         if plan.entry_invalidation_bps > 0.0 && overshoot_bps > plan.entry_invalidation_bps {
-            return EntryGuardState::Invalidated(format!(
+            return EntryGuardState::StructuralInvalidation(format!(
                 "strategy midpoint {signal_mid} overshot entry limit {limit} by {overshoot_bps:.1} bps against the setup (max {:.1})",
                 plan.entry_invalidation_bps
             ));
@@ -3025,13 +3036,24 @@ fn pending_entry_guard_state(
             && directional_flow < -plan.entry_guard_max_opposing_flow
             && directional_response < -plan.entry_guard_max_opposing_return_bps
         {
-            return EntryGuardState::Invalidated(format!(
+            return EntryGuardState::MicroReversal(format!(
                 "live flow {:.0}% and 10s strategy-market response {response:.1} bps reversed against the pending entry",
                 flow * 100.0
             ));
         }
     }
     EntryGuardState::Healthy
+}
+fn persistent_guard_reason(
+    since_ms: &mut Option<i64>,
+    now_ms: i64,
+    confirmation_ms: i64,
+    reason: &str,
+) -> Option<String> {
+    let started_ms = *since_ms.get_or_insert(now_ms);
+    let elapsed_ms = now_ms.saturating_sub(started_ms);
+    (elapsed_ms >= confirmation_ms)
+        .then(|| format!("{reason} continuously for {elapsed_ms}ms (need {confirmation_ms}ms)"))
 }
 fn bounded_fallback_quantity(quantity: f64, multiplier: f64, step: f64) -> f64 {
     floor_step(quantity * multiplier.clamp(0.01, 1.0), step)
@@ -3252,7 +3274,7 @@ mod tests {
         );
         let guard = pending_entry_guard_state(&plan, 98.60, Some(0.0), Some(0.0));
         assert!(
-            matches!(guard, EntryGuardState::Invalidated(reason) if reason.contains("40.4 bps"))
+            matches!(guard, EntryGuardState::StructuralInvalidation(reason) if reason.contains("40.4 bps"))
         );
     }
 
@@ -3264,7 +3286,7 @@ mod tests {
         plan.entry_limit = Some(5.34747);
         let guard = pending_entry_guard_state(&plan, 5.219, Some(-0.19), Some(-14.4));
         assert!(
-            matches!(guard, EntryGuardState::Invalidated(reason) if reason.contains("overshot entry limit"))
+            matches!(guard, EntryGuardState::StructuralInvalidation(reason) if reason.contains("overshot entry limit"))
         );
     }
 
@@ -3278,7 +3300,7 @@ mod tests {
         );
         assert!(matches!(
             pending_entry_guard_state(&plan, 101.40, Some(0.0), Some(0.0)),
-            EntryGuardState::Invalidated(_)
+            EntryGuardState::StructuralInvalidation(_)
         ));
     }
 
@@ -3291,8 +3313,29 @@ mod tests {
         );
         assert!(matches!(
             pending_entry_guard_state(&plan, 99.0, Some(-0.20), Some(-4.0)),
-            EntryGuardState::Invalidated(reason) if reason.contains("live flow")
+            EntryGuardState::MicroReversal(reason) if reason.contains("live flow")
         ));
+        assert_eq!(
+            pending_entry_guard_state(&plan, 99.0, None, None),
+            EntryGuardState::Healthy
+        );
+    }
+
+    #[test]
+    fn micro_reversal_must_persist_before_canceling_a_maker_order() {
+        let mut since = None;
+        assert_eq!(
+            persistent_guard_reason(&mut since, 10_000, 15_000, "flow reversed"),
+            None
+        );
+        assert_eq!(
+            persistent_guard_reason(&mut since, 24_999, 15_000, "flow reversed"),
+            None
+        );
+        assert_eq!(
+            persistent_guard_reason(&mut since, 25_000, 15_000, "flow reversed"),
+            Some("flow reversed continuously for 15000ms (need 15000ms)".into())
+        );
     }
 
     #[test]

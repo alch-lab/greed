@@ -457,7 +457,6 @@ fn record_diagnostics(
         return;
     };
     for key in [
-        "lane.breadth_momentum.status",
         "lane.sfp_reversal.status",
         "lane.trend_continuation.status",
         "lane.intraday_sweep_reversal.status",

@@ -1,7 +1,7 @@
 use crate::{
     recipes::{
-        breadth_momentum::BreadthMomentumNode, intraday_sweep_reversal::IntradaySweepReversalNode,
-        sfp_reversal::SfpReversalNode, trend_continuation::TrendContinuationNode,
+        intraday_sweep_reversal::IntradaySweepReversalNode, sfp_reversal::SfpReversalNode,
+        trend_continuation::TrendContinuationNode,
     },
     risk::PositionPlannerNode,
     StrategyConfig,
@@ -11,13 +11,6 @@ use greed_kernel::{GraphError, StrategyGraph, StrategyNode};
 pub fn build_graph(config: &StrategyConfig) -> Result<StrategyGraph, GraphError> {
     let mut nodes: Vec<Box<dyn StrategyNode>> = Vec::new();
     let mut lanes = Vec::new();
-    if config.lanes.breadth_momentum_enabled {
-        nodes.push(Box::new(BreadthMomentumNode::new(
-            &config.symbols,
-            config.lanes.clone(),
-        )));
-        lanes.push("lane.breadth_momentum".into());
-    }
     if config.lanes.sfp_reversal_enabled {
         nodes.push(Box::new(SfpReversalNode::new(
             &config.symbols,
