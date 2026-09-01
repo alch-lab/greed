@@ -469,8 +469,30 @@ impl BinanceDemoExecution {
             .with_context(|| format!("invalid Binance demo response: {path}"))
     }
 
+    /// Retry read-only account queries inside the same reconciliation cycle.
+    ///
+    /// Binance Demo occasionally drops a request while the public streams are
+    /// still healthy.  Waiting for the next five-second sync unnecessarily
+    /// makes the local protection view stale.  Only GET requests use this
+    /// helper: order mutations retain their deterministic client-id based
+    /// reconciliation and are never blindly retried.
+    async fn signed_read(&self, path: &str, parameters: Vec<(String, String)>) -> Result<Value> {
+        let mut last_error = None;
+        for delay_ms in [0, 250, 750] {
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            match self.signed(Method::GET, path, parameters.clone()).await {
+                Ok(value) => return Ok(value),
+                Err(error) => last_error = Some(error),
+            }
+        }
+        Err(last_error.unwrap_or_else(|| anyhow!("read-only Binance request failed")))
+            .with_context(|| format!("Binance demo read failed after three attempts: {path}"))
+    }
+
     pub async fn sync(&mut self) -> Result<Vec<ExchangeEvent>> {
-        let value = self.signed(Method::GET, "/fapi/v2/account", vec![]).await;
+        let value = self.signed_read("/fapi/v2/account", vec![]).await;
         match value {
             Ok(value) => {
                 let account = parse_account(&value)?;
@@ -507,8 +529,7 @@ impl BinanceDemoExecution {
                 let mut stop_orders: BTreeMap<String, ProtectiveOrderId> = BTreeMap::new();
                 for symbol in account.positions.keys() {
                     let open_orders = self
-                        .signed(
-                            Method::GET,
+                        .signed_read(
                             "/fapi/v1/openOrders",
                             vec![("symbol".into(), symbol.clone())],
                         )
@@ -536,8 +557,7 @@ impl BinanceDemoExecution {
                         }
                     }
                     let open_algo_orders = self
-                        .signed(
-                            Method::GET,
+                        .signed_read(
                             "/fapi/v1/openAlgoOrders",
                             vec![
                                 ("algoType".into(), "CONDITIONAL".into()),
@@ -839,8 +859,23 @@ impl BinanceDemoExecution {
                     })
                     .cloned()
                     .collect();
+                // The account snapshot was taken before all per-symbol order
+                // queries. A protective stop can legitimately trigger during
+                // that interval, leaving the old snapshot with a position and
+                // the newer order snapshot without its finished stop. Refresh
+                // positions before emergency flattening so a normal stop fill
+                // is not misreported as an unprotected-position failure.
+                let verified_positions = if unprotected.is_empty() {
+                    None
+                } else {
+                    let latest = self.signed_read("/fapi/v2/account", vec![]).await?;
+                    Some(parse_account(&latest)?.positions)
+                };
                 for symbol in unprotected {
-                    if let Some(position) = account.positions.get(&symbol) {
+                    if let Some(position) = verified_positions
+                        .as_ref()
+                        .and_then(|positions| positions.get(&symbol))
+                    {
                         self.close_market(position).await.with_context(|| {
                             format!(
                                 "unprotected Binance demo position {symbol} could not be closed"
