@@ -80,9 +80,9 @@ trend_min_flow_imbalance = 0.0
 # Later pullbacks belong to a mature move and must not be presented as fresh.
 trend_max_age_bars = 2
 trend_max_signal_age_seconds = 300
-# Start 0.30 ATR behind the completed reclaim, then move the post-only order
+# Start 0.03 ATR behind the completed reclaim, then move the post-only order
 # toward the live passive book every 15 seconds while the signal is still fresh.
-trend_limit_offset_atr = 0.30
+trend_limit_offset_atr = 0.03
 trend_entry_timeout_seconds = 60
 # Reprice the passive maker order toward the live book, but never chase farther
 # than this distance beyond the signal reference price.
@@ -102,7 +102,7 @@ trend_entry_invalidation_bps = 30.0
 trend_max_post_signal_extension_bps = 12.0
 # Veto only when live trade flow and the 10s price response both strongly
 # oppose the completed 15m signal.
-trend_max_opposing_micro_flow = 0.15
+trend_max_opposing_micro_flow = 0.10
 trend_max_opposing_micro_return_bps = 3.0
 # Walk-forward selected 0.6% account risk for this lane. On a 2,000 USDT
 # account the planned full-stop loss is about $12 before gap/slippage, instead
