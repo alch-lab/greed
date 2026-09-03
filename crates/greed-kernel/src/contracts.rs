@@ -146,8 +146,25 @@ pub struct InstrumentFrame {
     pub fast_perpetual: Option<CandleSeries>,
     /// One-minute websocket observations used by short-horizon entry guards.
     pub micro_perpetual: Option<CandleSeries>,
+    /// Five-minute Binance USD-M open-interest history. This is optional so
+    /// existing journals and cold-start frames remain backward compatible.
+    #[serde(default)]
+    pub open_interest: Option<OpenInterestSeries>,
     pub book: Option<BookState>,
     pub microstructure: Option<MicrostructureState>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenInterestPoint {
+    pub timestamp_ms: i64,
+    pub value_usd: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OpenInterestSeries {
+    pub interval_ms: i64,
+    pub meta: ObservationMeta,
+    pub values: Vec<OpenInterestPoint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

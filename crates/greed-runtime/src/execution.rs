@@ -1133,6 +1133,7 @@ impl BinanceDemoExecution {
             "sfp_reversal",
             "trend_continuation",
             "intraday_sweep_reversal",
+            "early_ignition",
         ]
         .into_iter()
         .flat_map(|recipe| {
@@ -3020,7 +3021,15 @@ fn average_fills(rows: &[Value], side: &str) -> Option<f64> {
 }
 fn is_post_only_rejection(error: &anyhow::Error) -> bool {
     let message = error.to_string();
-    message.contains("-5022") || message.contains("could not be executed as maker")
+    message.contains("-5022")
+        || message.contains("could not be executed as maker")
+        // Binance Demo can lag the mainnet market data used to build a plan.
+        // Its percent-price filter then rejects an otherwise passive limit.
+        // Treat these deterministic price-band errors like a stale passive
+        // quote so place_post_only_entry refreshes from the execution venue's
+        // own book instead of dropping the signal outright.
+        || message.contains("\"code\":-4016")
+        || message.contains("\"code\":-4024")
 }
 fn is_invalid_symbol_error(error: &anyhow::Error) -> bool {
     let message = error.to_string();
@@ -3261,6 +3270,20 @@ mod tests {
             "Binance returned {\"code\":-5022,\"msg\":\"Due to the order could not be executed as maker\"}"
         );
         assert!(is_post_only_rejection(&error));
+    }
+
+    #[test]
+    fn reprices_demo_price_band_rejections_from_the_execution_book() {
+        let too_high = anyhow!(
+            "{}",
+            "Binance demo /fapi/v1/order returned 400 Bad Request: {\"code\":-4016,\"msg\":\"Limit price can't be higher than 2.324700.\"}"
+        );
+        let too_low = anyhow!(
+            "{}",
+            "Binance demo /fapi/v1/order returned 400 Bad Request: {\"code\":-4024,\"msg\":\"Limit price can't be lower than 2.100000.\"}"
+        );
+        assert!(is_post_only_rejection(&too_high));
+        assert!(is_post_only_rejection(&too_low));
     }
 
     #[test]

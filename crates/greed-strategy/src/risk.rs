@@ -268,6 +268,7 @@ mod tests {
             hourly_perpetual: None,
             fast_perpetual: None,
             micro_perpetual: None,
+            open_interest: None,
             book: Some(BookState {
                 meta: meta(),
                 bid: 99.99,

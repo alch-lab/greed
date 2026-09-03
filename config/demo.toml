@@ -59,6 +59,7 @@ refresh_seconds = 15
 sfp_reversal_enabled = true
 trend_continuation_enabled = true
 intraday_sweep_reversal_enabled = true
+early_ignition_enabled = true
 max_candidates_per_lane = 2
 max_spread_bps = 6.0
 # Ten times the standard 2,000 USDT trend notional; spread remains capped at 6 bps.
@@ -129,6 +130,15 @@ intraday_max_signal_age_seconds = 120
 intraday_target_r = 2.0
 intraday_max_hold_minutes = 120
 intraday_risk_per_trade_pct = 0.0025
+early_ignition_min_market_return_1h = 0.002
+early_ignition_min_body_return = 0.005
+early_ignition_min_volume_ratio = 2.5
+early_ignition_min_flow = 0.15
+early_ignition_max_compression_ratio = 1.05
+early_ignition_max_prebreak_return_1h = 0.01
+early_ignition_max_return_4h = 0.025
+early_ignition_max_oi_change_15m = 0.01
+early_ignition_risk_per_trade_pct = 0.0025
 [strategy.risk]
 risk_per_trade_pct = 0.010
 high_confidence_risk_per_trade_pct = 0.010

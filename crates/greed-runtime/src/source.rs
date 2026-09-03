@@ -4,7 +4,7 @@ use anyhow::{anyhow, Result};
 use futures_util::{stream, StreamExt};
 use greed_kernel::{
     AccountFrame, Candle, CandleSeries, DataQuality, InstrumentFrame, MarketFrame, MarketKind,
-    ObservationMeta,
+    ObservationMeta, OpenInterestPoint, OpenInterestSeries,
 };
 use greed_strategy::StrategyConfig;
 use reqwest::{Client, StatusCode};
@@ -57,6 +57,8 @@ pub struct BinanceMarketSource {
     candle_bootstrap_retry_after: BTreeMap<(String, String), i64>,
     candle_bootstrap_pending: usize,
     candle_bootstrap_last_error: Option<String>,
+    open_interest_cache: BTreeMap<String, OpenInterestSeries>,
+    open_interest_retry_after: BTreeMap<String, i64>,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -102,6 +104,8 @@ const MAX_KLINE_BOOTSTRAP_REQUESTS_PER_FRAME: usize = 8;
 const KLINE_BOOTSTRAP_CONCURRENCY: usize = 4;
 const KLINE_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5);
 const KLINE_BOOTSTRAP_RETRY_DELAY_MS: i64 = 60_000;
+const OI_REFRESH_MS: i64 = 5 * 60_000;
+const MAX_OI_REQUESTS_PER_FRAME: usize = 4;
 
 fn heal_elapsed_candle_closes(values: &mut [Candle], now_ms: i64) {
     for candle in values {
@@ -143,6 +147,8 @@ impl BinanceMarketSource {
             candle_bootstrap_retry_after: BTreeMap::new(),
             candle_bootstrap_pending: 0,
             candle_bootstrap_last_error: None,
+            open_interest_cache: BTreeMap::new(),
+            open_interest_retry_after: BTreeMap::new(),
         })
     }
 
@@ -736,6 +742,88 @@ impl BinanceMarketSource {
         Ok(series.clone())
     }
 
+    async fn open_interest_history(&self, symbol: &str, now: i64) -> Result<OpenInterestSeries> {
+        let suffix = format!("/futures/data/openInterestHist?symbol={symbol}&period=5m&limit=24");
+        let values = self.get_from_bases(&self.futures_bases(), &suffix).await?;
+        let rows = values
+            .as_array()
+            .ok_or_else(|| anyhow!("open-interest response is not an array"))?;
+        let mut points = Vec::with_capacity(rows.len());
+        for row in rows {
+            let timestamp_ms = row
+                .get("timestamp")
+                .and_then(Value::as_i64)
+                .ok_or_else(|| anyhow!("open-interest timestamp is missing"))?;
+            let value_usd = row
+                .get("sumOpenInterestValue")
+                .and_then(Value::as_str)
+                .ok_or_else(|| anyhow!("open-interest value is missing"))?
+                .parse()?;
+            points.push(OpenInterestPoint {
+                timestamp_ms,
+                value_usd,
+            });
+        }
+        Ok(OpenInterestSeries {
+            interval_ms: 300_000,
+            meta: Self::meta(
+                now,
+                OI_REFRESH_MS + 60_000,
+                "binance_open_interest",
+                DataQuality::Complete,
+            ),
+            values: points,
+        })
+    }
+
+    async fn refresh_open_interest(&mut self, strategy: &StrategyConfig, now: i64) {
+        let symbols: Vec<_> = strategy
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                let stale = self
+                    .open_interest_cache
+                    .get(*symbol)
+                    .is_none_or(|series| now - series.meta.received_ms >= OI_REFRESH_MS);
+                let retry_ready = self
+                    .open_interest_retry_after
+                    .get(*symbol)
+                    .is_none_or(|retry_after| now >= *retry_after);
+                stale && retry_ready
+            })
+            .take(MAX_OI_REQUESTS_PER_FRAME)
+            .cloned()
+            .collect();
+        let source = &*self;
+        let results = stream::iter(symbols)
+            .map(|symbol| async move {
+                let result = tokio::time::timeout(
+                    KLINE_BOOTSTRAP_TIMEOUT,
+                    source.open_interest_history(&symbol, now),
+                )
+                .await
+                .map_err(|_| anyhow!("open-interest request timed out"))
+                .and_then(|value| value);
+                (symbol, result)
+            })
+            .buffer_unordered(MAX_OI_REQUESTS_PER_FRAME)
+            .collect::<Vec<_>>()
+            .await;
+        for (symbol, result) in results {
+            match result {
+                Ok(series) => {
+                    self.open_interest_cache.insert(symbol.clone(), series);
+                    self.open_interest_retry_after.remove(&symbol);
+                }
+                Err(error) => {
+                    tracing::debug!(symbol = %symbol, error = %error, "open-interest history is warming");
+                    self.open_interest_retry_after
+                        .insert(symbol, now + KLINE_BOOTSTRAP_RETRY_DELAY_MS);
+                }
+            }
+        }
+    }
+
     fn stream_observation_klines(
         &self,
         symbol: &str,
@@ -807,6 +895,7 @@ impl BinanceMarketSource {
         let mut warnings = Vec::new();
         self.set_stream_symbols(strategy);
         self.bootstrap_missing_klines(strategy, now).await;
+        self.refresh_open_interest(strategy, now).await;
         for symbol in &strategy.symbols {
             if !self
                 .candle_cache
@@ -893,6 +982,7 @@ impl BinanceMarketSource {
                     hourly_perpetual,
                     fast_perpetual,
                     micro_perpetual,
+                    open_interest: self.open_interest_cache.get(symbol).cloned(),
                     book,
                     microstructure,
                 },

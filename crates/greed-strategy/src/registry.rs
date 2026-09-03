@@ -1,7 +1,7 @@
 use crate::{
     recipes::{
-        intraday_sweep_reversal::IntradaySweepReversalNode, sfp_reversal::SfpReversalNode,
-        trend_continuation::TrendContinuationNode,
+        early_ignition::EarlyIgnitionNode, intraday_sweep_reversal::IntradaySweepReversalNode,
+        sfp_reversal::SfpReversalNode, trend_continuation::TrendContinuationNode,
     },
     risk::PositionPlannerNode,
     StrategyConfig,
@@ -31,6 +31,13 @@ pub fn build_graph(config: &StrategyConfig) -> Result<StrategyGraph, GraphError>
             config.lanes.clone(),
         )));
         lanes.push("lane.intraday_sweep_reversal".into());
+    }
+    if config.lanes.early_ignition_enabled {
+        nodes.push(Box::new(EarlyIgnitionNode::new(
+            &config.symbols,
+            config.lanes.clone(),
+        )));
+        lanes.push("lane.early_ignition".into());
     }
     nodes.push(Box::new(PositionPlannerNode::new(
         lanes,

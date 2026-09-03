@@ -62,6 +62,11 @@ impl SampleRecorder {
                         "price":instrument.price,
                         "last_5m":instrument.fast_perpetual.as_ref().and_then(|series|series.values.last()),
                         "last_1m":instrument.micro_perpetual.as_ref().and_then(|series|series.values.last()),
+                        "open_interest":instrument.open_interest.as_ref().and_then(|series|series.values.last().map(|latest|serde_json::json!({
+                                "timestamp_ms":latest.timestamp_ms,
+                                "value_usd":latest.value_usd,
+                                "quality":series.meta.quality,
+                            }))),
                         "book":instrument.book,
                         "microstructure":instrument.microstructure
                     }),
@@ -299,6 +304,16 @@ impl ResearchRecorder {
                     "quality":micro.meta.quality,
                 })
             });
+            let open_interest = instrument.open_interest.as_ref().and_then(|series| {
+                let latest = series.values.last()?;
+                Some(serde_json::json!({
+                    "interval_ms":series.interval_ms,
+                    "timestamp_ms":latest.timestamp_ms,
+                    "value_usd":latest.value_usd,
+                    "event_age_ms":frame.as_of_ms-series.meta.event_ms,
+                    "quality":series.meta.quality,
+                }))
+            });
             records.push((
                 "research_snapshot".to_string(),
                 serde_json::json!({
@@ -307,6 +322,7 @@ impl ResearchRecorder {
                     "price":price,
                     "book":book,
                     "flow":flow,
+                    "open_interest":open_interest,
                 }),
             ));
             queue.push_back(PendingResearchSample {

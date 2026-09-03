@@ -50,6 +50,7 @@ pub struct LaneConfig {
     pub sfp_reversal_enabled: bool,
     pub trend_continuation_enabled: bool,
     pub intraday_sweep_reversal_enabled: bool,
+    pub early_ignition_enabled: bool,
     pub max_candidates_per_lane: usize,
     pub max_spread_bps: f64,
     pub min_depth_usd: f64,
@@ -93,6 +94,15 @@ pub struct LaneConfig {
     pub intraday_target_r: f64,
     pub intraday_max_hold_minutes: u32,
     pub intraday_risk_per_trade_pct: f64,
+    pub early_ignition_min_market_return_1h: f64,
+    pub early_ignition_min_body_return: f64,
+    pub early_ignition_min_volume_ratio: f64,
+    pub early_ignition_min_flow: f64,
+    pub early_ignition_max_compression_ratio: f64,
+    pub early_ignition_max_prebreak_return_1h: f64,
+    pub early_ignition_max_return_4h: f64,
+    pub early_ignition_max_oi_change_15m: f64,
+    pub early_ignition_risk_per_trade_pct: f64,
 }
 
 impl Default for LaneConfig {
@@ -101,6 +111,7 @@ impl Default for LaneConfig {
             sfp_reversal_enabled: true,
             trend_continuation_enabled: true,
             intraday_sweep_reversal_enabled: true,
+            early_ignition_enabled: false,
             max_candidates_per_lane: 2,
             max_spread_bps: 6.0,
             min_depth_usd: 20_000.0,
@@ -144,6 +155,15 @@ impl Default for LaneConfig {
             intraday_target_r: 2.0,
             intraday_max_hold_minutes: 120,
             intraday_risk_per_trade_pct: 0.0025,
+            early_ignition_min_market_return_1h: 0.002,
+            early_ignition_min_body_return: 0.005,
+            early_ignition_min_volume_ratio: 2.5,
+            early_ignition_min_flow: 0.15,
+            early_ignition_max_compression_ratio: 1.05,
+            early_ignition_max_prebreak_return_1h: 0.01,
+            early_ignition_max_return_4h: 0.025,
+            early_ignition_max_oi_change_15m: 0.01,
+            early_ignition_risk_per_trade_pct: 0.0025,
         }
     }
 }
@@ -264,6 +284,15 @@ impl StrategyConfig {
             || !(1.0..=3.0).contains(&lanes.intraday_target_r)
             || !(30..=240).contains(&lanes.intraday_max_hold_minutes)
             || !(0.001..=0.005).contains(&lanes.intraday_risk_per_trade_pct)
+            || !(0.0..=0.02).contains(&lanes.early_ignition_min_market_return_1h)
+            || !(0.002..=0.02).contains(&lanes.early_ignition_min_body_return)
+            || !(1.0..=10.0).contains(&lanes.early_ignition_min_volume_ratio)
+            || !(0.0..=0.8).contains(&lanes.early_ignition_min_flow)
+            || !(0.5..=1.5).contains(&lanes.early_ignition_max_compression_ratio)
+            || !(0.0..=0.05).contains(&lanes.early_ignition_max_prebreak_return_1h)
+            || !(0.01..=0.10).contains(&lanes.early_ignition_max_return_4h)
+            || !(0.0..=0.05).contains(&lanes.early_ignition_max_oi_change_15m)
+            || !(0.001..=0.005).contains(&lanes.early_ignition_risk_per_trade_pct)
             || lanes.max_spread_bps <= 0.0
             || lanes.min_depth_usd <= 0.0
         {
