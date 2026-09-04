@@ -47,6 +47,7 @@ impl Default for UniverseConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LaneConfig {
+    pub btc_key_zone_enabled: bool,
     pub sfp_reversal_enabled: bool,
     pub trend_continuation_enabled: bool,
     pub intraday_sweep_reversal_enabled: bool,
@@ -103,11 +104,21 @@ pub struct LaneConfig {
     pub early_ignition_max_return_4h: f64,
     pub early_ignition_max_oi_change_15m: f64,
     pub early_ignition_risk_per_trade_pct: f64,
+    pub btc_key_zone_lookback_hours: usize,
+    pub btc_key_zone_pivot_bars: usize,
+    pub btc_key_zone_cluster_atr: f64,
+    pub btc_key_zone_max_distance_atr: f64,
+    pub btc_key_zone_invalidation_atr: f64,
+    pub btc_key_zone_min_touches: usize,
+    pub btc_key_zone_min_extension_atr: f64,
+    pub btc_key_zone_min_rejection_wick_body: f64,
+    pub btc_key_zone_risk_per_trade_pct: f64,
 }
 
 impl Default for LaneConfig {
     fn default() -> Self {
         Self {
+            btc_key_zone_enabled: false,
             sfp_reversal_enabled: true,
             trend_continuation_enabled: true,
             intraday_sweep_reversal_enabled: true,
@@ -164,6 +175,15 @@ impl Default for LaneConfig {
             early_ignition_max_return_4h: 0.025,
             early_ignition_max_oi_change_15m: 0.01,
             early_ignition_risk_per_trade_pct: 0.0025,
+            btc_key_zone_lookback_hours: 480,
+            btc_key_zone_pivot_bars: 3,
+            btc_key_zone_cluster_atr: 0.75,
+            btc_key_zone_max_distance_atr: 2.0,
+            btc_key_zone_invalidation_atr: 0.50,
+            btc_key_zone_min_touches: 2,
+            btc_key_zone_min_extension_atr: 1.0,
+            btc_key_zone_min_rejection_wick_body: 0.75,
+            btc_key_zone_risk_per_trade_pct: 0.005,
         }
     }
 }
@@ -293,6 +313,15 @@ impl StrategyConfig {
             || !(0.01..=0.10).contains(&lanes.early_ignition_max_return_4h)
             || !(0.0..=0.05).contains(&lanes.early_ignition_max_oi_change_15m)
             || !(0.001..=0.005).contains(&lanes.early_ignition_risk_per_trade_pct)
+            || !(168..=720).contains(&lanes.btc_key_zone_lookback_hours)
+            || !(2..=12).contains(&lanes.btc_key_zone_pivot_bars)
+            || !(0.25..=2.0).contains(&lanes.btc_key_zone_cluster_atr)
+            || !(0.5..=5.0).contains(&lanes.btc_key_zone_max_distance_atr)
+            || !(0.1..=2.0).contains(&lanes.btc_key_zone_invalidation_atr)
+            || !(2..=8).contains(&lanes.btc_key_zone_min_touches)
+            || !(0.0..=5.0).contains(&lanes.btc_key_zone_min_extension_atr)
+            || !(0.25..=5.0).contains(&lanes.btc_key_zone_min_rejection_wick_body)
+            || !(0.001..=0.01).contains(&lanes.btc_key_zone_risk_per_trade_pct)
             || lanes.max_spread_bps <= 0.0
             || lanes.min_depth_usd <= 0.0
         {

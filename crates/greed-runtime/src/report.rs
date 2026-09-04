@@ -457,6 +457,7 @@ fn record_diagnostics(
         return;
     };
     for key in [
+        "lane.btc_key_zone.status",
         "lane.sfp_reversal.status",
         "lane.trend_continuation.status",
         "lane.intraday_sweep_reversal.status",
@@ -521,7 +522,9 @@ fn classify(payload: &Value) -> (String, String) {
 }
 
 fn recipe_from_id(id: &str) -> &'static str {
-    if id.contains("breadth_momentum") {
+    if id.contains("btc_key_zone") {
+        "btc_key_zone"
+    } else if id.contains("breadth_momentum") {
         "breadth_momentum"
     } else if id.contains("sfp_reversal") {
         "sfp_reversal"
@@ -538,6 +541,7 @@ fn recipe_from_id(id: &str) -> &'static str {
 
 fn lane_for_recipe(recipe: &str) -> &'static str {
     match recipe {
+        "btc_key_zone" => "btc_key_zone",
         "breadth_momentum" => "breadth_momentum",
         "sfp_reversal" => "sfp_reversal",
         "trend_continuation" => "trend_continuation",

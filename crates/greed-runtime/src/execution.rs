@@ -85,6 +85,10 @@ struct ExecutionMeta {
     #[serde(default)]
     take_profit_prices: Vec<(f64, f64)>,
     #[serde(default)]
+    unprotected_runner_fraction: Option<f64>,
+    #[serde(default)]
+    runner_active: bool,
+    #[serde(default)]
     break_even_after_fraction: Option<f64>,
     #[serde(default)]
     break_even_buffer_pct: f64,
@@ -169,6 +173,10 @@ pub struct DemoPositionSnapshot {
     pub remaining_quantity: f64,
     pub stop_price: f64,
     pub take_profit_prices: Vec<(f64, f64)>,
+    pub unprotected_runner_fraction: Option<f64>,
+    pub runner_active: bool,
+    pub isolated: bool,
+    pub isolated_wallet_usd: f64,
     pub max_hold_ms: i64,
     pub break_even_armed: bool,
     pub profit_shield_activation_pct: Option<f64>,
@@ -192,6 +200,8 @@ struct RemotePosition {
     entry_price: f64,
     mark_price: f64,
     unrealized_pnl: f64,
+    isolated: bool,
+    isolated_wallet_usd: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -605,6 +615,7 @@ impl BinanceDemoExecution {
                         ))
                     })
                     .collect();
+                let mut runner_activations = Vec::new();
                 for (
                     symbol,
                     closed_quantity,
@@ -662,6 +673,80 @@ impl BinanceDemoExecution {
                             meta.cumulative_reported_fee_usd = summary.fees_usd;
                             meta.cumulative_reported_pnl_usd = summary.net_pnl_usd;
                         }
+                        if !meta.runner_active {
+                            if let Some(runner_fraction) = meta.unprotected_runner_fraction {
+                                let runner_quantity = meta.initial_quantity * runner_fraction;
+                                let remote_position = account.positions.get(&symbol);
+                                let isolated_wallet = remote_position
+                                    .map(|value| value.isolated_wallet_usd)
+                                    .unwrap_or_default();
+                                // trade_summary.net_pnl_usd is already net of
+                                // commission. Requiring fees a second time made
+                                // a genuinely funded tail unnecessarily hard to
+                                // activate. Never remove protection unless the
+                                // exchange confirms isolated margin and exposes
+                                // a positive, fully covered isolated wallet.
+                                let profits_cover_runner =
+                                    remote_position.is_some_and(|position| {
+                                        position.isolated
+                                            && isolated_wallet > f64::EPSILON
+                                            && meta.cumulative_reported_pnl_usd > isolated_wallet
+                                    });
+                                if remaining_quantity <= runner_quantity * 1.01
+                                    && remaining_quantity > f64::EPSILON
+                                    && profits_cover_runner
+                                {
+                                    runner_activations.push((
+                                        symbol.clone(),
+                                        remaining_quantity,
+                                        isolated_wallet,
+                                        meta.cumulative_reported_pnl_usd,
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+                for (symbol, remaining_quantity, isolated_wallet, locked_pnl) in runner_activations
+                {
+                    match self.cancel_all(&symbol).await {
+                        Ok(()) => {
+                            if let Some(meta) = self.state.positions.get_mut(&symbol) {
+                                meta.runner_active = true;
+                                meta.stop_price = 0.0;
+                                meta.stop_algo_id = None;
+                                meta.stop_reason = Some("unprotected_tail_runner".into());
+                                meta.take_profit_order_ids.clear();
+                                meta.profit_shield_activation_pct = None;
+                                meta.trailing_activation_pct = None;
+                                meta.trailing_distance_pct = None;
+                                meta.early_failure_after_ms = 0;
+                                meta.max_hold_ms = 0;
+                            }
+                            events.push(ExchangeEvent {
+                                kind: "exchange_runner_activated".into(),
+                                payload: serde_json::json!({
+                                    "ts_ms":now_ms,
+                                    "symbol":symbol,
+                                    "remaining_quantity":remaining_quantity,
+                                    "isolated_wallet_usd":isolated_wallet,
+                                    "locked_net_pnl_usd":locked_pnl,
+                                    "worst_case_campaign_pnl_usd":locked_pnl-isolated_wallet,
+                                    "reason":"preceding_realized_profit_covers_isolated_runner",
+                                    "venue":"binance_demo",
+                                    "paper_only":true
+                                }),
+                            });
+                        }
+                        Err(error) => events.push(ExchangeEvent {
+                            kind: "exchange_order_rejected".into(),
+                            payload: serde_json::json!({
+                                "ts_ms":now_ms,
+                                "symbol":symbol,
+                                "reason":format!("tail runner activation could not cancel protection: {error}"),
+                                "venue":"binance_demo"
+                            }),
+                        }),
                     }
                 }
                 let mut early_failures = Vec::new();
@@ -669,6 +754,9 @@ impl BinanceDemoExecution {
                     let Some(meta) = self.state.positions.get_mut(symbol) else {
                         continue;
                     };
+                    if meta.runner_active {
+                        continue;
+                    }
                     meta.extreme_price = if meta.extreme_price <= 0.0 {
                         position.mark_price
                     } else {
@@ -847,6 +935,11 @@ impl BinanceDemoExecution {
                     .keys()
                     .filter(|symbol| {
                         self.state.positions.contains_key(*symbol)
+                            && !self
+                                .state
+                                .positions
+                                .get(*symbol)
+                                .is_some_and(|meta| meta.runner_active)
                             && !protected.get(*symbol).is_some_and(|(stop, take)| {
                                 *stop
                                     && (*take
@@ -1130,6 +1223,7 @@ impl BinanceDemoExecution {
 
     pub fn recipe_gate_snapshots(&self, now_ms: i64) -> BTreeMap<String, RecipeGateStatus> {
         [
+            "btc_key_zone",
             "sfp_reversal",
             "trend_continuation",
             "intraday_sweep_reversal",
@@ -1195,6 +1289,11 @@ impl BinanceDemoExecution {
                                 }
                             })
                             .unwrap_or_default(),
+                        unprotected_runner_fraction: meta
+                            .and_then(|value| value.unprotected_runner_fraction),
+                        runner_active: meta.map(|value| value.runner_active).unwrap_or(false),
+                        isolated: position.isolated,
+                        isolated_wallet_usd: position.isolated_wallet_usd,
                         max_hold_ms: meta.map(|value| value.max_hold_ms).unwrap_or_default(),
                         break_even_armed: meta.map(|value| value.break_even_armed).unwrap_or(false),
                         profit_shield_activation_pct: meta
@@ -1250,6 +1349,64 @@ impl BinanceDemoExecution {
             if candidate.is_none_or(|value| frame.as_of_ms > value.expires_ms) {
                 continue;
             }
+            let recipe = candidate
+                .map(|value| value.recipe.clone())
+                .unwrap_or_else(|| "unknown".into());
+            let rotates_existing_tail = recipe == "btc_key_zone"
+                && self.state.positions.get(&plan.symbol).is_some_and(|meta| {
+                    let remaining_fraction =
+                        meta.last_observed_quantity / meta.initial_quantity.max(f64::EPSILON);
+                    meta.runner_active
+                        || (meta.recipe == "btc_key_zone"
+                            && meta.unprotected_runner_fraction.is_some_and(|runner| {
+                                remaining_fraction > 0.0 && remaining_fraction <= runner * 1.01
+                            }))
+                });
+            if rotates_existing_tail {
+                if let Some(position) = self
+                    .account
+                    .as_ref()
+                    .and_then(|account| account.positions.get(&plan.symbol))
+                    .cloned()
+                {
+                    match self.close_market(&position).await {
+                        Ok(()) => {
+                            if let Some(meta) = self.state.positions.get_mut(&plan.symbol) {
+                                meta.exit_requested = true;
+                                meta.pending_exit_reason = Some("campaign_tail_rotation".into());
+                            }
+                            self.save().ok();
+                            events.push(ExchangeEvent {
+                                kind: "exchange_exit_requested".into(),
+                                payload: serde_json::json!({
+                                    "ts_ms":frame.as_of_ms,
+                                    "candidate_id":plan.candidate_id,
+                                    "recipe":recipe,
+                                    "symbol":plan.symbol,
+                                    "side":position.side,
+                                    "reason":"campaign_tail_rotation",
+                                    "next_side":plan.side,
+                                    "venue":"binance_demo"
+                                }),
+                            });
+                        }
+                        Err(error) => events.push(ExchangeEvent {
+                            kind: "exchange_order_rejected".into(),
+                            payload: serde_json::json!({
+                                "ts_ms":frame.as_of_ms,
+                                "candidate_id":plan.candidate_id,
+                                "recipe":recipe,
+                                "symbol":plan.symbol,
+                                "reason":format!("campaign tail rotation failed: {error}"),
+                                "venue":"binance_demo"
+                            }),
+                        }),
+                    }
+                }
+                // Reconciliation removes the old one-way position on the next
+                // loop. The same unconsumed zone can then create the new leg.
+                continue;
+            }
             if self.account.as_ref().is_some_and(|account| {
                 account.positions.contains_key(&plan.symbol)
                     || self.state.positions.contains_key(&plan.symbol)
@@ -1257,9 +1414,6 @@ impl BinanceDemoExecution {
             }) {
                 continue;
             }
-            let recipe = candidate
-                .map(|value| value.recipe.clone())
-                .unwrap_or_else(|| "unknown".into());
             if !self.supports_symbol(&plan.symbol) {
                 self.state.seen.insert(plan.candidate_id.clone());
                 events.push(ExchangeEvent {
@@ -1348,6 +1502,8 @@ impl BinanceDemoExecution {
                                 .map(|value| value.0)
                                 .unwrap_or_default(),
                             take_profit_prices: fill.take_profit_prices.clone(),
+                            unprotected_runner_fraction: plan.unprotected_runner_fraction,
+                            runner_active: false,
                             break_even_after_fraction: plan.break_even_after_fraction.map(
                                 |fraction| {
                                     self.rules
@@ -1388,7 +1544,7 @@ impl BinanceDemoExecution {
                         .and_then(|value| value.parse::<i64>().ok());
                     events.push(ExchangeEvent {
                         kind: "exchange_entry".into(),
-                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"entry_mode":fill.entry_mode,"entry_price_source":fill.entry_price_source,"maker_attempted":fill.maker_attempted,"maker_wait_ms":fill.maker_wait_ms,"maker_reprices":fill.maker_reprices,"requested_limit":plan.entry_limit,"final_maker_limit":fill.final_maker_limit,"entry_price":fill.entry_price,"quantity":fill.quantity,"notional_usd":actual_notional_usd,"actual_notional_usd":actual_notional_usd,"planned_notional_usd":planned_notional_usd,"fill_ratio":fill_ratio,"partial_fill":fill_ratio < 0.999,"probe_size_multiplier":size_multiplier,"entry_size_multiplier":fill.size_multiplier,"entry_guard":{"invalidation_bps":plan.entry_invalidation_bps,"max_opposing_flow":plan.entry_guard_max_opposing_flow,"max_opposing_return_bps":plan.entry_guard_max_opposing_return_bps},"early_failure":{"after_ms":plan.early_failure_after_ms,"adverse_pct":plan.early_failure_adverse_pct,"max_favorable_pct":plan.early_failure_max_favorable_pct},"spread_bps":cost.spread_bps,"expected_exit_slippage_bps":cost.expected_exit_slippage_bps,"estimated_round_trip_cost_bps":cost.estimated_round_trip_cost_bps,"gross_target_bps":cost.gross_target_bps,"target_to_cost_ratio":cost.target_to_cost_ratio,"order_id":fill.order_id,"stop_algo_id":fill.stop_algo_id,"take_profit_order_ids":fill.take_profit_order_ids,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
+                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"entry_mode":fill.entry_mode,"entry_price_source":fill.entry_price_source,"maker_attempted":fill.maker_attempted,"maker_wait_ms":fill.maker_wait_ms,"maker_reprices":fill.maker_reprices,"requested_limit":plan.entry_limit,"final_maker_limit":fill.final_maker_limit,"entry_price":fill.entry_price,"quantity":fill.quantity,"notional_usd":actual_notional_usd,"actual_notional_usd":actual_notional_usd,"planned_notional_usd":planned_notional_usd,"fill_ratio":fill_ratio,"partial_fill":fill_ratio < 0.999,"probe_size_multiplier":size_multiplier,"entry_size_multiplier":fill.size_multiplier,"margin_type":"isolated","unprotected_runner_fraction":plan.unprotected_runner_fraction,"entry_guard":{"invalidation_bps":plan.entry_invalidation_bps,"max_opposing_flow":plan.entry_guard_max_opposing_flow,"max_opposing_return_bps":plan.entry_guard_max_opposing_return_bps},"early_failure":{"after_ms":plan.early_failure_after_ms,"adverse_pct":plan.early_failure_adverse_pct,"max_favorable_pct":plan.early_failure_max_favorable_pct},"spread_bps":cost.spread_bps,"expected_exit_slippage_bps":cost.expected_exit_slippage_bps,"estimated_round_trip_cost_bps":cost.estimated_round_trip_cost_bps,"gross_target_bps":cost.gross_target_bps,"target_to_cost_ratio":cost.target_to_cost_ratio,"order_id":fill.order_id,"stop_algo_id":fill.stop_algo_id,"take_profit_order_ids":fill.take_profit_order_ids,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
                     });
                 }
                 Err(error) => {
@@ -1548,6 +1704,21 @@ impl BinanceDemoExecution {
         if plan.take_profit_prices.is_empty() {
             return Err(anyhow!("position plan requires at least one take profit"));
         }
+        let take_profit_fraction = plan
+            .take_profit_prices
+            .iter()
+            .map(|(_, fraction)| *fraction)
+            .sum::<f64>();
+        if take_profit_fraction > 1.0 + 1e-6 {
+            return Err(anyhow!("staged take-profit fractions exceed the position"));
+        }
+        if let Some(runner_fraction) = plan.unprotected_runner_fraction {
+            if (take_profit_fraction + runner_fraction - 1.0).abs() > 1e-6 {
+                return Err(anyhow!(
+                    "take-profit fractions and tail runner must sum to one"
+                ));
+            }
+        }
         for (_, fraction) in &plan.take_profit_prices {
             if *fraction >= 1.0 - f64::EPSILON {
                 continue;
@@ -1580,6 +1751,7 @@ impl BinanceDemoExecution {
             }
         }
         self.prepare_symbol_for_entry(&plan.symbol).await?;
+        self.ensure_isolated_margin(&plan.symbol).await?;
         self.signed(
             Method::POST,
             "/fapi/v1/leverage",
@@ -1885,6 +2057,28 @@ impl BinanceDemoExecution {
             .with_context(|| format!("cancel orphaned greed conditional order on {symbol}"))?;
         }
         Ok(())
+    }
+
+    async fn ensure_isolated_margin(&self, symbol: &str) -> Result<()> {
+        match self
+            .signed(
+                Method::POST,
+                "/fapi/v1/marginType",
+                vec![
+                    ("symbol".into(), symbol.into()),
+                    ("marginType".into(), "ISOLATED".into()),
+                ],
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            // Binance reports "No need to change margin type" when the
+            // symbol is already isolated. Treat that idempotent response as
+            // success; every other response remains a hard entry failure.
+            Err(error) if error.to_string().contains("-4046") => Ok(()),
+            Err(error) => Err(error)
+                .with_context(|| format!("could not guarantee isolated margin for {symbol}")),
+        }
     }
 
     async fn resolve_entry_price(
@@ -2887,6 +3081,9 @@ fn parse_account(value: &Value) -> Result<RemoteAccount> {
                     })
                     .unwrap_or_else(|| parse_f64(row, "entryPrice").unwrap_or(0.0)),
                 unrealized_pnl: parse_f64(row, "unrealizedProfit").unwrap_or(0.0),
+                isolated: row["isolated"].as_bool().unwrap_or(false)
+                    || row["marginType"].as_str() == Some("isolated"),
+                isolated_wallet_usd: parse_f64(row, "isolatedWallet").unwrap_or_default(),
             },
         );
     }
@@ -3142,6 +3339,7 @@ mod tests {
             entry_guard_max_opposing_return_bps: 3.0,
             stop_price: 98.75,
             take_profit_prices: vec![(102.5, 0.4)],
+            unprotected_runner_fraction: None,
             break_even_after_fraction: Some(0.4),
             break_even_buffer_pct: 0.0018,
             profit_shield_activation_pct: Some(0.00625),

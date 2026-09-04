@@ -245,6 +245,7 @@ fn strategy_funnels_demo(
         })
     };
     serde_json::json!({
+        "btc_key_zone":build("btc_key_zone"),
         "sfp_reversal":build("sfp_reversal"),
         "trend_continuation":build("trend_continuation"),
         "intraday_sweep_reversal":build("intraday_sweep_reversal"),
@@ -367,6 +368,7 @@ async fn main() -> Result<()> {
             let graph = build_graph(&config.strategy)?;
             drop(graph);
             let enabled_lanes = usize::from(config.strategy.lanes.sfp_reversal_enabled)
+                + usize::from(config.strategy.lanes.btc_key_zone_enabled)
                 + usize::from(config.strategy.lanes.trend_continuation_enabled)
                 + usize::from(config.strategy.lanes.intraday_sweep_reversal_enabled)
                 + usize::from(config.strategy.lanes.early_ignition_enabled);

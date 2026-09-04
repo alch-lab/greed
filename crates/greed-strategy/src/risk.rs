@@ -13,6 +13,24 @@ fn tag_i64(candidate: &greed_kernel::TradeCandidate, key: &str) -> Option<i64> {
     candidate.tags.get(key)?.parse().ok()
 }
 
+fn take_profit_ladder(candidate: &greed_kernel::TradeCandidate) -> Option<Vec<(f64, f64)>> {
+    let encoded = candidate.tags.get("take_profit_ladder")?;
+    let values: Option<Vec<_>> = encoded
+        .split(',')
+        .map(|leg| {
+            let (target_r, fraction) = leg.split_once(':')?;
+            Some((target_r.parse::<f64>().ok()?, fraction.parse::<f64>().ok()?))
+        })
+        .collect();
+    values.filter(|legs| {
+        !legs.is_empty()
+            && legs.iter().all(|(target_r, fraction)| {
+                target_r.is_finite() && *target_r > 0.0 && fraction.is_finite() && *fraction > 0.0
+            })
+            && legs.iter().map(|(_, fraction)| *fraction).sum::<f64>() <= 1.0 + 1e-6
+    })
+}
+
 pub struct PositionPlannerNode {
     id: String,
     dependencies: Vec<String>,
@@ -164,13 +182,37 @@ impl StrategyNode for PositionPlannerNode {
             let sign = c.side.sign();
             let stop = c.reference_price * (1.0 - sign * stop_pct);
             let tp1 = c.reference_price * (1.0 + sign * stop_pct * target_r);
-            let mut take_profit_prices = vec![(tp1, take_fraction)];
-            if take_fraction < 1.0 && self.config.runner_take_profit_r > 0.0 {
+            let configured_ladder = take_profit_ladder(c);
+            let mut take_profit_prices = configured_ladder
+                .as_ref()
+                .map(|legs| {
+                    legs.iter()
+                        .map(|(target_r, fraction)| {
+                            (
+                                c.reference_price * (1.0 + sign * stop_pct * target_r),
+                                *fraction,
+                            )
+                        })
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_else(|| vec![(tp1, take_fraction)]);
+            if configured_ladder.is_none()
+                && take_fraction < 1.0
+                && self.config.runner_take_profit_r > 0.0
+            {
                 let runner = c.reference_price
                     * (1.0
                         + sign * self.config.initial_stop_pct * self.config.runner_take_profit_r);
                 take_profit_prices.push((runner, 1.0 - self.config.first_take_profit_fraction));
             }
+            let staged_exit_fraction = take_profit_prices
+                .iter()
+                .map(|(_, fraction)| *fraction)
+                .sum::<f64>();
+            let first_exit_fraction = take_profit_prices
+                .first()
+                .map(|value| value.1)
+                .unwrap_or_default();
             let plan = PositionPlan {
                 candidate_id: c.id.clone(),
                 symbol: c.symbol.clone(),
@@ -198,18 +240,24 @@ impl StrategyNode for PositionPlannerNode {
                 .unwrap_or_default(),
                 stop_price: stop,
                 take_profit_prices,
-                break_even_after_fraction: (take_fraction < 1.0).then_some(take_fraction),
+                break_even_after_fraction: (staged_exit_fraction < 1.0 - 1e-6)
+                    .then_some(first_exit_fraction),
+                unprotected_runner_fraction: tag_f64(c, "unprotected_runner_fraction")
+                    .filter(|fraction| (0.01..=0.25).contains(fraction)),
                 break_even_buffer_pct: self.config.break_even_buffer_pct,
                 profit_shield_activation_pct: ((take_fraction < 1.0 || explicit_profit_protection)
+                    && !c.tags.contains_key("unprotected_runner_fraction")
                     && profit_shield_activation_r > 0.0)
                     .then_some(stop_pct * profit_shield_activation_r),
                 // Start locking profit before TP1. Waiting until TP1 meant a
                 // position could reach roughly +1R, miss the 2R partial, and
                 // surrender almost all open profit back to the cost shield.
-                trailing_activation_pct: (take_fraction < 1.0 || explicit_profit_protection)
-                    .then_some(stop_pct * trailing_activation_r),
-                trailing_distance_pct: (take_fraction < 1.0 || explicit_profit_protection)
-                    .then_some(trailing_distance_pct),
+                trailing_activation_pct: ((take_fraction < 1.0 || explicit_profit_protection)
+                    && !c.tags.contains_key("unprotected_runner_fraction"))
+                .then_some(stop_pct * trailing_activation_r),
+                trailing_distance_pct: ((take_fraction < 1.0 || explicit_profit_protection)
+                    && !c.tags.contains_key("unprotected_runner_fraction"))
+                .then_some(trailing_distance_pct),
                 early_failure_after_ms,
                 early_failure_adverse_pct: stop_pct * early_failure_adverse_r,
                 early_failure_max_favorable_pct: stop_pct * early_failure_max_mfe_r,
@@ -351,5 +399,20 @@ mod tests {
         assert!(plans.iter().any(|plan| plan.candidate_id == "sfp:BTC"));
         assert!(!plans.iter().any(|plan| plan.candidate_id == "trend:BTC"));
         assert!(plans.iter().any(|plan| plan.candidate_id == "intraday:ETH"));
+    }
+
+    #[test]
+    fn parses_a_multi_stage_take_profit_ladder() {
+        let mut record = candidate("zone:BTC", "btc_key_zone", "BTCUSDT", 5);
+        let Artifact::Candidate(value) = &mut record.artifact else {
+            panic!("candidate fixture must contain a candidate");
+        };
+        value.tags.insert(
+            "take_profit_ladder".into(),
+            "0.8:0.20,1.5:0.25,2.5:0.25,3.5:0.20".into(),
+        );
+        let legs = take_profit_ladder(value).expect("valid ladder");
+        assert_eq!(legs.len(), 4);
+        assert!((legs.iter().map(|(_, fraction)| fraction).sum::<f64>() - 0.90).abs() < 1e-9);
     }
 }

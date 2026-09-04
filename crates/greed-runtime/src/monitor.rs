@@ -229,6 +229,7 @@ fn is_trade_event(value: &Value) -> bool {
         Some(
             "exchange_entry"
                 | "exchange_partial_exit"
+                | "exchange_runner_activated"
                 | "exchange_exit"
                 | "exchange_exit_requested"
                 | "exchange_entry_canceled"

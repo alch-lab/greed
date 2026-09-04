@@ -84,6 +84,11 @@ pub struct PositionPlan {
     pub entry_guard_max_opposing_return_bps: f64,
     pub stop_price: f64,
     pub take_profit_prices: Vec<(f64, f64)>,
+    /// Fraction of the original position intentionally left without a fixed
+    /// take-profit after the preceding staged exits complete. The executor
+    /// keeps the hard stop until this runner is actually reached.
+    #[serde(default)]
+    pub unprotected_runner_fraction: Option<f64>,
     pub break_even_after_fraction: Option<f64>,
     pub break_even_buffer_pct: f64,
     #[serde(default)]

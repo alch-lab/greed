@@ -56,6 +56,7 @@ min_24h_quote_volume_usd = 25000000.0
 refresh_seconds = 15
 
 [strategy.lanes]
+btc_key_zone_enabled = true
 sfp_reversal_enabled = true
 trend_continuation_enabled = true
 intraday_sweep_reversal_enabled = true
@@ -139,6 +140,18 @@ early_ignition_max_prebreak_return_1h = 0.01
 early_ignition_max_return_4h = 0.025
 early_ignition_max_oi_change_15m = 0.01
 early_ignition_risk_per_trade_pct = 0.0025
+# BTC-only structural-zone campaign. Repeated 1h swing levels are clustered
+# into a tradable band; orders are passive and use a four-stage 90% exit plus
+# a 10% isolated tail runner after locked profit covers its remaining margin.
+btc_key_zone_lookback_hours = 480
+btc_key_zone_pivot_bars = 3
+btc_key_zone_cluster_atr = 1.00
+btc_key_zone_max_distance_atr = 2.0
+btc_key_zone_invalidation_atr = 0.35
+btc_key_zone_min_touches = 2
+btc_key_zone_min_extension_atr = 1.0
+btc_key_zone_min_rejection_wick_body = 0.75
+btc_key_zone_risk_per_trade_pct = 0.005
 [strategy.risk]
 risk_per_trade_pct = 0.010
 high_confidence_risk_per_trade_pct = 0.010
