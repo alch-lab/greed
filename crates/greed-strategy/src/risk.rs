@@ -230,6 +230,9 @@ impl StrategyNode for PositionPlannerNode {
                     .unwrap_or_default(),
                 taker_fallback_size_multiplier: tag_f64(c, "taker_fallback_size_multiplier")
                     .unwrap_or(1.0),
+                min_fill_ratio: tag_f64(c, "min_fill_ratio")
+                    .unwrap_or_default()
+                    .clamp(0.0, 1.0),
                 entry_invalidation_bps: tag_f64(c, "entry_invalidation_bps").unwrap_or_default(),
                 entry_guard_max_opposing_flow: tag_f64(c, "entry_guard_max_opposing_flow")
                     .unwrap_or_default(),
@@ -358,8 +361,8 @@ mod tests {
     fn one_symbol_gets_only_the_highest_priority_strategy_plan() {
         let records = [
             candidate("trend:BTC", "trend_continuation", "BTCUSDT", 1),
-            candidate("sfp:BTC", "sfp_reversal", "BTCUSDT", 4),
-            candidate("intraday:ETH", "intraday_sweep_reversal", "ETHUSDT", 2),
+            candidate("primary:BTC", "primary", "BTCUSDT", 4),
+            candidate("secondary:ETH", "secondary", "ETHUSDT", 2),
         ];
         let artifacts = records
             .into_iter()
@@ -396,14 +399,16 @@ mod tests {
             })
             .collect();
         assert_eq!(plans.len(), 2);
-        assert!(plans.iter().any(|plan| plan.candidate_id == "sfp:BTC"));
+        assert!(plans.iter().any(|plan| plan.candidate_id == "primary:BTC"));
         assert!(!plans.iter().any(|plan| plan.candidate_id == "trend:BTC"));
-        assert!(plans.iter().any(|plan| plan.candidate_id == "intraday:ETH"));
+        assert!(plans
+            .iter()
+            .any(|plan| plan.candidate_id == "secondary:ETH"));
     }
 
     #[test]
     fn parses_a_multi_stage_take_profit_ladder() {
-        let mut record = candidate("zone:BTC", "btc_key_zone", "BTCUSDT", 5);
+        let mut record = candidate("ladder:BTC", "ladder", "BTCUSDT", 5);
         let Artifact::Candidate(value) = &mut record.artifact else {
             panic!("candidate fixture must contain a candidate");
         };
@@ -414,5 +419,50 @@ mod tests {
         let legs = take_profit_ladder(value).expect("valid ladder");
         assert_eq!(legs.len(), 4);
         assert!((legs.iter().map(|(_, fraction)| fraction).sum::<f64>() - 0.90).abs() < 1e-9);
+    }
+
+    #[test]
+    fn trend_plan_uses_risk_budget_and_rejects_tiny_managed_fills() {
+        let mut record = candidate("trend:BTC", "trend_continuation", "BTCUSDT", 1);
+        let Artifact::Candidate(value) = &mut record.artifact else {
+            panic!("candidate fixture must contain a candidate");
+        };
+        value
+            .tags
+            .insert("risk_per_trade_pct".into(), "0.006".into());
+        value.tags.insert("min_fill_ratio".into(), "0.80".into());
+        let artifacts = BTreeMap::from([(record.key.clone(), record)]);
+        let frame = MarketFrame {
+            as_of_ms: 2_000,
+            instruments: BTreeMap::from([("BTCUSDT".into(), instrument("BTCUSDT"))]),
+            account: AccountFrame {
+                equity_usd: 2_000.0,
+                cash_usd: 2_000.0,
+                realized_pnl_usd: 0.0,
+                peak_equity_usd: 2_000.0,
+                risk_day_start_equity_usd: 2_000.0,
+                gross_exposure_usd: 0.0,
+                open_positions: 0,
+            },
+        };
+        let mut risk = RiskConfig::default();
+        risk.initial_stop_pct = 0.0125;
+        let mut planner = PositionPlannerNode::new(vec![], risk);
+        let output = planner
+            .evaluate(&NodeContext {
+                frame: &frame,
+                artifacts: &artifacts,
+            })
+            .unwrap();
+        let plan = output
+            .iter()
+            .find_map(|record| match &record.artifact {
+                Artifact::PositionPlan(plan) => Some(plan),
+                _ => None,
+            })
+            .expect("trend candidate should produce a plan");
+        assert!((plan.notional_usd - 960.0).abs() < 1e-9);
+        assert!((plan.min_fill_ratio - 0.80).abs() < 1e-9);
+        assert!(!plan.taker_fallback);
     }
 }

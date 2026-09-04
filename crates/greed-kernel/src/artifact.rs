@@ -72,6 +72,10 @@ pub struct PositionPlan {
     pub taker_fallback_max_adverse_bps: f64,
     #[serde(default = "default_entry_size_multiplier")]
     pub taker_fallback_size_multiplier: f64,
+    /// Minimum fraction of the planned quantity that may become a managed
+    /// position. Smaller incidental maker fills are flattened immediately.
+    #[serde(default)]
+    pub min_fill_ratio: f64,
     /// Cancel a resting entry when the strategy-market midpoint overshoots the
     /// intended pullback limit by more than this many basis points.
     #[serde(default)]

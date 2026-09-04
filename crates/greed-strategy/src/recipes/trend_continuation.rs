@@ -339,18 +339,13 @@ impl StrategyNode for TrendContinuationNode {
                         "entry_timeout_ms".into(),
                         (i64::from(self.config.trend_entry_timeout_seconds) * 1_000).to_string(),
                     );
-                    tags.insert("taker_fallback".into(), "true".into());
                     tags.insert(
                         "max_entry_adverse_bps".into(),
                         self.config.trend_max_entry_adverse_bps.to_string(),
                     );
                     tags.insert(
-                        "taker_fallback_max_adverse_bps".into(),
-                        self.config.trend_taker_fallback_max_adverse_bps.to_string(),
-                    );
-                    tags.insert(
-                        "taker_fallback_size_multiplier".into(),
-                        self.config.trend_taker_fallback_size_multiplier.to_string(),
+                        "min_fill_ratio".into(),
+                        self.config.trend_min_fill_ratio.to_string(),
                     );
                     tags.insert(
                         "entry_invalidation_bps".into(),

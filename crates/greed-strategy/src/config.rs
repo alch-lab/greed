@@ -47,23 +47,9 @@ impl Default for UniverseConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct LaneConfig {
-    pub btc_key_zone_enabled: bool,
-    pub sfp_reversal_enabled: bool,
-    pub trend_continuation_enabled: bool,
-    pub intraday_sweep_reversal_enabled: bool,
-    pub early_ignition_enabled: bool,
     pub max_candidates_per_lane: usize,
     pub max_spread_bps: f64,
     pub min_depth_usd: f64,
-    pub sfp_lookback_hours: usize,
-    pub sfp_min_sweep_atr: f64,
-    pub sfp_max_sweep_atr: f64,
-    pub sfp_min_volume_ratio: f64,
-    pub sfp_confirmation_hours: u32,
-    pub sfp_max_signal_age_seconds: u32,
-    pub sfp_target_r: f64,
-    pub sfp_max_hold_minutes: u32,
-    pub sfp_risk_per_trade_pct: f64,
     pub trend_min_return_4h: f64,
     pub trend_min_efficiency: f64,
     pub trend_min_hour_volume_ratio: f64,
@@ -73,8 +59,7 @@ pub struct LaneConfig {
     pub trend_limit_offset_atr: f64,
     pub trend_entry_timeout_seconds: u32,
     pub trend_max_entry_adverse_bps: f64,
-    pub trend_taker_fallback_max_adverse_bps: f64,
-    pub trend_taker_fallback_size_multiplier: f64,
+    pub trend_min_fill_ratio: f64,
     pub trend_entry_invalidation_bps: f64,
     pub trend_max_post_signal_extension_bps: f64,
     pub trend_max_opposing_micro_flow: f64,
@@ -84,57 +69,14 @@ pub struct LaneConfig {
     pub trend_early_failure_seconds: u32,
     pub trend_early_failure_adverse_r: f64,
     pub trend_early_failure_max_mfe_r: f64,
-    pub intraday_lookback_bars: usize,
-    pub intraday_min_sweep_atr: f64,
-    pub intraday_min_wick_body: f64,
-    pub intraday_min_volume_ratio: f64,
-    pub intraday_min_directional_flow: f64,
-    pub intraday_max_abs_return_4h: f64,
-    pub intraday_confirmation_minutes: u32,
-    pub intraday_max_signal_age_seconds: u32,
-    pub intraday_target_r: f64,
-    pub intraday_max_hold_minutes: u32,
-    pub intraday_risk_per_trade_pct: f64,
-    pub early_ignition_min_market_return_1h: f64,
-    pub early_ignition_min_body_return: f64,
-    pub early_ignition_min_volume_ratio: f64,
-    pub early_ignition_min_flow: f64,
-    pub early_ignition_max_compression_ratio: f64,
-    pub early_ignition_max_prebreak_return_1h: f64,
-    pub early_ignition_max_return_4h: f64,
-    pub early_ignition_max_oi_change_15m: f64,
-    pub early_ignition_risk_per_trade_pct: f64,
-    pub btc_key_zone_lookback_hours: usize,
-    pub btc_key_zone_pivot_bars: usize,
-    pub btc_key_zone_cluster_atr: f64,
-    pub btc_key_zone_max_distance_atr: f64,
-    pub btc_key_zone_invalidation_atr: f64,
-    pub btc_key_zone_min_touches: usize,
-    pub btc_key_zone_min_extension_atr: f64,
-    pub btc_key_zone_min_rejection_wick_body: f64,
-    pub btc_key_zone_risk_per_trade_pct: f64,
 }
 
 impl Default for LaneConfig {
     fn default() -> Self {
         Self {
-            btc_key_zone_enabled: false,
-            sfp_reversal_enabled: true,
-            trend_continuation_enabled: true,
-            intraday_sweep_reversal_enabled: true,
-            early_ignition_enabled: false,
             max_candidates_per_lane: 2,
             max_spread_bps: 6.0,
             min_depth_usd: 20_000.0,
-            sfp_lookback_hours: 288,
-            sfp_min_sweep_atr: 0.10,
-            sfp_max_sweep_atr: 1.25,
-            sfp_min_volume_ratio: 1.0,
-            sfp_confirmation_hours: 3,
-            sfp_max_signal_age_seconds: 300,
-            sfp_target_r: 2.0,
-            sfp_max_hold_minutes: 180,
-            sfp_risk_per_trade_pct: 0.005,
             trend_min_return_4h: 0.025,
             trend_min_efficiency: 0.45,
             trend_min_hour_volume_ratio: 0.65,
@@ -142,10 +84,9 @@ impl Default for LaneConfig {
             trend_max_age_bars: 2,
             trend_max_signal_age_seconds: 300,
             trend_limit_offset_atr: 0.03,
-            trend_entry_timeout_seconds: 60,
+            trend_entry_timeout_seconds: 90,
             trend_max_entry_adverse_bps: 8.0,
-            trend_taker_fallback_max_adverse_bps: 20.0,
-            trend_taker_fallback_size_multiplier: 0.05,
+            trend_min_fill_ratio: 0.80,
             trend_entry_invalidation_bps: 30.0,
             trend_max_post_signal_extension_bps: 12.0,
             trend_max_opposing_micro_flow: 0.10,
@@ -155,35 +96,6 @@ impl Default for LaneConfig {
             trend_early_failure_seconds: 180,
             trend_early_failure_adverse_r: 0.50,
             trend_early_failure_max_mfe_r: 0.20,
-            intraday_lookback_bars: 8,
-            intraday_min_sweep_atr: 0.20,
-            intraday_min_wick_body: 1.20,
-            intraday_min_volume_ratio: 1.60,
-            intraday_min_directional_flow: 0.30,
-            intraday_max_abs_return_4h: 0.04,
-            intraday_confirmation_minutes: 30,
-            intraday_max_signal_age_seconds: 120,
-            intraday_target_r: 2.0,
-            intraday_max_hold_minutes: 120,
-            intraday_risk_per_trade_pct: 0.0025,
-            early_ignition_min_market_return_1h: 0.002,
-            early_ignition_min_body_return: 0.005,
-            early_ignition_min_volume_ratio: 2.5,
-            early_ignition_min_flow: 0.15,
-            early_ignition_max_compression_ratio: 1.05,
-            early_ignition_max_prebreak_return_1h: 0.01,
-            early_ignition_max_return_4h: 0.025,
-            early_ignition_max_oi_change_15m: 0.01,
-            early_ignition_risk_per_trade_pct: 0.0025,
-            btc_key_zone_lookback_hours: 480,
-            btc_key_zone_pivot_bars: 3,
-            btc_key_zone_cluster_atr: 0.75,
-            btc_key_zone_max_distance_atr: 2.0,
-            btc_key_zone_invalidation_atr: 0.50,
-            btc_key_zone_min_touches: 2,
-            btc_key_zone_min_extension_atr: 1.0,
-            btc_key_zone_min_rejection_wick_body: 0.75,
-            btc_key_zone_risk_per_trade_pct: 0.005,
         }
     }
 }
@@ -264,16 +176,6 @@ impl StrategyConfig {
         }
         let lanes = &self.lanes;
         if !(1..=5).contains(&lanes.max_candidates_per_lane)
-            || !(48..=480).contains(&lanes.sfp_lookback_hours)
-            || !(0.01..=1.0).contains(&lanes.sfp_min_sweep_atr)
-            || lanes.sfp_max_sweep_atr <= lanes.sfp_min_sweep_atr
-            || lanes.sfp_max_sweep_atr > 3.0
-            || !(0.5..=5.0).contains(&lanes.sfp_min_volume_ratio)
-            || !(1..=6).contains(&lanes.sfp_confirmation_hours)
-            || !(60..=900).contains(&lanes.sfp_max_signal_age_seconds)
-            || !(0.5..=3.0).contains(&lanes.sfp_target_r)
-            || !(30..=720).contains(&lanes.sfp_max_hold_minutes)
-            || !(0.001..=0.005).contains(&lanes.sfp_risk_per_trade_pct)
             || !(0.02..=0.20).contains(&lanes.trend_min_return_4h)
             || !(0.10..=0.90).contains(&lanes.trend_min_efficiency)
             || lanes.trend_min_hour_volume_ratio <= 0.0
@@ -282,8 +184,7 @@ impl StrategyConfig {
             || !(0.0..=0.5).contains(&lanes.trend_limit_offset_atr)
             || !(5..=120).contains(&lanes.trend_entry_timeout_seconds)
             || !(0.0..=12.0).contains(&lanes.trend_max_entry_adverse_bps)
-            || !(0.0..=50.0).contains(&lanes.trend_taker_fallback_max_adverse_bps)
-            || !(0.01..=0.25).contains(&lanes.trend_taker_fallback_size_multiplier)
+            || !(0.50..=1.0).contains(&lanes.trend_min_fill_ratio)
             || !(5.0..=100.0).contains(&lanes.trend_entry_invalidation_bps)
             || !(0.0..=100.0).contains(&lanes.trend_max_post_signal_extension_bps)
             || !(0.0..=0.80).contains(&lanes.trend_max_opposing_micro_flow)
@@ -293,35 +194,6 @@ impl StrategyConfig {
             || !(60..=900).contains(&lanes.trend_early_failure_seconds)
             || !(0.1..=0.9).contains(&lanes.trend_early_failure_adverse_r)
             || !(0.0..=0.5).contains(&lanes.trend_early_failure_max_mfe_r)
-            || !(4..=32).contains(&lanes.intraday_lookback_bars)
-            || !(0.05..=1.0).contains(&lanes.intraday_min_sweep_atr)
-            || !(0.5..=4.0).contains(&lanes.intraday_min_wick_body)
-            || !(0.5..=5.0).contains(&lanes.intraday_min_volume_ratio)
-            || !(0.05..=0.80).contains(&lanes.intraday_min_directional_flow)
-            || !(0.01..=0.06).contains(&lanes.intraday_max_abs_return_4h)
-            || !(5..=60).contains(&lanes.intraday_confirmation_minutes)
-            || !(30..=300).contains(&lanes.intraday_max_signal_age_seconds)
-            || !(1.0..=3.0).contains(&lanes.intraday_target_r)
-            || !(30..=240).contains(&lanes.intraday_max_hold_minutes)
-            || !(0.001..=0.005).contains(&lanes.intraday_risk_per_trade_pct)
-            || !(0.0..=0.02).contains(&lanes.early_ignition_min_market_return_1h)
-            || !(0.002..=0.02).contains(&lanes.early_ignition_min_body_return)
-            || !(1.0..=10.0).contains(&lanes.early_ignition_min_volume_ratio)
-            || !(0.0..=0.8).contains(&lanes.early_ignition_min_flow)
-            || !(0.5..=1.5).contains(&lanes.early_ignition_max_compression_ratio)
-            || !(0.0..=0.05).contains(&lanes.early_ignition_max_prebreak_return_1h)
-            || !(0.01..=0.10).contains(&lanes.early_ignition_max_return_4h)
-            || !(0.0..=0.05).contains(&lanes.early_ignition_max_oi_change_15m)
-            || !(0.001..=0.005).contains(&lanes.early_ignition_risk_per_trade_pct)
-            || !(168..=720).contains(&lanes.btc_key_zone_lookback_hours)
-            || !(2..=12).contains(&lanes.btc_key_zone_pivot_bars)
-            || !(0.25..=2.0).contains(&lanes.btc_key_zone_cluster_atr)
-            || !(0.5..=5.0).contains(&lanes.btc_key_zone_max_distance_atr)
-            || !(0.1..=2.0).contains(&lanes.btc_key_zone_invalidation_atr)
-            || !(2..=8).contains(&lanes.btc_key_zone_min_touches)
-            || !(0.0..=5.0).contains(&lanes.btc_key_zone_min_extension_atr)
-            || !(0.25..=5.0).contains(&lanes.btc_key_zone_min_rejection_wick_body)
-            || !(0.001..=0.01).contains(&lanes.btc_key_zone_risk_per_trade_pct)
             || lanes.max_spread_bps <= 0.0
             || lanes.min_depth_usd <= 0.0
         {

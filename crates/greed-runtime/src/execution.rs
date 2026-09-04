@@ -1903,9 +1903,55 @@ impl BinanceDemoExecution {
                 size_multiplier: 1.0,
             }
         };
-        let executed = parse_f64(&entry.order, "executedQty").unwrap_or(entry.requested_quantity);
+        let mut executed =
+            parse_f64(&entry.order, "executedQty").unwrap_or(entry.requested_quantity);
         if executed <= f64::EPSILON {
             return Err(anyhow!("entry order completed without a fill"));
+        }
+        let fill_ratio = executed / entry.requested_quantity.max(f64::EPSILON);
+        if plan.min_fill_ratio > 0.0 && fill_ratio + f64::EPSILON < plan.min_fill_ratio {
+            let close_id = client_order_id("underfill", &plan.candidate_id);
+            let close = self
+                .submit_or_lookup(
+                    &plan.symbol,
+                    &close_id,
+                    vec![
+                        ("symbol".into(), plan.symbol.clone()),
+                        ("side".into(), side_name(plan.side.opposite()).into()),
+                        ("type".into(), "MARKET".into()),
+                        ("quantity".into(), decimal(executed, rules.quantity_step)),
+                        ("reduceOnly".into(), "true".into()),
+                        ("newClientOrderId".into(), close_id.clone()),
+                        ("newOrderRespType".into(), "RESULT".into()),
+                    ],
+                )
+                .await;
+            match close {
+                Ok(close) => {
+                    let closed = parse_f64(&close, "executedQty").unwrap_or_default();
+                    if closed + rules.quantity_step * 0.5 >= executed {
+                        return Err(anyhow!(
+                            "maker fill ratio {:.1}% was below the strategy minimum {:.1}%; incidental fill was flattened",
+                            fill_ratio * 100.0,
+                            plan.min_fill_ratio * 100.0
+                        ));
+                    }
+                    executed = (executed - closed).max(0.0);
+                    tracing::error!(
+                        symbol = %plan.symbol,
+                        filled_quantity = executed + closed,
+                        closed_quantity = closed,
+                        residual_quantity = executed,
+                        "undersized maker fill was only partially flattened; protecting the residual"
+                    );
+                }
+                Err(error) => tracing::error!(
+                    symbol = %plan.symbol,
+                    filled_quantity = executed,
+                    error = %error,
+                    "undersized maker fill could not be flattened; protecting it instead"
+                ),
+            }
         }
         let order_id = entry.order["orderId"].as_i64().unwrap_or_default();
         let (entry_price, entry_price_source) = self
@@ -3334,6 +3380,7 @@ mod tests {
             max_entry_adverse_bps: 8.0,
             taker_fallback_max_adverse_bps: 20.0,
             taker_fallback_size_multiplier: 0.05,
+            min_fill_ratio: 0.80,
             entry_invalidation_bps: 30.0,
             entry_guard_max_opposing_flow: 0.15,
             entry_guard_max_opposing_return_bps: 3.0,

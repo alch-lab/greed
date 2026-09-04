@@ -1,49 +1,14 @@
 use crate::{
-    recipes::{
-        btc_key_zone::BtcKeyZoneNode, early_ignition::EarlyIgnitionNode,
-        intraday_sweep_reversal::IntradaySweepReversalNode, sfp_reversal::SfpReversalNode,
-        trend_continuation::TrendContinuationNode,
-    },
-    risk::PositionPlannerNode,
-    StrategyConfig,
+    recipes::trend_continuation::TrendContinuationNode, risk::PositionPlannerNode, StrategyConfig,
 };
 use greed_kernel::{GraphError, StrategyGraph, StrategyNode};
 
 pub fn build_graph(config: &StrategyConfig) -> Result<StrategyGraph, GraphError> {
-    let mut nodes: Vec<Box<dyn StrategyNode>> = Vec::new();
-    let mut lanes = Vec::new();
-    if config.lanes.btc_key_zone_enabled {
-        nodes.push(Box::new(BtcKeyZoneNode::new(config.lanes.clone())));
-        lanes.push("lane.btc_key_zone".into());
-    }
-    if config.lanes.sfp_reversal_enabled {
-        nodes.push(Box::new(SfpReversalNode::new(
-            &config.symbols,
-            config.lanes.clone(),
-        )));
-        lanes.push("lane.sfp_reversal".into());
-    }
-    if config.lanes.trend_continuation_enabled {
-        nodes.push(Box::new(TrendContinuationNode::new(
-            &config.symbols,
-            config.lanes.clone(),
-        )));
-        lanes.push("lane.trend_continuation".into());
-    }
-    if config.lanes.intraday_sweep_reversal_enabled {
-        nodes.push(Box::new(IntradaySweepReversalNode::new(
-            &config.symbols,
-            config.lanes.clone(),
-        )));
-        lanes.push("lane.intraday_sweep_reversal".into());
-    }
-    if config.lanes.early_ignition_enabled {
-        nodes.push(Box::new(EarlyIgnitionNode::new(
-            &config.symbols,
-            config.lanes.clone(),
-        )));
-        lanes.push("lane.early_ignition".into());
-    }
+    let lanes = vec!["lane.trend_continuation".into()];
+    let mut nodes: Vec<Box<dyn StrategyNode>> = vec![Box::new(TrendContinuationNode::new(
+        &config.symbols,
+        config.lanes.clone(),
+    ))];
     nodes.push(Box::new(PositionPlannerNode::new(
         lanes,
         config.risk.clone(),
