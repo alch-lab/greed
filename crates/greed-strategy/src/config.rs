@@ -50,6 +50,17 @@ pub struct LaneConfig {
     pub max_candidates_per_lane: usize,
     pub max_spread_bps: f64,
     pub min_depth_usd: f64,
+    pub fast_activation_enabled: bool,
+    pub fast_min_market_return_1h: f64,
+    pub fast_min_market_breadth: f64,
+    pub fast_min_body_return_5m: f64,
+    pub fast_min_volume_ratio_5m: f64,
+    pub fast_min_flow_5m: f64,
+    pub fast_max_compression_ratio: f64,
+    pub fast_max_prebreak_return_1h: f64,
+    pub fast_max_return_4h: f64,
+    pub fast_max_oi_change_15m: f64,
+    pub fast_risk_per_trade_pct: f64,
     pub trend_min_return_4h: f64,
     pub trend_min_efficiency: f64,
     pub trend_min_hour_volume_ratio: f64,
@@ -77,6 +88,17 @@ impl Default for LaneConfig {
             max_candidates_per_lane: 2,
             max_spread_bps: 6.0,
             min_depth_usd: 20_000.0,
+            fast_activation_enabled: true,
+            fast_min_market_return_1h: 0.002,
+            fast_min_market_breadth: 0.50,
+            fast_min_body_return_5m: 0.005,
+            fast_min_volume_ratio_5m: 2.50,
+            fast_min_flow_5m: 0.15,
+            fast_max_compression_ratio: 1.05,
+            fast_max_prebreak_return_1h: 0.01,
+            fast_max_return_4h: 0.05,
+            fast_max_oi_change_15m: 0.01,
+            fast_risk_per_trade_pct: 0.005,
             trend_min_return_4h: 0.025,
             trend_min_efficiency: 0.45,
             trend_min_hour_volume_ratio: 0.65,
@@ -176,6 +198,16 @@ impl StrategyConfig {
         }
         let lanes = &self.lanes;
         if !(1..=5).contains(&lanes.max_candidates_per_lane)
+            || !(0.0..=0.02).contains(&lanes.fast_min_market_return_1h)
+            || !(0.40..=0.90).contains(&lanes.fast_min_market_breadth)
+            || !(0.002..=0.02).contains(&lanes.fast_min_body_return_5m)
+            || !(1.0..=10.0).contains(&lanes.fast_min_volume_ratio_5m)
+            || !(0.0..=0.80).contains(&lanes.fast_min_flow_5m)
+            || !(0.5..=1.5).contains(&lanes.fast_max_compression_ratio)
+            || !(0.0..=0.05).contains(&lanes.fast_max_prebreak_return_1h)
+            || !(0.01..=0.10).contains(&lanes.fast_max_return_4h)
+            || !(0.001..=0.05).contains(&lanes.fast_max_oi_change_15m)
+            || !(0.001..=0.01).contains(&lanes.fast_risk_per_trade_pct)
             || !(0.02..=0.20).contains(&lanes.trend_min_return_4h)
             || !(0.10..=0.90).contains(&lanes.trend_min_efficiency)
             || lanes.trend_min_hour_volume_ratio <= 0.0

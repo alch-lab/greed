@@ -61,6 +61,20 @@ max_spread_bps = 6.0
 # Keep at least ten times the planned notional visible near the book; spread
 # remains capped independently at 6 bps.
 min_depth_usd = 20000.0
+# Separate paper-only offensive lane. It enters before the slower 4h trend
+# recipe, but only after a completed 5m ignition, a 1m retest, broad altcoin
+# participation and moderate (not crowded) open-interest growth.
+fast_activation_enabled = true
+fast_min_market_return_1h = 0.002
+fast_min_market_breadth = 0.50
+fast_min_body_return_5m = 0.005
+fast_min_volume_ratio_5m = 2.50
+fast_min_flow_5m = 0.15
+fast_max_compression_ratio = 1.05
+fast_max_prebreak_return_1h = 0.01
+fast_max_return_4h = 0.05
+fast_max_oi_change_15m = 0.01
+fast_risk_per_trade_pct = 0.005
 trend_min_return_4h = 0.025
 trend_min_efficiency = 0.45
 trend_min_hour_volume_ratio = 0.65

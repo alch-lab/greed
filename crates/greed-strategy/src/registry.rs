@@ -1,14 +1,25 @@
 use crate::{
-    recipes::trend_continuation::TrendContinuationNode, risk::PositionPlannerNode, StrategyConfig,
+    recipes::{
+        fast_trend_activation::FastTrendActivationNode, trend_continuation::TrendContinuationNode,
+    },
+    risk::PositionPlannerNode,
+    StrategyConfig,
 };
 use greed_kernel::{GraphError, StrategyGraph, StrategyNode};
 
 pub fn build_graph(config: &StrategyConfig) -> Result<StrategyGraph, GraphError> {
-    let lanes = vec!["lane.trend_continuation".into()];
+    let mut lanes = vec!["lane.trend_continuation".into()];
     let mut nodes: Vec<Box<dyn StrategyNode>> = vec![Box::new(TrendContinuationNode::new(
         &config.symbols,
         config.lanes.clone(),
     ))];
+    if config.lanes.fast_activation_enabled {
+        nodes.push(Box::new(FastTrendActivationNode::new(
+            &config.symbols,
+            config.lanes.clone(),
+        )));
+        lanes.push("lane.fast_trend_activation".into());
+    }
     nodes.push(Box::new(PositionPlannerNode::new(
         lanes,
         config.risk.clone(),

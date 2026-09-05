@@ -460,6 +460,7 @@ fn record_diagnostics(
         "lane.btc_key_zone.status",
         "lane.sfp_reversal.status",
         "lane.trend_continuation.status",
+        "lane.fast_trend_activation.status",
         "lane.intraday_sweep_reversal.status",
         "lane.early_ignition.status",
         "portfolio.risk",
@@ -530,6 +531,8 @@ fn recipe_from_id(id: &str) -> &'static str {
         "sfp_reversal"
     } else if id.contains("trend_continuation") {
         "trend_continuation"
+    } else if id.contains("fast_trend_activation") {
+        "fast_trend_activation"
     } else if id.contains("intraday_sweep_reversal") {
         "intraday_sweep_reversal"
     } else if id.contains("early_ignition") {
@@ -545,6 +548,7 @@ fn lane_for_recipe(recipe: &str) -> &'static str {
         "breadth_momentum" => "breadth_momentum",
         "sfp_reversal" => "sfp_reversal",
         "trend_continuation" => "trend_continuation",
+        "fast_trend_activation" => "fast_trend_activation",
         "intraday_sweep_reversal" => "intraday_sweep_reversal",
         "early_ignition" => "early_ignition",
         _ => "unknown",

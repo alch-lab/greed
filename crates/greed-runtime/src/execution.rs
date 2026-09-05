@@ -1226,6 +1226,7 @@ impl BinanceDemoExecution {
             "btc_key_zone",
             "sfp_reversal",
             "trend_continuation",
+            "fast_trend_activation",
             "intraday_sweep_reversal",
             "early_ignition",
         ]

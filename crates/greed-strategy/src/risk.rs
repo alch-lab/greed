@@ -446,8 +446,10 @@ mod tests {
                 open_positions: 0,
             },
         };
-        let mut risk = RiskConfig::default();
-        risk.initial_stop_pct = 0.0125;
+        let risk = RiskConfig {
+            initial_stop_pct: 0.0125,
+            ..RiskConfig::default()
+        };
         let mut planner = PositionPlannerNode::new(vec![], risk);
         let output = planner
             .evaluate(&NodeContext {
