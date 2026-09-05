@@ -156,6 +156,9 @@ impl StrategyNode for PositionPlannerNode {
                 .clamp(0.1, 1.0);
             let profit_shield_activation_r = tag_f64(c, "profit_shield_activation_r")
                 .unwrap_or(self.config.profit_shield_activation_r);
+            let break_even_buffer_pct = tag_f64(c, "break_even_buffer_pct")
+                .unwrap_or(self.config.break_even_buffer_pct)
+                .clamp(0.0, 0.01);
             let trailing_activation_r = tag_f64(c, "pre_tp_trailing_activation_r")
                 .unwrap_or(self.config.pre_tp_trailing_activation_r);
             let trailing_distance_pct =
@@ -248,7 +251,7 @@ impl StrategyNode for PositionPlannerNode {
                     .then_some(first_exit_fraction),
                 unprotected_runner_fraction: tag_f64(c, "unprotected_runner_fraction")
                     .filter(|fraction| (0.01..=0.25).contains(fraction)),
-                break_even_buffer_pct: self.config.break_even_buffer_pct,
+                break_even_buffer_pct,
                 profit_shield_activation_pct: ((take_fraction < 1.0 || explicit_profit_protection)
                     && !c.tags.contains_key("unprotected_runner_fraction")
                     && profit_shield_activation_r > 0.0)
@@ -432,6 +435,12 @@ mod tests {
             .tags
             .insert("risk_per_trade_pct".into(), "0.006".into());
         value.tags.insert("min_fill_ratio".into(), "0.80".into());
+        value
+            .tags
+            .insert("profit_shield_activation_r".into(), "0.32".into());
+        value
+            .tags
+            .insert("break_even_buffer_pct".into(), "0.0015".into());
         let artifacts = BTreeMap::from([(record.key.clone(), record)]);
         let frame = MarketFrame {
             as_of_ms: 2_000,
@@ -466,6 +475,8 @@ mod tests {
             .expect("trend candidate should produce a plan");
         assert!((plan.notional_usd - 960.0).abs() < 1e-9);
         assert!((plan.min_fill_ratio - 0.80).abs() < 1e-9);
+        assert_eq!(plan.profit_shield_activation_pct, Some(0.004));
+        assert!((plan.break_even_buffer_pct - 0.0015).abs() < 1e-9);
         assert_eq!(
             plan.signal_context
                 .get("risk_per_trade_pct")

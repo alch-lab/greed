@@ -529,6 +529,8 @@ fn recipe_from_id(id: &str) -> &'static str {
         "breadth_momentum"
     } else if id.contains("sfp_reversal") {
         "sfp_reversal"
+    } else if id.contains("trend_continuation_reentry") {
+        "trend_continuation_reentry"
     } else if id.contains("trend_continuation") {
         "trend_continuation"
     } else if id.contains("fast_trend_activation") {
@@ -547,7 +549,7 @@ fn lane_for_recipe(recipe: &str) -> &'static str {
         "btc_key_zone" => "btc_key_zone",
         "breadth_momentum" => "breadth_momentum",
         "sfp_reversal" => "sfp_reversal",
-        "trend_continuation" => "trend_continuation",
+        "trend_continuation" | "trend_continuation_reentry" => "trend_continuation",
         "fast_trend_activation" => "fast_trend_activation",
         "intraday_sweep_reversal" => "intraday_sweep_reversal",
         "early_ignition" => "early_ignition",
@@ -718,6 +720,18 @@ fn record_exit(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn second_leg_keeps_recipe_attribution_inside_trend_lane() {
+        assert_eq!(
+            recipe_from_id("trend_continuation_reentry:XRPUSDT:1"),
+            "trend_continuation_reentry"
+        );
+        assert_eq!(
+            lane_for_recipe("trend_continuation_reentry"),
+            "trend_continuation"
+        );
+    }
 
     #[test]
     fn report_attributes_trade_and_api_health() {

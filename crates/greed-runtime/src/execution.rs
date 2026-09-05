@@ -3,8 +3,11 @@ use crate::{
     market_stream::MarketStreamHub,
 };
 use anyhow::{anyhow, Context, Result};
-use greed_kernel::{AccountFrame, Artifact, GraphEvaluation, MarketFrame, Side};
-use greed_strategy::RiskConfig;
+use greed_kernel::{
+    AccountFrame, Artifact, ArtifactMeta, ArtifactRecord, Candle, DataQuality, GraphEvaluation,
+    MarketFrame, Side, StateArtifact, TradeCandidate, Verdict,
+};
+use greed_strategy::{LaneConfig, RiskConfig};
 use hmac::{Hmac, Mac};
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
@@ -25,6 +28,7 @@ const ENTRY_GUARD_STALE_GRACE_MS: i64 = 5_000;
 const ENTRY_GUARD_REVERSAL_CONFIRM_MS: i64 = 15_000;
 const MIN_PERFORMANCE_FILL_RATIO: f64 = 0.20;
 const PERFORMANCE_BASIS_VERSION: u32 = 2;
+const TREND_REENTRY_RECIPE: &str = "trend_continuation_reentry";
 
 pub struct ExchangeEvent {
     pub kind: String,
@@ -127,6 +131,32 @@ struct ExecutionMeta {
     take_profit_order_ids: Vec<i64>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TrendReentrySignal {
+    signal_ms: i64,
+    reference_price: f64,
+    stop_pct: f64,
+    body_pct: f64,
+    directional_flow: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct TrendReentryCampaign {
+    source_candidate_id: String,
+    symbol: String,
+    side: Side,
+    armed_ms: i64,
+    expires_ms: i64,
+    favorable_extreme: f64,
+    first_exit_price: f64,
+    #[serde(default)]
+    reset_ms: Option<i64>,
+    #[serde(default)]
+    last_evaluated_bar_ms: i64,
+    #[serde(default)]
+    signal: Option<TrendReentrySignal>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 struct DemoState {
@@ -138,6 +168,7 @@ struct DemoState {
     positions: BTreeMap<String, ExecutionMeta>,
     recipe_outcomes: BTreeMap<String, Vec<ExecutionOutcome>>,
     symbol_outcomes: BTreeMap<String, Vec<ExecutionOutcome>>,
+    trend_reentries: BTreeMap<String, TrendReentryCampaign>,
     performance_epoch: u32,
     performance_basis_version: u32,
     execution_halt_reason: Option<String>,
@@ -300,6 +331,7 @@ pub struct BinanceDemoExecution {
     config: ExecutionConfig,
     portfolio: PortfolioConfig,
     risk: RiskConfig,
+    lanes: LaneConfig,
     api_key: String,
     api_secret: String,
     clock_offset_ms: i64,
@@ -322,6 +354,7 @@ impl BinanceDemoExecution {
         config: ExecutionConfig,
         portfolio: PortfolioConfig,
         risk: RiskConfig,
+        lanes: LaneConfig,
         state_path: String,
         proxy: Option<&str>,
         market_stream: Option<MarketStreamHub>,
@@ -343,6 +376,7 @@ impl BinanceDemoExecution {
         if performance_epoch_reset {
             state.recipe_outcomes.clear();
             state.symbol_outcomes.clear();
+            state.trend_reentries.clear();
             state.performance_epoch = risk.rolling_pf_epoch;
             state.execution_halt_reason = None;
         }
@@ -359,6 +393,7 @@ impl BinanceDemoExecution {
             config,
             portfolio,
             risk,
+            lanes,
             api_key,
             api_secret,
             clock_offset_ms: 0,
@@ -1076,6 +1111,52 @@ impl BinanceDemoExecution {
                                     }
                                 })
                         });
+                        if self.lanes.trend_reentry_enabled
+                            && meta.recipe == "trend_continuation"
+                            && exit_reason == "profit_shield_stop"
+                            && summary
+                                .as_ref()
+                                .is_some_and(|value| value.net_pnl_usd > 0.0)
+                            && meta.extreme_price > f64::EPSILON
+                        {
+                            let first_exit_price = summary
+                                .as_ref()
+                                .map(|value| value.last_exit_price)
+                                .unwrap_or(meta.stop_price);
+                            let campaign = TrendReentryCampaign {
+                                source_candidate_id: meta.candidate_id.clone(),
+                                symbol: symbol.clone(),
+                                side: meta.side,
+                                armed_ms: now_ms,
+                                expires_ms: now_ms
+                                    + i64::from(self.lanes.trend_reentry_window_minutes) * 60_000,
+                                favorable_extreme: meta.extreme_price,
+                                first_exit_price,
+                                reset_ms: None,
+                                last_evaluated_bar_ms: now_ms,
+                                signal: None,
+                            };
+                            self.state
+                                .trend_reentries
+                                .insert(symbol.clone(), campaign.clone());
+                            events.push(ExchangeEvent {
+                                kind: "trend_reentry_state".into(),
+                                payload: serde_json::json!({
+                                    "ts_ms":now_ms,
+                                    "recipe":TREND_REENTRY_RECIPE,
+                                    "source_candidate_id":campaign.source_candidate_id,
+                                    "symbol":campaign.symbol,
+                                    "side":campaign.side,
+                                    "stage":"waiting_for_reset",
+                                    "favorable_extreme":campaign.favorable_extreme,
+                                    "first_exit_price":campaign.first_exit_price,
+                                    "reset_required_pct":self.lanes.trend_reentry_reset_pct,
+                                    "expires_ms":campaign.expires_ms,
+                                    "venue":"binance_demo",
+                                    "paper_only":true,
+                                }),
+                            });
+                        }
                         events.push(ExchangeEvent {
                             kind: "exchange_exit".into(),
                             payload: serde_json::json!({
@@ -1162,6 +1243,360 @@ impl BinanceDemoExecution {
         })
     }
 
+    /// Advance profitable Trend-continuation exits through a single, persisted
+    /// second-leg campaign. The execution layer owns this state because it is
+    /// created by a confirmed exchange exit, not by a stateless market scan.
+    pub fn trend_reentry_artifacts(
+        &mut self,
+        frame: &MarketFrame,
+    ) -> (Vec<ArtifactRecord>, Vec<ExchangeEvent>) {
+        let mut events = Vec::new();
+        let mut changed = false;
+        let symbols: Vec<_> = self.state.trend_reentries.keys().cloned().collect();
+
+        for symbol in symbols {
+            let Some(mut campaign) = self.state.trend_reentries.remove(&symbol) else {
+                continue;
+            };
+            if frame.as_of_ms > campaign.expires_ms {
+                changed = true;
+                events.push(reentry_state_event(
+                    frame.as_of_ms,
+                    &campaign,
+                    "expired",
+                    serde_json::json!({"reason":"confirmation_window_expired"}),
+                ));
+                continue;
+            }
+            let Some(instrument) = frame.instrument(&symbol) else {
+                self.state.trend_reentries.insert(symbol, campaign);
+                continue;
+            };
+
+            if campaign.reset_ms.is_none() {
+                let adverse_reset = match campaign.side {
+                    Side::Buy => {
+                        (campaign.favorable_extreme - instrument.price)
+                            / campaign.favorable_extreme.max(f64::EPSILON)
+                    }
+                    Side::Sell => {
+                        (instrument.price - campaign.favorable_extreme)
+                            / campaign.favorable_extreme.max(f64::EPSILON)
+                    }
+                };
+                if adverse_reset >= self.lanes.trend_reentry_reset_pct {
+                    campaign.reset_ms = Some(frame.as_of_ms);
+                    campaign.last_evaluated_bar_ms = frame.as_of_ms;
+                    changed = true;
+                    events.push(reentry_state_event(
+                        frame.as_of_ms,
+                        &campaign,
+                        "waiting_for_resume",
+                        serde_json::json!({
+                            "observed_reset_pct":adverse_reset,
+                            "reset_required_pct":self.lanes.trend_reentry_reset_pct,
+                        }),
+                    ));
+                }
+            }
+
+            if campaign.signal.is_none() {
+                if let (Some(reset_ms), Some(series)) =
+                    (campaign.reset_ms, instrument.fast_perpetual.as_ref())
+                {
+                    let closed: Vec<_> = series.values.iter().filter(|bar| bar.closed).collect();
+                    let lookback = self.lanes.trend_reentry_lookback_bars;
+                    for index in lookback..closed.len() {
+                        let bar = closed[index];
+                        if bar.close_ms <= reset_ms
+                            || bar.close_ms <= campaign.last_evaluated_bar_ms
+                        {
+                            continue;
+                        }
+                        campaign.last_evaluated_bar_ms = bar.close_ms;
+                        changed = true;
+                        let prior = &closed[index - lookback..index];
+                        let Some(signal) = second_leg_confirmation(
+                            campaign.side,
+                            instrument.price,
+                            bar,
+                            prior,
+                            self.lanes.trend_reentry_min_body_pct,
+                            self.lanes.trend_reentry_min_flow,
+                            (
+                                self.lanes.trend_reentry_min_stop_pct,
+                                self.lanes.trend_reentry_max_stop_pct,
+                            ),
+                        ) else {
+                            continue;
+                        };
+                        campaign.signal = Some(signal.clone());
+                        events.push(reentry_state_event(
+                            frame.as_of_ms,
+                            &campaign,
+                            "confirmed",
+                            serde_json::json!({
+                                "signal_ms":signal.signal_ms,
+                                "reference_price":signal.reference_price,
+                                "stop_pct":signal.stop_pct,
+                                "body_pct":signal.body_pct,
+                                "directional_flow":signal.directional_flow,
+                            }),
+                        ));
+                        break;
+                    }
+                }
+            }
+
+            if campaign.signal.as_ref().is_some_and(|signal| {
+                frame.as_of_ms > (signal.signal_ms + 300_000).min(campaign.expires_ms)
+            }) {
+                campaign.signal = None;
+                changed = true;
+                events.push(reentry_state_event(
+                    frame.as_of_ms,
+                    &campaign,
+                    "waiting_for_resume",
+                    serde_json::json!({"reason":"confirmed_entry_window_expired"}),
+                ));
+            }
+            self.state.trend_reentries.insert(symbol, campaign);
+        }
+
+        let mut artifacts = Vec::new();
+        let mut reset_count = 0u64;
+        let mut confirmed_count = 0u64;
+        let mut reasons = Vec::new();
+        for campaign in self.state.trend_reentries.values() {
+            if campaign.reset_ms.is_some() {
+                reset_count += 1;
+            }
+            if campaign.signal.is_some() {
+                confirmed_count += 1;
+            }
+            let stage = if campaign.signal.is_some() {
+                "confirmed"
+            } else if campaign.reset_ms.is_some() {
+                "waiting_for_resume"
+            } else {
+                "waiting_for_reset"
+            };
+            reasons.push(format!("{}: {stage}", campaign.symbol));
+            artifacts.push(ArtifactRecord {
+                key: format!("campaign.trend_reentry.{}", campaign.symbol),
+                producer: "lane.trend_continuation_reentry".into(),
+                artifact: Artifact::State(StateArtifact {
+                    state: stage.into(),
+                    score: campaign
+                        .signal
+                        .as_ref()
+                        .map(|signal| signal.body_pct * signal.directional_flow.max(0.0))
+                        .unwrap_or_default(),
+                    side: Some(campaign.side),
+                    verdict: if campaign.signal.is_some() {
+                        Verdict::Pass
+                    } else {
+                        Verdict::Block
+                    },
+                    reasons: vec![match stage {
+                        "waiting_for_reset" => format!(
+                            "waiting for a {:.1}% reset from the first-leg extreme",
+                            self.lanes.trend_reentry_reset_pct * 100.0
+                        ),
+                        "waiting_for_resume" => format!(
+                            "waiting for a completed 5m close through the prior {} bars",
+                            self.lanes.trend_reentry_lookback_bars
+                        ),
+                        _ => "second-leg entry is confirmed".into(),
+                    }],
+                    metrics: BTreeMap::from([
+                        ("armed_ms".into(), campaign.armed_ms as f64),
+                        ("expires_ms".into(), campaign.expires_ms as f64),
+                        ("favorable_extreme".into(), campaign.favorable_extreme),
+                        ("first_exit_price".into(), campaign.first_exit_price),
+                        (
+                            "reset_required_pct".into(),
+                            self.lanes.trend_reentry_reset_pct,
+                        ),
+                    ]),
+                    meta: ArtifactMeta {
+                        as_of_ms: frame.as_of_ms,
+                        expires_ms: campaign.expires_ms,
+                        quality: DataQuality::Complete,
+                        confidence: 1.0,
+                        lineage: vec![campaign.source_candidate_id.clone()],
+                    },
+                }),
+            });
+            if let Some(signal) = campaign.signal.as_ref() {
+                if let Some(book) = frame
+                    .instrument(&campaign.symbol)
+                    .and_then(|instrument| instrument.book.as_ref())
+                    .filter(|book| book.meta.usable_at(frame.as_of_ms))
+                {
+                    let mut tags = BTreeMap::from([
+                        ("lane".into(), TREND_REENTRY_RECIPE.into()),
+                        ("priority".into(), "1.2".into()),
+                        (
+                            "parent_candidate_id".into(),
+                            campaign.source_candidate_id.clone(),
+                        ),
+                        ("second_leg".into(), "true".into()),
+                        (
+                            "risk_per_trade_pct".into(),
+                            self.lanes.trend_risk_per_trade_pct.to_string(),
+                        ),
+                        ("stop_pct".into(), signal.stop_pct.to_string()),
+                        ("target_r".into(), "10".into()),
+                        ("take_profit_fraction".into(), "1".into()),
+                        (
+                            "profit_shield_activation_r".into(),
+                            (self.lanes.trend_reentry_profit_shield_pct / signal.stop_pct)
+                                .to_string(),
+                        ),
+                        (
+                            "break_even_buffer_pct".into(),
+                            self.lanes.trend_profit_shield_buffer_pct.to_string(),
+                        ),
+                        (
+                            "pre_tp_trailing_activation_r".into(),
+                            (self.lanes.trend_reentry_trailing_activation_pct / signal.stop_pct)
+                                .to_string(),
+                        ),
+                        (
+                            "trailing_distance_pct".into(),
+                            self.lanes.trend_reentry_trailing_distance_pct.to_string(),
+                        ),
+                        (
+                            "entry_timeout_ms".into(),
+                            (i64::from(self.lanes.trend_reentry_entry_timeout_seconds) * 1_000)
+                                .to_string(),
+                        ),
+                        ("taker_fallback".into(), "true".into()),
+                        ("taker_fallback_max_adverse_bps".into(), "8".into()),
+                        ("taker_fallback_size_multiplier".into(), "1".into()),
+                        ("max_entry_adverse_bps".into(), "8".into()),
+                        ("min_fill_ratio".into(), "0.8".into()),
+                        ("entry_invalidation_bps".into(), "20".into()),
+                        (
+                            "entry_guard_max_opposing_flow".into(),
+                            self.lanes.trend_max_opposing_micro_flow.to_string(),
+                        ),
+                        (
+                            "entry_guard_max_opposing_return_bps".into(),
+                            self.lanes.trend_max_opposing_micro_return_bps.to_string(),
+                        ),
+                        ("early_failure_after_ms".into(), "0".into()),
+                        ("early_failure_adverse_r".into(), "0".into()),
+                        ("early_failure_max_mfe_r".into(), "0".into()),
+                        ("body_pct".into(), signal.body_pct.to_string()),
+                        (
+                            "directional_flow".into(),
+                            signal.directional_flow.to_string(),
+                        ),
+                    ]);
+                    tags.insert(
+                        "entry_limit".into(),
+                        if campaign.side == Side::Buy {
+                            book.bid
+                        } else {
+                            book.ask
+                        }
+                        .to_string(),
+                    );
+                    let candidate = TradeCandidate {
+                        id: format!(
+                            "{TREND_REENTRY_RECIPE}:{}:{}",
+                            campaign.symbol, signal.signal_ms
+                        ),
+                        recipe: TREND_REENTRY_RECIPE.into(),
+                        symbol: campaign.symbol.clone(),
+                        side: campaign.side,
+                        signal_ms: signal.signal_ms,
+                        expires_ms: (signal.signal_ms + 300_000).min(campaign.expires_ms),
+                        reference_price: signal.reference_price,
+                        score: signal.body_pct * signal.directional_flow.max(0.0),
+                        confidence: (0.70
+                            + signal.body_pct.min(0.01) * 10.0
+                            + signal.directional_flow.min(0.30) * 0.30)
+                            .min(0.95),
+                        verdict: Verdict::Pass,
+                        blockers: vec![],
+                        evidence: vec![
+                            format!("{}.binance_5m_second_leg", campaign.symbol),
+                            format!("{}.binance_ws_microstructure", campaign.symbol),
+                            format!("{}.book", campaign.symbol),
+                        ],
+                        tags,
+                    };
+                    artifacts.push(ArtifactRecord {
+                        key: format!("candidate.{}", candidate.id),
+                        producer: "lane.trend_continuation_reentry".into(),
+                        artifact: Artifact::Candidate(candidate),
+                    });
+                }
+            }
+        }
+        artifacts.push(ArtifactRecord {
+            key: "lane.trend_continuation_reentry.status".into(),
+            producer: "lane.trend_continuation_reentry".into(),
+            artifact: Artifact::State(StateArtifact {
+                state: if confirmed_count > 0 {
+                    "ready_to_execute"
+                } else if reset_count > 0 {
+                    "waiting_for_resume"
+                } else if self.state.trend_reentries.is_empty() {
+                    "idle"
+                } else {
+                    "waiting_for_reset"
+                }
+                .into(),
+                score: confirmed_count as f64,
+                side: None,
+                verdict: if confirmed_count > 0 {
+                    Verdict::Pass
+                } else {
+                    Verdict::Block
+                },
+                reasons: if reasons.is_empty() {
+                    vec!["waiting for a profitable Trend continuation shield exit".into()]
+                } else {
+                    reasons
+                },
+                metrics: BTreeMap::from([
+                    (
+                        "armed_campaigns".into(),
+                        self.state.trend_reentries.len() as f64,
+                    ),
+                    ("reset_campaigns".into(), reset_count as f64),
+                    ("confirmed_campaigns".into(), confirmed_count as f64),
+                ]),
+                meta: ArtifactMeta {
+                    as_of_ms: frame.as_of_ms,
+                    expires_ms: frame.as_of_ms + 30_000,
+                    quality: DataQuality::Complete,
+                    confidence: 1.0,
+                    lineage: vec!["binance_confirmed_exit".into(), "binance_ws_5m".into()],
+                },
+            }),
+        });
+        if changed {
+            self.save().ok();
+        }
+        (artifacts, events)
+    }
+
+    pub fn pinned_symbols(&self) -> BTreeSet<String> {
+        self.position_symbols()
+            .cloned()
+            .chain(self.state.trend_reentries.keys().cloned())
+            .collect()
+    }
+
+    pub fn trend_reentry_status(&self) -> Value {
+        serde_json::to_value(&self.state.trend_reentries).unwrap_or_else(|_| serde_json::json!({}))
+    }
+
     pub fn has_seen(&self, candidate_id: &str) -> bool {
         self.state.seen.contains(candidate_id)
     }
@@ -1234,6 +1669,7 @@ impl BinanceDemoExecution {
             "btc_key_zone",
             "sfp_reversal",
             "trend_continuation",
+            TREND_REENTRY_RECIPE,
             "fast_trend_activation",
             "intraday_sweep_reversal",
             "early_ignition",
@@ -1424,6 +1860,29 @@ impl BinanceDemoExecution {
             }) {
                 continue;
             }
+            // A profitable first leg hands this symbol to the persisted re-entry
+            // campaign until it confirms, expires, or makes its single attempt.
+            // Without ownership here, a fresh 15m candidate could bypass the
+            // required reset and compete with the dedicated 5m second leg.
+            if recipe != TREND_REENTRY_RECIPE
+                && self.state.trend_reentries.contains_key(&plan.symbol)
+            {
+                self.state.seen.insert(plan.candidate_id.clone());
+                events.push(ExchangeEvent {
+                    kind: "exchange_plan_rejected".into(),
+                    payload: serde_json::json!({
+                        "ts_ms":frame.as_of_ms,
+                        "candidate_id":plan.candidate_id,
+                        "recipe":recipe,
+                        "symbol":plan.symbol,
+                        "side":plan.side,
+                        "reason":"trend_reentry_campaign_owns_symbol",
+                        "venue":"binance_demo",
+                        "paper_only":true
+                    }),
+                });
+                continue;
+            }
             if !self.supports_symbol(&plan.symbol) {
                 self.state.seen.insert(plan.candidate_id.clone());
                 events.push(ExchangeEvent {
@@ -1475,6 +1934,16 @@ impl BinanceDemoExecution {
                 1.0
             };
             let cost = plan_cost_diagnostics(frame, plan);
+            if recipe == TREND_REENTRY_RECIPE {
+                if let Some(campaign) = self.state.trend_reentries.remove(&plan.symbol) {
+                    events.push(reentry_state_event(
+                        frame.as_of_ms,
+                        &campaign,
+                        "entry_attempted",
+                        serde_json::json!({"candidate_id":plan.candidate_id}),
+                    ));
+                }
+            }
             // Claim the candidate before touching the exchange. At-most-once is the
             // safe failure mode: an entry can fill even when a later protection or
             // reconciliation request fails. Retrying the same signal would open and
@@ -3205,6 +3674,89 @@ fn protective_exit_reason(meta: &ExecutionMeta) -> &str {
     }
 }
 
+fn reentry_state_event(
+    ts_ms: i64,
+    campaign: &TrendReentryCampaign,
+    stage: &str,
+    detail: Value,
+) -> ExchangeEvent {
+    ExchangeEvent {
+        kind: "trend_reentry_state".into(),
+        payload: serde_json::json!({
+            "ts_ms":ts_ms,
+            "recipe":TREND_REENTRY_RECIPE,
+            "source_candidate_id":campaign.source_candidate_id,
+            "symbol":campaign.symbol,
+            "side":campaign.side,
+            "stage":stage,
+            "armed_ms":campaign.armed_ms,
+            "expires_ms":campaign.expires_ms,
+            "reset_ms":campaign.reset_ms,
+            "detail":detail,
+            "venue":"binance_demo",
+            "paper_only":true,
+        }),
+    }
+}
+
+fn second_leg_confirmation(
+    side: Side,
+    reference_price: f64,
+    bar: &Candle,
+    prior: &[&Candle],
+    min_body_pct: f64,
+    min_directional_flow: f64,
+    stop_bounds: (f64, f64),
+) -> Option<TrendReentrySignal> {
+    if prior.is_empty() || reference_price <= f64::EPSILON || bar.quote_volume <= f64::EPSILON {
+        return None;
+    }
+    let sign = side.sign();
+    let body_pct = sign * (bar.close / bar.open.max(f64::EPSILON) - 1.0);
+    let directional_flow =
+        sign * (2.0 * bar.taker_buy_quote? / bar.quote_volume.max(f64::EPSILON) - 1.0);
+    let resume_level = match side {
+        Side::Buy => prior
+            .iter()
+            .map(|value| value.high)
+            .fold(f64::NEG_INFINITY, f64::max),
+        Side::Sell => prior
+            .iter()
+            .map(|value| value.low)
+            .fold(f64::INFINITY, f64::min),
+    };
+    let resumed = match side {
+        Side::Buy => bar.close > resume_level,
+        Side::Sell => bar.close < resume_level,
+    };
+    if !resumed || body_pct < min_body_pct || directional_flow < min_directional_flow {
+        return None;
+    }
+    let structural_stop = match side {
+        Side::Buy => prior
+            .iter()
+            .map(|value| value.low)
+            .chain(std::iter::once(bar.low))
+            .fold(f64::INFINITY, f64::min),
+        Side::Sell => prior
+            .iter()
+            .map(|value| value.high)
+            .chain(std::iter::once(bar.high))
+            .fold(f64::NEG_INFINITY, f64::max),
+    };
+    let raw_stop_pct = sign * (reference_price - structural_stop) / reference_price;
+    if raw_stop_pct <= 0.0 {
+        return None;
+    }
+    Some(TrendReentrySignal {
+        signal_ms: bar.close_ms,
+        reference_price,
+        stop_pct: raw_stop_pct.clamp(stop_bounds.0, stop_bounds.1),
+        body_pct,
+        directional_flow,
+    })
+}
+
 fn early_failure_triggered(
     side: Side,
     entry_price: f64,
@@ -3595,6 +4147,27 @@ fn hex_bytes(bytes: &[u8]) -> String {
 mod tests {
     use super::*;
 
+    fn five_minute_bar(
+        open_ms: i64,
+        open: f64,
+        high: f64,
+        low: f64,
+        close: f64,
+        buy_share: f64,
+    ) -> Candle {
+        Candle {
+            open_ms,
+            close_ms: open_ms + 299_999,
+            open,
+            high,
+            low,
+            close,
+            quote_volume: 1_000.0,
+            taker_buy_quote: Some(1_000.0 * buy_share),
+            closed: true,
+        }
+    }
+
     fn guarded_plan(side: Side) -> greed_kernel::PositionPlan {
         greed_kernel::PositionPlan {
             candidate_id: "trend_continuation:TESTUSDT:1".into(),
@@ -3640,6 +4213,59 @@ mod tests {
         let value = client_order_id("entry", "alt.recipe:test:cycle-123");
         assert_eq!(value, client_order_id("entry", "alt.recipe:test:cycle-123"));
         assert!(value.len() <= 36);
+    }
+
+    #[test]
+    fn second_leg_requires_structure_body_and_directional_flow() {
+        let first = five_minute_bar(0, 100.0, 100.4, 99.5, 100.0, 0.50);
+        let second = five_minute_bar(300_000, 100.0, 100.6, 99.7, 100.2, 0.50);
+        let confirmed = five_minute_bar(600_000, 100.2, 101.2, 100.0, 100.9, 0.58);
+        let prior = [&first, &second];
+        let signal = second_leg_confirmation(
+            Side::Buy,
+            100.9,
+            &confirmed,
+            &prior,
+            0.002,
+            0.05,
+            (0.003, 0.0125),
+        )
+        .expect("completed structural resume should confirm");
+        assert_eq!(signal.signal_ms, confirmed.close_ms);
+        assert!((signal.directional_flow - 0.16).abs() < 1e-9);
+        assert_eq!(signal.stop_pct, 0.0125);
+
+        let weak_flow = five_minute_bar(600_000, 100.2, 101.2, 100.0, 100.9, 0.51);
+        assert!(second_leg_confirmation(
+            Side::Buy,
+            100.9,
+            &weak_flow,
+            &prior,
+            0.002,
+            0.05,
+            (0.003, 0.0125),
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn second_leg_confirmation_is_directionally_symmetric() {
+        let first = five_minute_bar(0, 100.0, 100.5, 99.6, 100.0, 0.50);
+        let second = five_minute_bar(300_000, 100.0, 100.3, 99.4, 99.8, 0.50);
+        let confirmed = five_minute_bar(600_000, 99.8, 100.0, 98.8, 99.1, 0.42);
+        let prior = [&first, &second];
+        let signal = second_leg_confirmation(
+            Side::Sell,
+            99.1,
+            &confirmed,
+            &prior,
+            0.002,
+            0.05,
+            (0.003, 0.0125),
+        )
+        .expect("short resume should use the mirrored rules");
+        assert!((signal.directional_flow - 0.16).abs() < 1e-9);
+        assert_eq!(signal.stop_pct, 0.0125);
     }
 
     #[test]

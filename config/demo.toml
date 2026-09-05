@@ -121,14 +121,37 @@ trend_max_opposing_micro_return_bps = 3.0
 # On a 5,000 USDT account with the default 1.25% stop, planned notional is
 # about $6,000 and the full-stop loss is about $75 before gap/slippage.
 trend_risk_per_trade_pct = 0.015
-# Do not tighten the pre-TP trail until +1R. This preserved validation and
-# locked-window expectancy while the cost shield still activates at +0.5R.
+# Keep the entire position when price first proves the trade. At +0.32R
+# (about +0.40% with the 1.25% stop), move the exchange-side stop to +0.15%
+# above entry. This protects a small net gain without clipping the right tail.
+trend_profit_shield_activation_r = 0.32
+trend_profit_shield_buffer_pct = 0.0015
+# Do not tighten the peak-following trail until +1R. Before then the fixed
+# profit shield protects the trade while leaving the full position exposed.
 trend_pre_tp_trailing_activation_r = 1.0
-# A continuation that cannot reach +0.2R and closes at least -0.5R after three
-# minutes has failed to continue; flatten it rather than waiting for -1R.
-trend_early_failure_seconds = 180
+# Below the +0.32R profit-shield handoff, a continuation that reaches -0.5R
+# after one minute has failed; flatten it rather than waiting for -1R.
+trend_early_failure_seconds = 60
 trend_early_failure_adverse_r = 0.50
-trend_early_failure_max_mfe_r = 0.20
+trend_early_failure_max_mfe_r = 0.32
+# A profitable shield exit keeps one continuation campaign alive. Price must
+# first reset 0.6% from the first-leg extreme, then a completed 5m candle must
+# resume through the prior two bars with a 0.2% body and 5% directional taker
+# imbalance. One re-entry is allowed for three hours; loss exits never arm it.
+trend_reentry_enabled = true
+trend_reentry_window_minutes = 180
+trend_reentry_reset_pct = 0.006
+trend_reentry_lookback_bars = 2
+trend_reentry_min_body_pct = 0.002
+trend_reentry_min_flow = 0.05
+trend_reentry_min_stop_pct = 0.003
+trend_reentry_max_stop_pct = 0.0125
+# The second leg has its own wider protection lifecycle. It does not inherit
+# the first leg's aggressive +0.4% shield, which would churn a resumed trend.
+trend_reentry_profit_shield_pct = 0.008
+trend_reentry_trailing_activation_pct = 0.0125
+trend_reentry_trailing_distance_pct = 0.005
+trend_reentry_entry_timeout_seconds = 30
 [strategy.risk]
 risk_per_trade_pct = 0.010
 high_confidence_risk_per_trade_pct = 0.010
@@ -161,4 +184,4 @@ loss_cooldown_minutes = 180
 rolling_pf_probe_size_multiplier = 1.00
 # Keep the current paper run and rolling PF history continuous while execution
 # mechanics are improved; changing this value intentionally starts a new gate window.
-rolling_pf_epoch = 15
+rolling_pf_epoch = 16

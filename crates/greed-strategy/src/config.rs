@@ -84,10 +84,24 @@ pub struct LaneConfig {
     pub trend_max_opposing_micro_flow: f64,
     pub trend_max_opposing_micro_return_bps: f64,
     pub trend_risk_per_trade_pct: f64,
+    pub trend_profit_shield_activation_r: f64,
+    pub trend_profit_shield_buffer_pct: f64,
     pub trend_pre_tp_trailing_activation_r: f64,
     pub trend_early_failure_seconds: u32,
     pub trend_early_failure_adverse_r: f64,
     pub trend_early_failure_max_mfe_r: f64,
+    pub trend_reentry_enabled: bool,
+    pub trend_reentry_window_minutes: u32,
+    pub trend_reentry_reset_pct: f64,
+    pub trend_reentry_lookback_bars: usize,
+    pub trend_reentry_min_body_pct: f64,
+    pub trend_reentry_min_flow: f64,
+    pub trend_reentry_min_stop_pct: f64,
+    pub trend_reentry_max_stop_pct: f64,
+    pub trend_reentry_profit_shield_pct: f64,
+    pub trend_reentry_trailing_activation_pct: f64,
+    pub trend_reentry_trailing_distance_pct: f64,
+    pub trend_reentry_entry_timeout_seconds: u32,
 }
 
 impl Default for LaneConfig {
@@ -124,10 +138,24 @@ impl Default for LaneConfig {
             trend_max_opposing_micro_flow: 0.10,
             trend_max_opposing_micro_return_bps: 3.0,
             trend_risk_per_trade_pct: 0.015,
+            trend_profit_shield_activation_r: 0.32,
+            trend_profit_shield_buffer_pct: 0.0015,
             trend_pre_tp_trailing_activation_r: 1.0,
             trend_early_failure_seconds: 180,
             trend_early_failure_adverse_r: 0.50,
-            trend_early_failure_max_mfe_r: 0.20,
+            trend_early_failure_max_mfe_r: 0.32,
+            trend_reentry_enabled: true,
+            trend_reentry_window_minutes: 180,
+            trend_reentry_reset_pct: 0.006,
+            trend_reentry_lookback_bars: 2,
+            trend_reentry_min_body_pct: 0.002,
+            trend_reentry_min_flow: 0.05,
+            trend_reentry_min_stop_pct: 0.003,
+            trend_reentry_max_stop_pct: 0.0125,
+            trend_reentry_profit_shield_pct: 0.008,
+            trend_reentry_trailing_activation_pct: 0.0125,
+            trend_reentry_trailing_distance_pct: 0.005,
+            trend_reentry_entry_timeout_seconds: 30,
         }
     }
 }
@@ -238,10 +266,26 @@ impl StrategyConfig {
             || !(0.0..=0.80).contains(&lanes.trend_max_opposing_micro_flow)
             || !(0.0..=25.0).contains(&lanes.trend_max_opposing_micro_return_bps)
             || !(0.001..=0.015).contains(&lanes.trend_risk_per_trade_pct)
+            || !(0.2..=0.5).contains(&lanes.trend_profit_shield_activation_r)
+            || !(0.0005..=0.003).contains(&lanes.trend_profit_shield_buffer_pct)
             || !(0.5..=2.0).contains(&lanes.trend_pre_tp_trailing_activation_r)
             || !(60..=900).contains(&lanes.trend_early_failure_seconds)
             || !(0.1..=0.9).contains(&lanes.trend_early_failure_adverse_r)
             || !(0.0..=0.5).contains(&lanes.trend_early_failure_max_mfe_r)
+            || lanes.trend_early_failure_max_mfe_r > lanes.trend_profit_shield_activation_r
+            || !(30..=360).contains(&lanes.trend_reentry_window_minutes)
+            || !(0.003..=0.02).contains(&lanes.trend_reentry_reset_pct)
+            || !(1..=4).contains(&lanes.trend_reentry_lookback_bars)
+            || !(0.001..=0.01).contains(&lanes.trend_reentry_min_body_pct)
+            || !(0.0..=0.50).contains(&lanes.trend_reentry_min_flow)
+            || !(0.002..=0.01).contains(&lanes.trend_reentry_min_stop_pct)
+            || !(lanes.trend_reentry_min_stop_pct..=0.03)
+                .contains(&lanes.trend_reentry_max_stop_pct)
+            || !(0.003..=0.02).contains(&lanes.trend_reentry_profit_shield_pct)
+            || !(lanes.trend_reentry_profit_shield_pct..=0.05)
+                .contains(&lanes.trend_reentry_trailing_activation_pct)
+            || !(0.002..=0.02).contains(&lanes.trend_reentry_trailing_distance_pct)
+            || !(5..=120).contains(&lanes.trend_reentry_entry_timeout_seconds)
             || lanes.max_spread_bps <= 0.0
             || lanes.min_depth_usd <= 0.0
         {

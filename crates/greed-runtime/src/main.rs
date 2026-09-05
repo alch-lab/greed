@@ -10,8 +10,8 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::AppConfig;
 use execution::BinanceDemoExecution;
-use greed_kernel::{AccountFrame, Artifact, GraphEvaluation, Verdict};
-use greed_strategy::{build_graph, StrategyConfig};
+use greed_kernel::{AccountFrame, Artifact, GraphEvaluation, NodeContext, StrategyNode, Verdict};
+use greed_strategy::{build_graph, risk::PositionPlannerNode, StrategyConfig};
 use journal::{Journal, ResearchRecorder, SampleRecorder, StatusWriter};
 use source::BinanceMarketSource;
 use std::{
@@ -139,7 +139,10 @@ fn strategy_funnels_demo(
 ) -> serde_json::Value {
     let positions = execution.position_snapshots();
     let build = |lane: &str| {
-        let is_lane = |recipe: &str| recipe == lane;
+        let is_lane = |recipe: &str| {
+            recipe == lane
+                || (lane == "trend_continuation" && recipe == "trend_continuation_reentry")
+        };
         let candidates: Vec<_> = evaluation
             .artifacts
             .values()
@@ -414,6 +417,7 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
         config.execution.clone(),
         config.portfolio.clone(),
         config.strategy.risk.clone(),
+        config.strategy.lanes.clone(),
         config.runtime.execution_state_path.clone(),
         config.runtime.proxy.as_deref(),
         source.market_stream_handle(),
@@ -606,7 +610,7 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                 .min(50);
             match source.discover_universe(&discovery_strategy, now_ms).await {
                 Ok(mut discovery) => {
-                    let position_symbols: Vec<_> = execution.position_symbols().cloned().collect();
+                    let position_symbols: Vec<_> = execution.pinned_symbols().into_iter().collect();
                     discovery.symbols.retain(|symbol| {
                         execution.supports_symbol(symbol) && !position_symbols.contains(symbol)
                     });
@@ -665,8 +669,49 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                     )?;
                 }
                 frame.account = execution.account_frame()?;
-                let evaluation = graph.evaluate(&frame)?;
+                let mut evaluation = graph.evaluate(&frame)?;
+                let (reentry_artifacts, reentry_events) = execution.trend_reentry_artifacts(&frame);
+                let has_reentry_candidate = reentry_artifacts
+                    .iter()
+                    .any(|record| matches!(&record.artifact, Artifact::Candidate(_)));
+                for record in reentry_artifacts {
+                    evaluation.artifacts.insert(record.key.clone(), record);
+                }
+                if !evaluation
+                    .node_order
+                    .iter()
+                    .any(|node| node == "lane.trend_continuation_reentry")
+                {
+                    let planner_index = evaluation
+                        .node_order
+                        .iter()
+                        .position(|node| node == "portfolio.position_planner")
+                        .unwrap_or(evaluation.node_order.len());
+                    evaluation
+                        .node_order
+                        .insert(planner_index, "lane.trend_continuation_reentry".into());
+                }
+                if has_reentry_candidate {
+                    let mut planner = PositionPlannerNode::new(
+                        vec!["lane.trend_continuation_reentry".into()],
+                        active_strategy.risk.clone(),
+                    );
+                    let records = planner
+                        .evaluate(&NodeContext {
+                            frame: &frame,
+                            artifacts: &evaluation.artifacts,
+                        })
+                        .map_err(anyhow::Error::msg)?;
+                    for record in records {
+                        evaluation.artifacts.insert(record.key.clone(), record);
+                    }
+                }
                 journal.append("graph_evaluation", serde_json::to_value(&evaluation)?)?;
+                for event in reentry_events {
+                    let payload = with_run_id(event.payload, &identity);
+                    history.append(&event.kind, payload.clone())?;
+                    journal.append(&event.kind, payload)?;
+                }
                 let entries_enabled = !paused.load(Ordering::SeqCst);
                 let order_events = execution
                     .apply_plans(&frame, &evaluation, entries_enabled)
@@ -706,6 +751,7 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                     "lanes":funnels,
                     "recipe_gates":execution.recipe_gate_snapshots(frame.as_of_ms),
                     "positions":execution.position_snapshots(),
+                    "trend_reentries":execution.trend_reentry_status(),
                     "graph":summarize(&evaluation),
                     "artifacts":evaluation.artifacts,
                     "universe":universe_status,
