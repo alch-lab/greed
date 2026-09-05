@@ -23,14 +23,12 @@ const BOOK_FLOW_HISTORY_MS: i64 = 2 * 60_000;
 // storm. Five minutes still detects a wedged reader while allowing the
 // exchange heartbeat to prove the socket is alive.
 const STREAM_IDLE_TIMEOUT_SECS: u64 = 5 * 60;
-// Binance raised the per-connection subscription ceiling to 1,024 streams.
-// With the configured 46-symbol universe the largest route contains only
-// 184 kline streams, so extra shards add failure surfaces without buying us
-// any capacity. Keep radar, candles, trades and depth isolated by purpose,
-// but use one socket for each purpose (four sockets total).
-const MARKET_STREAM_SHARDS: usize = 1;
-const TRADE_STREAM_SHARDS: usize = 1;
-const PUBLIC_STREAM_SHARDS: usize = 1;
+// Keep independent failure domains even though every route fits within
+// Binance's per-connection stream ceiling. A peer reset must warm only half
+// the universe instead of simultaneously removing every executable book.
+const MARKET_STREAM_SHARDS: usize = 2;
+const TRADE_STREAM_SHARDS: usize = 2;
+const PUBLIC_STREAM_SHARDS: usize = 2;
 const SYMBOL_WARMUP_MS: i64 = 10_000;
 
 #[derive(Debug, Clone)]
@@ -92,6 +90,8 @@ pub struct StreamTelemetry {
     /// Symbols with enough recent depth changes to calculate a 10-second
     /// snapshot OFI observation.
     pub book_flow_ready_symbols: usize,
+    /// Symbols with a fresh executable top-20 order-book snapshot.
+    pub book_ready_symbols: usize,
 }
 
 #[derive(Default)]
@@ -275,6 +275,13 @@ impl MarketStreamHub {
             })
             .count();
         let now_ms = chrono::Utc::now().timestamp_millis();
+        telemetry.book_ready_symbols = state
+            .books
+            .iter()
+            .filter(|(symbol, book)| {
+                state.desired_symbols.contains(*symbol) && book.meta.usable_at(now_ms)
+            })
+            .count();
         telemetry.book_flow_ready_symbols = state
             .book_flow
             .iter()
@@ -669,10 +676,13 @@ where
 
 fn route_url(base: &str, route: StreamRoute) -> String {
     let path = match route {
-        StreamRoute::Market(_) => "market/ws",
-        StreamRoute::Trade(_) => "market/ws",
-        StreamRoute::Public(_) => "public/ws",
-        StreamRoute::Radar => "market/ws",
+        // These connections send live SUBSCRIBE/UNSUBSCRIBE control frames.
+        // Binance documents `/stream` for request-based combined streams;
+        // `/ws/{name}` is the raw single-stream form.
+        StreamRoute::Market(_) => "market/stream",
+        StreamRoute::Trade(_) => "market/stream",
+        StreamRoute::Public(_) => "public/stream",
+        StreamRoute::Radar => "market/stream",
     };
     format!("{}/{path}", base.trim_end_matches('/'))
 }
@@ -1348,15 +1358,15 @@ mod tests {
         let public = public_streams(&symbols);
         assert_eq!(
             route_url("wss://fstream.binance.com", StreamRoute::Market(0)),
-            "wss://fstream.binance.com/market/ws"
+            "wss://fstream.binance.com/market/stream"
         );
         assert_eq!(
             route_url("wss://fstream.binance.com", StreamRoute::Public(0)),
-            "wss://fstream.binance.com/public/ws"
+            "wss://fstream.binance.com/public/stream"
         );
         assert_eq!(
             route_url("wss://fstream.binance.com", StreamRoute::Trade(0)),
-            "wss://fstream.binance.com/market/ws"
+            "wss://fstream.binance.com/market/stream"
         );
         assert!(!market.contains("!ticker@arr"));
         assert!(market.contains("ybusdt@kline_5m"));
@@ -1473,7 +1483,7 @@ mod tests {
         let (sender, receiver) = watch::channel(vec!["BTCUSDT".to_string()]);
         let task = tokio::spawn(run_dynamic_connection(
             StreamRoute::Market(shard),
-            format!("ws://{address}/market/ws"),
+            format!("ws://{address}/market/stream"),
             Arc::clone(&state),
             receiver,
         ));
@@ -1511,7 +1521,7 @@ mod tests {
                 .starts_with(&added_symbol.to_lowercase())
         }));
         assert_eq!(state.read().unwrap().telemetry.market_shards_connected, 1);
-        assert!(state.read().unwrap().telemetry.market_connected);
+        assert!(!state.read().unwrap().telemetry.market_connected);
         assert_eq!(state.read().unwrap().telemetry.reconnects, 0);
         task.abort();
     }
@@ -1537,14 +1547,14 @@ mod tests {
     }
 
     #[test]
-    fn public_reconnect_rewarms_all_symbols_on_the_single_depth_route() {
+    fn public_reconnect_rewarms_only_symbols_on_the_affected_depth_shard() {
         let symbols = vec![
             "BTCUSDT".to_string(),
             "ETHUSDT".to_string(),
             "SOLUSDT".to_string(),
             "XRPUSDT".to_string(),
         ];
-        let shard = 0;
+        let shard = symbol_shard("btcusdt@depth20@500ms", PUBLIC_STREAM_SHARDS);
         let state = Arc::new(RwLock::new(StreamState::default()));
         {
             let mut inner = state.write().unwrap();
@@ -1566,8 +1576,15 @@ mod tests {
 
         let inner = state.read().unwrap();
         for symbol in &symbols {
-            assert_eq!(inner.symbol_admitted_ms[symbol], 2_000);
-            assert!(!inner.book_flow.contains_key(symbol));
+            let affected = symbol_shard(
+                &format!("{}@depth20@500ms", symbol.to_lowercase()),
+                PUBLIC_STREAM_SHARDS,
+            ) == shard;
+            assert_eq!(
+                inner.symbol_admitted_ms[symbol],
+                if affected { 2_000 } else { 1_000 }
+            );
+            assert_eq!(inner.book_flow.contains_key(symbol), !affected);
         }
     }
 

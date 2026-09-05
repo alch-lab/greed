@@ -2999,6 +2999,36 @@ impl BinanceDemoExecution {
             }
             let now_ms = chrono::Utc::now().timestamp_millis();
             let partial_quantity = parse_f64(&order, "executedQty").unwrap_or_default();
+            // A completed order, or a partial fill that already satisfies the
+            // strategy's managed-position threshold, is no longer a pending
+            // setup. Hand it to bracket protection before evaluating maker
+            // invalidation. BUSDT filled a meaningful position and was then
+            // flattened because the midpoint crossed the still-resting limit
+            // by less than one extra basis point.
+            if status == "FILLED" {
+                return Ok(PostOnlyEntry::Filled {
+                    order,
+                    waited_ms: now_ms.saturating_sub(started_ms),
+                    reprices: reprice_attempt,
+                    final_limit: passive_price,
+                });
+            }
+            if managed_fill_threshold_reached(
+                partial_quantity,
+                quantity,
+                rules.quantity_step,
+                plan.min_fill_ratio,
+            ) {
+                let managed = self
+                    .cancel_or_reconcile_entry(&plan.symbol, &active_client_id)
+                    .await?;
+                return Ok(PostOnlyEntry::Filled {
+                    order: managed,
+                    waited_ms: now_ms.saturating_sub(started_ms),
+                    reprices: reprice_attempt,
+                    final_limit: passive_price,
+                });
+            }
             if partial_quantity > f64::EPSILON
                 && partial_quantity + rules.quantity_step * 0.5 < quantity
             {
@@ -3133,16 +3163,6 @@ impl BinanceDemoExecution {
                         &reason,
                     )
                     .await;
-            }
-            if status == "FILLED" {
-                return Ok(PostOnlyEntry::Filled {
-                    order,
-                    waited_ms: chrono::Utc::now()
-                        .timestamp_millis()
-                        .saturating_sub(started_ms),
-                    reprices: reprice_attempt,
-                    final_limit: passive_price,
-                });
             }
             if now_ms >= deadline {
                 let canceled = self
@@ -4125,6 +4145,16 @@ fn persistent_guard_reason(
 fn bounded_fallback_quantity(quantity: f64, multiplier: f64, step: f64) -> f64 {
     floor_step(quantity * multiplier.clamp(0.01, 1.0), step)
 }
+fn managed_fill_threshold_reached(
+    executed: f64,
+    requested: f64,
+    quantity_step: f64,
+    min_fill_ratio: f64,
+) -> bool {
+    min_fill_ratio > 0.0
+        && executed > f64::EPSILON
+        && executed + quantity_step * 0.5 >= requested * min_fill_ratio
+}
 fn reprice_client_id(base: &str, attempt: u8) -> String {
     format!("{}-r{attempt}", &base[..base.len().min(32)])
 }
@@ -4478,6 +4508,14 @@ mod tests {
         assert!((entry_adverse_bps(Side::Buy, 100.20, 100.0) - 20.0).abs() < 1e-9);
         assert!((entry_adverse_bps(Side::Sell, 99.80, 100.0) - 20.0).abs() < 1e-9);
         assert!(entry_adverse_bps(Side::Buy, 99.0, 100.0) < 0.0);
+    }
+
+    #[test]
+    fn meaningful_partial_fill_becomes_a_managed_position() {
+        assert!(managed_fill_threshold_reached(800.0, 1_000.0, 1.0, 0.80));
+        assert!(managed_fill_threshold_reached(799.6, 1_000.0, 1.0, 0.80));
+        assert!(!managed_fill_threshold_reached(799.4, 1_000.0, 1.0, 0.80));
+        assert!(!managed_fill_threshold_reached(1_000.0, 1_000.0, 1.0, 0.0));
     }
 
     #[test]
