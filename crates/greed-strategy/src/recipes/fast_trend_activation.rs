@@ -5,6 +5,11 @@ use greed_kernel::{
 };
 use std::collections::BTreeMap;
 
+const FAST_TAKE_PROFIT_LADDER: &str = "1.0:0.30,2.0:0.40";
+const FAST_PROFIT_SHIELD_ACTIVATION_R: &str = "0.5";
+const FAST_TRAILING_ACTIVATION_R: &str = "1.0";
+const FAST_TRAILING_DISTANCE_PCT: &str = "0.0035";
+
 pub struct FastTrendActivationNode {
     id: String,
     symbols: Vec<String>,
@@ -303,8 +308,21 @@ impl StrategyNode for FastTrendActivationNode {
                     oi_60m.unwrap_or_default().to_string(),
                 ),
                 ("stop_pct".into(), stop_pct.to_string()),
-                ("target_r".into(), "2.0".into()),
-                ("take_profit_fraction".into(), "1.0".into()),
+                ("take_profit_ladder".into(), FAST_TAKE_PROFIT_LADDER.into()),
+                ("target_r".into(), "1.0".into()),
+                ("take_profit_fraction".into(), "0.30".into()),
+                (
+                    "profit_shield_activation_r".into(),
+                    FAST_PROFIT_SHIELD_ACTIVATION_R.into(),
+                ),
+                (
+                    "pre_tp_trailing_activation_r".into(),
+                    FAST_TRAILING_ACTIVATION_R.into(),
+                ),
+                (
+                    "trailing_distance_pct".into(),
+                    FAST_TRAILING_DISTANCE_PCT.into(),
+                ),
                 (
                     "risk_per_trade_pct".into(),
                     self.config.fast_risk_per_trade_pct.to_string(),

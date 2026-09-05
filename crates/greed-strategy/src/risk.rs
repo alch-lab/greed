@@ -474,4 +474,61 @@ mod tests {
         );
         assert!(!plan.taker_fallback);
     }
+
+    #[test]
+    fn fast_plan_scales_out_twice_and_trails_the_runner() {
+        let mut record = candidate("fast:ALT", "fast_trend_activation", "ALTUSDT", 1);
+        let Artifact::Candidate(value) = &mut record.artifact else {
+            panic!("candidate fixture must contain a candidate");
+        };
+        value.tags.extend(BTreeMap::from([
+            ("stop_pct".into(), "0.005".into()),
+            ("risk_per_trade_pct".into(), "0.005".into()),
+            ("max_notional_multiple".into(), "1.0".into()),
+            ("take_profit_ladder".into(), "1.0:0.30,2.0:0.40".into()),
+            ("take_profit_fraction".into(), "0.30".into()),
+            ("profit_shield_activation_r".into(), "0.5".into()),
+            ("pre_tp_trailing_activation_r".into(), "1.0".into()),
+            ("trailing_distance_pct".into(), "0.0035".into()),
+        ]));
+        let artifacts = BTreeMap::from([(record.key.clone(), record)]);
+        let frame = MarketFrame {
+            as_of_ms: 2_000,
+            instruments: BTreeMap::from([("ALTUSDT".into(), instrument("ALTUSDT"))]),
+            account: AccountFrame {
+                equity_usd: 2_000.0,
+                cash_usd: 2_000.0,
+                realized_pnl_usd: 0.0,
+                peak_equity_usd: 2_000.0,
+                risk_day_start_equity_usd: 2_000.0,
+                gross_exposure_usd: 0.0,
+                open_positions: 0,
+            },
+        };
+        let mut planner = PositionPlannerNode::new(vec![], RiskConfig::default());
+        let output = planner
+            .evaluate(&NodeContext {
+                frame: &frame,
+                artifacts: &artifacts,
+            })
+            .unwrap();
+        let plan = output
+            .iter()
+            .find_map(|record| match &record.artifact {
+                Artifact::PositionPlan(plan) => Some(plan),
+                _ => None,
+            })
+            .expect("fast candidate should produce a plan");
+
+        assert!((plan.notional_usd - 2_000.0).abs() < 1e-9);
+        assert_eq!(plan.take_profit_prices.len(), 2);
+        assert!((plan.take_profit_prices[0].0 - 100.5).abs() < 1e-9);
+        assert!((plan.take_profit_prices[0].1 - 0.30).abs() < 1e-9);
+        assert!((plan.take_profit_prices[1].0 - 101.0).abs() < 1e-9);
+        assert!((plan.take_profit_prices[1].1 - 0.40).abs() < 1e-9);
+        assert_eq!(plan.break_even_after_fraction, Some(0.30));
+        assert_eq!(plan.profit_shield_activation_pct, Some(0.0025));
+        assert_eq!(plan.trailing_activation_pct, Some(0.005));
+        assert_eq!(plan.trailing_distance_pct, Some(0.0035));
+    }
 }
