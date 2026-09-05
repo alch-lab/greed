@@ -22,6 +22,8 @@ use std::{
 };
 use tokio::sync::{mpsc, oneshot};
 
+const MIN_OPERATOR_PASSWORD_LENGTH: usize = 8;
+
 pub enum ControlCommand {
     Audit {
         action: &'static str,
@@ -100,14 +102,14 @@ pub async fn start(config: &RuntimeConfig) -> Result<Monitor> {
     let configured_password = env::var("GREED_WEB_PASSWORD").ok();
     if configured_password
         .as_ref()
-        .is_some_and(|value| value.len() < 16)
+        .is_some_and(|value| value.chars().count() < MIN_OPERATOR_PASSWORD_LENGTH)
     {
         tracing::error!(
-            "GREED_WEB_PASSWORD is shorter than 16 characters; operator controls are disabled"
+            "GREED_WEB_PASSWORD is shorter than {MIN_OPERATOR_PASSWORD_LENGTH} characters; operator controls are disabled"
         );
     }
     let operator_password = configured_password
-        .filter(|value| value.len() >= 16)
+        .filter(|value| value.chars().count() >= MIN_OPERATOR_PASSWORD_LENGTH)
         .map(Arc::<str>::from);
     let operator_token = operator_password.as_ref().map(|password| {
         let seed = format!(

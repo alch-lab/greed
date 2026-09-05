@@ -41,14 +41,15 @@ cargo build --release
 ```bash
 export BINANCE_DEMO_API_KEY='...'
 export BINANCE_DEMO_API_SECRET='...'
-export GREED_WEB_PASSWORD='use-a-long-unique-password'
+export GREED_WEB_PASSWORD='8-or-more-characters'
 ./target/release/greed paper --config config/demo.toml
 ```
 
 `GREED_WEB_PASSWORD` enables the operator session in the dashboard. Authenticated
 operators can pause new entries and submit reduce-only manual closes; guests can
 only read status and history. Operator actions and their market context are kept
-in the same durable history ledger as automatic trades.
+in the same durable history ledger as automatic trades. The password must contain
+at least 8 characters.
 
 服务器首次启动或交易接口升级后，先停止运行时并执行零成交预检。脚本会验证普通订单 test
 endpoint，以及创建、查询并撤销一张远离市价的 Demo 条件保护单；它拒绝在存在持仓或挂单时运行：
