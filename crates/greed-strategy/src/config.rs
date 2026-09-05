@@ -28,6 +28,9 @@ pub struct UniverseConfig {
     pub top_liquidity_names: usize,
     pub top_mover_names: usize,
     pub min_24h_quote_volume_usd: f64,
+    pub surge_min_24h_quote_volume_usd: f64,
+    pub surge_min_abs_change_24h: f64,
+    pub surge_min_abs_return_15m: f64,
     pub refresh_seconds: u32,
 }
 
@@ -39,6 +42,9 @@ impl Default for UniverseConfig {
             top_liquidity_names: 18,
             top_mover_names: 12,
             min_24h_quote_volume_usd: 15_000_000.0,
+            surge_min_24h_quote_volume_usd: 2_000_000.0,
+            surge_min_abs_change_24h: 0.08,
+            surge_min_abs_return_15m: 0.015,
             refresh_seconds: 15,
         }
     }
@@ -196,6 +202,10 @@ impl StrategyConfig {
             || self.universe.top_liquidity_names + self.universe.top_mover_names
                 < self.universe.max_symbols
             || self.universe.min_24h_quote_volume_usd <= 0.0
+            || self.universe.surge_min_24h_quote_volume_usd <= 0.0
+            || self.universe.surge_min_24h_quote_volume_usd > self.universe.min_24h_quote_volume_usd
+            || !(0.01..=0.50).contains(&self.universe.surge_min_abs_change_24h)
+            || !(0.005..=0.10).contains(&self.universe.surge_min_abs_return_15m)
             || !(5..=60).contains(&self.universe.refresh_seconds)
         {
             return Err("unified universe parameters are invalid".into());

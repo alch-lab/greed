@@ -53,6 +53,13 @@ max_symbols = 46
 top_liquidity_names = 26
 top_mover_names = 20
 min_24h_quote_volume_usd = 15000000.0
+# A thin contract may temporarily join the mover side of the universe when it
+# is already active now, rather than waiting for its rolling 24h volume to
+# catch up. This only grants data coverage: all strategy and live-book gates
+# remain unchanged before an order can be planned.
+surge_min_24h_quote_volume_usd = 2000000.0
+surge_min_abs_change_24h = 0.08
+surge_min_abs_return_15m = 0.015
 refresh_seconds = 15
 
 [strategy.lanes]

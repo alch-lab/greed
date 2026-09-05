@@ -1,5 +1,5 @@
 use crate::config::RuntimeConfig;
-use crate::market_stream::MarketStreamHub;
+use crate::market_stream::{MarketStreamHub, StreamTicker};
 use anyhow::{anyhow, Result};
 use futures_util::{stream, StreamExt};
 use greed_kernel::{
@@ -67,6 +67,7 @@ pub struct UniverseDiscovery {
     pub symbols: Vec<String>,
     pub eligible_contracts: usize,
     pub liquid_contracts: usize,
+    pub surge_contracts: usize,
     pub rolling_history_ready: usize,
     pub leaders: Vec<UniverseLeader>,
 }
@@ -81,6 +82,7 @@ pub struct UniverseLeader {
     pub return_15m_pct: Option<f64>,
     pub return_1h_pct: Option<f64>,
     pub anomaly_score: f64,
+    pub admission: &'static str,
 }
 
 type DiscoveryRow = (
@@ -91,6 +93,7 @@ type DiscoveryRow = (
     Option<f64>,
     Option<f64>,
     Option<f64>,
+    bool,
 );
 
 // The all-market ticker stream only includes contracts whose rolling ticker
@@ -123,6 +126,14 @@ fn median_abs(values: impl Iterator<Item = Option<f64>>, floor: f64) -> f64 {
         .copied()
         .unwrap_or(floor)
         .max(floor)
+}
+
+fn is_surge_admission(ticker: &StreamTicker, universe: &greed_strategy::UniverseConfig) -> bool {
+    ticker.quote_volume_24h >= universe.surge_min_24h_quote_volume_usd
+        && ticker.change_24h().abs() >= universe.surge_min_abs_change_24h
+        && ticker
+            .return_15m
+            .is_some_and(|value| value.abs() >= universe.surge_min_abs_return_15m)
 }
 
 impl BinanceMarketSource {
@@ -212,6 +223,7 @@ impl BinanceMarketSource {
                 symbols: strategy.symbols.clone(),
                 eligible_contracts: strategy.symbols.len(),
                 liquid_contracts: strategy.symbols.len(),
+                surge_contracts: 0,
                 rolling_history_ready: 0,
                 leaders: Vec::new(),
             });
@@ -240,7 +252,13 @@ impl BinanceMarketSource {
             let price = ticker.price;
             let quote_volume = ticker.quote_volume_24h;
             let change_24h = ticker.change_24h();
-            if price <= 0.0 || quote_volume < strategy.universe.min_24h_quote_volume_usd {
+            if price <= 0.0 {
+                continue;
+            }
+            let core_admission = quote_volume >= strategy.universe.min_24h_quote_volume_usd;
+            let surge_admission =
+                !core_admission && is_surge_admission(&ticker, &strategy.universe);
+            if !core_admission && !surge_admission {
                 continue;
             }
             let history = self.discovery_prices.entry(symbol.clone()).or_default();
@@ -264,21 +282,21 @@ impl BinanceMarketSource {
                 ticker.return_5m,
                 ticker.return_15m,
                 return_1h,
+                surge_admission,
             ));
         }
-        let rolling_history_ready = rows
-            .iter()
-            .filter(|(_, _, _, _, return_5m, _, _)| return_5m.is_some())
-            .count();
+        let surge_contracts = rows.iter().filter(|row| row.7).count();
+        let core_rows: Vec<_> = rows.iter().filter(|row| !row.7).cloned().collect();
+        let rolling_history_ready = rows.iter().filter(|row| row.4.is_some()).count();
         let mut selected: BTreeSet<String> = strategy
             .symbols
             .iter()
             .filter(|symbol| eligible.contains(*symbol))
             .cloned()
             .collect();
-        let mut by_liquidity = rows.clone();
+        let mut by_liquidity = core_rows.clone();
         by_liquidity.sort_by(|a, b| b.1.total_cmp(&a.1));
-        for (symbol, _, _, _, _, _, _) in by_liquidity
+        for (symbol, _, _, _, _, _, _, _) in by_liquidity
             .iter()
             .take(strategy.universe.top_liquidity_names)
         {
@@ -295,14 +313,15 @@ impl BinanceMarketSource {
                 + row.2.abs() * 0.05 / 0.03
         };
         by_movement.sort_by(|a, b| anomaly_score(b).total_cmp(&anomaly_score(a)));
-        for (symbol, _, _, _, _, _, _) in by_movement.iter().take(strategy.universe.top_mover_names)
+        for (symbol, _, _, _, _, _, _, _) in
+            by_movement.iter().take(strategy.universe.top_mover_names)
         {
             selected.insert(symbol.clone());
         }
         // Liquidity and mover rankings overlap heavily in trending markets.
         // Fill the remainder from executable, liquid contracts so max_symbols
         // is the active target rather than an accidental upper bound.
-        for (symbol, _, _, _, _, _, _) in &by_liquidity {
+        for (symbol, _, _, _, _, _, _, _) in &by_liquidity {
             if selected.len() >= strategy.universe.max_symbols {
                 break;
             }
@@ -324,7 +343,7 @@ impl BinanceMarketSource {
         let selected_symbols: BTreeSet<_> = symbols.iter().map(String::as_str).collect();
         let leaders = by_movement
             .into_iter()
-            .filter(|(symbol, _, _, _, _, _, _)| selected_symbols.contains(symbol.as_str()))
+            .filter(|(symbol, _, _, _, _, _, _, _)| selected_symbols.contains(symbol.as_str()))
             .take(20)
             .map(|row| UniverseLeader {
                 symbol: row.0.clone(),
@@ -335,13 +354,19 @@ impl BinanceMarketSource {
                 return_15m_pct: row.5.map(|value| value * 100.0),
                 return_1h_pct: row.6.map(|value| value * 100.0),
                 anomaly_score: anomaly_score(&row),
+                admission: if row.7 {
+                    "short_term_surge"
+                } else {
+                    "core_liquidity"
+                },
             })
             .collect();
         Ok(UniverseDiscovery {
             as_of_ms: now_ms,
             symbols,
             eligible_contracts: eligible.len(),
-            liquid_contracts: rows.len(),
+            liquid_contracts: core_rows.len(),
+            surge_contracts,
             rolling_history_ready,
             leaders,
         })
@@ -1002,6 +1027,43 @@ impl BinanceMarketSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn ticker(quote_volume_24h: f64, change_24h: f64, return_15m: Option<f64>) -> StreamTicker {
+        StreamTicker {
+            received_ms: 1,
+            price: 1.0 + change_24h,
+            open_24h: 1.0,
+            quote_volume_24h,
+            return_1m: None,
+            return_5m: None,
+            return_15m,
+        }
+    }
+
+    #[test]
+    fn short_term_surge_admission_requires_volume_change_and_recent_move() {
+        let universe = greed_strategy::UniverseConfig::default();
+        assert!(is_surge_admission(
+            &ticker(2_100_000.0, 0.15, Some(0.02)),
+            &universe
+        ));
+        assert!(!is_surge_admission(
+            &ticker(1_900_000.0, 0.15, Some(0.02)),
+            &universe
+        ));
+        assert!(!is_surge_admission(
+            &ticker(2_100_000.0, 0.07, Some(0.02)),
+            &universe
+        ));
+        assert!(!is_surge_admission(
+            &ticker(2_100_000.0, 0.15, Some(0.01)),
+            &universe
+        ));
+        assert!(!is_surge_admission(
+            &ticker(2_100_000.0, 0.15, None),
+            &universe
+        ));
+    }
 
     #[test]
     fn elapsed_candles_are_closed_after_a_missed_websocket_terminal_update() {
