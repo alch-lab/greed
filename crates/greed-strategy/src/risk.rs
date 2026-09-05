@@ -215,6 +215,7 @@ impl StrategyNode for PositionPlannerNode {
                 .unwrap_or_default();
             let plan = PositionPlan {
                 candidate_id: c.id.clone(),
+                signal_context: c.tags.clone(),
                 symbol: c.symbol.clone(),
                 side: c.side,
                 reference_price: c.reference_price,
@@ -463,6 +464,12 @@ mod tests {
             .expect("trend candidate should produce a plan");
         assert!((plan.notional_usd - 960.0).abs() < 1e-9);
         assert!((plan.min_fill_ratio - 0.80).abs() < 1e-9);
+        assert_eq!(
+            plan.signal_context
+                .get("risk_per_trade_pct")
+                .map(String::as_str),
+            Some("0.006")
+        );
         assert!(!plan.taker_fallback);
     }
 }

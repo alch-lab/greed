@@ -58,6 +58,11 @@ pub struct TradeCandidate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PositionPlan {
     pub candidate_id: String,
+    /// Immutable signal-time measurements copied from the candidate. These
+    /// are journaled with the eventual entry so later research can separate
+    /// market regimes without reconstructing a historical live frame.
+    #[serde(default)]
+    pub signal_context: BTreeMap<String, String>,
     pub symbol: String,
     pub side: Side,
     pub reference_price: f64,

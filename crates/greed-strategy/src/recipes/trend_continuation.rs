@@ -32,6 +32,20 @@ fn ema(values: &[&Candle], period: usize) -> Vec<f64> {
     output
 }
 
+fn median(values: impl Iterator<Item = f64>) -> Option<f64> {
+    let mut values: Vec<_> = values.filter(|value| value.is_finite()).collect();
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_by(f64::total_cmp);
+    let middle = values.len() / 2;
+    Some(if values.len() % 2 == 0 {
+        (values[middle - 1] + values[middle]) * 0.5
+    } else {
+        values[middle]
+    })
+}
+
 fn trend_age_bars(values: &[&Candle], end: usize, sign: f64, threshold: f64) -> usize {
     let mut age = 0;
     for cursor in (16..=end).rev() {
@@ -81,6 +95,31 @@ impl StrategyNode for TrendContinuationNode {
     }
 
     fn evaluate(&mut self, ctx: &NodeContext<'_>) -> Result<Vec<ArtifactRecord>, String> {
+        let market_returns: BTreeMap<_, _> = self
+            .symbols
+            .iter()
+            .filter_map(|symbol| {
+                let instrument = ctx.frame.instrument(symbol)?;
+                let closed: Vec<_> = instrument
+                    .perpetual
+                    .values
+                    .iter()
+                    .filter(|value| value.closed)
+                    .collect();
+                let i = closed.len().checked_sub(1)?;
+                (i >= 16).then(|| (symbol.clone(), closed[i].close / closed[i - 16].close - 1.0))
+            })
+            .collect();
+        let market_median_return_4h = median(market_returns.values().copied()).unwrap_or_default();
+        let market_positive_breadth = if market_returns.is_empty() {
+            0.0
+        } else {
+            market_returns
+                .values()
+                .filter(|value| **value > 0.0)
+                .count() as f64
+                / market_returns.len() as f64
+        };
         let mut passed = Vec::new();
         let mut observations = Vec::new();
         let mut inspected = 0u64;
@@ -121,6 +160,24 @@ impl StrategyNode for TrendContinuationNode {
                 Side::Sell
             };
             let sign = side.sign();
+            let market_directional_breadth = if market_returns.is_empty() {
+                0.0
+            } else {
+                market_returns
+                    .values()
+                    .filter(|value| sign * **value > 0.0)
+                    .count() as f64
+                    / market_returns.len() as f64
+            };
+            let market_directional_rank = if market_returns.is_empty() {
+                0.0
+            } else {
+                market_returns
+                    .values()
+                    .filter(|value| sign * **value <= sign * return_4h)
+                    .count() as f64
+                    / market_returns.len() as f64
+            };
             let trend_age_bars = trend_age_bars(&closed, i, sign, self.config.trend_min_return_4h);
             let atr = (i.saturating_sub(19)..=i)
                 .map(|index| {
@@ -298,6 +355,22 @@ impl StrategyNode for TrendContinuationNode {
                 ("lane".into(), "trend_continuation".into()),
                 ("priority".into(), "1".into()),
                 ("return_4h".into(), return_4h.to_string()),
+                (
+                    "market_median_return_4h".into(),
+                    market_median_return_4h.to_string(),
+                ),
+                (
+                    "market_signed_median_return_4h".into(),
+                    (sign * market_median_return_4h).to_string(),
+                ),
+                (
+                    "market_directional_breadth".into(),
+                    market_directional_breadth.to_string(),
+                ),
+                (
+                    "market_directional_rank".into(),
+                    market_directional_rank.to_string(),
+                ),
                 ("trend_efficiency".into(), efficiency.to_string()),
                 ("trend_age_bars".into(), trend_age_bars.to_string()),
                 ("trend_extension_atr".into(), extension_atr.to_string()),
@@ -467,6 +540,8 @@ impl StrategyNode for TrendContinuationNode {
                     ("reclaim_hits".into(), reclaim_hits as f64),
                     ("pass_candidates".into(), passed.len() as f64),
                     ("candidate_observations".into(), observations.len() as f64),
+                    ("market_median_return_4h".into(), market_median_return_4h),
+                    ("market_positive_breadth".into(), market_positive_breadth),
                 ]),
                 meta: meta(
                     ctx.frame.as_of_ms,
@@ -498,6 +573,13 @@ impl StrategyNode for TrendContinuationNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn market_median_handles_even_and_odd_universes() {
+        assert_eq!(median([3.0, 1.0, 2.0].into_iter()), Some(2.0));
+        assert_eq!(median([4.0, 1.0, 3.0, 2.0].into_iter()), Some(2.5));
+        assert_eq!(median([f64::NAN].into_iter()), None);
+    }
 
     fn candle(open_ms: i64, close: f64) -> Candle {
         Candle {
