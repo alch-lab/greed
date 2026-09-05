@@ -154,4 +154,4 @@ loss_cooldown_minutes = 180
 rolling_pf_probe_size_multiplier = 1.00
 # Keep the current paper run and rolling PF history continuous while execution
 # mechanics are improved; changing this value intentionally starts a new gate window.
-rolling_pf_epoch = 14
+rolling_pf_epoch = 15
