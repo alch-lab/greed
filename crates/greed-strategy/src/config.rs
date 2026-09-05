@@ -38,7 +38,7 @@ impl Default for UniverseConfig {
             max_symbols: 30,
             top_liquidity_names: 18,
             top_mover_names: 12,
-            min_24h_quote_volume_usd: 25_000_000.0,
+            min_24h_quote_volume_usd: 15_000_000.0,
             refresh_seconds: 15,
         }
     }
