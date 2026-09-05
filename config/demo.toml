@@ -30,7 +30,7 @@ execution_state_path = "data/runtime/binance-alpha-state.json"
 http_listen = "127.0.0.1:8088"
 
 [portfolio]
-initial_equity_usd = 2000.0
+initial_equity_usd = 5000.0
 max_positions = 3
 
 [execution]
@@ -106,8 +106,8 @@ trend_max_post_signal_extension_bps = 12.0
 # oppose the completed 15m signal.
 trend_max_opposing_micro_flow = 0.10
 trend_max_opposing_micro_return_bps = 3.0
-# Walk-forward selected 0.6% account risk for this lane. On a 2,000 USDT
-# account the planned full-stop loss is about $12 before gap/slippage, instead
+# Walk-forward selected 0.6% account risk for this lane. On a 5,000 USDT
+# account the planned full-stop loss is about $30 before gap/slippage, instead
 # of the previous $20 risk budget that produced a $26.37 PROM loss.
 trend_risk_per_trade_pct = 0.006
 # Do not tighten the pre-TP trail until +1R. This preserved validation and
@@ -150,4 +150,4 @@ loss_cooldown_minutes = 180
 rolling_pf_probe_size_multiplier = 1.00
 # Keep the current paper run and rolling PF history continuous while execution
 # mechanics are improved; changing this value intentionally starts a new gate window.
-rolling_pf_epoch = 13
+rolling_pf_epoch = 14

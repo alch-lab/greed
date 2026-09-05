@@ -16,6 +16,7 @@ use journal::{Journal, ResearchRecorder, SampleRecorder, StatusWriter};
 use source::BinanceMarketSource;
 use std::{
     collections::{BTreeMap, BTreeSet},
+    sync::atomic::Ordering,
     time::Duration,
 };
 use tracing::{info, warn};
@@ -397,7 +398,11 @@ async fn run_paper(config: AppConfig, iterations: u64) -> Result<()> {
 async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
     let started_ms = chrono::Utc::now().timestamp_millis();
     let identity = runtime_identity(&config, started_ms);
-    let _monitor = monitor::start(&config.runtime).await?;
+    let monitor::Monitor {
+        task: _monitor,
+        mut commands,
+        paused,
+    } = monitor::start(&config.runtime).await?;
     let mut source = BinanceMarketSource::new(config.runtime.clone())?;
     if let Err(error) = source.start_market_stream(&config.strategy).await {
         // The stream hub owns reconnect loops. A cold-start timeout must halt
@@ -501,6 +506,89 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
             history.append(&event.kind, payload.clone())?;
             journal.append(&event.kind, payload)?;
         }
+        while let Ok(command) = commands.try_recv() {
+            match command {
+                monitor::ControlCommand::Audit {
+                    action,
+                    actor,
+                    requested_ms,
+                } => {
+                    let payload = with_run_id(
+                        serde_json::json!({
+                            "ts_ms":requested_ms,
+                            "action":action,
+                            "actor":actor,
+                            "paused":paused.load(Ordering::SeqCst),
+                            "paper_only":true,
+                        }),
+                        &identity,
+                    );
+                    history.append("operator_control", payload.clone())?;
+                    journal.append("operator_control", payload)?;
+                }
+                monitor::ControlCommand::ManualClose {
+                    symbol,
+                    note,
+                    actor,
+                    requested_ms,
+                    response,
+                } => {
+                    let result = execution
+                        .request_manual_close(&symbol, &actor, note.as_deref(), requested_ms)
+                        .await;
+                    match result {
+                        Ok(event) => {
+                            let payload = with_run_id(event.payload, &identity);
+                            history.append(&event.kind, payload.clone())?;
+                            journal.append(&event.kind, payload)?;
+                            match execution.sync().await {
+                                Ok(events) => {
+                                    for event in events {
+                                        let payload = with_run_id(event.payload, &identity);
+                                        history.append(&event.kind, payload.clone())?;
+                                        journal.append(&event.kind, payload)?;
+                                    }
+                                    let _ = response.send(Ok(serde_json::json!({
+                                        "ok":true,
+                                        "symbol":symbol,
+                                        "state":"close_submitted",
+                                    })));
+                                }
+                                Err(error) => {
+                                    let message = format!(
+                                        "close was submitted but immediate reconciliation failed: {error}"
+                                    );
+                                    let _ = response.send(Ok(serde_json::json!({
+                                        "ok":true,
+                                        "symbol":symbol,
+                                        "state":"close_submitted_reconciliation_pending",
+                                        "detail":message,
+                                    })));
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            let payload = with_run_id(
+                                serde_json::json!({
+                                    "ts_ms":requested_ms,
+                                    "symbol":symbol,
+                                    "reason":message,
+                                    "operator_action":true,
+                                    "exit_actor":actor,
+                                    "operator_note":note,
+                                    "paper_only":true,
+                                }),
+                                &identity,
+                            );
+                            history.append("operator_manual_close_failed", payload.clone())?;
+                            journal.append("operator_manual_close_failed", payload)?;
+                            let _ = response.send(Err(message));
+                        }
+                    }
+                }
+            }
+        }
         let refresh_ms = i64::from(config.strategy.universe.refresh_seconds) * 1_000;
         if config.strategy.universe.dynamic_enabled
             && now_ms - last_universe_refresh_ms >= refresh_ms
@@ -579,7 +667,10 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                 frame.account = execution.account_frame()?;
                 let evaluation = graph.evaluate(&frame)?;
                 journal.append("graph_evaluation", serde_json::to_value(&evaluation)?)?;
-                let order_events = execution.apply_plans(&frame, &evaluation).await;
+                let entries_enabled = !paused.load(Ordering::SeqCst);
+                let order_events = execution
+                    .apply_plans(&frame, &evaluation, entries_enabled)
+                    .await;
                 for event in &order_events {
                     let payload = with_run_id(event.payload.clone(), &identity);
                     history.append(&event.kind, payload.clone())?;
@@ -621,6 +712,7 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                     "data_health":data_health,
                     "research":research_journal.as_ref().map(|journal|research_samples.status(journal)),
                     "execution":execution_health,
+                    "control":{"paused":!entries_enabled},
                     "runtime":identity,
                 }))?;
                 completed += 1;

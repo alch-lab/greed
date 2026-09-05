@@ -11,7 +11,8 @@ Restart=always
 RestartSec=10
 EnvironmentFile=-/etc/greed-paper.env
 
-# Credentials in /etc/greed-paper.env must belong to Binance Demo only.
+# Binance credentials must belong to Demo. GREED_WEB_PASSWORD in the same file
+# enables authenticated operator controls; unauthenticated visitors are read-only.
 NoNewPrivileges=true
 ProtectSystem=full
 ProtectHome=true

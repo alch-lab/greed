@@ -116,6 +116,10 @@ struct ExecutionMeta {
     #[serde(default)]
     pending_exit_reason: Option<String>,
     #[serde(default)]
+    pending_exit_actor: Option<String>,
+    #[serde(default)]
+    pending_exit_note: Option<String>,
+    #[serde(default)]
     stop_algo_id: Option<i64>,
     #[serde(default)]
     stop_reason: Option<String>,
@@ -1033,9 +1037,11 @@ impl BinanceDemoExecution {
                             .initial_risk_usd
                             .is_some()
                             .then_some(meta.fill_ratio.unwrap_or_default());
-                        let performance_sample = statistical_fill_ratio
-                            .is_some_and(|value| value >= MIN_PERFORMANCE_FILL_RATIO);
-                        if let Some(summary) = summary.as_ref() {
+                        let operator_intervention = meta.pending_exit_actor.is_some();
+                        let performance_sample = !operator_intervention
+                            && statistical_fill_ratio
+                                .is_some_and(|value| value >= MIN_PERFORMANCE_FILL_RATIO);
+                        if let Some(summary) = summary.as_ref().filter(|_| !operator_intervention) {
                             let trade_pnl_usd = summary.net_pnl_usd;
                             let outcome = ExecutionOutcome {
                                 exit_ms: now_ms,
@@ -1098,6 +1104,8 @@ impl BinanceDemoExecution {
                                 "mae_pct": mae_pct,
                                 "hold_ms": now_ms - meta.entry_ms,
                                 "reason": exit_reason,
+                                "exit_actor": meta.pending_exit_actor,
+                                "operator_note": meta.pending_exit_note,
                                 "planned_stop_price": meta.stop_price,
                                 "stop_slippage_bps": stop_slippage_bps,
                                 "exit_order_id": exit_order_id,
@@ -1327,9 +1335,10 @@ impl BinanceDemoExecution {
         &mut self,
         frame: &MarketFrame,
         evaluation: &GraphEvaluation,
+        allow_entries: bool,
     ) -> Vec<ExchangeEvent> {
         let mut events = self.apply_exit_intents(frame, evaluation).await;
-        if self.state.execution_halt_reason.is_some() {
+        if self.state.execution_halt_reason.is_some() || !allow_entries {
             return events;
         }
         for record in evaluation.artifacts.values() {
@@ -1531,6 +1540,8 @@ impl BinanceDemoExecution {
                             max_hold_ms: plan.max_hold_ms,
                             exit_requested: false,
                             pending_exit_reason: None,
+                            pending_exit_actor: None,
+                            pending_exit_note: None,
                             stop_algo_id: Some(fill.stop_algo_id),
                             stop_reason: Some("initial_stop".into()),
                             take_profit_order_ids: fill.take_profit_order_ids.clone(),
@@ -1613,6 +1624,87 @@ impl BinanceDemoExecution {
             }
         }
         events
+    }
+
+    /// Submit a reduce-only market close requested by an authenticated operator.
+    ///
+    /// The exchange remains the source of truth. This method records the intent
+    /// in persisted execution state; the next `sync` attributes the confirmed
+    /// fill and emits the final `exchange_exit` ledger event.
+    pub async fn request_manual_close(
+        &mut self,
+        symbol: &str,
+        actor: &str,
+        note: Option<&str>,
+        requested_ms: i64,
+    ) -> Result<ExchangeEvent> {
+        let position = self
+            .account
+            .as_ref()
+            .and_then(|account| account.positions.get(symbol))
+            .cloned()
+            .ok_or_else(|| anyhow!("{symbol} is not an open position"))?;
+        let meta = self
+            .state
+            .positions
+            .get(symbol)
+            .cloned()
+            .ok_or_else(|| anyhow!("{symbol} is not owned by this runtime"))?;
+        if meta.exit_requested {
+            return Err(anyhow!("{symbol} already has a close in progress"));
+        }
+        let current_notional_usd = position.quantity.abs() * position.mark_price;
+        let entry_notional_usd = position.quantity.abs() * position.entry_price;
+        let unrealized_pnl_pct = (entry_notional_usd > f64::EPSILON)
+            .then_some(position.unrealized_pnl / entry_notional_usd);
+        let mfe_pct =
+            meta.side.sign() * (meta.extreme_price / meta.entry_price.max(f64::EPSILON) - 1.0);
+        let mae_pct = (-meta.side.sign()
+            * (meta.adverse_price / meta.entry_price.max(f64::EPSILON) - 1.0))
+            .max(0.0);
+        self.close_market(&position).await?;
+        if let Some(state) = self.state.positions.get_mut(symbol) {
+            state.exit_requested = true;
+            state.pending_exit_reason = Some("operator_manual_close".into());
+            state.pending_exit_actor = Some(actor.to_string());
+            state.pending_exit_note = note.map(str::to_string);
+        }
+        self.save()?;
+        Ok(ExchangeEvent {
+            kind: "exchange_exit_requested".into(),
+            payload: serde_json::json!({
+                "ts_ms":requested_ms,
+                "candidate_id":meta.candidate_id,
+                "recipe":meta.recipe,
+                "symbol":symbol,
+                "side":position.side,
+                "reason":"operator_manual_close",
+                "operator_action":true,
+                "exit_actor":actor,
+                "operator_note":note,
+                "entry_ms":meta.entry_ms,
+                "entry_price":position.entry_price,
+                "mark_price":position.mark_price,
+                "quantity":position.quantity.abs(),
+                "current_notional_usd":current_notional_usd,
+                "unrealized_pnl_usd":position.unrealized_pnl,
+                "unrealized_pnl_pct":unrealized_pnl_pct,
+                "mfe_pct":mfe_pct,
+                "mae_pct":mae_pct,
+                "realized_before_close_usd":meta.cumulative_reported_pnl_usd,
+                "hold_ms":requested_ms.saturating_sub(meta.entry_ms),
+                "protection":{
+                    "stop_price":meta.stop_price,
+                    "stop_reason":meta.stop_reason,
+                    "take_profit_prices":meta.take_profit_prices,
+                    "break_even_armed":meta.break_even_armed,
+                    "runner_active":meta.runner_active,
+                    "extreme_price":meta.extreme_price,
+                },
+                "venue":"binance_demo",
+                "paper_only":true,
+            }),
+        })
     }
 
     async fn apply_exit_intents(

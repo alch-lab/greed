@@ -1,25 +1,67 @@
 use crate::config::RuntimeConfig;
 use anyhow::{Context, Result};
 use axum::{
-    extract::{Query, State},
-    http::StatusCode,
+    extract::{Path as AxumPath, Query, State},
+    http::{HeaderMap, StatusCode},
     response::{IntoResponse, Response},
-    routing::get,
+    routing::{get, post},
     Json, Router,
 };
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::{
     collections::BTreeMap,
+    env,
     io::{Read, Seek, SeekFrom},
     path::{Path, PathBuf},
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
 };
+use tokio::sync::{mpsc, oneshot};
+
+pub enum ControlCommand {
+    Audit {
+        action: &'static str,
+        actor: String,
+        requested_ms: i64,
+    },
+    ManualClose {
+        symbol: String,
+        note: Option<String>,
+        actor: String,
+        requested_ms: i64,
+        response: oneshot::Sender<Result<Value, String>>,
+    },
+}
+
+pub struct Monitor {
+    pub task: tokio::task::JoinHandle<()>,
+    pub commands: mpsc::Receiver<ControlCommand>,
+    pub paused: Arc<AtomicBool>,
+}
 
 #[derive(Clone)]
 struct ApiState {
     status_path: PathBuf,
     journal_path: PathBuf,
     history_path: PathBuf,
+    command_tx: mpsc::Sender<ControlCommand>,
+    paused: Arc<AtomicBool>,
+    operator_password: Option<Arc<str>>,
+    operator_token: Option<Arc<str>>,
+}
+
+#[derive(Deserialize)]
+struct LoginRequest {
+    password: String,
+}
+
+#[derive(Deserialize, Default)]
+struct ManualCloseRequest {
+    note: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -44,14 +86,45 @@ fn default_page_limit() -> usize {
     50
 }
 
-pub async fn start(config: &RuntimeConfig) -> Result<tokio::task::JoinHandle<()>> {
+pub async fn start(config: &RuntimeConfig) -> Result<Monitor> {
     let listener = tokio::net::TcpListener::bind(&config.http_listen)
         .await
         .with_context(|| format!("bind monitoring API on {}", config.http_listen))?;
+    let (command_tx, commands) = mpsc::channel(32);
+    let initially_paused = std::fs::read(&config.status_path)
+        .ok()
+        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
+        .and_then(|value| value["control"]["paused"].as_bool())
+        .unwrap_or(false);
+    let paused = Arc::new(AtomicBool::new(initially_paused));
+    let configured_password = env::var("GREED_WEB_PASSWORD").ok();
+    if configured_password
+        .as_ref()
+        .is_some_and(|value| value.len() < 16)
+    {
+        tracing::error!(
+            "GREED_WEB_PASSWORD is shorter than 16 characters; operator controls are disabled"
+        );
+    }
+    let operator_password = configured_password
+        .filter(|value| value.len() >= 16)
+        .map(Arc::<str>::from);
+    let operator_token = operator_password.as_ref().map(|password| {
+        let seed = format!(
+            "greed-operator-session-v1:{password}:{}:{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or_default(),
+            std::process::id()
+        );
+        Arc::<str>::from(hex_digest(seed.as_bytes()))
+    });
     let state = ApiState {
         status_path: config.status_path.clone().into(),
         journal_path: config.journal_path.clone().into(),
         history_path: config.history_path.clone().into(),
+        command_tx,
+        paused: paused.clone(),
+        operator_password,
+        operator_token,
     };
     let router = Router::new()
         .route("/api/health", get(health))
@@ -60,12 +133,22 @@ pub async fn start(config: &RuntimeConfig) -> Result<tokio::task::JoinHandle<()>
         .route("/api/history", get(history))
         .route("/api/trades", get(trades))
         .route("/api/equity", get(equity))
+        .route("/api/auth/login", post(login))
+        .route("/api/auth/session", get(session))
+        .route("/api/control/pause", post(pause))
+        .route("/api/control/resume", post(resume))
+        .route("/api/positions/{symbol}/close", post(manual_close))
         .with_state(state);
-    Ok(tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         if let Err(error) = axum::serve(listener, router).await {
             tracing::error!(error = %error, "monitoring API stopped");
         }
-    }))
+    });
+    Ok(Monitor {
+        task,
+        commands,
+        paused,
+    })
 }
 
 async fn health(State(state): State<ApiState>) -> Json<Value> {
@@ -81,6 +164,7 @@ async fn status(State(state): State<ApiState>) -> Response {
     match read_json(&state.status_path) {
         Ok(mut value) => {
             reconcile_closed_positions(&mut value, &state.history_path);
+            value["control"] = control_status(&state);
             Json(value).into_response()
         }
         Err(error)
@@ -100,6 +184,178 @@ async fn status(State(state): State<ApiState>) -> Response {
         )
             .into_response(),
     }
+}
+
+async fn login(State(state): State<ApiState>, Json(input): Json<LoginRequest>) -> Response {
+    let Some(expected) = state.operator_password.as_deref() else {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "operator login is disabled; set GREED_WEB_PASSWORD",
+        );
+    };
+    if !constant_time_eq(input.password.as_bytes(), expected.as_bytes()) {
+        return api_error(StatusCode::UNAUTHORIZED, "invalid password");
+    }
+    Json(json!({
+        "role":"operator",
+        "token":state.operator_token.as_deref(),
+        "paused":state.paused.load(Ordering::SeqCst),
+    }))
+    .into_response()
+}
+
+async fn session(State(state): State<ApiState>, headers: HeaderMap) -> Json<Value> {
+    Json(json!({
+        "role":if is_operator(&state, &headers) { "operator" } else { "guest" },
+        "login_enabled":state.operator_password.is_some(),
+        "paused":state.paused.load(Ordering::SeqCst),
+    }))
+}
+
+async fn pause(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    set_paused(state, headers, true).await
+}
+
+async fn resume(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    set_paused(state, headers, false).await
+}
+
+async fn set_paused(state: ApiState, headers: HeaderMap, paused: bool) -> Response {
+    let Some(actor) = operator_actor(&state, &headers) else {
+        return api_error(StatusCode::UNAUTHORIZED, "operator login required");
+    };
+    let previous = state.paused.swap(paused, Ordering::SeqCst);
+    let action = if paused {
+        "strategy_paused"
+    } else {
+        "strategy_resumed"
+    };
+    if previous != paused
+        && state
+            .command_tx
+            .send(ControlCommand::Audit {
+                action,
+                actor,
+                requested_ms: chrono::Utc::now().timestamp_millis(),
+            })
+            .await
+            .is_err()
+    {
+        state.paused.store(previous, Ordering::SeqCst);
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "strategy runtime is unavailable",
+        );
+    }
+    Json(json!({"ok":true,"paused":paused})).into_response()
+}
+
+async fn manual_close(
+    State(state): State<ApiState>,
+    AxumPath(symbol): AxumPath<String>,
+    headers: HeaderMap,
+    Json(input): Json<ManualCloseRequest>,
+) -> Response {
+    let Some(actor) = operator_actor(&state, &headers) else {
+        return api_error(StatusCode::UNAUTHORIZED, "operator login required");
+    };
+    let symbol = symbol.trim().to_ascii_uppercase();
+    if !valid_symbol(&symbol) {
+        return api_error(StatusCode::BAD_REQUEST, "invalid symbol");
+    }
+    let note = input
+        .note
+        .map(|value| value.trim().chars().take(240).collect::<String>())
+        .filter(|value| !value.is_empty());
+    let (response_tx, response_rx) = oneshot::channel();
+    if state
+        .command_tx
+        .send(ControlCommand::ManualClose {
+            symbol,
+            note,
+            actor,
+            requested_ms: chrono::Utc::now().timestamp_millis(),
+            response: response_tx,
+        })
+        .await
+        .is_err()
+    {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "strategy runtime is unavailable",
+        );
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(30), response_rx).await {
+        Ok(Ok(Ok(value))) => Json(value).into_response(),
+        Ok(Ok(Err(error))) => api_error(StatusCode::CONFLICT, &error),
+        Ok(Err(_)) => api_error(StatusCode::SERVICE_UNAVAILABLE, "strategy runtime stopped"),
+        Err(_) => api_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "manual close is still pending; check the position and activity ledger",
+        ),
+    }
+}
+
+fn control_status(state: &ApiState) -> Value {
+    json!({
+        "paused":state.paused.load(Ordering::SeqCst),
+        "operator_login_enabled":state.operator_password.is_some(),
+    })
+}
+
+fn is_operator(state: &ApiState, headers: &HeaderMap) -> bool {
+    let Some(expected) = state.operator_token.as_deref() else {
+        return false;
+    };
+    bearer(headers).is_some_and(|actual| constant_time_eq(actual.as_bytes(), expected.as_bytes()))
+}
+
+fn operator_actor(state: &ApiState, headers: &HeaderMap) -> Option<String> {
+    let token = bearer(headers)?;
+    is_operator(state, headers).then(|| format!("operator:{}", &hex_digest(token.as_bytes())[..12]))
+}
+
+fn bearer(headers: &HeaderMap) -> Option<&str> {
+    headers
+        .get(axum::http::header::AUTHORIZATION)?
+        .to_str()
+        .ok()?
+        .strip_prefix("Bearer ")
+}
+
+fn api_error(status: StatusCode, message: &str) -> Response {
+    (status, Json(json!({"error":message}))).into_response()
+}
+
+fn valid_symbol(value: &str) -> bool {
+    value.len() >= 5
+        && value.len() <= 24
+        && value.ends_with("USDT")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
+}
+
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    let mut difference = left.len() ^ right.len();
+    let length = left.len().max(right.len());
+    for index in 0..length {
+        difference |= usize::from(
+            left.get(index).copied().unwrap_or_default()
+                ^ right.get(index).copied().unwrap_or_default(),
+        );
+    }
+    difference == 0
+}
+
+fn hex_digest(value: &[u8]) -> String {
+    use std::fmt::Write;
+    Sha256::digest(value)
+        .iter()
+        .fold(String::with_capacity(64), |mut output, byte| {
+            write!(&mut output, "{byte:02x}").expect("writing to String cannot fail");
+            output
+        })
 }
 
 fn reconcile_closed_positions(status: &mut Value, history_path: &Path) {
@@ -172,11 +428,17 @@ async fn trades(State(state): State<ApiState>, Query(query): Query<PageQuery>) -
 }
 
 async fn equity(State(state): State<ApiState>, Query(query): Query<PageQuery>) -> Response {
+    let run_id = query.run_id;
     match reverse_jsonl_page(
         &state.history_path,
         query.limit.clamp(2, 2_000),
         query.before,
-        |value| value["kind"].as_str() == Some("exchange_equity"),
+        move |value| {
+            value["kind"].as_str() == Some("exchange_equity")
+                && run_id.as_ref().is_none_or(|expected| {
+                    value["payload"]["runtime"]["run_id"].as_str() == Some(expected.as_str())
+                })
+        },
     ) {
         Ok((events, next_cursor)) => {
             let events: Vec<_> = events.into_iter().map(compact_equity_event).collect();
@@ -209,6 +471,7 @@ fn compact_equity_event(value: Value) -> Value {
         "payload": {
             "ts_ms": value["payload"]["ts_ms"],
             "equity_usd": value["payload"]["equity_usd"],
+            "run_id": value["payload"]["runtime"]["run_id"],
         }
     })
 }
@@ -235,6 +498,7 @@ fn is_trade_event(value: &Value) -> bool {
                 | "exchange_entry_canceled"
                 | "exchange_plan_rejected"
                 | "exchange_order_rejected"
+                | "operator_manual_close_failed"
         )
     )
 }
@@ -471,5 +735,17 @@ mod tests {
         assert_eq!(status["account"]["open_positions"], 0);
         assert_eq!(status["account"]["gross_exposure_usd"], 0.0);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn operator_auth_helpers_reject_prefixes_and_invalid_symbols() {
+        assert!(constant_time_eq(b"correct horse", b"correct horse"));
+        assert!(!constant_time_eq(b"correct", b"correct horse"));
+        assert!(!constant_time_eq(b"wrong horse", b"correct horse"));
+        assert!(valid_symbol("PROMUSDT"));
+        assert!(valid_symbol("1000PEPEUSDT"));
+        assert!(!valid_symbol("promusdt"));
+        assert!(!valid_symbol("BTCUSDC"));
+        assert!(!valid_symbol("BTC/USDT"));
     }
 }

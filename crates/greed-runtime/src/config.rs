@@ -110,7 +110,7 @@ pub struct PortfolioConfig {
 impl Default for PortfolioConfig {
     fn default() -> Self {
         Self {
-            initial_equity_usd: 2_000.0,
+            initial_equity_usd: 5_000.0,
             max_positions: 3,
         }
     }

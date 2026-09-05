@@ -51,6 +51,9 @@ set +a
 
 : "${BINANCE_DEMO_API_KEY:?BINANCE_DEMO_API_KEY is missing from ${ENV_FILE}}"
 : "${BINANCE_DEMO_API_SECRET:?BINANCE_DEMO_API_SECRET is missing from ${ENV_FILE}}"
+: "${GREED_WEB_PASSWORD:?GREED_WEB_PASSWORD is missing from ${ENV_FILE}}"
+[[ "${#GREED_WEB_PASSWORD}" -ge 16 ]] \
+  || fail "GREED_WEB_PASSWORD must contain at least 16 characters"
 
 if command -v systemctl >/dev/null 2>&1 \
   && systemctl is-active --quiet greed-paper.service; then

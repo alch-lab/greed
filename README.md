@@ -41,8 +41,14 @@ cargo build --release
 ```bash
 export BINANCE_DEMO_API_KEY='...'
 export BINANCE_DEMO_API_SECRET='...'
+export GREED_WEB_PASSWORD='use-a-long-unique-password'
 ./target/release/greed paper --config config/demo.toml
 ```
+
+`GREED_WEB_PASSWORD` enables the operator session in the dashboard. Authenticated
+operators can pause new entries and submit reduce-only manual closes; guests can
+only read status and history. Operator actions and their market context are kept
+in the same durable history ledger as automatic trades.
 
 服务器首次启动或交易接口升级后，先停止运行时并执行零成交预检。脚本会验证普通订单 test
 endpoint，以及创建、查询并撤销一张远离市价的 Demo 条件保护单；它拒绝在存在持仓或挂单时运行：
@@ -52,5 +58,6 @@ sudo systemctl stop greed-paper
 sudo /opt/greed/deploy/preflight-binance-demo.sh /etc/greed-paper.env
 ```
 
-API 默认监听 `127.0.0.1:8088`：`/api/health`、`/api/status`、`/api/events`、
-`/api/history`。运行细节见 [架构说明](docs/ARCHITECTURE.zh-CN.md)。
+API 默认监听 `127.0.0.1:8088`。只读状态接口保持公开；暂停、恢复和手动平仓接口
+必须使用登录后取得的进程级 Bearer token（服务重启后自动失效）。运行细节见
+[架构说明](docs/ARCHITECTURE.zh-CN.md)。
