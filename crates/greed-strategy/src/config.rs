@@ -66,6 +66,8 @@ pub struct LaneConfig {
     pub trend_min_hour_volume_ratio: f64,
     pub trend_min_flow_imbalance: f64,
     pub trend_max_age_bars: usize,
+    pub trend_max_extension_atr: f64,
+    pub trend_max_reclaim_body_atr: f64,
     pub trend_max_signal_age_seconds: u32,
     pub trend_limit_offset_atr: f64,
     pub trend_entry_timeout_seconds: u32,
@@ -104,6 +106,8 @@ impl Default for LaneConfig {
             trend_min_hour_volume_ratio: 0.65,
             trend_min_flow_imbalance: 0.0,
             trend_max_age_bars: 2,
+            trend_max_extension_atr: 3.5,
+            trend_max_reclaim_body_atr: 2.5,
             trend_max_signal_age_seconds: 300,
             trend_limit_offset_atr: 0.03,
             trend_entry_timeout_seconds: 90,
@@ -213,6 +217,8 @@ impl StrategyConfig {
             || lanes.trend_min_hour_volume_ratio <= 0.0
             || !(-0.50..=0.50).contains(&lanes.trend_min_flow_imbalance)
             || !(1..=8).contains(&lanes.trend_max_age_bars)
+            || !(1.0..=10.0).contains(&lanes.trend_max_extension_atr)
+            || !(0.5..=10.0).contains(&lanes.trend_max_reclaim_body_atr)
             || !(0.0..=0.5).contains(&lanes.trend_limit_offset_atr)
             || !(5..=120).contains(&lanes.trend_entry_timeout_seconds)
             || !(0.0..=12.0).contains(&lanes.trend_max_entry_adverse_bps)

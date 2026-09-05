@@ -79,9 +79,13 @@ trend_min_return_4h = 0.025
 trend_min_efficiency = 0.45
 trend_min_hour_volume_ratio = 0.65
 trend_min_flow_imbalance = 0.0
-# A 6% / 4h trend is actionable only during its first two completed 15m bars.
+# A qualifying 4h trend is actionable only during its first two completed 15m bars.
 # Later pullbacks belong to a mature move and must not be presented as fresh.
 trend_max_age_bars = 2
+# A pullback reclaim must still be a pullback. Oversized displacement candles
+# are handled by the fast lane instead of being chased by trend continuation.
+trend_max_extension_atr = 3.5
+trend_max_reclaim_body_atr = 2.5
 trend_max_signal_age_seconds = 300
 # Start 0.03 ATR behind the completed reclaim, then move the post-only order
 # toward the live passive book every 15 seconds while the signal is still fresh.

@@ -256,6 +256,18 @@ impl StrategyNode for TrendContinuationNode {
                     self.config.trend_max_age_bars
                 ));
             }
+            if extension_atr > self.config.trend_max_extension_atr {
+                blockers.push(format!(
+                    "trend extension {extension_atr:.2} ATR / max {:.2} ATR",
+                    self.config.trend_max_extension_atr
+                ));
+            }
+            if reclaim_body_atr > self.config.trend_max_reclaim_body_atr {
+                blockers.push(format!(
+                    "reclaim candle body {reclaim_body_atr:.2} ATR / max {:.2} ATR",
+                    self.config.trend_max_reclaim_body_atr
+                ));
+            }
             if post_signal_extension_bps > self.config.trend_max_post_signal_extension_bps {
                 blockers.push(format!(
                     "price extended {post_signal_extension_bps:.1} bps after the signal / max {:.1} bps",
@@ -339,13 +351,15 @@ impl StrategyNode for TrendContinuationNode {
             }
             let trend_ready = return_4h.abs() >= self.config.trend_min_return_4h
                 && trend_age_bars <= self.config.trend_max_age_bars
+                && extension_atr <= self.config.trend_max_extension_atr
+                && reclaim_body_atr <= self.config.trend_max_reclaim_body_atr
                 && sign * return_12h > 0.0
                 && ema_aligned
                 && efficiency >= self.config.trend_min_efficiency;
             trend_hits += u64::from(trend_ready);
             reclaim_hits += u64::from(trend_ready && touched && reclaimed);
             let score = return_4h.abs() * efficiency * volume_ratio;
-            let progress = (13usize.saturating_sub(blockers.len()).min(13) as f64) / 13.0;
+            let progress = (15usize.saturating_sub(blockers.len()).min(15) as f64) / 15.0;
             let verdict = if blockers.is_empty() {
                 Verdict::Pass
             } else {
