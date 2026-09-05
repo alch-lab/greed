@@ -1872,13 +1872,15 @@ impl BinanceDemoExecution {
                     reprices,
                     final_limit,
                 } => EntryExecution {
-                    order,
-                    requested_quantity: quantity,
-                    mode: if reprices > 0 {
+                    mode: if order["_greedTradeThroughRecovery"].as_bool() == Some(true) {
+                        "maker_partial_trade_through_recovery"
+                    } else if reprices > 0 {
                         "adaptive_maker_limit"
                     } else {
                         "maker_limit"
                     },
+                    order,
+                    requested_quantity: quantity,
                     maker_attempted: true,
                     maker_wait_ms: waited_ms,
                     maker_reprices: reprices,
@@ -2527,6 +2529,98 @@ impl BinanceDemoExecution {
                 return Err(anyhow!("post-only entry ended with status {status}"));
             }
             let now_ms = chrono::Utc::now().timestamp_millis();
+            let partial_quantity = parse_f64(&order, "executedQty").unwrap_or_default();
+            if partial_quantity > f64::EPSILON
+                && partial_quantity + rules.quantity_step * 0.5 < quantity
+            {
+                // Binance Demo occasionally leaves a resting maker order only
+                // fractionally filled even after the public best price trades
+                // through it.  On a liquid production book that order would
+                // already be marketable. Recover only at the same-or-better
+                // price; this restores normal limit semantics without chasing.
+                let ticker = self
+                    .public_get_params(
+                        "/fapi/v1/ticker/bookTicker",
+                        &[("symbol", plan.symbol.as_str())],
+                    )
+                    .await?;
+                let executable = if plan.side == Side::Buy {
+                    parse_f64(&ticker, "askPrice")
+                } else {
+                    parse_f64(&ticker, "bidPrice")
+                };
+                let traded_through = executable.is_some_and(|price| {
+                    price_traded_through_limit(
+                        plan.side,
+                        price,
+                        passive_price,
+                        rules.price_tick,
+                        plan.entry_invalidation_bps,
+                    )
+                });
+                if traded_through {
+                    let canceled = self
+                        .cancel_or_reconcile_entry(&plan.symbol, &active_client_id)
+                        .await?;
+                    let maker_quantity =
+                        parse_f64(&canceled, "executedQty").unwrap_or(partial_quantity);
+                    if maker_quantity + rules.quantity_step * 0.5 >= quantity {
+                        return Ok(PostOnlyEntry::Filled {
+                            order: canceled,
+                            waited_ms: now_ms.saturating_sub(started_ms),
+                            reprices: reprice_attempt,
+                            final_limit: passive_price,
+                        });
+                    }
+                    let remaining = floor_step(quantity - maker_quantity, rules.quantity_step);
+                    if remaining >= rules.min_quantity
+                        && remaining * executable.unwrap_or_default() >= rules.min_notional
+                    {
+                        let recovery_id = client_order_id("crossfill", &plan.candidate_id);
+                        let recovery = self
+                            .submit_or_lookup(
+                                &plan.symbol,
+                                &recovery_id,
+                                vec![
+                                    ("symbol".into(), plan.symbol.clone()),
+                                    ("side".into(), side_name(plan.side).into()),
+                                    ("type".into(), "LIMIT".into()),
+                                    ("timeInForce".into(), "IOC".into()),
+                                    ("quantity".into(), decimal(remaining, rules.quantity_step)),
+                                    ("price".into(), decimal(passive_price, rules.price_tick)),
+                                    ("newClientOrderId".into(), recovery_id.clone()),
+                                    ("newOrderRespType".into(), "RESULT".into()),
+                                ],
+                            )
+                            .await?;
+                        let merged = merge_entry_orders(
+                            &canceled,
+                            &recovery,
+                            passive_price,
+                            executable.unwrap_or(passive_price),
+                        );
+                        tracing::warn!(
+                            symbol = %plan.symbol,
+                            maker_quantity,
+                            recovery_quantity = remaining,
+                            limit = passive_price,
+                            "recovered a Binance Demo maker partial after best-price trade-through"
+                        );
+                        return Ok(PostOnlyEntry::Filled {
+                            order: merged,
+                            waited_ms: now_ms.saturating_sub(started_ms),
+                            reprices: reprice_attempt,
+                            final_limit: passive_price,
+                        });
+                    }
+                    return Ok(PostOnlyEntry::Filled {
+                        order: canceled,
+                        waited_ms: now_ms.saturating_sub(started_ms),
+                        reprices: reprice_attempt,
+                        final_limit: passive_price,
+                    });
+                }
+            }
             let invalidation = match self.pending_entry_guard(plan, now_ms) {
                 EntryGuardState::Healthy => {
                     guard_unavailable_since_ms = None;
@@ -3241,6 +3335,33 @@ fn parse_f64(value: &Value, key: &str) -> Option<f64> {
         .or_else(|| value[key].as_f64())
 }
 
+fn merge_entry_orders(
+    maker: &Value,
+    recovery: &Value,
+    maker_fallback_price: f64,
+    recovery_fallback_price: f64,
+) -> Value {
+    let maker_quantity = parse_f64(maker, "executedQty").unwrap_or_default();
+    let recovery_quantity = parse_f64(recovery, "executedQty").unwrap_or_default();
+    let total_quantity = maker_quantity + recovery_quantity;
+    let maker_price = parse_f64(maker, "avgPrice")
+        .filter(|value| *value > 0.0)
+        .unwrap_or(maker_fallback_price);
+    let recovery_price = parse_f64(recovery, "avgPrice")
+        .filter(|value| *value > 0.0)
+        .unwrap_or(recovery_fallback_price);
+    let average_price = if total_quantity > f64::EPSILON {
+        (maker_quantity * maker_price + recovery_quantity * recovery_price) / total_quantity
+    } else {
+        recovery_price
+    };
+    let mut merged = recovery.clone();
+    merged["executedQty"] = Value::String(total_quantity.to_string());
+    merged["avgPrice"] = Value::String(average_price.to_string());
+    merged["_greedTradeThroughRecovery"] = Value::Bool(true);
+    merged
+}
+
 fn side_name(side: Side) -> &'static str {
     match side {
         Side::Buy => "BUY",
@@ -3393,6 +3514,20 @@ fn passive_price_improves(side: Side, current: f64, proposed: f64, tick: f64) ->
 fn entry_adverse_bps(side: Side, executable: f64, reference: f64) -> f64 {
     side.sign() * (executable / reference.max(f64::EPSILON) - 1.0) * 10_000.0
 }
+fn price_traded_through_limit(
+    side: Side,
+    executable: f64,
+    limit: f64,
+    tick: f64,
+    max_invalidation_bps: f64,
+) -> bool {
+    let crossed = match side {
+        Side::Buy => executable <= limit + tick * 0.5,
+        Side::Sell => executable >= limit - tick * 0.5,
+    };
+    let overshoot_bps = -side.sign() * (executable / limit.max(f64::EPSILON) - 1.0) * 10_000.0;
+    crossed && (max_invalidation_bps <= 0.0 || overshoot_bps <= max_invalidation_bps)
+}
 fn pending_entry_guard_state(
     plan: &greed_kernel::PositionPlan,
     signal_mid: f64,
@@ -3505,6 +3640,63 @@ mod tests {
         let value = client_order_id("entry", "alt.recipe:test:cycle-123");
         assert_eq!(value, client_order_id("entry", "alt.recipe:test:cycle-123"));
         assert!(value.len() <= 36);
+    }
+
+    #[test]
+    fn trade_through_recovery_preserves_total_quantity_and_weighted_price() {
+        let maker = serde_json::json!({"executedQty":"2", "avgPrice":"99"});
+        let recovery = serde_json::json!({"executedQty":"8", "avgPrice":"98.5", "orderId":7});
+        let merged = merge_entry_orders(&maker, &recovery, 100.0, 100.0);
+        assert_eq!(parse_f64(&merged, "executedQty"), Some(10.0));
+        assert_eq!(parse_f64(&merged, "avgPrice"), Some(98.6));
+        assert_eq!(merged["orderId"], 7);
+        assert_eq!(merged["_greedTradeThroughRecovery"], true);
+    }
+
+    #[test]
+    fn trade_through_recovery_never_chases_beyond_the_resting_limit() {
+        assert!(price_traded_through_limit(
+            Side::Buy,
+            98.9,
+            99.0,
+            0.01,
+            30.0
+        ));
+        assert!(!price_traded_through_limit(
+            Side::Buy,
+            98.6,
+            99.0,
+            0.01,
+            30.0
+        ));
+        assert!(!price_traded_through_limit(
+            Side::Buy,
+            99.1,
+            99.0,
+            0.01,
+            30.0
+        ));
+        assert!(price_traded_through_limit(
+            Side::Sell,
+            100.1,
+            100.0,
+            0.01,
+            30.0
+        ));
+        assert!(!price_traded_through_limit(
+            Side::Sell,
+            100.4,
+            100.0,
+            0.01,
+            30.0
+        ));
+        assert!(!price_traded_through_limit(
+            Side::Sell,
+            99.9,
+            100.0,
+            0.01,
+            30.0
+        ));
     }
 
     #[test]
