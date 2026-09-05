@@ -55,7 +55,6 @@ impl Default for UniverseConfig {
 pub struct LaneConfig {
     pub max_candidates_per_lane: usize,
     pub max_spread_bps: f64,
-    pub min_depth_usd: f64,
     pub fast_activation_enabled: bool,
     pub fast_min_market_return_1h: f64,
     pub fast_min_market_breadth: f64,
@@ -109,17 +108,16 @@ impl Default for LaneConfig {
         Self {
             max_candidates_per_lane: 2,
             max_spread_bps: 6.0,
-            min_depth_usd: 20_000.0,
             fast_activation_enabled: true,
             fast_min_market_return_1h: 0.002,
             fast_min_market_breadth: 0.50,
             fast_min_body_return_5m: 0.005,
-            fast_min_volume_ratio_5m: 2.50,
+            fast_min_volume_ratio_5m: 2.0,
             fast_min_flow_5m: 0.15,
             fast_max_compression_ratio: 1.05,
-            fast_max_prebreak_return_1h: 0.01,
-            fast_max_return_4h: 0.05,
-            fast_max_oi_change_15m: 0.01,
+            fast_max_prebreak_return_1h: 0.03,
+            fast_max_return_4h: 0.06,
+            fast_max_oi_change_15m: 0.03,
             fast_risk_per_trade_pct: 0.005,
             trend_min_return_4h: 0.025,
             trend_min_efficiency: 0.45,
@@ -168,6 +166,14 @@ pub struct RiskConfig {
     pub high_confidence_threshold: f64,
     pub max_notional_per_trade_multiple: f64,
     pub max_total_gross_multiple: f64,
+    /// Never consume more than this fraction of the executable top-20 side.
+    pub max_book_participation_pct: f64,
+    /// Maximum simulated VWAP impact for a protective/taker exit.
+    pub max_book_slippage_bps: f64,
+    /// A liquidity-reduced order must retain this fraction of desired size.
+    pub min_liquidity_size_ratio: f64,
+    /// And it must remain at least this fraction of current strategy equity.
+    pub min_liquidity_notional_multiple: f64,
     pub max_positions: usize,
     pub initial_stop_pct: f64,
     pub first_take_profit_r: f64,
@@ -197,6 +203,10 @@ impl Default for RiskConfig {
             high_confidence_threshold: 0.85,
             max_notional_per_trade_multiple: 1.50,
             max_total_gross_multiple: 4.0,
+            max_book_participation_pct: 0.35,
+            max_book_slippage_bps: 8.0,
+            min_liquidity_size_ratio: 0.50,
+            min_liquidity_notional_multiple: 0.20,
             max_positions: 3,
             initial_stop_pct: 0.0125,
             first_take_profit_r: 2.0,
@@ -287,7 +297,6 @@ impl StrategyConfig {
             || !(0.002..=0.02).contains(&lanes.trend_reentry_trailing_distance_pct)
             || !(5..=120).contains(&lanes.trend_reentry_entry_timeout_seconds)
             || lanes.max_spread_bps <= 0.0
-            || lanes.min_depth_usd <= 0.0
         {
             return Err("alpha lane parameters are invalid".into());
         }
@@ -297,6 +306,10 @@ impl StrategyConfig {
             || risk.high_confidence_risk_per_trade_pct > 0.015
             || !(0.20..=1.5).contains(&risk.max_notional_per_trade_multiple)
             || !(0.5..=4.0).contains(&risk.max_total_gross_multiple)
+            || !(0.05..=0.50).contains(&risk.max_book_participation_pct)
+            || !(1.0..=25.0).contains(&risk.max_book_slippage_bps)
+            || !(0.25..=1.0).contains(&risk.min_liquidity_size_ratio)
+            || !(0.05..=0.50).contains(&risk.min_liquidity_notional_multiple)
             || !(1..=5).contains(&risk.max_positions)
             || !(0.003..=0.03).contains(&risk.initial_stop_pct)
             || risk.first_take_profit_r <= 0.0

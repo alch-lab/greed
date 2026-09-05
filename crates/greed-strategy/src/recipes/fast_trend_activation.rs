@@ -71,6 +71,26 @@ fn oi_change(values: &[(i64, f64)], at_ms: i64, lookback_ms: i64) -> Option<f64>
     (prior > 0.0).then_some(current / prior - 1.0)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn is_ignition(
+    breakout: bool,
+    body_return: f64,
+    volume_ratio: f64,
+    flow: Option<f64>,
+    compression_ratio: f64,
+    prebreak_return_1h: f64,
+    return_4h: f64,
+    config: &LaneConfig,
+) -> bool {
+    breakout
+        && body_return >= config.fast_min_body_return_5m
+        && volume_ratio >= config.fast_min_volume_ratio_5m
+        && flow.is_some_and(|value| value >= config.fast_min_flow_5m)
+        && compression_ratio <= config.fast_max_compression_ratio
+        && prebreak_return_1h <= config.fast_max_prebreak_return_1h
+        && return_4h <= config.fast_max_return_4h
+}
+
 impl StrategyNode for FastTrendActivationNode {
     fn id(&self) -> &str {
         &self.id
@@ -149,13 +169,16 @@ impl StrategyNode for FastTrendActivationNode {
                 .max(f64::EPSILON);
             let prebreak_return_1h = bar.open / closed[index - 12].open - 1.0;
             let return_4h = bar.close / closed[index - 48].close - 1.0;
-            let ignition = bar.close > breakout_level
-                && body_return >= self.config.fast_min_body_return_5m
-                && volume_ratio >= self.config.fast_min_volume_ratio_5m
-                && flow.is_some_and(|value| value >= self.config.fast_min_flow_5m)
-                && compression_ratio <= self.config.fast_max_compression_ratio
-                && prebreak_return_1h <= self.config.fast_max_prebreak_return_1h
-                && return_4h <= self.config.fast_max_return_4h;
+            let ignition = is_ignition(
+                bar.close > breakout_level,
+                body_return,
+                volume_ratio,
+                flow,
+                compression_ratio,
+                prebreak_return_1h,
+                return_4h,
+                &self.config,
+            );
             ignition_hits += u64::from(ignition);
 
             let confirmation = instrument
@@ -247,11 +270,6 @@ impl StrategyNode for FastTrendActivationNode {
                 ));
             }
 
-            let expected_notional = ctx.frame.account.equity_usd;
-            let required_depth = self
-                .config
-                .min_depth_usd
-                .min((expected_notional * 8.0).max(5_000.0));
             match instrument.book.as_ref() {
                 Some(book) if book.meta.usable_at(ctx.frame.as_of_ms) => {
                     let spread = (book.ask - book.bid)
@@ -259,9 +277,6 @@ impl StrategyNode for FastTrendActivationNode {
                         * 10_000.0;
                     if spread > self.config.max_spread_bps {
                         blockers.push(format!("spread {spread:.1} bps is too wide"));
-                    }
-                    if book.bid_depth_usd.min(book.ask_depth_usd) < required_depth {
-                        blockers.push(format!("book depth is below ${required_depth:.0}"));
                     }
                 }
                 _ => blockers.push("order book is warming".into()),
@@ -459,5 +474,21 @@ mod tests {
         let values = [(0, 100.0), (300_000, 101.0), (900_000, 102.0)];
         let change = oi_change(&values, 900_000, 900_000).unwrap();
         assert!((change - 0.02).abs() < 1e-9);
+    }
+
+    #[test]
+    fn early_surge_thresholds_admit_the_first_4usdt_leg() {
+        let config = LaneConfig::default();
+        assert!(is_ignition(
+            true,
+            0.0092,
+            2.1,
+            Some(0.20),
+            1.033,
+            0.029,
+            0.052,
+            &config,
+        ));
+        assert!(0.0233 <= config.fast_max_oi_change_15m);
     }
 }

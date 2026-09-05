@@ -53,10 +53,9 @@ max_symbols = 46
 top_liquidity_names = 26
 top_mover_names = 20
 min_24h_quote_volume_usd = 15000000.0
-# A thin contract may temporarily join the mover side of the universe when it
-# is already active now, rather than waiting for its rolling 24h volume to
-# catch up. This only grants data coverage: all strategy and live-book gates
-# remain unchanged before an order can be planned.
+# A thin contract may join on either a fresh 15m impulse or an established 24h
+# move. Requiring both made early movers invisible until the first leg was over.
+# This only grants data coverage; signal and plan-level liquidity gates remain.
 surge_min_24h_quote_volume_usd = 2000000.0
 surge_min_abs_change_24h = 0.08
 surge_min_abs_return_15m = 0.015
@@ -65,9 +64,6 @@ refresh_seconds = 15
 [strategy.lanes]
 max_candidates_per_lane = 2
 max_spread_bps = 6.0
-# Keep at least ten times the planned notional visible near the book; spread
-# remains capped independently at 6 bps.
-min_depth_usd = 20000.0
 # Separate paper-only offensive lane. It enters before the slower 4h trend
 # recipe, but only after a completed 5m ignition, a 1m retest, broad altcoin
 # participation and moderate (not crowded) open-interest growth.
@@ -75,12 +71,15 @@ fast_activation_enabled = true
 fast_min_market_return_1h = 0.002
 fast_min_market_breadth = 0.50
 fast_min_body_return_5m = 0.005
-fast_min_volume_ratio_5m = 2.50
+fast_min_volume_ratio_5m = 2.0
 fast_min_flow_5m = 0.15
 fast_max_compression_ratio = 1.05
-fast_max_prebreak_return_1h = 0.01
-fast_max_return_4h = 0.05
-fast_max_oi_change_15m = 0.01
+# Stay early without demanding a perfectly flat pre-break hour. 4USDT on
+# 2026-09-05 began its persistent leg with +2.9% pre-break, +5.2% over 4h and
+# +2.3% OI over 15m, then supplied the required 1m reclaim.
+fast_max_prebreak_return_1h = 0.03
+fast_max_return_4h = 0.06
+fast_max_oi_change_15m = 0.03
 fast_risk_per_trade_pct = 0.005
 trend_min_return_4h = 0.025
 trend_min_efficiency = 0.45
@@ -158,6 +157,14 @@ high_confidence_risk_per_trade_pct = 0.010
 high_confidence_threshold = 0.85
 max_notional_per_trade_multiple = 1.50
 max_total_gross_multiple = 4.00
+# Size against the actual protective-exit side of the live top-20 book. Orders
+# may shrink, but may not consume more than 35% of visible depth or simulate
+# more than 8 bps of VWAP impact. Reject sizes below half the intended order or
+# 0.20x equity because their expected dollar contribution is immaterial.
+max_book_participation_pct = 0.35
+max_book_slippage_bps = 8.0
+min_liquidity_size_ratio = 0.50
+min_liquidity_notional_multiple = 0.20
 max_positions = 3
 initial_stop_pct = 0.0125
 first_take_profit_r = 2.0

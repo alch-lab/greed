@@ -10,7 +10,9 @@ use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use config::AppConfig;
 use execution::BinanceDemoExecution;
-use greed_kernel::{AccountFrame, Artifact, GraphEvaluation, NodeContext, StrategyNode, Verdict};
+use greed_kernel::{
+    AccountFrame, Artifact, ArtifactRecord, GraphEvaluation, NodeContext, StrategyNode, Verdict,
+};
 use greed_strategy::{build_graph, risk::PositionPlannerNode, StrategyConfig};
 use journal::{Journal, ResearchRecorder, SampleRecorder, StatusWriter};
 use source::BinanceMarketSource;
@@ -215,6 +217,18 @@ fn strategy_funnels_demo(
             .flat_map(|candidate| candidate.blockers.iter())
             .cloned()
             .collect::<std::collections::BTreeSet<_>>();
+        for candidate in &candidates {
+            let key = format!("portfolio.liquidity.{}", candidate.id);
+            if let Some(ArtifactRecord {
+                artifact: Artifact::State(state),
+                ..
+            }) = evaluation.artifacts.get(&key)
+            {
+                if state.verdict == Verdict::Block {
+                    blocker_set.extend(state.reasons.iter().cloned());
+                }
+            }
+        }
         if performance_gated > 0 {
             blocker_set.insert("rolling PF gate is cooling down this recipe".into());
         }

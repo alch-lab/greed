@@ -1,9 +1,120 @@
 use crate::{primitives::meta, RiskConfig};
 use greed_kernel::{
-    Artifact, ArtifactRecord, DataQuality, NodeContext, PositionPlan, StateArtifact, StrategyNode,
-    Verdict,
+    Artifact, ArtifactRecord, BookState, DataQuality, NodeContext, PositionPlan, PriceLevel, Side,
+    StateArtifact, StrategyNode, Verdict,
 };
 use std::collections::BTreeMap;
+
+#[derive(Debug, Clone, Copy)]
+struct LiquiditySizing {
+    notional_cap_usd: f64,
+    visible_exit_depth_usd: f64,
+    impact_cap_usd: f64,
+    expected_exit_slippage_bps: Option<f64>,
+}
+
+fn sweep_slippage_bps(levels: &[PriceLevel], notional_usd: f64, reference: f64) -> Option<f64> {
+    if levels.is_empty() || notional_usd <= 0.0 || reference <= 0.0 {
+        return None;
+    }
+    let mut remaining = notional_usd;
+    let mut quantity = 0.0;
+    let mut cost = 0.0;
+    for level in levels {
+        if level.price <= 0.0 || level.quantity <= 0.0 {
+            continue;
+        }
+        let quote = level.price * level.quantity;
+        let take = remaining.min(quote);
+        quantity += take / level.price;
+        cost += take;
+        remaining -= take;
+        if remaining <= f64::EPSILON {
+            break;
+        }
+    }
+    if remaining > 1e-6 || quantity <= f64::EPSILON {
+        return None;
+    }
+    Some((cost / quantity / reference - 1.0).abs() * 10_000.0)
+}
+
+fn sweep_capacity_usd(levels: &[PriceLevel], reference: f64, max_slippage_bps: f64) -> f64 {
+    if levels.is_empty() || reference <= 0.0 {
+        return 0.0;
+    }
+    let total: f64 = levels
+        .iter()
+        .map(|level| level.price * level.quantity)
+        .filter(|value| value.is_finite() && *value > 0.0)
+        .sum();
+    if total <= f64::EPSILON {
+        return 0.0;
+    }
+    if sweep_slippage_bps(levels, total, reference)
+        .is_some_and(|slippage| slippage <= max_slippage_bps)
+    {
+        return total;
+    }
+    let mut low = 0.0;
+    let mut high = total;
+    for _ in 0..40 {
+        let middle = (low + high) * 0.5;
+        if sweep_slippage_bps(levels, middle, reference)
+            .is_some_and(|slippage| slippage <= max_slippage_bps)
+        {
+            low = middle;
+        } else {
+            high = middle;
+        }
+    }
+    low
+}
+
+fn liquidity_sizing(
+    book: &BookState,
+    side: Side,
+    desired_notional_usd: f64,
+    config: &RiskConfig,
+) -> LiquiditySizing {
+    // Entries are passive, so the immediately executable side that matters
+    // most is the protective exit: bids for a long, asks for a short.
+    let (levels, reference, visible_depth, fallback_slippage) = match side {
+        Side::Buy => (
+            book.bids.as_slice(),
+            book.bid,
+            book.bid_depth_usd,
+            book.expected_sell_slippage_bps,
+        ),
+        Side::Sell => (
+            book.asks.as_slice(),
+            book.ask,
+            book.ask_depth_usd,
+            book.expected_buy_slippage_bps,
+        ),
+    };
+    let impact_cap = if levels.is_empty() {
+        fallback_slippage
+            .filter(|slippage| *slippage <= config.max_book_slippage_bps)
+            .map_or(0.0, |_| visible_depth)
+    } else {
+        sweep_capacity_usd(levels, reference, config.max_book_slippage_bps)
+    };
+    let participation_cap = visible_depth.max(0.0) * config.max_book_participation_pct;
+    let notional_cap = impact_cap.min(participation_cap).max(0.0);
+    let sized_notional = desired_notional_usd.min(notional_cap);
+    let expected_exit_slippage_bps = if levels.is_empty() {
+        fallback_slippage
+    } else {
+        sweep_slippage_bps(levels, sized_notional, reference)
+    };
+    LiquiditySizing {
+        notional_cap_usd: notional_cap,
+        visible_exit_depth_usd: visible_depth,
+        impact_cap_usd: impact_cap,
+        expected_exit_slippage_bps,
+    }
+}
 
 fn tag_f64(candidate: &greed_kernel::TradeCandidate, key: &str) -> Option<f64> {
     candidate.tags.get(key)?.parse().ok()
@@ -115,6 +226,8 @@ impl StrategyNode for PositionPlannerNode {
         let mut slots = self.config.max_positions.saturating_sub(a.open_positions);
         let mut planned_symbols = std::collections::BTreeSet::new();
         let mut suppressed_symbol_conflicts = 0u64;
+        let mut liquidity_rejections = 0u64;
+        let mut liquidity_scaled_plans = 0u64;
         for c in candidates {
             if slots == 0 {
                 break;
@@ -169,12 +282,82 @@ impl StrategyNode for PositionPlannerNode {
             let early_failure_after_ms = tag_i64(c, "early_failure_after_ms").unwrap_or_default();
             let early_failure_adverse_r = tag_f64(c, "early_failure_adverse_r").unwrap_or_default();
             let early_failure_max_mfe_r = tag_f64(c, "early_failure_max_mfe_r").unwrap_or_default();
-            let notional = (a.equity_usd * risk_pct / stop_pct).min(
+            let desired_notional = (a.equity_usd * risk_pct / stop_pct).min(
                 a.equity_usd
                     * tag_f64(c, "max_notional_multiple")
                         .unwrap_or(self.config.max_notional_per_trade_multiple)
                         .clamp(0.20, self.config.max_notional_per_trade_multiple),
             );
+            let book = i.book.as_ref().expect("market_ok requires a live book");
+            let liquidity = liquidity_sizing(book, c.side, desired_notional, &self.config);
+            let minimum_notional = (desired_notional * self.config.min_liquidity_size_ratio)
+                .max(a.equity_usd * self.config.min_liquidity_notional_multiple)
+                .min(desired_notional);
+            let notional = desired_notional.min(liquidity.notional_cap_usd);
+            let liquidity_ok = notional + 1e-6 >= minimum_notional;
+            let was_scaled = liquidity_ok && notional + 1e-6 < desired_notional;
+            let liquidity_reason = if !liquidity_ok {
+                Some(format!(
+                    "{} exit liquidity supports ${notional:.0} / minimum ${minimum_notional:.0} (wanted ${desired_notional:.0})",
+                    if c.side == Side::Buy { "bid" } else { "ask" }
+                ))
+            } else if was_scaled {
+                Some(format!(
+                    "liquidity scaled ${desired_notional:.0} to ${notional:.0}"
+                ))
+            } else {
+                None
+            };
+            out.push(ArtifactRecord {
+                key: format!("portfolio.liquidity.{}", c.id),
+                producer: self.id.clone(),
+                artifact: Artifact::State(StateArtifact {
+                    state: if !liquidity_ok {
+                        "too_thin"
+                    } else if was_scaled {
+                        "scaled"
+                    } else {
+                        "full_size"
+                    }
+                    .into(),
+                    score: notional / desired_notional.max(1.0),
+                    side: Some(c.side),
+                    verdict: if liquidity_ok {
+                        Verdict::Pass
+                    } else {
+                        Verdict::Block
+                    },
+                    reasons: liquidity_reason.into_iter().collect(),
+                    metrics: BTreeMap::from([
+                        ("desired_notional_usd".into(), desired_notional),
+                        ("sized_notional_usd".into(), notional),
+                        ("minimum_notional_usd".into(), minimum_notional),
+                        (
+                            "visible_exit_depth_usd".into(),
+                            liquidity.visible_exit_depth_usd,
+                        ),
+                        ("impact_cap_usd".into(), liquidity.impact_cap_usd),
+                        ("liquidity_cap_usd".into(), liquidity.notional_cap_usd),
+                        (
+                            "expected_exit_slippage_bps".into(),
+                            liquidity.expected_exit_slippage_bps.unwrap_or(-1.0),
+                        ),
+                    ]),
+                    meta: meta(
+                        ctx.frame.as_of_ms,
+                        30_000,
+                        DataQuality::Complete,
+                        1.0,
+                        vec![format!("{}.book", c.symbol)],
+                    ),
+                }),
+            });
+            if !liquidity_ok {
+                liquidity_rejections += 1;
+                planned_symbols.remove(&c.symbol);
+                continue;
+            }
+            liquidity_scaled_plans += u64::from(was_scaled);
             let multiple = notional / a.equity_usd.max(1.0);
             if planned_gross + multiple > self.config.max_total_gross_multiple + f64::EPSILON {
                 planned_symbols.remove(&c.symbol);
@@ -216,9 +399,26 @@ impl StrategyNode for PositionPlannerNode {
                 .first()
                 .map(|value| value.1)
                 .unwrap_or_default();
+            let mut signal_context = c.tags.clone();
+            signal_context.insert("desired_notional_usd".into(), desired_notional.to_string());
+            signal_context.insert(
+                "liquidity_cap_usd".into(),
+                liquidity.notional_cap_usd.to_string(),
+            );
+            signal_context.insert("liquidity_sized_notional_usd".into(), notional.to_string());
+            signal_context.insert(
+                "visible_exit_depth_usd".into(),
+                liquidity.visible_exit_depth_usd.to_string(),
+            );
+            if let Some(slippage) = liquidity.expected_exit_slippage_bps {
+                signal_context.insert(
+                    "expected_sized_exit_slippage_bps".into(),
+                    slippage.to_string(),
+                );
+            }
             let plan = PositionPlan {
                 candidate_id: c.id.clone(),
-                signal_context: c.tags.clone(),
+                signal_context,
                 symbol: c.symbol.clone(),
                 side: c.side,
                 reference_price: c.reference_price,
@@ -285,6 +485,13 @@ impl StrategyNode for PositionPlannerNode {
             state.metrics.insert(
                 "suppressed_symbol_conflicts".into(),
                 suppressed_symbol_conflicts as f64,
+            );
+            state
+                .metrics
+                .insert("liquidity_rejections".into(), liquidity_rejections as f64);
+            state.metrics.insert(
+                "liquidity_scaled_plans".into(),
+                liquidity_scaled_plans as f64,
             );
         }
         Ok(out)
@@ -359,6 +566,124 @@ mod tests {
                 tags: BTreeMap::from([("priority".into(), priority.to_string())]),
             }),
         }
+    }
+
+    #[test]
+    fn liquidity_cap_uses_the_protective_exit_side_and_visible_participation() {
+        let book = BookState {
+            meta: meta(),
+            bid: 100.0,
+            ask: 100.01,
+            bid_depth_usd: 10_000.0,
+            ask_depth_usd: 100_000.0,
+            expected_buy_slippage_bps: Some(0.0),
+            expected_sell_slippage_bps: Some(0.0),
+            bids: vec![PriceLevel {
+                price: 100.0,
+                quantity: 100.0,
+            }],
+            asks: vec![PriceLevel {
+                price: 100.01,
+                quantity: 1_000.0,
+            }],
+        };
+        let sizing = liquidity_sizing(&book, Side::Buy, 6_000.0, &RiskConfig::default());
+        assert!((sizing.notional_cap_usd - 3_500.0).abs() < 1e-6);
+        assert_eq!(sizing.visible_exit_depth_usd, 10_000.0);
+        assert_eq!(sizing.expected_exit_slippage_bps, Some(0.0));
+    }
+
+    #[test]
+    fn liquidity_impact_cap_stops_before_a_deep_but_distant_level() {
+        let levels = vec![
+            PriceLevel {
+                price: 100.0,
+                quantity: 10.0,
+            },
+            PriceLevel {
+                price: 99.0,
+                quantity: 100.0,
+            },
+        ];
+        let cap = sweep_capacity_usd(&levels, 100.0, 8.0);
+        assert!(cap > 1_000.0);
+        assert!(cap < 2_000.0);
+        assert!(sweep_slippage_bps(&levels, cap, 100.0).unwrap() <= 8.01);
+    }
+
+    fn planned_output_for_bid_depth(bid_depth_usd: f64) -> Vec<ArtifactRecord> {
+        let mut record = candidate("trend:ALT", "trend_continuation", "ALTUSDT", 1);
+        let Artifact::Candidate(value) = &mut record.artifact else {
+            panic!("candidate fixture must contain a candidate");
+        };
+        value
+            .tags
+            .insert("risk_per_trade_pct".into(), "0.015".into());
+        let artifacts = BTreeMap::from([(record.key.clone(), record)]);
+        let mut market = instrument("ALTUSDT");
+        let book = market.book.as_mut().expect("book fixture");
+        book.bid_depth_usd = bid_depth_usd;
+        book.bids = vec![PriceLevel {
+            price: book.bid,
+            quantity: bid_depth_usd / book.bid,
+        }];
+        let frame = MarketFrame {
+            as_of_ms: 2_000,
+            instruments: BTreeMap::from([("ALTUSDT".into(), market)]),
+            account: AccountFrame {
+                equity_usd: 5_000.0,
+                cash_usd: 5_000.0,
+                realized_pnl_usd: 0.0,
+                peak_equity_usd: 5_000.0,
+                risk_day_start_equity_usd: 5_000.0,
+                gross_exposure_usd: 0.0,
+                open_positions: 0,
+            },
+        };
+        PositionPlannerNode::new(vec![], RiskConfig::default())
+            .evaluate(&NodeContext {
+                frame: &frame,
+                artifacts: &artifacts,
+            })
+            .unwrap()
+    }
+
+    #[test]
+    fn planner_scales_a_trade_when_liquidity_still_supports_meaningful_size() {
+        let output = planned_output_for_bid_depth(12_000.0);
+        let plan = output.iter().find_map(|record| match &record.artifact {
+            Artifact::PositionPlan(plan) => Some(plan),
+            _ => None,
+        });
+        assert!((plan.expect("scaled plan").notional_usd - 4_200.0).abs() < 1e-6);
+        let state = output
+            .iter()
+            .find(|record| record.key.starts_with("portfolio.liquidity."))
+            .and_then(|record| match &record.artifact {
+                Artifact::State(state) => Some(state),
+                _ => None,
+            })
+            .expect("liquidity state");
+        assert_eq!(state.state, "scaled");
+        assert_eq!(state.verdict, Verdict::Pass);
+    }
+
+    #[test]
+    fn planner_rejects_a_liquidity_reduction_below_half_desired_size() {
+        let output = planned_output_for_bid_depth(6_000.0);
+        assert!(!output
+            .iter()
+            .any(|record| matches!(record.artifact, Artifact::PositionPlan(_))));
+        let state = output
+            .iter()
+            .find(|record| record.key.starts_with("portfolio.liquidity."))
+            .and_then(|record| match &record.artifact {
+                Artifact::State(state) => Some(state),
+                _ => None,
+            })
+            .expect("liquidity state");
+        assert_eq!(state.state, "too_thin");
+        assert_eq!(state.verdict, Verdict::Block);
     }
 
     #[test]

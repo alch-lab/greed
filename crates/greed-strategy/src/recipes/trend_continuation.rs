@@ -334,17 +334,10 @@ impl StrategyNode for TrendContinuationNode {
                     let spread = (book.ask - book.bid)
                         / ((book.ask + book.bid) * 0.5).max(f64::EPSILON)
                         * 10_000.0;
-                    let depth = book.bid_depth_usd.min(book.ask_depth_usd);
                     if spread > self.config.max_spread_bps {
                         blockers.push(format!(
                             "spread {:.1} bps / max {:.1} bps",
                             spread, self.config.max_spread_bps
-                        ));
-                    }
-                    if depth < self.config.min_depth_usd {
-                        blockers.push(format!(
-                            "book depth ${depth:.0} / need ${:.0}",
-                            self.config.min_depth_usd
                         ));
                     }
                 }

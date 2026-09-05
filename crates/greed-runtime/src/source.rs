@@ -130,10 +130,10 @@ fn median_abs(values: impl Iterator<Item = Option<f64>>, floor: f64) -> f64 {
 
 fn is_surge_admission(ticker: &StreamTicker, universe: &greed_strategy::UniverseConfig) -> bool {
     ticker.quote_volume_24h >= universe.surge_min_24h_quote_volume_usd
-        && ticker.change_24h().abs() >= universe.surge_min_abs_change_24h
-        && ticker
-            .return_15m
-            .is_some_and(|value| value.abs() >= universe.surge_min_abs_return_15m)
+        && (ticker.change_24h().abs() >= universe.surge_min_abs_change_24h
+            || ticker
+                .return_15m
+                .is_some_and(|value| value.abs() >= universe.surge_min_abs_return_15m))
 }
 
 impl BinanceMarketSource {
@@ -1041,7 +1041,7 @@ mod tests {
     }
 
     #[test]
-    fn short_term_surge_admission_requires_volume_change_and_recent_move() {
+    fn short_term_surge_admission_accepts_either_early_or_established_momentum() {
         let universe = greed_strategy::UniverseConfig::default();
         assert!(is_surge_admission(
             &ticker(2_100_000.0, 0.15, Some(0.02)),
@@ -1051,16 +1051,20 @@ mod tests {
             &ticker(1_900_000.0, 0.15, Some(0.02)),
             &universe
         ));
-        assert!(!is_surge_admission(
+        assert!(is_surge_admission(
             &ticker(2_100_000.0, 0.07, Some(0.02)),
             &universe
         ));
-        assert!(!is_surge_admission(
+        assert!(is_surge_admission(
             &ticker(2_100_000.0, 0.15, Some(0.01)),
             &universe
         ));
-        assert!(!is_surge_admission(
+        assert!(is_surge_admission(
             &ticker(2_100_000.0, 0.15, None),
+            &universe
+        ));
+        assert!(!is_surge_admission(
+            &ticker(2_100_000.0, 0.07, Some(0.01)),
             &universe
         ));
     }
