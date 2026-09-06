@@ -18,9 +18,11 @@ use journal::{Journal, ResearchRecorder, SampleRecorder, StatusWriter};
 use source::BinanceMarketSource;
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::atomic::Ordering,
+    sync::atomic::{AtomicBool, Ordering},
+    sync::Arc,
     time::Duration,
 };
+use tokio::sync::{mpsc, Mutex};
 use tracing::{info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
@@ -329,8 +331,12 @@ fn git_commit() -> Option<String> {
 }
 
 fn with_run_id(mut payload: serde_json::Value, identity: &serde_json::Value) -> serde_json::Value {
-    if let (Some(object), Some(run_id)) = (payload.as_object_mut(), identity["run_id"].as_str()) {
-        object.insert("run_id".into(), serde_json::Value::String(run_id.into()));
+    if let Some(object) = payload.as_object_mut() {
+        for key in ["run_id", "version", "git_commit", "config_hash"] {
+            if let Some(value) = identity.get(key).filter(|value| !value.is_null()) {
+                object.insert(key.into(), value.clone());
+            }
+        }
     }
     payload
 }
@@ -427,7 +433,7 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
         // subsequent paper frames keep retrying until fresh market data exists.
         warn!(error=%error, "Binance market websocket is not warm; keeping runtime alive and blocking orders until reconnect");
     }
-    let mut execution = BinanceDemoExecution::connect(
+    let execution = BinanceDemoExecution::connect(
         config.execution.clone(),
         config.portfolio.clone(),
         config.strategy.risk.clone(),
@@ -438,6 +444,7 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
     )
     .await
     .context("Binance demo execution initialization failed; trading runtime cannot start")?;
+    let execution = Arc::new(Mutex::new(execution));
     let journal = Journal::new(&config.runtime.journal_path)?;
     let history = Journal::new(&config.runtime.history_path)?;
     let research_capacity_bytes = config
@@ -467,9 +474,10 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
         research_capacity_bytes,
     );
     let status = StatusWriter::new(&config.runtime.status_path);
+    let start_execution_health = execution.lock().await.health();
     let start_payload = serde_json::json!({
         "paper_only": true,
-        "execution": execution.health(),
+        "execution": start_execution_health,
         "config": config,
         "runtime": identity,
     });
@@ -505,24 +513,42 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
     });
     let mut samples = SampleRecorder::default();
     let mut completed = 0u64;
+    let (sync_tx, mut sync_rx) = mpsc::unbounded_channel();
+    let sync_execution = Arc::clone(&execution);
+    let reconciliation_healthy = Arc::new(AtomicBool::new(true));
+    let sync_health = Arc::clone(&reconciliation_healthy);
+    tokio::spawn(async move {
+        loop {
+            let result = {
+                let mut execution = sync_execution.lock().await;
+                execution.sync().await.map_err(|error| error.to_string())
+            };
+            sync_health.store(result.is_ok(), Ordering::SeqCst);
+            if sync_tx.send(result).is_err() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+    });
     loop {
         let now_ms = chrono::Utc::now().timestamp_millis();
-        let sync_events = match execution.sync().await {
-            Ok(events) => events,
-            Err(error) => {
-                warn!(error=%error, "Binance demo account sync failed; blocking evaluation and orders");
-                journal.append(
-                    "exchange_sync_error",
-                    serde_json::json!({"ts_ms":now_ms,"error":error.to_string(),"venue":"binance_demo"}),
-                )?;
-                tokio::time::sleep(Duration::from_secs(config.runtime.poll_seconds)).await;
-                continue;
+        while let Ok(result) = sync_rx.try_recv() {
+            match result {
+                Ok(events) => {
+                    for event in events {
+                        let payload = with_run_id(event.payload, &identity);
+                        history.append(&event.kind, payload.clone())?;
+                        journal.append(&event.kind, payload)?;
+                    }
+                }
+                Err(error) => {
+                    warn!(error=%error, "Binance demo account sync failed; blocking new orders until reconciliation recovers");
+                    journal.append(
+                        "exchange_sync_error",
+                        serde_json::json!({"ts_ms":now_ms,"error":error,"venue":"binance_demo"}),
+                    )?;
+                }
             }
-        };
-        for event in sync_events {
-            let payload = with_run_id(event.payload, &identity);
-            history.append(&event.kind, payload.clone())?;
-            journal.append(&event.kind, payload)?;
         }
         while let Ok(command) = commands.try_recv() {
             match command {
@@ -551,39 +577,22 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                     requested_ms,
                     response,
                 } => {
-                    let result = execution
-                        .request_manual_close(&symbol, &actor, note.as_deref(), requested_ms)
-                        .await;
+                    let result = {
+                        let mut execution = execution.lock().await;
+                        execution
+                            .request_manual_close(&symbol, &actor, note.as_deref(), requested_ms)
+                            .await
+                    };
                     match result {
                         Ok(event) => {
                             let payload = with_run_id(event.payload, &identity);
                             history.append(&event.kind, payload.clone())?;
                             journal.append(&event.kind, payload)?;
-                            match execution.sync().await {
-                                Ok(events) => {
-                                    for event in events {
-                                        let payload = with_run_id(event.payload, &identity);
-                                        history.append(&event.kind, payload.clone())?;
-                                        journal.append(&event.kind, payload)?;
-                                    }
-                                    let _ = response.send(Ok(serde_json::json!({
-                                        "ok":true,
-                                        "symbol":symbol,
-                                        "state":"close_submitted",
-                                    })));
-                                }
-                                Err(error) => {
-                                    let message = format!(
-                                        "close was submitted but immediate reconciliation failed: {error}"
-                                    );
-                                    let _ = response.send(Ok(serde_json::json!({
-                                        "ok":true,
-                                        "symbol":symbol,
-                                        "state":"close_submitted_reconciliation_pending",
-                                        "detail":message,
-                                    })));
-                                }
-                            }
+                            let _ = response.send(Ok(serde_json::json!({
+                                "ok":true,
+                                "symbol":symbol,
+                                "state":"close_submitted_reconciliation_pending",
+                            })));
                         }
                         Err(error) => {
                             let message = error.to_string();
@@ -624,9 +633,19 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                 .min(50);
             match source.discover_universe(&discovery_strategy, now_ms).await {
                 Ok(mut discovery) => {
-                    let position_symbols: Vec<_> = execution.pinned_symbols().into_iter().collect();
+                    let (position_symbols, supported_symbols) = {
+                        let execution = execution.lock().await;
+                        let pinned: Vec<_> = execution.pinned_symbols().into_iter().collect();
+                        let supported: BTreeSet<_> = discovery
+                            .symbols
+                            .iter()
+                            .filter(|symbol| execution.supports_symbol(symbol))
+                            .cloned()
+                            .collect();
+                        (pinned, supported)
+                    };
                     discovery.symbols.retain(|symbol| {
-                        execution.supports_symbol(symbol) && !position_symbols.contains(symbol)
+                        supported_symbols.contains(symbol) && !position_symbols.contains(symbol)
                     });
                     discovery.symbols.truncate(
                         config
@@ -668,7 +687,11 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                 )?,
             }
         }
-        let account = execution.account_frame()?;
+        if !reconciliation_healthy.load(Ordering::SeqCst) {
+            tokio::time::sleep(Duration::from_secs(config.runtime.poll_seconds)).await;
+            continue;
+        }
+        let account = execution.lock().await.account_frame()?;
         match source.fetch_frame(&active_strategy, account).await {
             Ok(mut frame) => {
                 samples.record(&journal, &frame)?;
@@ -682,9 +705,10 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                         data_health.clone(),
                     )?;
                 }
-                frame.account = execution.account_frame()?;
+                frame.account = execution.lock().await.account_frame()?;
                 let mut evaluation = graph.evaluate(&frame)?;
-                let (reentry_artifacts, reentry_events) = execution.trend_reentry_artifacts(&frame);
+                let (reentry_artifacts, reentry_events) =
+                    execution.lock().await.trend_reentry_artifacts(&frame);
                 let has_reentry_candidate = reentry_artifacts
                     .iter()
                     .any(|record| matches!(&record.artifact, Artifact::Candidate(_)));
@@ -726,8 +750,11 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                     history.append(&event.kind, payload.clone())?;
                     journal.append(&event.kind, payload)?;
                 }
-                let entries_enabled = !paused.load(Ordering::SeqCst);
+                let entries_enabled =
+                    !paused.load(Ordering::SeqCst) && reconciliation_healthy.load(Ordering::SeqCst);
                 let order_events = execution
+                    .lock()
+                    .await
                     .apply_plans(&frame, &evaluation, entries_enabled)
                     .await;
                 for event in &order_events {
@@ -735,16 +762,17 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                     history.append(&event.kind, payload.clone())?;
                     journal.append(&event.kind, payload)?;
                 }
-                if !order_events.is_empty() {
-                    for event in execution.sync().await? {
-                        let payload = with_run_id(event.payload, &identity);
-                        history.append(&event.kind, payload.clone())?;
-                        journal.append(&event.kind, payload)?;
-                    }
-                }
-                let account = execution.account_frame()?;
-                let funnels = strategy_funnels_demo(&active_strategy, &evaluation, &execution);
-                let execution_health = execution.health();
+                let (account, funnels, execution_health, gate_snapshots, positions, reentries) = {
+                    let mut execution = execution.lock().await;
+                    (
+                        execution.account_frame()?,
+                        strategy_funnels_demo(&active_strategy, &evaluation, &execution),
+                        execution.health(),
+                        execution.recipe_gate_snapshots(frame.as_of_ms),
+                        execution.position_snapshots(),
+                        execution.trend_reentry_status(),
+                    )
+                };
                 let observation = serde_json::json!({
                     "ts_ms":frame.as_of_ms,
                     "equity_usd":account.equity_usd,
@@ -763,9 +791,9 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                     "paper_only":true,
                     "account":account,
                     "lanes":funnels,
-                    "recipe_gates":execution.recipe_gate_snapshots(frame.as_of_ms),
-                    "positions":execution.position_snapshots(),
-                    "trend_reentries":execution.trend_reentry_status(),
+                    "recipe_gates":gate_snapshots,
+                    "positions":positions,
+                    "trend_reentries":reentries,
                     "graph":summarize(&evaluation),
                     "artifacts":evaluation.artifacts,
                     "universe":universe_status,

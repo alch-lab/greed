@@ -27,7 +27,7 @@ const MAX_MAKER_REPRICES: u8 = 3;
 const ENTRY_GUARD_STALE_GRACE_MS: i64 = 5_000;
 const ENTRY_GUARD_REVERSAL_CONFIRM_MS: i64 = 15_000;
 const MIN_PERFORMANCE_FILL_RATIO: f64 = 0.20;
-const PERFORMANCE_BASIS_VERSION: u32 = 2;
+const PERFORMANCE_BASIS_VERSION: u32 = 3;
 const TREND_REENTRY_RECIPE: &str = "trend_continuation_reentry";
 
 pub struct ExchangeEvent {
@@ -43,6 +43,10 @@ pub struct RecipeGateStatus {
     pub rolling_profit_factor: Option<f64>,
     pub rolling_net_pnl_usd: f64,
     pub next_probe_ms: Option<i64>,
+    pub entry_attempts: u64,
+    pub filled_entry_attempts: u64,
+    pub formal_positions: u64,
+    pub closed_trades: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -64,7 +68,20 @@ struct ExecutionMeta {
     candidate_id: String,
     recipe: String,
     side: Side,
+    /// Legacy persisted holding clock. New entries set this to first_fill_ms;
+    /// old state files retain their original value without pretending that it
+    /// was an exchange-confirmed fill timestamp.
     entry_ms: i64,
+    #[serde(default)]
+    signal_ms: i64,
+    #[serde(default)]
+    order_submitted_ms: i64,
+    #[serde(default)]
+    first_fill_ms: Option<i64>,
+    #[serde(default)]
+    entry_completed_ms: Option<i64>,
+    #[serde(default)]
+    entry_time_source: Option<String>,
     #[serde(default)]
     entry_price: f64,
     #[serde(default)]
@@ -131,6 +148,18 @@ struct ExecutionMeta {
     take_profit_order_ids: Vec<i64>,
 }
 
+impl ExecutionMeta {
+    fn holding_started_ms(&self) -> i64 {
+        self.first_fill_ms.unwrap_or(self.entry_ms)
+    }
+
+    fn holding_time_source(&self) -> &str {
+        self.entry_time_source
+            .as_deref()
+            .unwrap_or("legacy_entry_ms_unknown_semantics")
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct TrendReentrySignal {
     signal_ms: i64,
@@ -157,6 +186,56 @@ struct TrendReentryCampaign {
     signal: Option<TrendReentrySignal>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingEntryState {
+    plan: greed_kernel::PositionPlan,
+    recipe: String,
+    signal_ms: i64,
+    #[serde(default)]
+    discovery_latency_ms: Option<i64>,
+    size_multiplier: f64,
+    requested_quantity: f64,
+    active_client_id: String,
+    passive_price: f64,
+    order_submitted_ms: i64,
+    deadline_ms: i64,
+    next_reprice_ms: i64,
+    #[serde(default)]
+    reprice_attempt: u8,
+    #[serde(default)]
+    first_fill_ms: Option<i64>,
+    #[serde(default)]
+    first_fill_time_source: Option<String>,
+    #[serde(default)]
+    preliminary_stop_algo_id: Option<i64>,
+    #[serde(default)]
+    guard_unavailable_since_ms: Option<i64>,
+    #[serde(default)]
+    micro_reversal_since_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[serde(default)]
+struct RecipeExecutionCounts {
+    entry_attempts: u64,
+    filled_entry_attempts: u64,
+    formal_positions: u64,
+    closed_trades: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PendingAccountingState {
+    candidate_id: String,
+    recipe: String,
+    symbol: String,
+    side: Side,
+    start_ms: i64,
+    requested_quantity: f64,
+    expected_exit_quantity: f64,
+    reference_price: f64,
+    planned_stop_price: f64,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 #[serde(default)]
 struct DemoState {
@@ -166,22 +245,36 @@ struct DemoState {
     risk_day: String,
     seen: BTreeSet<String>,
     positions: BTreeMap<String, ExecutionMeta>,
+    pending_entries: BTreeMap<String, PendingEntryState>,
     recipe_outcomes: BTreeMap<String, Vec<ExecutionOutcome>>,
     symbol_outcomes: BTreeMap<String, Vec<ExecutionOutcome>>,
     trend_reentries: BTreeMap<String, TrendReentryCampaign>,
     performance_epoch: u32,
     performance_basis_version: u32,
     execution_halt_reason: Option<String>,
+    entry_attempt_ids: BTreeSet<String>,
+    filled_entry_attempt_ids: BTreeSet<String>,
+    accounted_attempt_ids: BTreeSet<String>,
+    formal_position_ids: BTreeSet<String>,
+    closed_trade_ids: BTreeSet<String>,
+    recipe_execution_counts: BTreeMap<String, RecipeExecutionCounts>,
+    pending_accounting: BTreeMap<String, PendingAccountingState>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ExecutionOutcome {
+    #[serde(default)]
+    candidate_id: String,
     exit_ms: i64,
     pnl_usd: f64,
     #[serde(default)]
     pnl_r: Option<f64>,
     #[serde(default)]
     fill_ratio: Option<f64>,
+    #[serde(default)]
+    initial_risk_usd: Option<f64>,
+    #[serde(default)]
+    sample_kind: String,
 }
 
 impl ExecutionOutcome {
@@ -202,6 +295,11 @@ pub struct DemoPositionSnapshot {
     pub symbol: String,
     pub side: Side,
     pub entry_ms: i64,
+    pub signal_ms: i64,
+    pub order_submitted_ms: i64,
+    pub first_fill_ms: Option<i64>,
+    pub entry_completed_ms: Option<i64>,
+    pub entry_time_source: String,
     pub entry_price: f64,
     pub quantity: f64,
     pub initial_quantity: f64,
@@ -292,21 +390,10 @@ struct BracketExecution {
     maker_reprices: u8,
     final_maker_limit: Option<f64>,
     size_multiplier: f64,
-}
-
-#[derive(Debug)]
-enum PostOnlyEntry {
-    Filled {
-        order: Value,
-        waited_ms: i64,
-        reprices: u8,
-        final_limit: f64,
-    },
-    Unfilled {
-        waited_ms: i64,
-        reprices: u8,
-        final_limit: f64,
-    },
+    order_submitted_ms: i64,
+    first_fill_ms: i64,
+    entry_completed_ms: i64,
+    entry_time_source: &'static str,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -315,15 +402,6 @@ enum EntryGuardState {
     Unavailable(String),
     StructuralInvalidation(String),
     MicroReversal(String),
-}
-
-struct PendingEntryAttempt<'a> {
-    order: &'a Value,
-    status: &'a str,
-    active_client_id: &'a str,
-    rules: &'a SymbolRules,
-    waited_ms: i64,
-    reprices: u8,
 }
 
 pub struct BinanceDemoExecution {
@@ -377,6 +455,12 @@ impl BinanceDemoExecution {
             state.recipe_outcomes.clear();
             state.symbol_outcomes.clear();
             state.trend_reentries.clear();
+            state.accounted_attempt_ids.clear();
+            state.entry_attempt_ids.clear();
+            state.filled_entry_attempt_ids.clear();
+            state.formal_position_ids.clear();
+            state.closed_trade_ids.clear();
+            state.recipe_execution_counts.clear();
             state.performance_epoch = risk.rolling_pf_epoch;
             state.execution_halt_reason = None;
         }
@@ -413,7 +497,11 @@ impl BinanceDemoExecution {
                 .account
                 .as_ref()
                 .is_some_and(|account| account.positions.is_empty());
-            if !account_is_flat || !value.state.positions.is_empty() {
+            if !account_is_flat
+                || !value.state.positions.is_empty()
+                || !value.state.pending_entries.is_empty()
+                || !value.state.pending_accounting.is_empty()
+            {
                 return Err(anyhow!(
                     "cannot start a new performance epoch while Binance demo positions are open"
                 ));
@@ -544,11 +632,41 @@ impl BinanceDemoExecution {
         let value = self.signed_read("/fapi/v2/account", vec![]).await;
         match value {
             Ok(value) => {
-                let account = parse_account(&value)?;
+                let mut account = parse_account(&value)?;
+                let now_ms = chrono::Utc::now().timestamp_millis();
+                let (mut events, pending_changed) =
+                    match self.progress_pending_entries(now_ms).await {
+                        Ok(events) => {
+                            let changed = !events.is_empty();
+                            (events, changed)
+                        }
+                        Err(error) => (
+                            vec![ExchangeEvent {
+                                kind: "exchange_pending_entry_error".into(),
+                                payload: serde_json::json!({
+                                    "ts_ms":now_ms,
+                                    "reason":error.to_string(),
+                                    "pending_entries":self.state.pending_entries.len(),
+                                    "existing_position_management_continued":true,
+                                    "venue":"binance_demo",
+                                    "paper_only":true
+                                }),
+                            }],
+                            false,
+                        ),
+                    };
+                if pending_changed {
+                    let refreshed = self.signed_read("/fapi/v2/account", vec![]).await?;
+                    account = parse_account(&refreshed)?;
+                }
+                events.extend(self.progress_pending_accounting(now_ms).await);
                 let foreign: Vec<_> = account
                     .positions
                     .keys()
-                    .filter(|symbol| !self.state.positions.contains_key(*symbol))
+                    .filter(|symbol| {
+                        !self.state.positions.contains_key(*symbol)
+                            && !self.state.pending_entries.contains_key(*symbol)
+                    })
                     .cloned()
                     .collect();
                 if !foreign.is_empty() {
@@ -560,7 +678,6 @@ impl BinanceDemoExecution {
                 if self.state.baseline_wallet_usd.is_none() {
                     self.state.baseline_wallet_usd = Some(account.wallet_balance);
                 }
-                let now_ms = chrono::Utc::now().timestamp_millis();
                 let expired: Vec<_> = self
                     .state
                     .positions
@@ -568,12 +685,11 @@ impl BinanceDemoExecution {
                     .filter(|(symbol, meta)| {
                         !meta.exit_requested
                             && meta.max_hold_ms > 0
-                            && now_ms - meta.entry_ms >= meta.max_hold_ms
+                            && now_ms - meta.holding_started_ms() >= meta.max_hold_ms
                             && account.positions.contains_key(*symbol)
                     })
                     .map(|(symbol, _)| symbol.clone())
                     .collect();
-                let mut events = Vec::new();
                 let mut protected: BTreeMap<String, (bool, bool)> = BTreeMap::new();
                 let mut stop_orders: BTreeMap<String, ProtectiveOrderId> = BTreeMap::new();
                 for symbol in account.positions.keys() {
@@ -647,7 +763,7 @@ impl BinanceDemoExecution {
                             symbol.clone(),
                             previous - position.quantity.abs(),
                             position.quantity.abs(),
-                            meta.entry_ms,
+                            meta.holding_started_ms(),
                             meta.candidate_id.clone(),
                             meta.recipe.clone(),
                             meta.side,
@@ -826,7 +942,7 @@ impl BinanceDemoExecution {
                             meta.entry_price,
                             meta.extreme_price,
                             position.mark_price,
-                            now_ms.saturating_sub(meta.entry_ms),
+                            now_ms.saturating_sub(meta.holding_started_ms()),
                             (
                                 meta.early_failure_after_ms,
                                 meta.early_failure_adverse_pct,
@@ -1053,7 +1169,7 @@ impl BinanceDemoExecution {
                 for symbol in disappeared {
                     if let Some(meta) = self.state.positions.remove(&symbol) {
                         let summary = self
-                            .trade_summary(&symbol, meta.entry_ms, meta.side)
+                            .trade_summary(&symbol, meta.holding_started_ms(), meta.side)
                             .await
                             .ok();
                         let (exit_reason, exit_order_id, exit_order_status) =
@@ -1079,22 +1195,23 @@ impl BinanceDemoExecution {
                         if let Some(summary) = summary.as_ref().filter(|_| !operator_intervention) {
                             let trade_pnl_usd = summary.net_pnl_usd;
                             let outcome = ExecutionOutcome {
+                                candidate_id: meta.candidate_id.clone(),
                                 exit_ms: now_ms,
                                 pnl_usd: trade_pnl_usd,
                                 pnl_r,
                                 fill_ratio: statistical_fill_ratio.or(Some(0.0)),
+                                initial_risk_usd: meta.initial_risk_usd,
+                                sample_kind: "formal_position".into(),
                             };
-                            self.state
-                                .recipe_outcomes
-                                .entry(gate_key(&meta.recipe, meta.side))
-                                .or_default()
-                                .push(outcome.clone());
-                            self.state
-                                .symbol_outcomes
-                                .entry(symbol.clone())
-                                .or_default()
-                                .push(outcome);
+                            self.record_outcome_once(
+                                &meta.candidate_id,
+                                &meta.recipe,
+                                &symbol,
+                                meta.side,
+                                outcome,
+                            );
                         }
+                        self.record_closed_trade(&meta.candidate_id, &meta.recipe);
                         let mfe_pct = meta.side.sign()
                             * (meta.extreme_price / meta.entry_price.max(f64::EPSILON) - 1.0);
                         let mae_pct = (-meta.side.sign()
@@ -1183,7 +1300,8 @@ impl BinanceDemoExecution {
                                 "taker_notional_usd":summary.as_ref().map(|value| value.taker_notional_usd),
                                 "mfe_pct": mfe_pct,
                                 "mae_pct": mae_pct,
-                                "hold_ms": now_ms - meta.entry_ms,
+                                "hold_ms": now_ms - meta.holding_started_ms(),
+                                "holding_time_source":meta.holding_time_source(),
                                 "reason": exit_reason,
                                 "exit_actor": meta.pending_exit_actor,
                                 "operator_note": meta.pending_exit_note,
@@ -1477,6 +1595,10 @@ impl BinanceDemoExecution {
                         ("taker_fallback_size_multiplier".into(), "1".into()),
                         ("max_entry_adverse_bps".into(), "8".into()),
                         ("min_fill_ratio".into(), "0.8".into()),
+                        (
+                            "min_managed_fill_ratio".into(),
+                            self.lanes.trend_min_managed_fill_ratio.to_string(),
+                        ),
                         ("entry_invalidation_bps".into(), "20".into()),
                         (
                             "entry_guard_max_opposing_flow".into(),
@@ -1589,6 +1711,7 @@ impl BinanceDemoExecution {
     pub fn pinned_symbols(&self) -> BTreeSet<String> {
         self.position_symbols()
             .cloned()
+            .chain(self.state.pending_entries.keys().cloned())
             .chain(self.state.trend_reentries.keys().cloned())
             .collect()
     }
@@ -1635,6 +1758,16 @@ impl BinanceDemoExecution {
                 .unwrap_or_default()
                 + i64::from(self.risk.rolling_pf_cooldown_minutes) * 60_000
         });
+        let count_key = recipe
+            .strip_suffix(":buy")
+            .or_else(|| recipe.strip_suffix(":sell"))
+            .unwrap_or(recipe);
+        let counts = self
+            .state
+            .recipe_execution_counts
+            .get(count_key)
+            .cloned()
+            .unwrap_or_default();
         RecipeGateStatus {
             allowed: !failed || next_probe_ms.is_some_and(|value| now_ms >= value),
             completed_trades: window.len(),
@@ -1642,6 +1775,10 @@ impl BinanceDemoExecution {
             rolling_profit_factor,
             rolling_net_pnl_usd: window.iter().map(|outcome| outcome.pnl_usd).sum(),
             next_probe_ms,
+            entry_attempts: counts.entry_attempts,
+            filled_entry_attempts: counts.filled_entry_attempts,
+            formal_positions: counts.formal_positions,
+            closed_trades: counts.closed_trades,
         }
     }
 
@@ -1717,7 +1854,18 @@ impl BinanceDemoExecution {
                             .unwrap_or_else(|| "external".into()),
                         symbol: symbol.clone(),
                         side: position.side,
-                        entry_ms: meta.map(|value| value.entry_ms).unwrap_or_default(),
+                        entry_ms: meta
+                            .map(ExecutionMeta::holding_started_ms)
+                            .unwrap_or_default(),
+                        signal_ms: meta.map(|value| value.signal_ms).unwrap_or_default(),
+                        order_submitted_ms: meta
+                            .map(|value| value.order_submitted_ms)
+                            .unwrap_or_default(),
+                        first_fill_ms: meta.and_then(|value| value.first_fill_ms),
+                        entry_completed_ms: meta.and_then(|value| value.entry_completed_ms),
+                        entry_time_source: meta
+                            .map(|value| value.holding_time_source().to_string())
+                            .unwrap_or_else(|| "unavailable".into()),
                         entry_price: position.entry_price,
                         quantity: position.quantity.abs(),
                         initial_quantity: meta
@@ -1856,7 +2004,9 @@ impl BinanceDemoExecution {
             if self.account.as_ref().is_some_and(|account| {
                 account.positions.contains_key(&plan.symbol)
                     || self.state.positions.contains_key(&plan.symbol)
-                    || self.state.positions.len() >= self.portfolio.max_positions
+                    || self.state.pending_entries.contains_key(&plan.symbol)
+                    || self.state.positions.len() + self.state.pending_entries.len()
+                        >= self.portfolio.max_positions
             }) {
                 continue;
             }
@@ -1950,7 +2100,44 @@ impl BinanceDemoExecution {
             // flatten it repeatedly, paying spread and fees on every frame.
             self.state.seen.insert(plan.candidate_id.clone());
             self.save().ok();
+            let signal_ms = candidate
+                .map(|value| value.signal_ms)
+                .unwrap_or(frame.as_of_ms);
+            let discovery_latency_ms = candidate
+                .and_then(|value| value.tags.get("discovery_latency_ms"))
+                .and_then(|value| value.parse::<i64>().ok());
+            if plan.entry_limit.is_some() {
+                match self
+                    .start_pending_entry(
+                        plan,
+                        recipe.clone(),
+                        size_multiplier,
+                        signal_ms,
+                        discovery_latency_ms,
+                    )
+                    .await
+                {
+                    Ok(event) => events.push(event),
+                    Err(error) => events.push(ExchangeEvent {
+                        kind: "exchange_order_rejected".into(),
+                        payload: serde_json::json!({
+                            "ts_ms":chrono::Utc::now().timestamp_millis(),
+                            "candidate_id":plan.candidate_id,
+                            "recipe":recipe,
+                            "symbol":plan.symbol,
+                            "side":plan.side,
+                            "reason":error.to_string(),
+                            "stage":"entry_submission",
+                            "venue":"binance_demo",
+                            "paper_only":true,
+                        }),
+                    }),
+                }
+                continue;
+            }
             let attempt_started_ms = chrono::Utc::now().timestamp_millis();
+            self.record_entry_attempt(&plan.candidate_id, &recipe);
+            self.save().ok();
             match self.place_bracket(plan, size_multiplier).await {
                 Ok(fill) => {
                     let planned_notional_usd =
@@ -1963,7 +2150,12 @@ impl BinanceDemoExecution {
                             candidate_id: plan.candidate_id.clone(),
                             recipe: recipe.clone(),
                             side: plan.side,
-                            entry_ms: frame.as_of_ms,
+                            entry_ms: fill.first_fill_ms,
+                            signal_ms: candidate.map(|value| value.signal_ms).unwrap_or_default(),
+                            order_submitted_ms: fill.order_submitted_ms,
+                            first_fill_ms: Some(fill.first_fill_ms),
+                            entry_completed_ms: Some(fill.entry_completed_ms),
+                            entry_time_source: Some(fill.entry_time_source.into()),
                             entry_price: fill.entry_price,
                             initial_quantity: fill.quantity,
                             last_observed_quantity: fill.quantity,
@@ -2016,16 +2208,15 @@ impl BinanceDemoExecution {
                             take_profit_order_ids: fill.take_profit_order_ids.clone(),
                         },
                     );
+                    self.record_filled_attempt(&plan.candidate_id, &recipe);
+                    self.record_formal_position(&plan.candidate_id, &recipe);
                     self.save().ok();
                     let signal_to_order_ms = candidate
                         .map(|value| frame.as_of_ms.saturating_sub(value.signal_ms))
                         .unwrap_or_default();
-                    let discovery_latency_ms = candidate
-                        .and_then(|value| value.tags.get("discovery_latency_ms"))
-                        .and_then(|value| value.parse::<i64>().ok());
                     events.push(ExchangeEvent {
                         kind: "exchange_entry".into(),
-                        payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"signal_context":plan.signal_context,"entry_mode":fill.entry_mode,"entry_price_source":fill.entry_price_source,"maker_attempted":fill.maker_attempted,"maker_wait_ms":fill.maker_wait_ms,"maker_reprices":fill.maker_reprices,"requested_limit":plan.entry_limit,"final_maker_limit":fill.final_maker_limit,"entry_price":fill.entry_price,"quantity":fill.quantity,"notional_usd":actual_notional_usd,"actual_notional_usd":actual_notional_usd,"planned_notional_usd":planned_notional_usd,"fill_ratio":fill_ratio,"partial_fill":fill_ratio < 0.999,"probe_size_multiplier":size_multiplier,"entry_size_multiplier":fill.size_multiplier,"margin_type":"isolated","unprotected_runner_fraction":plan.unprotected_runner_fraction,"entry_guard":{"invalidation_bps":plan.entry_invalidation_bps,"max_opposing_flow":plan.entry_guard_max_opposing_flow,"max_opposing_return_bps":plan.entry_guard_max_opposing_return_bps},"early_failure":{"after_ms":plan.early_failure_after_ms,"adverse_pct":plan.early_failure_adverse_pct,"max_favorable_pct":plan.early_failure_max_favorable_pct},"spread_bps":cost.spread_bps,"expected_exit_slippage_bps":cost.expected_exit_slippage_bps,"estimated_round_trip_cost_bps":cost.estimated_round_trip_cost_bps,"gross_target_bps":cost.gross_target_bps,"target_to_cost_ratio":cost.target_to_cost_ratio,"order_id":fill.order_id,"stop_algo_id":fill.stop_algo_id,"take_profit_order_ids":fill.take_profit_order_ids,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
+                        payload: serde_json::json!({"ts_ms":fill.first_fill_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"signal_context":plan.signal_context,"entry_mode":fill.entry_mode,"entry_price_source":fill.entry_price_source,"maker_attempted":fill.maker_attempted,"maker_wait_ms":fill.maker_wait_ms,"maker_reprices":fill.maker_reprices,"requested_limit":plan.entry_limit,"final_maker_limit":fill.final_maker_limit,"entry_price":fill.entry_price,"quantity":fill.quantity,"notional_usd":actual_notional_usd,"actual_notional_usd":actual_notional_usd,"planned_notional_usd":planned_notional_usd,"fill_ratio":fill_ratio,"partial_fill":fill_ratio < 0.999,"probe_size_multiplier":size_multiplier,"entry_size_multiplier":fill.size_multiplier,"margin_type":"isolated","unprotected_runner_fraction":plan.unprotected_runner_fraction,"entry_timing":{"signal_ms":candidate.map(|value|value.signal_ms),"order_submitted_ms":fill.order_submitted_ms,"first_fill_ms":fill.first_fill_ms,"entry_completed_ms":fill.entry_completed_ms,"source":fill.entry_time_source},"entry_guard":{"invalidation_bps":plan.entry_invalidation_bps,"max_opposing_flow":plan.entry_guard_max_opposing_flow,"max_opposing_return_bps":plan.entry_guard_max_opposing_return_bps},"early_failure":{"after_ms":plan.early_failure_after_ms,"adverse_pct":plan.early_failure_adverse_pct,"max_favorable_pct":plan.early_failure_max_favorable_pct},"spread_bps":cost.spread_bps,"expected_exit_slippage_bps":cost.expected_exit_slippage_bps,"estimated_round_trip_cost_bps":cost.estimated_round_trip_cost_bps,"gross_target_bps":cost.gross_target_bps,"target_to_cost_ratio":cost.target_to_cost_ratio,"order_id":fill.order_id,"stop_algo_id":fill.stop_algo_id,"take_profit_order_ids":fill.take_profit_order_ids,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
                     });
                 }
                 Err(error) => {
@@ -2047,9 +2238,79 @@ impl BinanceDemoExecution {
                         )
                         .await
                         .ok();
+                    if let Some(summary) = attempt.as_ref().filter(|value| {
+                        value.entry_quantity > f64::EPSILON && value.exit_quantity > f64::EPSILON
+                    }) {
+                        self.record_filled_attempt(&plan.candidate_id, &recipe);
+                        let actual_risk = summary.entry_quantity
+                            * (summary.entry_price
+                                - plan.stop_price * summary.entry_price
+                                    / plan.reference_price.max(f64::EPSILON))
+                            .abs();
+                        self.record_outcome_once(
+                            &plan.candidate_id,
+                            &recipe,
+                            &plan.symbol,
+                            plan.side,
+                            ExecutionOutcome {
+                                candidate_id: plan.candidate_id.clone(),
+                                exit_ms: chrono::Utc::now().timestamp_millis(),
+                                pnl_usd: summary.net_pnl_usd,
+                                pnl_r: (actual_risk > f64::EPSILON)
+                                    .then_some(summary.net_pnl_usd / actual_risk),
+                                fill_ratio: Some(
+                                    summary.entry_quantity
+                                        / (plan.notional_usd * size_multiplier
+                                            / plan.reference_price.max(f64::EPSILON))
+                                        .max(f64::EPSILON),
+                                ),
+                                initial_risk_usd: (actual_risk > f64::EPSILON)
+                                    .then_some(actual_risk),
+                                sample_kind: "filled_entry_attempt".into(),
+                            },
+                        );
+                        self.save().ok();
+                    }
                     let failure = error.to_string();
+                    let filled_round_trip = attempt.as_ref().is_some_and(|value| {
+                        value.entry_quantity > f64::EPSILON && value.exit_quantity > f64::EPSILON
+                    });
+                    let accounting_may_be_late = !filled_round_trip
+                        && (attempt
+                            .as_ref()
+                            .is_some_and(|value| value.entry_quantity > f64::EPSILON)
+                            || failure.contains("protective order failed")
+                            || failure.contains("incidental fill was flattened"));
+                    if accounting_may_be_late {
+                        self.state.pending_accounting.insert(
+                            plan.candidate_id.clone(),
+                            PendingAccountingState {
+                                candidate_id: plan.candidate_id.clone(),
+                                recipe: recipe.clone(),
+                                symbol: plan.symbol.clone(),
+                                side: plan.side,
+                                start_ms: attempt_started_ms.saturating_sub(1_000),
+                                requested_quantity: plan.notional_usd * size_multiplier
+                                    / plan.reference_price.max(f64::EPSILON),
+                                expected_exit_quantity: attempt
+                                    .as_ref()
+                                    .map(|value| value.entry_quantity)
+                                    .unwrap_or_default(),
+                                reference_price: plan.reference_price,
+                                planned_stop_price: plan.stop_price,
+                            },
+                        );
+                        self.save().ok();
+                    }
                     events.push(ExchangeEvent {
-                        kind: entry_failure_event_kind(&failure).into(),
+                        kind: if filled_round_trip {
+                            "exchange_entry_attempt_closed"
+                        } else if accounting_may_be_late {
+                            "exchange_entry_attempt_pending_accounting"
+                        } else {
+                            entry_failure_event_kind(&failure)
+                        }
+                        .into(),
                         payload: serde_json::json!({
                             "ts_ms":frame.as_of_ms,
                             "candidate_id":plan.candidate_id,
@@ -2074,6 +2335,9 @@ impl BinanceDemoExecution {
                             "reason":failure,
                             "attempt_exit_price":attempt.as_ref().map(|value| value.exit_price),
                             "attempt_exit_quantity":attempt.as_ref().map(|value| value.exit_quantity),
+                            "attempt_entry_quantity":attempt.as_ref().map(|value| value.entry_quantity),
+                            "attempt_fill_ratio":attempt.as_ref().map(|value| value.entry_quantity / (plan.notional_usd * size_multiplier / plan.reference_price.max(f64::EPSILON)).max(f64::EPSILON)),
+                            "attempt_initial_risk_usd":attempt.as_ref().map(|value| value.entry_quantity * (value.entry_price - plan.stop_price * value.entry_price / plan.reference_price.max(f64::EPSILON)).abs()),
                             "attempt_fee_usd":attempt.as_ref().map(|value| value.fees_usd),
                             "attempt_net_pnl_usd":attempt.as_ref().map(|value| value.net_pnl_usd),
                             "attempt_maker_fills":attempt.as_ref().map(|value| value.maker_fills),
@@ -2093,6 +2357,1166 @@ impl BinanceDemoExecution {
             }
         }
         events
+    }
+
+    fn record_entry_attempt(&mut self, candidate_id: &str, recipe: &str) {
+        if self
+            .state
+            .entry_attempt_ids
+            .insert(candidate_id.to_string())
+        {
+            self.state
+                .recipe_execution_counts
+                .entry(recipe.to_string())
+                .or_default()
+                .entry_attempts += 1;
+        }
+    }
+
+    fn record_filled_attempt(&mut self, candidate_id: &str, recipe: &str) {
+        if self
+            .state
+            .filled_entry_attempt_ids
+            .insert(candidate_id.to_string())
+        {
+            self.state
+                .recipe_execution_counts
+                .entry(recipe.to_string())
+                .or_default()
+                .filled_entry_attempts += 1;
+        }
+    }
+
+    fn record_formal_position(&mut self, candidate_id: &str, recipe: &str) {
+        if self
+            .state
+            .formal_position_ids
+            .insert(candidate_id.to_string())
+        {
+            self.state
+                .recipe_execution_counts
+                .entry(recipe.to_string())
+                .or_default()
+                .formal_positions += 1;
+        }
+    }
+
+    fn record_closed_trade(&mut self, candidate_id: &str, recipe: &str) {
+        if self.state.closed_trade_ids.insert(candidate_id.to_string()) {
+            self.state
+                .recipe_execution_counts
+                .entry(recipe.to_string())
+                .or_default()
+                .closed_trades += 1;
+        }
+    }
+
+    fn record_outcome_once(
+        &mut self,
+        candidate_id: &str,
+        recipe: &str,
+        symbol: &str,
+        side: Side,
+        outcome: ExecutionOutcome,
+    ) -> bool {
+        if !self
+            .state
+            .accounted_attempt_ids
+            .insert(candidate_id.to_string())
+        {
+            return false;
+        }
+        self.state
+            .recipe_outcomes
+            .entry(gate_key(recipe, side))
+            .or_default()
+            .push(outcome.clone());
+        self.state
+            .symbol_outcomes
+            .entry(symbol.to_string())
+            .or_default()
+            .push(outcome);
+        self.record_closed_trade(candidate_id, recipe);
+        true
+    }
+
+    async fn progress_pending_accounting(&mut self, now_ms: i64) -> Vec<ExchangeEvent> {
+        let ids: Vec<_> = self.state.pending_accounting.keys().cloned().collect();
+        let mut events = Vec::new();
+        for candidate_id in ids {
+            let Some(pending) = self.state.pending_accounting.get(&candidate_id).cloned() else {
+                continue;
+            };
+            let Ok(summary) = self
+                .trade_summary(&pending.symbol, pending.start_ms, pending.side)
+                .await
+            else {
+                continue;
+            };
+            let expected_exit = if pending.expected_exit_quantity > f64::EPSILON {
+                pending.expected_exit_quantity
+            } else {
+                summary.entry_quantity
+            };
+            if summary.entry_quantity <= f64::EPSILON
+                || summary.exit_quantity + 1e-9 < expected_exit
+            {
+                continue;
+            }
+            let risk = summary.entry_quantity
+                * (summary.entry_price
+                    - pending.planned_stop_price * summary.entry_price
+                        / pending.reference_price.max(f64::EPSILON))
+                .abs();
+            self.record_filled_attempt(&candidate_id, &pending.recipe);
+            self.record_outcome_once(
+                &candidate_id,
+                &pending.recipe,
+                &pending.symbol,
+                pending.side,
+                ExecutionOutcome {
+                    candidate_id: candidate_id.clone(),
+                    exit_ms: now_ms,
+                    pnl_usd: summary.net_pnl_usd,
+                    pnl_r: (risk > f64::EPSILON).then_some(summary.net_pnl_usd / risk),
+                    fill_ratio: Some(
+                        summary.entry_quantity / pending.requested_quantity.max(f64::EPSILON),
+                    ),
+                    initial_risk_usd: (risk > f64::EPSILON).then_some(risk),
+                    sample_kind: "filled_entry_attempt".into(),
+                },
+            );
+            self.state.pending_accounting.remove(&candidate_id);
+            self.save().ok();
+            events.push(ExchangeEvent {
+                kind: "exchange_entry_attempt_closed".into(),
+                payload: serde_json::json!({
+                    "ts_ms":now_ms,"candidate_id":candidate_id,"recipe":pending.recipe,
+                    "symbol":pending.symbol,"side":pending.side,
+                    "reason":"deferred_fill_accounting_reconciled",
+                    "planned_quantity":pending.requested_quantity,
+                    "filled_quantity":summary.entry_quantity,
+                    "fill_ratio":summary.entry_quantity / pending.requested_quantity.max(f64::EPSILON),
+                    "attempt_entry_price":summary.entry_price,
+                    "attempt_entry_quantity":summary.entry_quantity,
+                    "attempt_initial_risk_usd":risk,
+                    "attempt_fee_usd":summary.fees_usd,
+                    "attempt_net_pnl_usd":summary.net_pnl_usd,
+                    "venue":"binance_demo","paper_only":true
+                }),
+            });
+        }
+        events
+    }
+
+    async fn start_pending_entry(
+        &mut self,
+        plan: &greed_kernel::PositionPlan,
+        recipe: String,
+        size_multiplier: f64,
+        signal_ms: i64,
+        discovery_latency_ms: Option<i64>,
+    ) -> Result<ExchangeEvent> {
+        let rules = self
+            .rules
+            .get(&plan.symbol)
+            .cloned()
+            .ok_or_else(|| anyhow!("missing exchange rules for {}", plan.symbol))?;
+        let quantity = floor_step(
+            plan.notional_usd * size_multiplier / plan.reference_price,
+            rules.quantity_step,
+        );
+        validate_entry_quantity_and_exits(plan, quantity, plan.reference_price, &rules)?;
+        match self.pending_entry_guard(plan, chrono::Utc::now().timestamp_millis()) {
+            EntryGuardState::Healthy | EntryGuardState::MicroReversal(_) => {}
+            EntryGuardState::StructuralInvalidation(reason) => {
+                return Err(anyhow!(
+                    "entry signal invalidated before submission: {reason}"
+                ));
+            }
+            EntryGuardState::Unavailable(reason) => {
+                return Err(anyhow!(
+                    "entry guard unavailable before submission: {reason}"
+                ));
+            }
+        }
+        self.prepare_symbol_for_entry(&plan.symbol).await?;
+        self.ensure_isolated_margin(&plan.symbol).await?;
+        self.signed(
+            Method::POST,
+            "/fapi/v1/leverage",
+            vec![
+                ("symbol".into(), plan.symbol.clone()),
+                ("leverage".into(), self.config.leverage.to_string()),
+            ],
+        )
+        .await
+        .with_context(|| format!("set {} leverage to {}x", plan.symbol, self.config.leverage))?;
+
+        let base_client_id = client_order_id("entry", &plan.candidate_id);
+        let mut active_client_id = base_client_id.clone();
+        let mut passive_price = if plan.side == Side::Buy {
+            floor_step(
+                plan.entry_limit.unwrap_or(plan.reference_price),
+                rules.price_tick,
+            )
+        } else {
+            ceil_step(
+                plan.entry_limit.unwrap_or(plan.reference_price),
+                rules.price_tick,
+            )
+        };
+        let mut reprice_attempt = 0u8;
+        let order_submitted_ms = chrono::Utc::now().timestamp_millis();
+        let mut pending = PendingEntryState {
+            plan: plan.clone(),
+            recipe: recipe.clone(),
+            signal_ms,
+            discovery_latency_ms,
+            size_multiplier,
+            requested_quantity: quantity,
+            active_client_id: active_client_id.clone(),
+            passive_price,
+            order_submitted_ms,
+            deadline_ms: order_submitted_ms + plan.entry_timeout_ms.clamp(5_000, 120_000),
+            next_reprice_ms: order_submitted_ms + MAKER_REPRICE_INTERVAL_MS,
+            reprice_attempt,
+            first_fill_ms: None,
+            first_fill_time_source: None,
+            preliminary_stop_algo_id: None,
+            guard_unavailable_since_ms: None,
+            micro_reversal_since_ms: None,
+        };
+        self.record_entry_attempt(&plan.candidate_id, &recipe);
+        // Write the deterministic client id before touching Binance. If the
+        // process dies after submission, restart reconciliation can find the
+        // same order and establish protection instead of losing ownership.
+        self.state
+            .pending_entries
+            .insert(plan.symbol.clone(), pending.clone());
+        self.save()?;
+        let order = loop {
+            pending.active_client_id.clone_from(&active_client_id);
+            pending.passive_price = passive_price;
+            pending.reprice_attempt = reprice_attempt;
+            self.state
+                .pending_entries
+                .insert(plan.symbol.clone(), pending.clone());
+            self.save()?;
+            match self
+                .submit_or_lookup(
+                    &plan.symbol,
+                    &active_client_id,
+                    vec![
+                        ("symbol".into(), plan.symbol.clone()),
+                        ("side".into(), side_name(plan.side).into()),
+                        ("type".into(), "LIMIT".into()),
+                        ("timeInForce".into(), "GTX".into()),
+                        ("quantity".into(), decimal(quantity, rules.quantity_step)),
+                        ("price".into(), decimal(passive_price, rules.price_tick)),
+                        ("newClientOrderId".into(), active_client_id.clone()),
+                        ("newOrderRespType".into(), "ACK".into()),
+                    ],
+                )
+                .await
+            {
+                Ok(order) => break order,
+                Err(error) if is_post_only_rejection(&error) => {
+                    reprice_attempt += 1;
+                    if reprice_attempt > 3 {
+                        self.state.pending_entries.remove(&plan.symbol);
+                        self.save().ok();
+                        return Err(error).context("post-only entry crossed after three reprices");
+                    }
+                    let ticker = self
+                        .public_get_params(
+                            "/fapi/v1/ticker/bookTicker",
+                            &[("symbol", plan.symbol.as_str())],
+                        )
+                        .await?;
+                    passive_price = match plan.side {
+                        Side::Buy => floor_step(
+                            parse_f64(&ticker, "bidPrice")
+                                .ok_or_else(|| anyhow!("book ticker bid is missing"))?,
+                            rules.price_tick,
+                        ),
+                        Side::Sell => ceil_step(
+                            parse_f64(&ticker, "askPrice")
+                                .ok_or_else(|| anyhow!("book ticker ask is missing"))?,
+                            rules.price_tick,
+                        ),
+                    };
+                    let adverse_bps =
+                        entry_adverse_bps(plan.side, passive_price, plan.reference_price);
+                    if adverse_bps > plan.max_entry_adverse_bps {
+                        self.state.pending_entries.remove(&plan.symbol);
+                        self.save().ok();
+                        return Err(anyhow!(
+                            "post-only reprice drifted {adverse_bps:.1} bps against the signal (max {:.1})",
+                            plan.max_entry_adverse_bps
+                        ));
+                    }
+                    active_client_id = reprice_client_id(&base_client_id, reprice_attempt);
+                }
+                Err(error) => {
+                    self.state.pending_entries.remove(&plan.symbol);
+                    self.save().ok();
+                    return Err(error);
+                }
+            }
+        };
+        let accepted_ms = chrono::Utc::now().timestamp_millis();
+        let reconciled = self
+            .signed_read(
+                "/fapi/v1/order",
+                vec![
+                    ("symbol".into(), plan.symbol.clone()),
+                    ("origClientOrderId".into(), active_client_id.clone()),
+                ],
+            )
+            .await
+            .unwrap_or(order.clone());
+        let initially_executed = parse_f64(&reconciled, "executedQty").unwrap_or_default();
+        let preliminary_stop_algo_id = if initially_executed > f64::EPSILON {
+            let stop_distance = plan.side.sign() * (plan.reference_price - plan.stop_price)
+                / plan.reference_price.max(f64::EPSILON);
+            let provisional_stop_price = passive_price * (1.0 - plan.side.sign() * stop_distance);
+            match self
+                .place_close_all_trigger(
+                    &plan.symbol,
+                    plan.side.opposite(),
+                    "STOP_MARKET",
+                    provisional_stop_price,
+                    &rules,
+                    client_order_id("pendingstop", &plan.candidate_id),
+                )
+                .await
+            {
+                Ok(order_id) => Some(order_id),
+                Err(protection_error) => {
+                    let final_order = self
+                        .cancel_or_reconcile_entry(&plan.symbol, &active_client_id)
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "pending stop failed ({protection_error}) and entry cancellation could not be reconciled"
+                            )
+                        })?;
+                    let executed = parse_f64(&final_order, "executedQty").unwrap_or_default();
+                    if executed > f64::EPSILON {
+                        let order_id = final_order["orderId"].as_i64().unwrap_or_default();
+                        let (fill_ms, source) = self
+                            .resolve_first_fill_time(
+                                &plan.symbol,
+                                order_id,
+                                &final_order,
+                                plan.side,
+                                accepted_ms,
+                            )
+                            .await;
+                        pending.first_fill_ms = Some(fill_ms);
+                        pending.first_fill_time_source = Some(source.into());
+                        self.state
+                            .pending_entries
+                            .insert(plan.symbol.clone(), pending.clone());
+                        self.save().ok();
+                        let reason = format!("provisional_protection_failed: {protection_error}");
+                        return match self
+                            .finish_failed_pending_entry(
+                                pending,
+                                executed,
+                                &rules,
+                                accepted_ms,
+                                reason,
+                            )
+                            .await
+                        {
+                            Ok(event) => Ok(event),
+                            Err(close_error) => {
+                                self.state.execution_halt_reason = Some(format!(
+                                    "unprotected maker fill after stop and emergency close failure: {close_error}"
+                                ));
+                                self.save().ok();
+                                Err(close_error)
+                            }
+                        };
+                    }
+                    self.state.pending_entries.remove(&plan.symbol);
+                    self.save().ok();
+                    return Err(anyhow!(
+                        "pending entry was canceled because its immediate close-all stop failed: {protection_error}"
+                    ));
+                }
+            }
+        } else {
+            None
+        };
+        pending.active_client_id = active_client_id.clone();
+        pending.passive_price = passive_price;
+        pending.deadline_ms = accepted_ms + plan.entry_timeout_ms.clamp(5_000, 120_000);
+        pending.next_reprice_ms = accepted_ms + MAKER_REPRICE_INTERVAL_MS;
+        pending.reprice_attempt = reprice_attempt;
+        pending.preliminary_stop_algo_id = preliminary_stop_algo_id;
+        self.state
+            .pending_entries
+            .insert(plan.symbol.clone(), pending);
+        if let Err(error) = self.save() {
+            let final_order = self
+                .cancel_or_reconcile_entry(&plan.symbol, &active_client_id)
+                .await
+                .with_context(|| {
+                    format!(
+                        "persist pending entry failed ({error}); cancellation reconciliation failed"
+                    )
+                })?;
+            let executed = parse_f64(&final_order, "executedQty").unwrap_or_default();
+            let mut cleanup_stop = preliminary_stop_algo_id;
+            if executed > f64::EPSILON {
+                if cleanup_stop.is_none() {
+                    let stop_distance = plan.side.sign() * (plan.reference_price - plan.stop_price)
+                        / plan.reference_price.max(f64::EPSILON);
+                    cleanup_stop = Some(
+                        self.place_close_all_trigger(
+                            &plan.symbol,
+                            plan.side.opposite(),
+                            "STOP_MARKET",
+                            passive_price * (1.0 - plan.side.sign() * stop_distance),
+                            &rules,
+                            client_order_id("pendingstop", &plan.candidate_id),
+                        )
+                        .await
+                        .context("protect raced fill after pending-state persistence failed")?,
+                    );
+                }
+                self.flatten_entry_quantity(
+                    &plan.symbol,
+                    plan.side,
+                    executed,
+                    rules.quantity_step,
+                    &client_order_id("persistfail", &plan.candidate_id),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "persist pending entry failed ({error}); raced fill remains protected but emergency close failed"
+                    )
+                })?;
+            }
+            if let Some(order_id) = cleanup_stop {
+                self.cancel_protective_order(&plan.symbol, ProtectiveOrderId::Algo(order_id))
+                    .await
+                    .ok();
+            }
+            self.state.pending_entries.remove(&plan.symbol);
+            return Err(error).context("persist pending entry before returning to the main loop");
+        }
+        Ok(ExchangeEvent {
+            kind: "exchange_entry_submitted".into(),
+            payload: serde_json::json!({
+                "ts_ms":order_submitted_ms,
+                "candidate_id":plan.candidate_id,
+                "recipe":recipe,
+                "symbol":plan.symbol,
+                "side":plan.side,
+                "requested_quantity":quantity,
+                "limit_price":passive_price,
+                "order_id":order["orderId"],
+                "client_order_id":active_client_id,
+                "deadline_ms":accepted_ms + plan.entry_timeout_ms.clamp(5_000, 120_000),
+                "venue":"binance_demo",
+                "paper_only":true,
+            }),
+        })
+    }
+
+    /// Advance every resting maker entry by one non-blocking reconciliation
+    /// step. The state is persisted after every exchange mutation, so a
+    /// restart resumes the same client order rather than submitting a second
+    /// entry. Existing positions are managed by the remainder of `sync`
+    /// regardless of how long these orders wait.
+    async fn progress_pending_entries(&mut self, now_ms: i64) -> Result<Vec<ExchangeEvent>> {
+        let symbols: Vec<_> = self.state.pending_entries.keys().cloned().collect();
+        let mut events = Vec::new();
+        for symbol in symbols {
+            let Some(mut pending) = self.state.pending_entries.get(&symbol).cloned() else {
+                continue;
+            };
+            let rules = self
+                .rules
+                .get(&symbol)
+                .cloned()
+                .ok_or_else(|| anyhow!("missing exchange rules for pending entry {symbol}"))?;
+            let mut order = match self
+                .signed_read(
+                    "/fapi/v1/order",
+                    vec![
+                        ("symbol".into(), symbol.clone()),
+                        ("origClientOrderId".into(), pending.active_client_id.clone()),
+                    ],
+                )
+                .await
+            {
+                Ok(value) => value,
+                Err(_) => {
+                    // The persisted write-ahead state can legitimately exist
+                    // before Binance accepted the request. Re-submit with the
+                    // same deterministic id; submit_or_lookup makes this safe
+                    // when the original acknowledgement was merely lost.
+                    self.submit_or_lookup(
+                        &symbol,
+                        &pending.active_client_id,
+                        vec![
+                            ("symbol".into(), symbol.clone()),
+                            ("side".into(), side_name(pending.plan.side).into()),
+                            ("type".into(), "LIMIT".into()),
+                            ("timeInForce".into(), "GTX".into()),
+                            (
+                                "quantity".into(),
+                                decimal(pending.requested_quantity, rules.quantity_step),
+                            ),
+                            (
+                                "price".into(),
+                                decimal(pending.passive_price, rules.price_tick),
+                            ),
+                            ("newClientOrderId".into(), pending.active_client_id.clone()),
+                            ("newOrderRespType".into(), "ACK".into()),
+                        ],
+                    )
+                    .await?
+                }
+            };
+            let mut executed = parse_f64(&order, "executedQty").unwrap_or_default();
+            if executed > f64::EPSILON && pending.first_fill_ms.is_none() {
+                let order_id = order["orderId"].as_i64().unwrap_or_default();
+                let (fill_ms, source) = self
+                    .resolve_first_fill_time(&symbol, order_id, &order, pending.plan.side, now_ms)
+                    .await;
+                pending.first_fill_ms = Some(fill_ms);
+                pending.first_fill_time_source = Some(source.into());
+                self.record_filled_attempt(&pending.plan.candidate_id, &pending.recipe);
+            }
+            if executed > f64::EPSILON && pending.preliminary_stop_algo_id.is_none() {
+                let stop_distance = pending.plan.side.sign()
+                    * (pending.plan.reference_price - pending.plan.stop_price)
+                    / pending.plan.reference_price.max(f64::EPSILON);
+                let trigger =
+                    pending.passive_price * (1.0 - pending.plan.side.sign() * stop_distance);
+                pending.preliminary_stop_algo_id = Some(
+                    self.place_close_all_trigger(
+                        &symbol,
+                        pending.plan.side.opposite(),
+                        "STOP_MARKET",
+                        trigger,
+                        &rules,
+                        client_order_id("pendingstop", &pending.plan.candidate_id),
+                    )
+                    .await
+                    .context("re-arm provisional stop for a recovered partial fill")?,
+                );
+                self.state
+                    .pending_entries
+                    .insert(symbol.clone(), pending.clone());
+                self.save()?;
+            }
+
+            let mut invalidation = None;
+            match self.pending_entry_guard(&pending.plan, now_ms) {
+                EntryGuardState::Healthy => {
+                    pending.guard_unavailable_since_ms = None;
+                    pending.micro_reversal_since_ms = None;
+                }
+                EntryGuardState::StructuralInvalidation(reason) => invalidation = Some(reason),
+                EntryGuardState::MicroReversal(reason) => {
+                    pending.guard_unavailable_since_ms = None;
+                    invalidation = persistent_guard_reason(
+                        &mut pending.micro_reversal_since_ms,
+                        now_ms,
+                        ENTRY_GUARD_REVERSAL_CONFIRM_MS,
+                        &reason,
+                    );
+                }
+                EntryGuardState::Unavailable(reason) => {
+                    pending.micro_reversal_since_ms = None;
+                    let missing_since = *pending.guard_unavailable_since_ms.get_or_insert(now_ms);
+                    invalidation =
+                        (now_ms - missing_since >= ENTRY_GUARD_STALE_GRACE_MS).then(|| {
+                            format!(
+                                "{reason} for {}ms (max {}ms)",
+                                now_ms - missing_since,
+                                ENTRY_GUARD_STALE_GRACE_MS
+                            )
+                        });
+                }
+            }
+
+            let status = order["status"].as_str().unwrap_or("NEW").to_string();
+            let terminal = matches!(
+                status.as_str(),
+                "FILLED" | "CANCELED" | "EXPIRED" | "REJECTED"
+            );
+            let wait_satisfied = managed_fill_threshold_reached(
+                executed,
+                pending.requested_quantity,
+                rules.quantity_step,
+                pending.plan.min_fill_ratio,
+            );
+            let deadline = now_ms >= pending.deadline_ms;
+            if invalidation.is_some() || terminal || wait_satisfied || deadline {
+                if status != "FILLED"
+                    && !matches!(status.as_str(), "CANCELED" | "EXPIRED" | "REJECTED")
+                {
+                    order = self
+                        .cancel_or_reconcile_entry(&symbol, &pending.active_client_id)
+                        .await?;
+                    executed = reconciled_executed_quantity(executed, &order);
+                    if executed > f64::EPSILON && pending.first_fill_ms.is_none() {
+                        let order_id = order["orderId"].as_i64().unwrap_or_default();
+                        let (fill_ms, source) = self
+                            .resolve_first_fill_time(
+                                &symbol,
+                                order_id,
+                                &order,
+                                pending.plan.side,
+                                now_ms,
+                            )
+                            .await;
+                        pending.first_fill_ms = Some(fill_ms);
+                        pending.first_fill_time_source = Some(source.into());
+                        self.record_filled_attempt(&pending.plan.candidate_id, &pending.recipe);
+                    }
+                }
+
+                if invalidation.is_none()
+                    && executed <= f64::EPSILON
+                    && deadline
+                    && pending.plan.taker_fallback
+                {
+                    let ticker = self
+                        .public_get_params(
+                            "/fapi/v1/ticker/bookTicker",
+                            &[("symbol", symbol.as_str())],
+                        )
+                        .await?;
+                    let executable = if pending.plan.side == Side::Buy {
+                        parse_f64(&ticker, "askPrice")
+                    } else {
+                        parse_f64(&ticker, "bidPrice")
+                    }
+                    .ok_or_else(|| anyhow!("book ticker is missing an executable price"))?;
+                    let adverse = entry_adverse_bps(
+                        pending.plan.side,
+                        executable,
+                        pending.plan.reference_price,
+                    );
+                    if adverse <= pending.plan.taker_fallback_max_adverse_bps {
+                        let fallback_size =
+                            pending.plan.taker_fallback_size_multiplier.clamp(0.01, 1.0);
+                        let fallback_quantity = bounded_fallback_quantity(
+                            pending.requested_quantity,
+                            fallback_size,
+                            rules.quantity_step,
+                        );
+                        validate_entry_quantity_and_exits(
+                            &pending.plan,
+                            fallback_quantity,
+                            executable,
+                            &rules,
+                        )?;
+                        let fallback_id = client_order_id("fallback", &pending.plan.candidate_id);
+                        order = self
+                            .submit_or_lookup(
+                                &symbol,
+                                &fallback_id,
+                                vec![
+                                    ("symbol".into(), symbol.clone()),
+                                    ("side".into(), side_name(pending.plan.side).into()),
+                                    ("type".into(), "MARKET".into()),
+                                    (
+                                        "quantity".into(),
+                                        decimal(fallback_quantity, rules.quantity_step),
+                                    ),
+                                    ("newClientOrderId".into(), fallback_id.clone()),
+                                    ("newOrderRespType".into(), "RESULT".into()),
+                                ],
+                            )
+                            .await?;
+                        pending.requested_quantity = fallback_quantity;
+                        pending.size_multiplier *= fallback_size;
+                        executed = parse_f64(&order, "executedQty").unwrap_or_default();
+                        let order_id = order["orderId"].as_i64().unwrap_or_default();
+                        let (fill_ms, source) = self
+                            .resolve_first_fill_time(
+                                &symbol,
+                                order_id,
+                                &order,
+                                pending.plan.side,
+                                now_ms,
+                            )
+                            .await;
+                        pending.first_fill_ms = Some(fill_ms);
+                        pending.first_fill_time_source = Some(source.into());
+                        self.record_filled_attempt(&pending.plan.candidate_id, &pending.recipe);
+                    }
+                }
+
+                if let Some(reason) = invalidation {
+                    events.push(
+                        self.finish_failed_pending_entry(
+                            pending,
+                            executed,
+                            &rules,
+                            now_ms,
+                            format!("signal_invalidated: {reason}"),
+                        )
+                        .await?,
+                    );
+                    continue;
+                }
+                if executed <= f64::EPSILON {
+                    self.cancel_pending_stop(&symbol, &pending).await;
+                    self.state.pending_entries.remove(&symbol);
+                    self.save()?;
+                    events.push(ExchangeEvent {
+                        kind: "exchange_entry_expired".into(),
+                        payload: serde_json::json!({
+                            "ts_ms":now_ms,"candidate_id":pending.plan.candidate_id,
+                            "recipe":pending.recipe,"symbol":symbol,"side":pending.plan.side,
+                            "reason":if terminal {format!("order_{status}")} else {"maker_timeout".into()},
+                            "venue":"binance_demo","paper_only":true
+                        }),
+                    });
+                    continue;
+                }
+                let manageable = partial_fill_is_manageable(
+                    executed,
+                    pending.requested_quantity,
+                    entry_price_hint(&order, pending.passive_price),
+                    pending.plan.min_managed_fill_ratio,
+                    &rules,
+                    &pending.plan.take_profit_prices,
+                );
+                if manageable {
+                    events.push(
+                        self.finalize_pending_entry(pending, order, executed, &rules, now_ms)
+                            .await?,
+                    );
+                } else {
+                    events.push(
+                        self.finish_failed_pending_entry(
+                            pending,
+                            executed,
+                            &rules,
+                            now_ms,
+                            "fill_below_manageable_minimum".into(),
+                        )
+                        .await?,
+                    );
+                }
+                continue;
+            }
+
+            if executed <= f64::EPSILON
+                && now_ms >= pending.next_reprice_ms
+                && pending.reprice_attempt < MAX_MAKER_REPRICES
+            {
+                let ticker = self
+                    .public_get_params("/fapi/v1/ticker/bookTicker", &[("symbol", symbol.as_str())])
+                    .await?;
+                let best_passive = match pending.plan.side {
+                    Side::Buy => parse_f64(&ticker, "bidPrice"),
+                    Side::Sell => parse_f64(&ticker, "askPrice"),
+                }
+                .ok_or_else(|| anyhow!("book ticker passive price is missing"))?;
+                let next_price = capped_passive_price(
+                    pending.plan.side,
+                    best_passive,
+                    pending.plan.reference_price,
+                    pending.plan.max_entry_adverse_bps,
+                    rules.price_tick,
+                );
+                pending.next_reprice_ms += MAKER_REPRICE_INTERVAL_MS;
+                if passive_price_improves(
+                    pending.plan.side,
+                    pending.passive_price,
+                    next_price,
+                    rules.price_tick,
+                ) {
+                    let canceled = self
+                        .cancel_or_reconcile_entry(&symbol, &pending.active_client_id)
+                        .await?;
+                    let raced = reconciled_executed_quantity(executed, &canceled);
+                    if raced > f64::EPSILON {
+                        let order_id = canceled["orderId"].as_i64().unwrap_or_default();
+                        let (fill_ms, source) = self
+                            .resolve_first_fill_time(
+                                &symbol,
+                                order_id,
+                                &canceled,
+                                pending.plan.side,
+                                now_ms,
+                            )
+                            .await;
+                        pending.first_fill_ms = Some(fill_ms);
+                        pending.first_fill_time_source = Some(source.into());
+                        self.record_filled_attempt(&pending.plan.candidate_id, &pending.recipe);
+                        if partial_fill_is_manageable(
+                            raced,
+                            pending.requested_quantity,
+                            entry_price_hint(&canceled, pending.passive_price),
+                            pending.plan.min_managed_fill_ratio,
+                            &rules,
+                            &pending.plan.take_profit_prices,
+                        ) {
+                            events.push(
+                                self.finalize_pending_entry(
+                                    pending, canceled, raced, &rules, now_ms,
+                                )
+                                .await?,
+                            );
+                        } else {
+                            events.push(
+                                self.finish_failed_pending_entry(
+                                    pending,
+                                    raced,
+                                    &rules,
+                                    now_ms,
+                                    "reprice_cancel_race_below_manageable_minimum".into(),
+                                )
+                                .await?,
+                            );
+                        }
+                        continue;
+                    }
+                    pending.reprice_attempt += 1;
+                    pending.passive_price = next_price;
+                    pending.active_client_id = reprice_client_id(
+                        &client_order_id("entry", &pending.plan.candidate_id),
+                        pending.reprice_attempt,
+                    );
+                    self.submit_or_lookup(
+                        &symbol,
+                        &pending.active_client_id,
+                        vec![
+                            ("symbol".into(), symbol.clone()),
+                            ("side".into(), side_name(pending.plan.side).into()),
+                            ("type".into(), "LIMIT".into()),
+                            ("timeInForce".into(), "GTX".into()),
+                            (
+                                "quantity".into(),
+                                decimal(pending.requested_quantity, rules.quantity_step),
+                            ),
+                            ("price".into(), decimal(next_price, rules.price_tick)),
+                            ("newClientOrderId".into(), pending.active_client_id.clone()),
+                            ("newOrderRespType".into(), "ACK".into()),
+                        ],
+                    )
+                    .await?;
+                }
+            }
+            self.state.pending_entries.insert(symbol, pending);
+            self.save()?;
+        }
+        Ok(events)
+    }
+
+    async fn finalize_pending_entry(
+        &mut self,
+        pending: PendingEntryState,
+        order: Value,
+        executed: f64,
+        rules: &SymbolRules,
+        completed_ms: i64,
+    ) -> Result<ExchangeEvent> {
+        let plan = &pending.plan;
+        let order_id = order["orderId"].as_i64().unwrap_or_default();
+        let (entry_price, entry_price_source) = self
+            .resolve_entry_price(&plan.symbol, order_id, &order, plan.side)
+            .await
+            .unwrap_or((pending.passive_price, "strategy_reference_fallback"));
+        let (first_fill_ms, time_source) = match (
+            pending.first_fill_ms,
+            pending.first_fill_time_source.as_deref(),
+        ) {
+            (Some(value), Some(source)) => (value, source.to_string()),
+            _ => {
+                let (value, source) = self
+                    .resolve_first_fill_time(
+                        &plan.symbol,
+                        order_id,
+                        &order,
+                        plan.side,
+                        completed_ms,
+                    )
+                    .await;
+                (value, source.into())
+            }
+        };
+        let sign = plan.side.sign();
+        let stop_distance = sign * (plan.reference_price - plan.stop_price)
+            / plan.reference_price.max(f64::EPSILON);
+        let stop_price = entry_price * (1.0 - sign * stop_distance);
+        let take_profit_prices: Vec<_> = plan
+            .take_profit_prices
+            .iter()
+            .map(|(target, fraction)| {
+                let distance = sign * (*target / plan.reference_price.max(f64::EPSILON) - 1.0);
+                (entry_price * (1.0 + sign * distance), *fraction)
+            })
+            .collect();
+
+        let exact_stop = self
+            .place_close_all_trigger(
+                &plan.symbol,
+                plan.side.opposite(),
+                "STOP_MARKET",
+                stop_price,
+                rules,
+                client_order_id("stop", &plan.candidate_id),
+            )
+            .await;
+        let stop_algo_id = match exact_stop {
+            Ok(value) => value,
+            Err(error) => {
+                return self
+                    .finish_failed_pending_entry(
+                        pending,
+                        executed,
+                        rules,
+                        completed_ms,
+                        format!("exact_protection_failed: {error}"),
+                    )
+                    .await;
+            }
+        };
+        self.cancel_pending_stop(&plan.symbol, &pending).await;
+        let mut take_profit_order_ids = Vec::new();
+        for (index, (target, fraction)) in take_profit_prices.iter().enumerate() {
+            match self
+                .place_reduce_only_take_profit(
+                    &plan.symbol,
+                    plan.side.opposite(),
+                    *target,
+                    floor_step(executed * fraction, rules.quantity_step),
+                    rules,
+                    client_order_id(&format!("take{index}"), &plan.candidate_id),
+                )
+                .await
+            {
+                Ok(value) => take_profit_order_ids.push(value),
+                Err(error) => {
+                    return self
+                        .finish_failed_pending_entry(
+                            pending,
+                            executed,
+                            rules,
+                            completed_ms,
+                            format!("take_profit_protection_failed: {error}"),
+                        )
+                        .await;
+                }
+            }
+        }
+        let planned_notional_usd = plan.notional_usd * pending.size_multiplier;
+        let actual_notional_usd = entry_price * executed;
+        let fill_ratio = executed / pending.requested_quantity.max(f64::EPSILON);
+        self.state.positions.insert(
+            plan.symbol.clone(),
+            ExecutionMeta {
+                candidate_id: plan.candidate_id.clone(),
+                recipe: pending.recipe.clone(),
+                side: plan.side,
+                entry_ms: first_fill_ms,
+                signal_ms: pending.signal_ms,
+                order_submitted_ms: pending.order_submitted_ms,
+                first_fill_ms: Some(first_fill_ms),
+                entry_completed_ms: Some(completed_ms),
+                entry_time_source: Some(time_source.clone()),
+                entry_price,
+                initial_quantity: executed,
+                last_observed_quantity: executed,
+                cumulative_reported_fee_usd: 0.0,
+                cumulative_reported_pnl_usd: 0.0,
+                planned_notional_usd: Some(planned_notional_usd),
+                fill_ratio: Some(fill_ratio),
+                initial_risk_usd: Some(executed * (entry_price - stop_price).abs()),
+                stop_price,
+                take_profit_price: take_profit_prices
+                    .last()
+                    .map(|value| value.0)
+                    .unwrap_or_default(),
+                take_profit_prices: take_profit_prices.clone(),
+                unprotected_runner_fraction: plan.unprotected_runner_fraction,
+                runner_active: false,
+                break_even_after_fraction: plan.break_even_after_fraction.map(|fraction| {
+                    floor_step(executed * fraction, rules.quantity_step)
+                        / executed.max(f64::EPSILON)
+                }),
+                break_even_buffer_pct: plan.break_even_buffer_pct,
+                profit_shield_activation_pct: plan.profit_shield_activation_pct,
+                break_even_armed: false,
+                extreme_price: entry_price,
+                adverse_price: entry_price,
+                trailing_activation_pct: plan.trailing_activation_pct,
+                trailing_distance_pct: plan.trailing_distance_pct,
+                early_failure_after_ms: plan.early_failure_after_ms,
+                early_failure_adverse_pct: plan.early_failure_adverse_pct,
+                early_failure_max_favorable_pct: plan.early_failure_max_favorable_pct,
+                max_hold_ms: plan.max_hold_ms,
+                exit_requested: false,
+                pending_exit_reason: None,
+                pending_exit_actor: None,
+                pending_exit_note: None,
+                stop_algo_id: Some(stop_algo_id),
+                stop_reason: Some("initial_stop".into()),
+                take_profit_order_ids: take_profit_order_ids.clone(),
+            },
+        );
+        self.state.pending_entries.remove(&plan.symbol);
+        self.record_filled_attempt(&plan.candidate_id, &pending.recipe);
+        self.record_formal_position(&plan.candidate_id, &pending.recipe);
+        self.save()?;
+        Ok(ExchangeEvent {
+            kind: "exchange_entry".into(),
+            payload: serde_json::json!({
+                "ts_ms":first_fill_ms,"candidate_id":plan.candidate_id,"recipe":pending.recipe,
+                "lane":pending.recipe,"symbol":plan.symbol,"side":plan.side,
+                "signal_context":plan.signal_context,"entry_mode":"persistent_maker_limit",
+                "entry_price_source":entry_price_source,"maker_attempted":true,
+                "maker_wait_ms":completed_ms.saturating_sub(pending.order_submitted_ms),
+                "maker_reprices":pending.reprice_attempt,"requested_limit":plan.entry_limit,
+                "final_maker_limit":pending.passive_price,"entry_price":entry_price,
+                "quantity":executed,"notional_usd":actual_notional_usd,
+                "actual_notional_usd":actual_notional_usd,"planned_notional_usd":planned_notional_usd,
+                "fill_ratio":fill_ratio,"partial_fill":fill_ratio < 0.999,
+                "probe_size_multiplier":pending.size_multiplier,"margin_type":"isolated",
+                "entry_timing":{"signal_ms":pending.signal_ms,"order_submitted_ms":pending.order_submitted_ms,
+                    "first_fill_ms":first_fill_ms,"entry_completed_ms":completed_ms,"source":time_source},
+                "order_id":order_id,"stop_algo_id":stop_algo_id,
+                "take_profit_order_ids":take_profit_order_ids,
+                "discovery_latency_ms":pending.discovery_latency_ms,
+                "venue":"binance_demo","paper_only":true
+            }),
+        })
+    }
+
+    async fn finish_failed_pending_entry(
+        &mut self,
+        pending: PendingEntryState,
+        executed: f64,
+        rules: &SymbolRules,
+        now_ms: i64,
+        reason: String,
+    ) -> Result<ExchangeEvent> {
+        if executed > f64::EPSILON {
+            let close_id = client_order_id("attemptclose", &pending.plan.candidate_id);
+            self.flatten_entry_quantity(
+                &pending.plan.symbol,
+                pending.plan.side,
+                executed,
+                rules.quantity_step,
+                &close_id,
+            )
+            .await
+            .with_context(|| format!("{reason}; emergency close failed"))?;
+            self.record_filled_attempt(&pending.plan.candidate_id, &pending.recipe);
+            self.cancel_all(&pending.plan.symbol).await.ok();
+        } else {
+            self.cancel_pending_stop(&pending.plan.symbol, &pending)
+                .await;
+        }
+        // Keep the provisional close-all stop live until Binance has accepted
+        // the reduce-only flatten. A failed close therefore leaves a protected,
+        // recoverable pending state instead of an unprotected foreign position.
+        self.state.pending_entries.remove(&pending.plan.symbol);
+        let started_ms = pending
+            .first_fill_ms
+            .unwrap_or(pending.order_submitted_ms)
+            .saturating_sub(1_000);
+        let summary = if executed > f64::EPSILON {
+            self.trade_summary_after_close(
+                &pending.plan.symbol,
+                started_ms,
+                pending.plan.side,
+                executed,
+            )
+            .await
+            .ok()
+        } else {
+            None
+        };
+        if let Some(summary) = summary.as_ref() {
+            let risk = summary.entry_quantity
+                * (summary.entry_price
+                    - pending.plan.stop_price * summary.entry_price
+                        / pending.plan.reference_price.max(f64::EPSILON))
+                .abs();
+            let outcome = ExecutionOutcome {
+                candidate_id: pending.plan.candidate_id.clone(),
+                exit_ms: now_ms,
+                pnl_usd: summary.net_pnl_usd,
+                pnl_r: (risk > f64::EPSILON).then_some(summary.net_pnl_usd / risk),
+                fill_ratio: Some(
+                    summary.entry_quantity / pending.requested_quantity.max(f64::EPSILON),
+                ),
+                initial_risk_usd: (risk > f64::EPSILON).then_some(risk),
+                sample_kind: "filled_entry_attempt".into(),
+            };
+            self.record_outcome_once(
+                &pending.plan.candidate_id,
+                &pending.recipe,
+                &pending.plan.symbol,
+                pending.plan.side,
+                outcome,
+            );
+        }
+        if executed > f64::EPSILON && summary.is_none() {
+            self.state.pending_accounting.insert(
+                pending.plan.candidate_id.clone(),
+                PendingAccountingState {
+                    candidate_id: pending.plan.candidate_id.clone(),
+                    recipe: pending.recipe.clone(),
+                    symbol: pending.plan.symbol.clone(),
+                    side: pending.plan.side,
+                    start_ms: started_ms,
+                    requested_quantity: pending.requested_quantity,
+                    expected_exit_quantity: executed,
+                    reference_price: pending.plan.reference_price,
+                    planned_stop_price: pending.plan.stop_price,
+                },
+            );
+        }
+        self.save()?;
+        Ok(ExchangeEvent {
+            kind: if executed > f64::EPSILON && summary.is_some() {
+                "exchange_entry_attempt_closed"
+            } else if executed > f64::EPSILON {
+                "exchange_entry_attempt_pending_accounting"
+            } else {
+                "exchange_entry_expired"
+            }
+            .into(),
+            payload: serde_json::json!({
+                "ts_ms":now_ms,"candidate_id":pending.plan.candidate_id,
+                "recipe":pending.recipe,"symbol":pending.plan.symbol,"side":pending.plan.side,
+                "reason":reason,"planned_quantity":pending.requested_quantity,
+                "filled_quantity":executed,
+                "fill_ratio":executed / pending.requested_quantity.max(f64::EPSILON),
+                "attempt_entry_price":summary.as_ref().map(|value| value.entry_price),
+                "attempt_entry_quantity":summary.as_ref().map(|value| value.entry_quantity),
+                "attempt_initial_risk_usd":summary.as_ref().map(|value| value.entry_quantity * (value.entry_price - pending.plan.stop_price * value.entry_price / pending.plan.reference_price.max(f64::EPSILON)).abs()),
+                "attempt_fee_usd":summary.as_ref().map(|value| value.fees_usd),
+                "attempt_net_pnl_usd":summary.as_ref().map(|value| value.net_pnl_usd),
+                "venue":"binance_demo","paper_only":true
+            }),
+        })
+    }
+
+    async fn cancel_pending_stop(&self, symbol: &str, pending: &PendingEntryState) {
+        if let Some(order_id) = pending.preliminary_stop_algo_id {
+            self.cancel_protective_order(symbol, ProtectiveOrderId::Algo(order_id))
+                .await
+                .ok();
+        }
     }
 
     /// Submit a reduce-only market close requested by an authenticated operator.
@@ -2151,7 +3575,12 @@ impl BinanceDemoExecution {
                 "operator_action":true,
                 "exit_actor":actor,
                 "operator_note":note,
-                "entry_ms":meta.entry_ms,
+                "entry_ms":meta.holding_started_ms(),
+                "signal_ms":meta.signal_ms,
+                "order_submitted_ms":meta.order_submitted_ms,
+                "first_fill_ms":meta.first_fill_ms,
+                "entry_completed_ms":meta.entry_completed_ms,
+                "holding_time_source":meta.holding_time_source(),
                 "entry_price":position.entry_price,
                 "mark_price":position.mark_price,
                 "quantity":position.quantity.abs(),
@@ -2161,7 +3590,7 @@ impl BinanceDemoExecution {
                 "mfe_pct":mfe_pct,
                 "mae_pct":mae_pct,
                 "realized_before_close_usd":meta.cumulative_reported_pnl_usd,
-                "hold_ms":requested_ms.saturating_sub(meta.entry_ms),
+                "hold_ms":requested_ms.saturating_sub(meta.holding_started_ms()),
                 "protection":{
                     "stop_price":meta.stop_price,
                     "stop_reason":meta.stop_reason,
@@ -2324,148 +3753,35 @@ impl BinanceDemoExecution {
         )
         .await
         .with_context(|| format!("set {} leverage to {}x", plan.symbol, self.config.leverage))?;
+        if plan.entry_limit.is_some() {
+            return Err(anyhow!(
+                "maker plans must be advanced by the persistent pending-entry state machine"
+            ));
+        }
         let client_id = client_order_id("entry", &plan.candidate_id);
-        let entry = if let Some(limit) = plan.entry_limit {
-            let price = if plan.side == Side::Buy {
-                floor_step(limit, rules.price_tick)
-            } else {
-                ceil_step(limit, rules.price_tick)
-            };
-            match self
-                .place_post_only_entry(plan, quantity, price, rules, &client_id)
-                .await?
-            {
-                PostOnlyEntry::Filled {
-                    order,
-                    waited_ms,
-                    reprices,
-                    final_limit,
-                } => EntryExecution {
-                    mode: if order["_greedTradeThroughRecovery"].as_bool() == Some(true) {
-                        "maker_partial_trade_through_recovery"
-                    } else if reprices > 0 {
-                        "adaptive_maker_limit"
-                    } else {
-                        "maker_limit"
-                    },
-                    order,
-                    requested_quantity: quantity,
-                    maker_attempted: true,
-                    maker_wait_ms: waited_ms,
-                    maker_reprices: reprices,
-                    final_maker_limit: Some(final_limit),
-                    size_multiplier: 1.0,
-                },
-                PostOnlyEntry::Unfilled {
-                    waited_ms,
-                    reprices,
-                    final_limit,
-                } if plan.taker_fallback => {
-                    let ticker = self
-                        .public_get_params(
-                            "/fapi/v1/ticker/bookTicker",
-                            &[("symbol", plan.symbol.as_str())],
-                        )
-                        .await?;
-                    let executable = if plan.side == Side::Buy {
-                        parse_f64(&ticker, "askPrice")
-                    } else {
-                        parse_f64(&ticker, "bidPrice")
-                    }
-                    .ok_or_else(|| anyhow!("book ticker is missing an executable price"))?;
-                    let adverse_bps =
-                        entry_adverse_bps(plan.side, executable, plan.reference_price);
-                    if adverse_bps > plan.taker_fallback_max_adverse_bps {
-                        return Err(anyhow!(
-                            "maker entry expired and price drifted {adverse_bps:.1} bps against the signal (max {:.1})",
-                            plan.taker_fallback_max_adverse_bps
-                        ));
-                    }
-                    let fallback_size = plan.taker_fallback_size_multiplier.clamp(0.01, 1.0);
-                    let fallback_quantity =
-                        bounded_fallback_quantity(quantity, fallback_size, rules.quantity_step);
-                    if fallback_quantity < rules.min_quantity
-                        || fallback_quantity * executable < rules.min_notional
-                    {
-                        return Err(anyhow!(
-                            "bounded fallback probe is below Binance quantity or notional minimum"
-                        ));
-                    }
-                    for (_, fraction) in &plan.take_profit_prices {
-                        if *fraction >= 1.0 - f64::EPSILON {
-                            continue;
-                        }
-                        let partial = floor_step(fallback_quantity * fraction, rules.quantity_step);
-                        if partial < rules.min_quantity || partial * executable < rules.min_notional
-                        {
-                            return Err(anyhow!(
-                                "bounded fallback take profit is below Binance quantity or notional minimum"
-                            ));
-                        }
-                    }
-                    let fallback_id = client_order_id("fallback", &plan.candidate_id);
-                    let order = self
-                        .submit_or_lookup(
-                            &plan.symbol,
-                            &fallback_id,
-                            vec![
-                                ("symbol".into(), plan.symbol.clone()),
-                                ("side".into(), side_name(plan.side).into()),
-                                ("type".into(), "MARKET".into()),
-                                (
-                                    "quantity".into(),
-                                    decimal(fallback_quantity, rules.quantity_step),
-                                ),
-                                ("newClientOrderId".into(), fallback_id.clone()),
-                                ("newOrderRespType".into(), "RESULT".into()),
-                            ],
-                        )
-                        .await?;
-                    EntryExecution {
-                        order,
-                        requested_quantity: fallback_quantity,
-                        mode: "maker_timeout_taker_fallback",
-                        maker_attempted: true,
-                        maker_wait_ms: waited_ms,
-                        maker_reprices: reprices,
-                        final_maker_limit: Some(final_limit),
-                        size_multiplier: fallback_size,
-                    }
-                }
-                PostOnlyEntry::Unfilled {
-                    waited_ms,
-                    reprices,
-                    final_limit,
-                } => {
-                    return Err(anyhow!(
-                        "adaptive maker entry expired without fill after {waited_ms}ms ({reprices} reprices, final limit {final_limit}); chasing is disabled"
-                    ));
-                }
-            }
-        } else {
-            EntryExecution {
-                order: self
-                    .submit_or_lookup(
-                        &plan.symbol,
-                        &client_id,
-                        vec![
-                            ("symbol".into(), plan.symbol.clone()),
-                            ("side".into(), side_name(plan.side).into()),
-                            ("type".into(), "MARKET".into()),
-                            ("quantity".into(), decimal(quantity, rules.quantity_step)),
-                            ("newClientOrderId".into(), client_id.clone()),
-                            ("newOrderRespType".into(), "RESULT".into()),
-                        ],
-                    )
-                    .await?,
-                requested_quantity: quantity,
-                mode: "taker_market",
-                maker_attempted: false,
-                maker_wait_ms: 0,
-                maker_reprices: 0,
-                final_maker_limit: None,
-                size_multiplier: 1.0,
-            }
+        let order_submitted_ms = chrono::Utc::now().timestamp_millis();
+        let entry = EntryExecution {
+            order: self
+                .submit_or_lookup(
+                    &plan.symbol,
+                    &client_id,
+                    vec![
+                        ("symbol".into(), plan.symbol.clone()),
+                        ("side".into(), side_name(plan.side).into()),
+                        ("type".into(), "MARKET".into()),
+                        ("quantity".into(), decimal(quantity, rules.quantity_step)),
+                        ("newClientOrderId".into(), client_id.clone()),
+                        ("newOrderRespType".into(), "RESULT".into()),
+                    ],
+                )
+                .await?,
+            requested_quantity: quantity,
+            mode: "taker_market",
+            maker_attempted: false,
+            maker_wait_ms: 0,
+            maker_reprices: 0,
+            final_maker_limit: None,
+            size_multiplier: 1.0,
         };
         let mut executed =
             parse_f64(&entry.order, "executedQty").unwrap_or(entry.requested_quantity);
@@ -2473,7 +3789,18 @@ impl BinanceDemoExecution {
             return Err(anyhow!("entry order completed without a fill"));
         }
         let fill_ratio = executed / entry.requested_quantity.max(f64::EPSILON);
-        if plan.min_fill_ratio > 0.0 && fill_ratio + f64::EPSILON < plan.min_fill_ratio {
+        let manageable_partial = partial_fill_is_manageable(
+            executed,
+            entry.requested_quantity,
+            entry_price_hint(&entry.order, plan.reference_price),
+            plan.min_managed_fill_ratio,
+            rules,
+            &plan.take_profit_prices,
+        );
+        if plan.min_fill_ratio > 0.0
+            && fill_ratio + f64::EPSILON < plan.min_fill_ratio
+            && !manageable_partial
+        {
             let close_id = client_order_id("underfill", &plan.candidate_id);
             let close = self
                 .submit_or_lookup(
@@ -2495,9 +3822,9 @@ impl BinanceDemoExecution {
                     let closed = parse_f64(&close, "executedQty").unwrap_or_default();
                     if closed + rules.quantity_step * 0.5 >= executed {
                         return Err(anyhow!(
-                            "maker fill ratio {:.1}% was below the strategy minimum {:.1}%; incidental fill was flattened",
+                            "maker fill ratio {:.1}% was below the manageable minimum {:.1}% or failed exchange-size validation; incidental fill was flattened",
                             fill_ratio * 100.0,
-                            plan.min_fill_ratio * 100.0
+                            plan.min_managed_fill_ratio * 100.0
                         ));
                     }
                     executed = (executed - closed).max(0.0);
@@ -2518,10 +3845,20 @@ impl BinanceDemoExecution {
             }
         }
         let order_id = entry.order["orderId"].as_i64().unwrap_or_default();
+        let entry_completed_ms = chrono::Utc::now().timestamp_millis();
         let (entry_price, entry_price_source) = self
             .resolve_entry_price(&plan.symbol, order_id, &entry.order, plan.side)
             .await
             .unwrap_or((plan.reference_price, "strategy_reference_fallback"));
+        let (first_fill_ms, entry_time_source) = self
+            .resolve_first_fill_time(
+                &plan.symbol,
+                order_id,
+                &entry.order,
+                plan.side,
+                entry_completed_ms,
+            )
+            .await;
         // Preserve the planned risk/reward distances from the actual exchange
         // fill. A fast market can move between signal construction and fill;
         // anchoring protection to the stale reference would silently change
@@ -2605,6 +3942,10 @@ impl BinanceDemoExecution {
             maker_reprices: entry.maker_reprices,
             final_maker_limit: entry.final_maker_limit,
             size_multiplier: entry.size_multiplier,
+            order_submitted_ms,
+            first_fill_ms,
+            entry_completed_ms,
+            entry_time_source,
         })
     }
 
@@ -2742,6 +4083,52 @@ impl BinanceDemoExecution {
         ))
     }
 
+    async fn resolve_first_fill_time(
+        &self,
+        symbol: &str,
+        order_id: i64,
+        order: &Value,
+        side: Side,
+        locally_observed_ms: i64,
+    ) -> (i64, &'static str) {
+        if order_id > 0 {
+            for _ in 0..3 {
+                if let Ok(trades) = self
+                    .signed(
+                        Method::GET,
+                        "/fapi/v1/userTrades",
+                        vec![
+                            ("symbol".into(), symbol.into()),
+                            ("orderId".into(), order_id.to_string()),
+                            ("limit".into(), "1000".into()),
+                        ],
+                    )
+                    .await
+                {
+                    let first = trades.as_array().and_then(|rows| {
+                        rows.iter()
+                            .filter(|row| {
+                                row["side"].as_str().is_some_and(|value| {
+                                    value.eq_ignore_ascii_case(side_name(side))
+                                })
+                            })
+                            .filter_map(|row| row["time"].as_i64())
+                            .min()
+                    });
+                    if let Some(first_fill_ms) = first {
+                        return (first_fill_ms, "exchange_user_trade_time");
+                    }
+                }
+                tokio::time::sleep(Duration::from_millis(100)).await;
+            }
+        }
+        // `updateTime` is an order lifecycle timestamp and may represent the
+        // final fill, so it is deliberately not relabelled as the first fill.
+        // The local observation is honest and safe for the holding clock.
+        let _ = order;
+        (locally_observed_ms, "local_first_fill_observation")
+    }
+
     async fn attribute_exit(
         &self,
         symbol: &str,
@@ -2854,433 +4241,6 @@ impl BinanceDemoExecution {
             micro.as_ref().and_then(|value| value.trade_imbalance()),
             micro.as_ref().and_then(|value| value.mid_return_bps_10s),
         )
-    }
-
-    async fn abort_invalidated_entry(
-        &self,
-        plan: &greed_kernel::PositionPlan,
-        attempt: PendingEntryAttempt<'_>,
-        reason: &str,
-    ) -> Result<PostOnlyEntry> {
-        let reconciled = if attempt.status == "FILLED" {
-            attempt.order.clone()
-        } else {
-            self.cancel_or_reconcile_entry(&plan.symbol, attempt.active_client_id)
-                .await?
-        };
-        let executed = parse_f64(&reconciled, "executedQty")
-            .or_else(|| parse_f64(attempt.order, "executedQty"))
-            .unwrap_or_default();
-        if executed > f64::EPSILON {
-            let guard_client_id = client_order_id("guard", &plan.candidate_id);
-            self.submit_or_lookup(
-                &plan.symbol,
-                &guard_client_id,
-                vec![
-                    ("symbol".into(), plan.symbol.clone()),
-                    ("side".into(), side_name(plan.side.opposite()).into()),
-                    ("type".into(), "MARKET".into()),
-                    (
-                        "quantity".into(),
-                        decimal(executed, attempt.rules.quantity_step),
-                    ),
-                    ("reduceOnly".into(), "true".into()),
-                    ("newClientOrderId".into(), guard_client_id.clone()),
-                ],
-            )
-            .await
-            .with_context(|| {
-                format!(
-                    "pending entry signal invalidated ({reason}); emergency close of {executed} {} failed",
-                    plan.symbol
-                )
-            })?;
-            return Err(anyhow!(
-                "pending entry signal invalidated after {}ms ({} reprices): {reason}; {executed} filled quantity was immediately closed",
-                attempt.waited_ms,
-                attempt.reprices
-            ));
-        }
-        Err(anyhow!(
-            "pending entry signal invalidated after {}ms ({} reprices): {reason}; maker order canceled without fill",
-            attempt.waited_ms,
-            attempt.reprices
-        ))
-    }
-
-    async fn place_post_only_entry(
-        &self,
-        plan: &greed_kernel::PositionPlan,
-        quantity: f64,
-        price: f64,
-        rules: &SymbolRules,
-        client_id: &str,
-    ) -> Result<PostOnlyEntry> {
-        let mut active_client_id = client_id.to_string();
-        let mut passive_price = price;
-        let mut reprice_attempt = 0u8;
-        let mut order = loop {
-            let submitted = self
-                .submit_or_lookup(
-                    &plan.symbol,
-                    &active_client_id,
-                    vec![
-                        ("symbol".into(), plan.symbol.clone()),
-                        ("side".into(), side_name(plan.side).into()),
-                        ("type".into(), "LIMIT".into()),
-                        ("timeInForce".into(), "GTX".into()),
-                        ("quantity".into(), decimal(quantity, rules.quantity_step)),
-                        ("price".into(), decimal(passive_price, rules.price_tick)),
-                        ("newClientOrderId".into(), active_client_id.clone()),
-                        ("newOrderRespType".into(), "ACK".into()),
-                    ],
-                )
-                .await;
-            match submitted {
-                Ok(order) => break order,
-                Err(error) if is_post_only_rejection(&error) => {
-                    reprice_attempt += 1;
-                    if reprice_attempt > 3 {
-                        return Err(error).context("post-only entry crossed after three reprices");
-                    }
-                    let ticker = self
-                        .public_get_params(
-                            "/fapi/v1/ticker/bookTicker",
-                            &[("symbol", plan.symbol.as_str())],
-                        )
-                        .await?;
-                    passive_price = match plan.side {
-                        Side::Buy => floor_step(
-                            parse_f64(&ticker, "bidPrice")
-                                .ok_or_else(|| anyhow!("book ticker bid is missing"))?,
-                            rules.price_tick,
-                        ),
-                        Side::Sell => ceil_step(
-                            parse_f64(&ticker, "askPrice")
-                                .ok_or_else(|| anyhow!("book ticker ask is missing"))?,
-                            rules.price_tick,
-                        ),
-                    };
-                    let adverse_bps = plan.side.sign()
-                        * (passive_price / plan.reference_price.max(f64::EPSILON) - 1.0)
-                        * 10_000.0;
-                    if adverse_bps > plan.max_entry_adverse_bps {
-                        return Err(anyhow!(
-                            "post-only reprice drifted {adverse_bps:.1} bps against the signal (max {:.1})",
-                            plan.max_entry_adverse_bps
-                        ));
-                    }
-                    active_client_id = reprice_client_id(client_id, reprice_attempt);
-                    tokio::time::sleep(Duration::from_millis(100)).await;
-                }
-                Err(error) => return Err(error),
-            }
-        };
-        let started_ms = chrono::Utc::now().timestamp_millis();
-        let deadline = started_ms + plan.entry_timeout_ms.clamp(5_000, 120_000);
-        let mut next_reprice_ms = started_ms + MAKER_REPRICE_INTERVAL_MS;
-        let mut guard_unavailable_since_ms = None;
-        let mut micro_reversal_since_ms = None;
-        loop {
-            let status = order.get("status").and_then(Value::as_str).unwrap_or("NEW");
-            if matches!(status, "CANCELED" | "EXPIRED" | "REJECTED") {
-                let executed = parse_f64(&order, "executedQty").unwrap_or_default();
-                if executed > f64::EPSILON {
-                    return Ok(PostOnlyEntry::Filled {
-                        order,
-                        waited_ms: chrono::Utc::now()
-                            .timestamp_millis()
-                            .saturating_sub(started_ms),
-                        reprices: reprice_attempt,
-                        final_limit: passive_price,
-                    });
-                }
-                return Err(anyhow!("post-only entry ended with status {status}"));
-            }
-            let now_ms = chrono::Utc::now().timestamp_millis();
-            let partial_quantity = parse_f64(&order, "executedQty").unwrap_or_default();
-            // A completed order, or a partial fill that already satisfies the
-            // strategy's managed-position threshold, is no longer a pending
-            // setup. Hand it to bracket protection before evaluating maker
-            // invalidation. BUSDT filled a meaningful position and was then
-            // flattened because the midpoint crossed the still-resting limit
-            // by less than one extra basis point.
-            if status == "FILLED" {
-                return Ok(PostOnlyEntry::Filled {
-                    order,
-                    waited_ms: now_ms.saturating_sub(started_ms),
-                    reprices: reprice_attempt,
-                    final_limit: passive_price,
-                });
-            }
-            if managed_fill_threshold_reached(
-                partial_quantity,
-                quantity,
-                rules.quantity_step,
-                plan.min_fill_ratio,
-            ) {
-                let managed = self
-                    .cancel_or_reconcile_entry(&plan.symbol, &active_client_id)
-                    .await?;
-                return Ok(PostOnlyEntry::Filled {
-                    order: managed,
-                    waited_ms: now_ms.saturating_sub(started_ms),
-                    reprices: reprice_attempt,
-                    final_limit: passive_price,
-                });
-            }
-            if partial_quantity > f64::EPSILON
-                && partial_quantity + rules.quantity_step * 0.5 < quantity
-            {
-                // Binance Demo occasionally leaves a resting maker order only
-                // fractionally filled even after the public best price trades
-                // through it.  On a liquid production book that order would
-                // already be marketable. Recover only at the same-or-better
-                // price; this restores normal limit semantics without chasing.
-                let ticker = self
-                    .public_get_params(
-                        "/fapi/v1/ticker/bookTicker",
-                        &[("symbol", plan.symbol.as_str())],
-                    )
-                    .await?;
-                let executable = if plan.side == Side::Buy {
-                    parse_f64(&ticker, "askPrice")
-                } else {
-                    parse_f64(&ticker, "bidPrice")
-                };
-                let traded_through = executable.is_some_and(|price| {
-                    price_traded_through_limit(
-                        plan.side,
-                        price,
-                        passive_price,
-                        rules.price_tick,
-                        plan.entry_invalidation_bps,
-                    )
-                });
-                if traded_through {
-                    let canceled = self
-                        .cancel_or_reconcile_entry(&plan.symbol, &active_client_id)
-                        .await?;
-                    let maker_quantity =
-                        parse_f64(&canceled, "executedQty").unwrap_or(partial_quantity);
-                    if maker_quantity + rules.quantity_step * 0.5 >= quantity {
-                        return Ok(PostOnlyEntry::Filled {
-                            order: canceled,
-                            waited_ms: now_ms.saturating_sub(started_ms),
-                            reprices: reprice_attempt,
-                            final_limit: passive_price,
-                        });
-                    }
-                    let remaining = floor_step(quantity - maker_quantity, rules.quantity_step);
-                    if remaining >= rules.min_quantity
-                        && remaining * executable.unwrap_or_default() >= rules.min_notional
-                    {
-                        let recovery_id = client_order_id("crossfill", &plan.candidate_id);
-                        let recovery = self
-                            .submit_or_lookup(
-                                &plan.symbol,
-                                &recovery_id,
-                                vec![
-                                    ("symbol".into(), plan.symbol.clone()),
-                                    ("side".into(), side_name(plan.side).into()),
-                                    ("type".into(), "LIMIT".into()),
-                                    ("timeInForce".into(), "IOC".into()),
-                                    ("quantity".into(), decimal(remaining, rules.quantity_step)),
-                                    ("price".into(), decimal(passive_price, rules.price_tick)),
-                                    ("newClientOrderId".into(), recovery_id.clone()),
-                                    ("newOrderRespType".into(), "RESULT".into()),
-                                ],
-                            )
-                            .await?;
-                        let merged = merge_entry_orders(
-                            &canceled,
-                            &recovery,
-                            passive_price,
-                            executable.unwrap_or(passive_price),
-                        );
-                        tracing::warn!(
-                            symbol = %plan.symbol,
-                            maker_quantity,
-                            recovery_quantity = remaining,
-                            limit = passive_price,
-                            "recovered a Binance Demo maker partial after best-price trade-through"
-                        );
-                        return Ok(PostOnlyEntry::Filled {
-                            order: merged,
-                            waited_ms: now_ms.saturating_sub(started_ms),
-                            reprices: reprice_attempt,
-                            final_limit: passive_price,
-                        });
-                    }
-                    return Ok(PostOnlyEntry::Filled {
-                        order: canceled,
-                        waited_ms: now_ms.saturating_sub(started_ms),
-                        reprices: reprice_attempt,
-                        final_limit: passive_price,
-                    });
-                }
-            }
-            let invalidation = match self.pending_entry_guard(plan, now_ms) {
-                EntryGuardState::Healthy => {
-                    guard_unavailable_since_ms = None;
-                    micro_reversal_since_ms = None;
-                    None
-                }
-                EntryGuardState::StructuralInvalidation(reason) => Some(reason),
-                EntryGuardState::MicroReversal(reason) => {
-                    guard_unavailable_since_ms = None;
-                    persistent_guard_reason(
-                        &mut micro_reversal_since_ms,
-                        now_ms,
-                        ENTRY_GUARD_REVERSAL_CONFIRM_MS,
-                        &reason,
-                    )
-                }
-                EntryGuardState::Unavailable(reason) => {
-                    micro_reversal_since_ms = None;
-                    let missing_since = *guard_unavailable_since_ms.get_or_insert(now_ms);
-                    (now_ms - missing_since >= ENTRY_GUARD_STALE_GRACE_MS).then(|| {
-                        format!(
-                            "{reason} for {}ms (max {}ms)",
-                            now_ms - missing_since,
-                            ENTRY_GUARD_STALE_GRACE_MS
-                        )
-                    })
-                }
-            };
-            if let Some(reason) = invalidation {
-                return self
-                    .abort_invalidated_entry(
-                        plan,
-                        PendingEntryAttempt {
-                            order: &order,
-                            status,
-                            active_client_id: &active_client_id,
-                            rules,
-                            waited_ms: now_ms.saturating_sub(started_ms),
-                            reprices: reprice_attempt,
-                        },
-                        &reason,
-                    )
-                    .await;
-            }
-            if now_ms >= deadline {
-                let canceled = self
-                    .cancel_or_reconcile_entry(&plan.symbol, &active_client_id)
-                    .await?;
-                let executed = parse_f64(&canceled, "executedQty")
-                    .or_else(|| parse_f64(&order, "executedQty"))
-                    .unwrap_or_default();
-                if executed > f64::EPSILON {
-                    return Ok(PostOnlyEntry::Filled {
-                        order: canceled,
-                        waited_ms: chrono::Utc::now()
-                            .timestamp_millis()
-                            .saturating_sub(started_ms),
-                        reprices: reprice_attempt,
-                        final_limit: passive_price,
-                    });
-                }
-                return Ok(PostOnlyEntry::Unfilled {
-                    waited_ms: plan.entry_timeout_ms.clamp(5_000, 120_000),
-                    reprices: reprice_attempt,
-                    final_limit: passive_price,
-                });
-            }
-            if now_ms >= next_reprice_ms && reprice_attempt < MAX_MAKER_REPRICES {
-                // Once a maker order has started filling, keep the remainder at
-                // the same queue position until the deadline. Canceling on the
-                // first partial fill turned 3-5% probes into complete trades and
-                // threw away the remaining minute of fill opportunity.
-                if parse_f64(&order, "executedQty").unwrap_or_default() > f64::EPSILON {
-                    next_reprice_ms = deadline.saturating_add(1);
-                    tokio::time::sleep(Duration::from_secs(1)).await;
-                    if let Ok(value) = self
-                        .signed(
-                            Method::GET,
-                            "/fapi/v1/order",
-                            vec![
-                                ("symbol".into(), plan.symbol.clone()),
-                                ("origClientOrderId".into(), active_client_id.clone()),
-                            ],
-                        )
-                        .await
-                    {
-                        order = value;
-                    }
-                    continue;
-                }
-                let ticker = self
-                    .public_get_params(
-                        "/fapi/v1/ticker/bookTicker",
-                        &[("symbol", plan.symbol.as_str())],
-                    )
-                    .await?;
-                let best_passive = match plan.side {
-                    Side::Buy => parse_f64(&ticker, "bidPrice"),
-                    Side::Sell => parse_f64(&ticker, "askPrice"),
-                }
-                .ok_or_else(|| anyhow!("book ticker passive price is missing"))?;
-                let next_price = capped_passive_price(
-                    plan.side,
-                    best_passive,
-                    plan.reference_price,
-                    plan.max_entry_adverse_bps,
-                    rules.price_tick,
-                );
-                next_reprice_ms += MAKER_REPRICE_INTERVAL_MS;
-                if passive_price_improves(plan.side, passive_price, next_price, rules.price_tick) {
-                    let canceled = self
-                        .cancel_or_reconcile_entry(&plan.symbol, &active_client_id)
-                        .await?;
-                    if parse_f64(&canceled, "executedQty").unwrap_or_default() > f64::EPSILON {
-                        return Ok(PostOnlyEntry::Filled {
-                            order: canceled,
-                            waited_ms: now_ms.saturating_sub(started_ms),
-                            reprices: reprice_attempt,
-                            final_limit: passive_price,
-                        });
-                    }
-                    reprice_attempt += 1;
-                    passive_price = next_price;
-                    active_client_id = reprice_client_id(client_id, reprice_attempt);
-                    order = self
-                        .submit_or_lookup(
-                            &plan.symbol,
-                            &active_client_id,
-                            vec![
-                                ("symbol".into(), plan.symbol.clone()),
-                                ("side".into(), side_name(plan.side).into()),
-                                ("type".into(), "LIMIT".into()),
-                                ("timeInForce".into(), "GTX".into()),
-                                ("quantity".into(), decimal(quantity, rules.quantity_step)),
-                                ("price".into(), decimal(passive_price, rules.price_tick)),
-                                ("newClientOrderId".into(), active_client_id.clone()),
-                                ("newOrderRespType".into(), "ACK".into()),
-                            ],
-                        )
-                        .await
-                        .with_context(|| {
-                            format!("adaptive maker reprice {reprice_attempt} failed")
-                        })?;
-                    continue;
-                }
-            }
-            tokio::time::sleep(Duration::from_secs(1)).await;
-            if let Ok(value) = self
-                .signed(
-                    Method::GET,
-                    "/fapi/v1/order",
-                    vec![
-                        ("symbol".into(), plan.symbol.clone()),
-                        ("origClientOrderId".into(), active_client_id.clone()),
-                    ],
-                )
-                .await
-            {
-                order = value;
-            }
-        }
     }
 
     async fn cancel_or_reconcile_entry(&self, symbol: &str, client_id: &str) -> Result<Value> {
@@ -3527,8 +4487,7 @@ impl BinanceDemoExecution {
         position_side: Side,
     ) -> Result<TradeSummary> {
         let value = self
-            .signed(
-                Method::GET,
+            .signed_read(
                 "/fapi/v1/userTrades",
                 vec![
                     ("symbol".into(), symbol.into()),
@@ -3541,6 +4500,33 @@ impl BinanceDemoExecution {
             .as_array()
             .ok_or_else(|| anyhow!("userTrades response is not an array"))?;
         Ok(summarize_trades(rows, position_side))
+    }
+
+    async fn trade_summary_after_close(
+        &self,
+        symbol: &str,
+        start_ms: i64,
+        position_side: Side,
+        expected_exit_quantity: f64,
+    ) -> Result<TradeSummary> {
+        let mut last = None;
+        for delay_ms in [0, 100, 250, 500] {
+            if delay_ms > 0 {
+                tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+            }
+            let summary = self.trade_summary(symbol, start_ms, position_side).await?;
+            if summary.entry_quantity > f64::EPSILON
+                && summary.exit_quantity + 1e-9 >= expected_exit_quantity
+            {
+                return Ok(summary);
+            }
+            last = Some(summary);
+        }
+        Err(anyhow!(
+            "userTrades did not expose the complete filled-attempt round trip; latest entry={} exit={} expected_exit={expected_exit_quantity}",
+            last.as_ref().map(|value| value.entry_quantity).unwrap_or_default(),
+            last.as_ref().map(|value| value.exit_quantity).unwrap_or_default(),
+        ))
     }
 
     async fn close_market(&self, position: &RemotePosition) -> Result<()> {
@@ -3565,6 +4551,30 @@ impl BinanceDemoExecution {
         )
         .await?;
         Ok(())
+    }
+
+    async fn flatten_entry_quantity(
+        &self,
+        symbol: &str,
+        side: Side,
+        quantity: f64,
+        quantity_step: f64,
+        client_id: &str,
+    ) -> Result<Value> {
+        self.submit_or_lookup(
+            symbol,
+            client_id,
+            vec![
+                ("symbol".into(), symbol.into()),
+                ("side".into(), side_name(side.opposite()).into()),
+                ("type".into(), "MARKET".into()),
+                ("quantity".into(), decimal(quantity, quantity_step)),
+                ("reduceOnly".into(), "true".into()),
+                ("newClientOrderId".into(), client_id.into()),
+                ("newOrderRespType".into(), "RESULT".into()),
+            ],
+        )
+        .await
     }
 
     fn save(&self) -> Result<()> {
@@ -3592,6 +4602,9 @@ impl BinanceDemoExecution {
             "performance_epoch_reset": self.performance_epoch_reset,
             "performance_basis":"risk_r_v1",
             "performance_basis_reset":self.performance_basis_reset,
+            "pending_entries":self.state.pending_entries.len(),
+            "pending_accounting":self.state.pending_accounting.len(),
+            "recipe_execution_counts":self.state.recipe_execution_counts,
         })
     }
 }
@@ -3907,31 +4920,12 @@ fn parse_f64(value: &Value, key: &str) -> Option<f64> {
         .or_else(|| value[key].as_f64())
 }
 
-fn merge_entry_orders(
-    maker: &Value,
-    recovery: &Value,
-    maker_fallback_price: f64,
-    recovery_fallback_price: f64,
-) -> Value {
-    let maker_quantity = parse_f64(maker, "executedQty").unwrap_or_default();
-    let recovery_quantity = parse_f64(recovery, "executedQty").unwrap_or_default();
-    let total_quantity = maker_quantity + recovery_quantity;
-    let maker_price = parse_f64(maker, "avgPrice")
-        .filter(|value| *value > 0.0)
-        .unwrap_or(maker_fallback_price);
-    let recovery_price = parse_f64(recovery, "avgPrice")
-        .filter(|value| *value > 0.0)
-        .unwrap_or(recovery_fallback_price);
-    let average_price = if total_quantity > f64::EPSILON {
-        (maker_quantity * maker_price + recovery_quantity * recovery_price) / total_quantity
-    } else {
-        recovery_price
-    };
-    let mut merged = recovery.clone();
-    merged["executedQty"] = Value::String(total_quantity.to_string());
-    merged["avgPrice"] = Value::String(average_price.to_string());
-    merged["_greedTradeThroughRecovery"] = Value::Bool(true);
-    merged
+fn reconciled_executed_quantity(previously_observed: f64, final_order: &Value) -> f64 {
+    // executedQty is cumulative and must never move backwards. Keeping the
+    // larger observation also protects against an incomplete cancel response.
+    parse_f64(final_order, "executedQty")
+        .unwrap_or_default()
+        .max(previously_observed)
 }
 
 fn side_name(side: Side) -> &'static str {
@@ -4030,6 +5024,9 @@ fn order_average_price(order: &Value) -> Option<f64> {
             (quantity > f64::EPSILON).then_some(quote / quantity)
         })
 }
+fn entry_price_hint(order: &Value, fallback: f64) -> f64 {
+    order_average_price(order).unwrap_or(fallback)
+}
 fn average_fills(rows: &[Value], side: &str) -> Option<f64> {
     let (notional, quantity) = rows
         .iter()
@@ -4086,20 +5083,6 @@ fn passive_price_improves(side: Side, current: f64, proposed: f64, tick: f64) ->
 fn entry_adverse_bps(side: Side, executable: f64, reference: f64) -> f64 {
     side.sign() * (executable / reference.max(f64::EPSILON) - 1.0) * 10_000.0
 }
-fn price_traded_through_limit(
-    side: Side,
-    executable: f64,
-    limit: f64,
-    tick: f64,
-    max_invalidation_bps: f64,
-) -> bool {
-    let crossed = match side {
-        Side::Buy => executable <= limit + tick * 0.5,
-        Side::Sell => executable >= limit - tick * 0.5,
-    };
-    let overshoot_bps = -side.sign() * (executable / limit.max(f64::EPSILON) - 1.0) * 10_000.0;
-    crossed && (max_invalidation_bps <= 0.0 || overshoot_bps <= max_invalidation_bps)
-}
 fn pending_entry_guard_state(
     plan: &greed_kernel::PositionPlan,
     signal_mid: f64,
@@ -4154,6 +5137,71 @@ fn managed_fill_threshold_reached(
     min_fill_ratio > 0.0
         && executed > f64::EPSILON
         && executed + quantity_step * 0.5 >= requested * min_fill_ratio
+}
+
+fn partial_fill_is_manageable(
+    executed: f64,
+    requested: f64,
+    price: f64,
+    min_managed_fill_ratio: f64,
+    rules: &SymbolRules,
+    take_profit_prices: &[(f64, f64)],
+) -> bool {
+    let threshold = min_managed_fill_ratio.clamp(0.0, 1.0);
+    let ratio_ok =
+        requested > f64::EPSILON && executed + rules.quantity_step * 0.5 >= requested * threshold;
+    let position_ok = executed >= rules.min_quantity && executed * price >= rules.min_notional;
+    let exits_ok = take_profit_prices.iter().all(|(_, fraction)| {
+        if *fraction >= 1.0 - f64::EPSILON {
+            return position_ok;
+        }
+        let quantity = floor_step(executed * fraction, rules.quantity_step);
+        quantity >= rules.min_quantity && quantity * price >= rules.min_notional
+    });
+    ratio_ok && position_ok && exits_ok
+}
+
+fn validate_entry_quantity_and_exits(
+    plan: &greed_kernel::PositionPlan,
+    quantity: f64,
+    price: f64,
+    rules: &SymbolRules,
+) -> Result<()> {
+    if quantity < rules.min_quantity || quantity * price < rules.min_notional {
+        return Err(anyhow!(
+            "order is below Binance quantity or notional minimum"
+        ));
+    }
+    if plan.take_profit_prices.is_empty() {
+        return Err(anyhow!("position plan requires at least one take profit"));
+    }
+    let take_profit_fraction = plan
+        .take_profit_prices
+        .iter()
+        .map(|(_, fraction)| *fraction)
+        .sum::<f64>();
+    if take_profit_fraction > 1.0 + 1e-6 {
+        return Err(anyhow!("staged take-profit fractions exceed the position"));
+    }
+    if let Some(runner_fraction) = plan.unprotected_runner_fraction {
+        if (take_profit_fraction + runner_fraction - 1.0).abs() > 1e-6 {
+            return Err(anyhow!(
+                "take-profit fractions and tail runner must sum to one"
+            ));
+        }
+    }
+    for (_, fraction) in &plan.take_profit_prices {
+        if *fraction >= 1.0 - f64::EPSILON {
+            continue;
+        }
+        let partial = floor_step(quantity * fraction, rules.quantity_step);
+        if partial < rules.min_quantity || partial * price < rules.min_notional {
+            return Err(anyhow!(
+                "staged take profit is below Binance quantity or notional minimum"
+            ));
+        }
+    }
+    Ok(())
 }
 fn reprice_client_id(base: &str, attempt: u8) -> String {
     format!("{}-r{attempt}", &base[..base.len().min(32)])
@@ -4213,6 +5261,7 @@ mod tests {
             taker_fallback_max_adverse_bps: 20.0,
             taker_fallback_size_multiplier: 0.05,
             min_fill_ratio: 0.80,
+            min_managed_fill_ratio: 0.20,
             entry_invalidation_bps: 30.0,
             entry_guard_max_opposing_flow: 0.15,
             entry_guard_max_opposing_return_bps: 3.0,
@@ -4296,63 +5345,6 @@ mod tests {
         .expect("short resume should use the mirrored rules");
         assert!((signal.directional_flow - 0.16).abs() < 1e-9);
         assert_eq!(signal.stop_pct, 0.0125);
-    }
-
-    #[test]
-    fn trade_through_recovery_preserves_total_quantity_and_weighted_price() {
-        let maker = serde_json::json!({"executedQty":"2", "avgPrice":"99"});
-        let recovery = serde_json::json!({"executedQty":"8", "avgPrice":"98.5", "orderId":7});
-        let merged = merge_entry_orders(&maker, &recovery, 100.0, 100.0);
-        assert_eq!(parse_f64(&merged, "executedQty"), Some(10.0));
-        assert_eq!(parse_f64(&merged, "avgPrice"), Some(98.6));
-        assert_eq!(merged["orderId"], 7);
-        assert_eq!(merged["_greedTradeThroughRecovery"], true);
-    }
-
-    #[test]
-    fn trade_through_recovery_never_chases_beyond_the_resting_limit() {
-        assert!(price_traded_through_limit(
-            Side::Buy,
-            98.9,
-            99.0,
-            0.01,
-            30.0
-        ));
-        assert!(!price_traded_through_limit(
-            Side::Buy,
-            98.6,
-            99.0,
-            0.01,
-            30.0
-        ));
-        assert!(!price_traded_through_limit(
-            Side::Buy,
-            99.1,
-            99.0,
-            0.01,
-            30.0
-        ));
-        assert!(price_traded_through_limit(
-            Side::Sell,
-            100.1,
-            100.0,
-            0.01,
-            30.0
-        ));
-        assert!(!price_traded_through_limit(
-            Side::Sell,
-            100.4,
-            100.0,
-            0.01,
-            30.0
-        ));
-        assert!(!price_traded_through_limit(
-            Side::Sell,
-            99.9,
-            100.0,
-            0.01,
-            30.0
-        ));
     }
 
     #[test]
@@ -4519,6 +5511,120 @@ mod tests {
     }
 
     #[test]
+    fn cancel_race_keeps_the_additional_fill() {
+        let observed_before_cancel = 0.0;
+        let cancel_response = serde_json::json!({"status":"CANCELED","executedQty":"55"});
+        assert_eq!(
+            reconciled_executed_quantity(observed_before_cancel, &cancel_response),
+            55.0
+        );
+        let incomplete_cancel_response = serde_json::json!({"status":"CANCELED"});
+        assert_eq!(
+            reconciled_executed_quantity(12.0, &incomplete_cancel_response),
+            12.0
+        );
+    }
+
+    #[test]
+    fn maker_wait_is_not_counted_as_holding_time() {
+        let meta: ExecutionMeta = serde_json::from_value(serde_json::json!({
+            "candidate_id":"test:1","recipe":"test","side":"buy",
+            "entry_ms":190_000,"signal_ms":10_000,"order_submitted_ms":20_000,
+            "first_fill_ms":190_000,"entry_completed_ms":200_000,
+            "entry_time_source":"exchange_user_trade_time",
+            "stop_price":99.0,"max_hold_ms":60_000
+        }))
+        .unwrap();
+        assert_eq!(meta.holding_started_ms(), 190_000);
+        assert_eq!(200_000 - meta.holding_started_ms(), 10_000);
+
+        let legacy: ExecutionMeta = serde_json::from_value(serde_json::json!({
+            "candidate_id":"legacy:1","recipe":"test","side":"buy",
+            "entry_ms":42_000,"stop_price":99.0,"max_hold_ms":60_000
+        }))
+        .unwrap();
+        assert_eq!(legacy.holding_started_ms(), 42_000);
+        assert_eq!(
+            legacy.holding_time_source(),
+            "legacy_entry_ms_unknown_semantics"
+        );
+    }
+
+    #[test]
+    fn fifty_five_percent_fill_is_managed_only_when_every_exit_is_executable() {
+        let rules = SymbolRules {
+            quantity_step: 1.0,
+            min_quantity: 1.0,
+            price_tick: 0.01,
+            min_notional: 5.0,
+        };
+        assert!(partial_fill_is_manageable(
+            55.0,
+            100.0,
+            1.0,
+            0.20,
+            &rules,
+            &[(1.02, 0.40), (1.04, 0.60)]
+        ));
+        assert!(!partial_fill_is_manageable(
+            4.0,
+            100.0,
+            1.0,
+            0.20,
+            &rules,
+            &[(1.02, 0.40), (1.04, 0.60)]
+        ));
+        let coarse = SymbolRules {
+            quantity_step: 10.0,
+            min_quantity: 10.0,
+            price_tick: 0.01,
+            min_notional: 5.0,
+        };
+        assert!(!partial_fill_is_manageable(
+            20.0,
+            100.0,
+            1.0,
+            0.20,
+            &coarse,
+            &[(1.02, 0.33), (1.04, 0.67)]
+        ));
+    }
+
+    #[test]
+    fn pending_entry_state_survives_restart_serialization() {
+        let plan = guarded_plan(Side::Buy);
+        let mut state = DemoState::default();
+        state.pending_entries.insert(
+            plan.symbol.clone(),
+            PendingEntryState {
+                plan,
+                recipe: "trend_continuation".into(),
+                signal_ms: 10,
+                discovery_latency_ms: Some(7),
+                size_multiplier: 1.0,
+                requested_quantity: 10.0,
+                active_client_id: "greed-entry-1".into(),
+                passive_price: 99.0,
+                order_submitted_ms: 20,
+                deadline_ms: 120_000,
+                next_reprice_ms: 35_000,
+                reprice_attempt: 1,
+                first_fill_ms: Some(30),
+                first_fill_time_source: Some("exchange_user_trade_time".into()),
+                preliminary_stop_algo_id: Some(123),
+                guard_unavailable_since_ms: None,
+                micro_reversal_since_ms: None,
+            },
+        );
+        let restored: DemoState = serde_json::from_slice(&serde_json::to_vec(&state).unwrap())
+            .expect("pending order state must be restart-safe");
+        let pending = restored.pending_entries.get("TESTUSDT").unwrap();
+        assert_eq!(pending.active_client_id, "greed-entry-1");
+        assert_eq!(pending.first_fill_ms, Some(30));
+        assert_eq!(pending.preliminary_stop_algo_id, Some(123));
+    }
+
+    #[test]
     fn pending_buy_is_canceled_after_it_falls_through_the_pullback_limit() {
         let plan = guarded_plan(Side::Buy);
         assert_eq!(
@@ -4618,6 +5724,7 @@ mod tests {
             pnl_usd: -2.0,
             pnl_r: Some(-1.0),
             fill_ratio: Some(1.0),
+            ..ExecutionOutcome::default()
         };
         assert_eq!(loss_cooldown_until(Some(&[loss]), 180), Some(10_801_000));
         let recovered = [
@@ -4626,12 +5733,14 @@ mod tests {
                 pnl_usd: -2.0,
                 pnl_r: Some(-1.0),
                 fill_ratio: Some(1.0),
+                ..ExecutionOutcome::default()
             },
             ExecutionOutcome {
                 exit_ms: 2_000,
                 pnl_usd: 1.0,
                 pnl_r: Some(0.5),
                 fill_ratio: Some(1.0),
+                ..ExecutionOutcome::default()
             },
         ];
         assert_eq!(loss_cooldown_until(Some(&recovered), 180), None);
@@ -4644,18 +5753,21 @@ mod tests {
             pnl_usd: 20.0,
             pnl_r: Some(1.0),
             fill_ratio: Some(0.95),
+            ..ExecutionOutcome::default()
         };
         let tiny = ExecutionOutcome {
             exit_ms: 2_000,
             pnl_usd: -0.50,
             pnl_r: Some(-1.0),
             fill_ratio: Some(0.05),
+            ..ExecutionOutcome::default()
         };
         let legacy = ExecutionOutcome {
             exit_ms: 3_000,
             pnl_usd: -4.0,
             pnl_r: None,
             fill_ratio: None,
+            ..ExecutionOutcome::default()
         };
         assert!(full.performance_eligible());
         assert!(!tiny.performance_eligible());

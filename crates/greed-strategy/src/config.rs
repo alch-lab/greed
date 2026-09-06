@@ -66,6 +66,8 @@ pub struct LaneConfig {
     pub fast_max_return_4h: f64,
     pub fast_max_oi_change_15m: f64,
     pub fast_risk_per_trade_pct: f64,
+    pub fast_min_fill_ratio: f64,
+    pub fast_min_managed_fill_ratio: f64,
     pub trend_min_return_4h: f64,
     pub trend_min_efficiency: f64,
     pub trend_min_hour_volume_ratio: f64,
@@ -78,6 +80,7 @@ pub struct LaneConfig {
     pub trend_entry_timeout_seconds: u32,
     pub trend_max_entry_adverse_bps: f64,
     pub trend_min_fill_ratio: f64,
+    pub trend_min_managed_fill_ratio: f64,
     pub trend_entry_invalidation_bps: f64,
     pub trend_max_post_signal_extension_bps: f64,
     pub trend_max_opposing_micro_flow: f64,
@@ -119,6 +122,8 @@ impl Default for LaneConfig {
             fast_max_return_4h: 0.06,
             fast_max_oi_change_15m: 0.03,
             fast_risk_per_trade_pct: 0.005,
+            fast_min_fill_ratio: 0.80,
+            fast_min_managed_fill_ratio: 0.20,
             trend_min_return_4h: 0.025,
             trend_min_efficiency: 0.45,
             trend_min_hour_volume_ratio: 0.65,
@@ -131,6 +136,7 @@ impl Default for LaneConfig {
             trend_entry_timeout_seconds: 90,
             trend_max_entry_adverse_bps: 8.0,
             trend_min_fill_ratio: 0.80,
+            trend_min_managed_fill_ratio: 0.20,
             trend_entry_invalidation_bps: 30.0,
             trend_max_post_signal_extension_bps: 12.0,
             trend_max_opposing_micro_flow: 0.10,
@@ -260,6 +266,8 @@ impl StrategyConfig {
             || !(0.01..=0.10).contains(&lanes.fast_max_return_4h)
             || !(0.001..=0.05).contains(&lanes.fast_max_oi_change_15m)
             || !(0.001..=0.01).contains(&lanes.fast_risk_per_trade_pct)
+            || !(0.50..=1.0).contains(&lanes.fast_min_fill_ratio)
+            || !(0.0..=lanes.fast_min_fill_ratio).contains(&lanes.fast_min_managed_fill_ratio)
             || !(0.02..=0.20).contains(&lanes.trend_min_return_4h)
             || !(0.10..=0.90).contains(&lanes.trend_min_efficiency)
             || lanes.trend_min_hour_volume_ratio <= 0.0
@@ -271,6 +279,7 @@ impl StrategyConfig {
             || !(5..=120).contains(&lanes.trend_entry_timeout_seconds)
             || !(0.0..=12.0).contains(&lanes.trend_max_entry_adverse_bps)
             || !(0.50..=1.0).contains(&lanes.trend_min_fill_ratio)
+            || !(0.0..=lanes.trend_min_fill_ratio).contains(&lanes.trend_min_managed_fill_ratio)
             || !(5.0..=100.0).contains(&lanes.trend_entry_invalidation_bps)
             || !(0.0..=100.0).contains(&lanes.trend_max_post_signal_extension_bps)
             || !(0.0..=0.80).contains(&lanes.trend_max_opposing_micro_flow)

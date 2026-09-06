@@ -81,6 +81,8 @@ fast_max_prebreak_return_1h = 0.03
 fast_max_return_4h = 0.06
 fast_max_oi_change_15m = 0.03
 fast_risk_per_trade_pct = 0.005
+fast_min_fill_ratio = 0.80
+fast_min_managed_fill_ratio = 0.20
 trend_min_return_4h = 0.025
 trend_min_efficiency = 0.45
 trend_min_hour_volume_ratio = 0.65
@@ -101,9 +103,10 @@ trend_entry_timeout_seconds = 90
 # than this distance beyond the signal reference price.
 trend_max_entry_adverse_bps = 8.0
 # A timeout with no fill is skipped. Incidental fills below 80% of the planned
-# size are flattened, so every managed position carries a meaningful and
-# comparable risk budget instead of becoming a $40-$250 pseudo-trade.
+# Stop waiting for the remainder at 80%. At expiry, a smaller fill may still
+# be managed from 20% upward when every protective exit passes exchange rules.
 trend_min_fill_ratio = 0.80
+trend_min_managed_fill_ratio = 0.20
 # A pullback that trades more than 30 bps through our intended maker limit is
 # no longer a retest. Cancel it immediately instead of filling a rebound after
 # the live signal has already failed.

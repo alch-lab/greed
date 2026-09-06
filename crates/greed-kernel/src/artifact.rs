@@ -77,10 +77,15 @@ pub struct PositionPlan {
     pub taker_fallback_max_adverse_bps: f64,
     #[serde(default = "default_entry_size_multiplier")]
     pub taker_fallback_size_multiplier: f64,
-    /// Minimum fraction of the planned quantity that may become a managed
-    /// position. Smaller incidental maker fills are flattened immediately.
+    /// Fill fraction at which the executor stops waiting for the remaining
+    /// maker quantity and promotes the fill to a managed position.
     #[serde(default)]
     pub min_fill_ratio: f64,
+    /// Minimum fill fraction that is worth managing if the entry deadline or
+    /// signal guard ends before `min_fill_ratio` is reached. Exchange quantity,
+    /// step and notional rules are checked independently.
+    #[serde(default)]
+    pub min_managed_fill_ratio: f64,
     /// Cancel a resting entry when the strategy-market midpoint overshoots the
     /// intended pullback limit by more than this many basis points.
     #[serde(default)]

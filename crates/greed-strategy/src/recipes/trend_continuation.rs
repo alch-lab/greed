@@ -444,6 +444,10 @@ impl StrategyNode for TrendContinuationNode {
                         self.config.trend_min_fill_ratio.to_string(),
                     );
                     tags.insert(
+                        "min_managed_fill_ratio".into(),
+                        self.config.trend_min_managed_fill_ratio.to_string(),
+                    );
+                    tags.insert(
                         "entry_invalidation_bps".into(),
                         self.config.trend_entry_invalidation_bps.to_string(),
                     );

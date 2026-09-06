@@ -437,6 +437,9 @@ impl StrategyNode for PositionPlannerNode {
                 min_fill_ratio: tag_f64(c, "min_fill_ratio")
                     .unwrap_or_default()
                     .clamp(0.0, 1.0),
+                min_managed_fill_ratio: tag_f64(c, "min_managed_fill_ratio")
+                    .unwrap_or_default()
+                    .clamp(0.0, 1.0),
                 entry_invalidation_bps: tag_f64(c, "entry_invalidation_bps").unwrap_or_default(),
                 entry_guard_max_opposing_flow: tag_f64(c, "entry_guard_max_opposing_flow")
                     .unwrap_or_default(),

@@ -9,6 +9,7 @@ use std::{
 #[derive(Debug, Clone, Default)]
 struct Performance {
     entries: u64,
+    filled_attempt_exits: u64,
     partial_exits: u64,
     completed_trades: u64,
     wins: u64,
@@ -44,9 +45,16 @@ impl Performance {
             self.gross_loss_usd += -trade_pnl;
         }
     }
+    fn filled_attempt_exit(&mut self, trade_pnl: f64, fee: f64) {
+        self.filled_attempt_exits += 1;
+        self.fees_usd += fee;
+        self.net_realized_pnl_usd += trade_pnl;
+        self.complete(trade_pnl, 0);
+    }
     fn value(&self) -> Value {
         serde_json::json!({
             "entries":self.entries,
+            "filled_attempt_exits":self.filled_attempt_exits,
             "partial_exits":self.partial_exits,
             "completed_trades":self.completed_trades,
             "wins":self.wins,
@@ -98,6 +106,7 @@ struct EquityRisk {
     max_equity_usd: Option<f64>,
     max_drawdown_pct: f64,
     max_daily_loss_pct: f64,
+    latest_account_realized_pnl_usd: Option<f64>,
 }
 
 impl EquityRisk {
@@ -114,6 +123,7 @@ impl EquityRisk {
         self.max_daily_loss_pct = self
             .max_daily_loss_pct
             .max(value["daily_loss_pct"].as_f64().unwrap_or(0.0));
+        self.latest_account_realized_pnl_usd = value["realized_pnl_usd"].as_f64();
     }
 }
 
@@ -224,6 +234,10 @@ pub fn build(path: &str) -> Result<Value> {
     let mut runner_starts = 0u64;
     let mut candles = BTreeSet::new();
     let mut candidate_ids = BTreeSet::new();
+    let mut entry_attempt_ids = BTreeSet::new();
+    let mut filled_attempt_ids = BTreeSet::new();
+    let mut formal_position_ids = BTreeSet::new();
+    let mut closed_trade_ids = BTreeSet::new();
     let mut total = Performance::default();
     let mut sleeves: BTreeMap<String, Performance> = BTreeMap::new();
     let mut recipes: BTreeMap<String, Performance> = BTreeMap::new();
@@ -336,6 +350,10 @@ pub fn build(path: &str) -> Result<Value> {
                 record_diagnostics(payload, &mut diagnostic_states, &mut diagnostic_reasons);
             }
             "exchange_entry" => {
+                let candidate_id = payload["candidate_id"].as_str().unwrap_or_default();
+                entry_attempt_ids.insert(candidate_id.to_string());
+                filled_attempt_ids.insert(candidate_id.to_string());
+                formal_position_ids.insert(candidate_id.to_string());
                 record_daily(payload, true, &mut daily);
                 record_entry(
                     payload,
@@ -350,6 +368,14 @@ pub fn build(path: &str) -> Result<Value> {
                 );
             }
             "exchange_partial_exit" | "exchange_exit" => {
+                if kind == "exchange_exit" {
+                    closed_trade_ids.insert(
+                        payload["candidate_id"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .to_string(),
+                    );
+                }
                 record_daily(payload, false, &mut daily);
                 record_exit(
                     payload,
@@ -361,6 +387,29 @@ pub fn build(path: &str) -> Result<Value> {
                     &mut recipe_sides,
                     &mut open_trades,
                 );
+            }
+            "exchange_entry_submitted" => {
+                entry_attempt_ids.insert(
+                    payload["candidate_id"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string(),
+                );
+            }
+            "exchange_entry_attempt_closed" => {
+                let candidate_id = payload["candidate_id"].as_str().unwrap_or_default();
+                entry_attempt_ids.insert(candidate_id.to_string());
+                filled_attempt_ids.insert(candidate_id.to_string());
+                closed_trade_ids.insert(candidate_id.to_string());
+                record_attempt_exit(
+                    payload,
+                    &mut total,
+                    &mut sleeves,
+                    &mut recipes,
+                    &mut sides,
+                    &mut recipe_sides,
+                );
+                record_daily_attempt(payload, &mut daily);
             }
             "exchange_entry_canceled" => {
                 let (sleeve, recipe) = classify(payload);
@@ -374,6 +423,14 @@ pub fn build(path: &str) -> Result<Value> {
                 }
             }
             "exchange_plan_rejected" | "exchange_order_rejected" => {
+                if kind == "exchange_order_rejected" {
+                    if let Some(candidate_id) = payload["candidate_id"]
+                        .as_str()
+                        .filter(|value| !value.is_empty())
+                    {
+                        entry_attempt_ids.insert(candidate_id.to_string());
+                    }
+                }
                 let (sleeve, recipe) = classify(payload);
                 for stats in [
                     sleeve_funnels.entry(sleeve).or_default(),
@@ -408,6 +465,8 @@ pub fn build(path: &str) -> Result<Value> {
         .map(|(key, value)| (key, value.value()))
         .collect();
     let observed_frames = successful_frames + frame_errors;
+    let attributed_trade_pnl_usd = total.net_realized_pnl_usd;
+    let account_realized_pnl_usd = portfolio_risk.latest_account_realized_pnl_usd;
     Ok(serde_json::json!({
         "journal":path,
         "first_recorded_ms":first_ms,
@@ -423,7 +482,19 @@ pub fn build(path: &str) -> Result<Value> {
         "frame_success_rate":(observed_frames>0).then_some(successful_frames as f64/observed_frames as f64),
         "max_frame_gap_minutes":max_frame_gap_ms as f64/60_000.0,
         "unique_candidates":candidate_ids.len(),
+        "execution_lifecycle":{
+            "entry_attempts":entry_attempt_ids.len(),
+            "filled_entry_attempts":filled_attempt_ids.len(),
+            "formal_positions":formal_position_ids.len(),
+            "closed_trades":closed_trade_ids.len(),
+        },
         "portfolio_performance":total.value(),
+        "pnl_reconciliation":{
+            "account_realized_pnl_usd":account_realized_pnl_usd,
+            "attributed_trade_pnl_usd":attributed_trade_pnl_usd,
+            "unattributed_pnl_usd":account_realized_pnl_usd.map(|value|value-attributed_trade_pnl_usd),
+            "note":"unattributed PnL can include funding, external/manual activity, or legacy records",
+        },
         "performance_by_lane":sleeve_values,
         "performance_by_recipe":recipe_values,
         "performance_by_side":side_values,
@@ -512,6 +583,22 @@ fn record_daily(payload: &Value, entry: bool, daily: &mut BTreeMap<String, Daily
         stats.exit_legs += 1;
         stats.net_realized_pnl_usd += payload["pnl_usd"].as_f64().unwrap_or(0.0);
     }
+}
+
+fn record_daily_attempt(payload: &Value, daily: &mut BTreeMap<String, DailyPerformance>) {
+    let ts_ms = payload["ts_ms"].as_i64().unwrap_or(0);
+    let day = chrono::DateTime::from_timestamp_millis(ts_ms)
+        .map(|value| {
+            value
+                .with_timezone(&chrono::FixedOffset::east_opt(8 * 3600).expect("valid offset"))
+                .format("%Y-%m-%d")
+                .to_string()
+        })
+        .unwrap_or_else(|| "unknown".into());
+    let stats = daily.entry(day).or_default();
+    stats.exit_legs += 1;
+    stats.fees_usd += payload["attempt_fee_usd"].as_f64().unwrap_or(0.0);
+    stats.net_realized_pnl_usd += payload["attempt_net_pnl_usd"].as_f64().unwrap_or(0.0);
 }
 
 fn classify(payload: &Value) -> (String, String) {
@@ -717,9 +804,70 @@ fn record_exit(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn record_attempt_exit(
+    payload: &Value,
+    total: &mut Performance,
+    sleeves: &mut BTreeMap<String, Performance>,
+    recipes: &mut BTreeMap<String, Performance>,
+    sides: &mut BTreeMap<String, Performance>,
+    recipe_sides: &mut BTreeMap<String, Performance>,
+) {
+    let (sleeve, recipe) = classify(payload);
+    let side = payload["side"].as_str().unwrap_or("unknown").to_owned();
+    let pnl = payload["attempt_net_pnl_usd"].as_f64().unwrap_or(0.0);
+    let fee = payload["attempt_fee_usd"].as_f64().unwrap_or(0.0);
+    total.filled_attempt_exit(pnl, fee);
+    sleeves
+        .entry(sleeve)
+        .or_default()
+        .filled_attempt_exit(pnl, fee);
+    recipes
+        .entry(recipe.clone())
+        .or_default()
+        .filled_attempt_exit(pnl, fee);
+    sides
+        .entry(side.clone())
+        .or_default()
+        .filled_attempt_exit(pnl, fee);
+    recipe_sides
+        .entry(format!("{recipe}:{side}"))
+        .or_default()
+        .filled_attempt_exit(pnl, fee);
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn filled_entry_attempt_pnl_is_not_dropped_from_performance() {
+        let payload = serde_json::json!({
+            "candidate_id":"fast_trend_activation:TEST:1",
+            "recipe":"fast_trend_activation",
+            "side":"buy",
+            "attempt_fee_usd":1.25,
+            "attempt_net_pnl_usd":-3.50
+        });
+        let mut total = Performance::default();
+        let mut sleeves = BTreeMap::new();
+        let mut recipes = BTreeMap::new();
+        let mut sides = BTreeMap::new();
+        let mut recipe_sides = BTreeMap::new();
+        record_attempt_exit(
+            &payload,
+            &mut total,
+            &mut sleeves,
+            &mut recipes,
+            &mut sides,
+            &mut recipe_sides,
+        );
+        assert_eq!(total.entries, 0);
+        assert_eq!(total.filled_attempt_exits, 1);
+        assert_eq!(total.completed_trades, 1);
+        assert_eq!(total.net_realized_pnl_usd, -3.50);
+        assert_eq!(total.fees_usd, 1.25);
+    }
 
     #[test]
     fn second_leg_keeps_recipe_attribution_inside_trend_lane() {

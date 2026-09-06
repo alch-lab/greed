@@ -344,7 +344,14 @@ impl StrategyNode for FastTrendActivationNode {
                 ),
                 ("max_notional_multiple".into(), "1.0".into()),
                 ("entry_timeout_ms".into(), "120000".into()),
-                ("min_fill_ratio".into(), "0.80".into()),
+                (
+                    "min_fill_ratio".into(),
+                    self.config.fast_min_fill_ratio.to_string(),
+                ),
+                (
+                    "min_managed_fill_ratio".into(),
+                    self.config.fast_min_managed_fill_ratio.to_string(),
+                ),
                 ("entry_invalidation_bps".into(), "25".into()),
                 ("max_entry_adverse_bps".into(), "6".into()),
                 ("taker_fallback".into(), "false".into()),
