@@ -209,6 +209,8 @@ struct PendingEntryState {
     #[serde(default)]
     preliminary_stop_algo_id: Option<i64>,
     #[serde(default)]
+    preliminary_stop_price: Option<f64>,
+    #[serde(default)]
     guard_unavailable_since_ms: Option<i64>,
     #[serde(default)]
     micro_reversal_since_ms: Option<i64>,
@@ -446,32 +448,12 @@ impl BinanceDemoExecution {
             builder = builder.proxy(reqwest::Proxy::all(proxy)?);
         }
         let client = builder.build()?;
-        let mut state: DemoState = fs::read_to_string(&state_path)
+        let state: DemoState = fs::read_to_string(&state_path)
             .ok()
             .and_then(|text| serde_json::from_str(&text).ok())
             .unwrap_or_default();
         let performance_epoch_reset = state.performance_epoch != risk.rolling_pf_epoch;
-        if performance_epoch_reset {
-            state.recipe_outcomes.clear();
-            state.symbol_outcomes.clear();
-            state.trend_reentries.clear();
-            state.accounted_attempt_ids.clear();
-            state.entry_attempt_ids.clear();
-            state.filled_entry_attempt_ids.clear();
-            state.formal_position_ids.clear();
-            state.closed_trade_ids.clear();
-            state.recipe_execution_counts.clear();
-            state.performance_epoch = risk.rolling_pf_epoch;
-            state.execution_halt_reason = None;
-        }
         let performance_basis_reset = state.performance_basis_version != PERFORMANCE_BASIS_VERSION;
-        if performance_basis_reset {
-            // Dollar PF and risk-normalized R PF cannot share one rolling
-            // window. Reset only the internal recipe sample window; account
-            // baseline, run history, PnL curve, symbol cooldowns and exits stay.
-            state.recipe_outcomes.clear();
-            state.performance_basis_version = PERFORMANCE_BASIS_VERSION;
-        }
         let mut value = Self {
             client,
             config,
@@ -506,6 +488,22 @@ impl BinanceDemoExecution {
                     "cannot start a new performance epoch while Binance demo positions are open"
                 ));
             }
+            // Commit the new epoch only after reconciliation has proved the
+            // account and every persisted lifecycle are flat. Previously sync
+            // could persist the epoch number before this check and leave a
+            // half-reset state if startup then failed.
+            value.state.recipe_outcomes.clear();
+            value.state.symbol_outcomes.clear();
+            value.state.trend_reentries.clear();
+            value.state.accounted_attempt_ids.clear();
+            value.state.entry_attempt_ids.clear();
+            value.state.filled_entry_attempt_ids.clear();
+            value.state.formal_position_ids.clear();
+            value.state.closed_trade_ids.clear();
+            value.state.recipe_execution_counts.clear();
+            value.state.performance_epoch = value.risk.rolling_pf_epoch;
+            value.state.performance_basis_version = PERFORMANCE_BASIS_VERSION;
+            value.state.execution_halt_reason = None;
             let wallet = value
                 .account
                 .as_ref()
@@ -518,6 +516,11 @@ impl BinanceDemoExecution {
             value.state.seen.clear();
             value.save()?;
         } else if value.performance_basis_reset {
+            // Dollar PF and risk-normalized R PF cannot share one rolling
+            // window. Reset only the internal recipe sample window; account
+            // baseline, run history, PnL curve, symbol cooldowns and exits stay.
+            value.state.recipe_outcomes.clear();
+            value.state.performance_basis_version = PERFORMANCE_BASIS_VERSION;
             value.save()?;
         }
         Ok(value)
@@ -634,32 +637,34 @@ impl BinanceDemoExecution {
             Ok(value) => {
                 let mut account = parse_account(&value)?;
                 let now_ms = chrono::Utc::now().timestamp_millis();
-                let (mut events, pending_changed) =
-                    match self.progress_pending_entries(now_ms).await {
-                        Ok(events) => {
-                            let changed = !events.is_empty();
-                            (events, changed)
-                        }
-                        Err(error) => (
-                            vec![ExchangeEvent {
-                                kind: "exchange_pending_entry_error".into(),
-                                payload: serde_json::json!({
-                                    "ts_ms":now_ms,
-                                    // Preserve the full anyhow chain. `to_string()` only
-                                    // exposes the outer context and previously hid the
-                                    // actual Binance rejection (for example an invalid
-                                    // clientAlgoId), making a protection failure impossible
-                                    // to diagnose from a production bundle.
-                                    "reason":format!("{error:#}"),
-                                    "pending_entries":self.state.pending_entries.len(),
-                                    "existing_position_management_continued":true,
-                                    "venue":"binance_demo",
-                                    "paper_only":true
-                                }),
-                            }],
-                            false,
-                        ),
-                    };
+                let (mut events, pending_changed) = match self
+                    .progress_pending_entries(now_ms, &account.positions)
+                    .await
+                {
+                    Ok(events) => {
+                        let changed = !events.is_empty();
+                        (events, changed)
+                    }
+                    Err(error) => (
+                        vec![ExchangeEvent {
+                            kind: "exchange_pending_entry_error".into(),
+                            payload: serde_json::json!({
+                                "ts_ms":now_ms,
+                                // Preserve the full anyhow chain. `to_string()` only
+                                // exposes the outer context and previously hid the
+                                // actual Binance rejection (for example an invalid
+                                // clientAlgoId), making a protection failure impossible
+                                // to diagnose from a production bundle.
+                                "reason":format!("{error:#}"),
+                                "pending_entries":self.state.pending_entries.len(),
+                                "existing_position_management_continued":true,
+                                "venue":"binance_demo",
+                                "paper_only":true
+                            }),
+                        }],
+                        false,
+                    ),
+                };
                 if pending_changed {
                     let refreshed = self.signed_read("/fapi/v2/account", vec![]).await?;
                     account = parse_account(&refreshed)?;
@@ -2606,6 +2611,7 @@ impl BinanceDemoExecution {
             first_fill_ms: None,
             first_fill_time_source: None,
             preliminary_stop_algo_id: None,
+            preliminary_stop_price: None,
             guard_unavailable_since_ms: None,
             micro_reversal_since_ms: None,
         };
@@ -2779,6 +2785,11 @@ impl BinanceDemoExecution {
         pending.next_reprice_ms = accepted_ms + MAKER_REPRICE_INTERVAL_MS;
         pending.reprice_attempt = reprice_attempt;
         pending.preliminary_stop_algo_id = preliminary_stop_algo_id;
+        pending.preliminary_stop_price = preliminary_stop_algo_id.map(|_| {
+            let stop_distance = plan.side.sign() * (plan.reference_price - plan.stop_price)
+                / plan.reference_price.max(f64::EPSILON);
+            passive_price * (1.0 - plan.side.sign() * stop_distance)
+        });
         self.state
             .pending_entries
             .insert(plan.symbol.clone(), pending);
@@ -2856,7 +2867,11 @@ impl BinanceDemoExecution {
     /// restart resumes the same client order rather than submitting a second
     /// entry. Existing positions are managed by the remainder of `sync`
     /// regardless of how long these orders wait.
-    async fn progress_pending_entries(&mut self, now_ms: i64) -> Result<Vec<ExchangeEvent>> {
+    async fn progress_pending_entries(
+        &mut self,
+        now_ms: i64,
+        account_positions: &BTreeMap<String, RemotePosition>,
+    ) -> Result<Vec<ExchangeEvent>> {
         let symbols: Vec<_> = self.state.pending_entries.keys().cloned().collect();
         let mut events = Vec::new();
         for symbol in symbols {
@@ -2955,10 +2970,103 @@ impl BinanceDemoExecution {
             }
 
             let status = order["status"].as_str().unwrap_or("NEW").to_string();
-            let terminal = matches!(
-                status.as_str(),
-                "FILLED" | "CANCELED" | "EXPIRED" | "REJECTED"
-            );
+            let terminal = order_status_is_terminal(&status);
+            // A user or exchange-side protection may close a recovered fill
+            // before the runtime has promoted it into `positions`. Only treat
+            // it as flat after userTrades proves a complete round trip; a
+            // freshly filled order can briefly precede the account snapshot.
+            if executed > f64::EPSILON && !account_positions.contains_key(&symbol) {
+                let started_ms = pending
+                    .first_fill_ms
+                    .unwrap_or(pending.order_submitted_ms)
+                    .saturating_sub(1_000);
+                if let Ok(mut summary) = self
+                    .trade_summary_after_close(&symbol, started_ms, pending.plan.side, executed)
+                    .await
+                {
+                    // An operator can flatten a partially filled position while
+                    // the remainder of its maker order is still resting. Never
+                    // leave that order able to reopen the symbol. Freeze it,
+                    // account for any cancel-race fill, and flatten that race
+                    // quantity before declaring the pending lifecycle closed.
+                    if !terminal {
+                        order = self
+                            .cancel_or_reconcile_entry(&symbol, &pending.active_client_id)
+                            .await?;
+                        executed = reconciled_executed_quantity(executed, &order);
+                        if executed > summary.exit_quantity + 1e-9 {
+                            let close_id = client_order_id("raceclose", &pending.plan.candidate_id);
+                            self.flatten_entry_quantity(
+                                &symbol,
+                                pending.plan.side,
+                                executed - summary.exit_quantity,
+                                rules.quantity_step,
+                                &close_id,
+                            )
+                            .await
+                            .context(
+                                "maker cancel raced with an operator close and the incremental fill could not be flattened",
+                            )?;
+                        }
+                        summary = self
+                            .trade_summary_after_close(
+                                &symbol,
+                                started_ms,
+                                pending.plan.side,
+                                executed,
+                            )
+                            .await?;
+                    }
+                    self.cancel_pending_stop(&symbol, &pending).await;
+                    // Also remove any old regular/algo order whose identifier
+                    // predates the current state schema. This is best-effort;
+                    // `prepare_symbol_for_entry` performs a second hard check
+                    // before this symbol can ever be traded again.
+                    self.cancel_all(&symbol).await.ok();
+                    self.state.pending_entries.remove(&symbol);
+                    if !self.performance_epoch_reset {
+                        let risk = summary.entry_quantity
+                            * (summary.entry_price
+                                - pending.plan.stop_price * summary.entry_price
+                                    / pending.plan.reference_price.max(f64::EPSILON))
+                            .abs();
+                        self.record_filled_attempt(&pending.plan.candidate_id, &pending.recipe);
+                        self.record_outcome_once(
+                            &pending.plan.candidate_id,
+                            &pending.recipe,
+                            &pending.plan.symbol,
+                            pending.plan.side,
+                            ExecutionOutcome {
+                                candidate_id: pending.plan.candidate_id.clone(),
+                                exit_ms: now_ms,
+                                pnl_usd: summary.net_pnl_usd,
+                                pnl_r: (risk > f64::EPSILON).then_some(summary.net_pnl_usd / risk),
+                                fill_ratio: Some(
+                                    summary.entry_quantity
+                                        / pending.requested_quantity.max(f64::EPSILON),
+                                ),
+                                initial_risk_usd: (risk > f64::EPSILON).then_some(risk),
+                                sample_kind: "filled_entry_attempt".into(),
+                            },
+                        );
+                    }
+                    self.save()?;
+                    events.push(ExchangeEvent {
+                        kind: "exchange_pending_entry_reconciled_flat".into(),
+                        payload: serde_json::json!({
+                            "ts_ms":now_ms,"candidate_id":pending.plan.candidate_id,
+                            "recipe":pending.recipe,"symbol":symbol,"side":pending.plan.side,
+                            "filled_quantity":summary.entry_quantity,
+                            "exit_quantity":summary.exit_quantity,
+                            "fee_usd":summary.fees_usd,"net_pnl_usd":summary.net_pnl_usd,
+                            "performance_epoch_reset":self.performance_epoch_reset,
+                            "reason":"exchange_position_already_flat_with_complete_round_trip",
+                            "venue":"binance_demo","paper_only":true
+                        }),
+                    });
+                    continue;
+                }
+            }
             let wait_satisfied = managed_fill_threshold_reached(
                 executed,
                 pending.requested_quantity,
@@ -3152,6 +3260,7 @@ impl BinanceDemoExecution {
                 {
                     Ok(algo_id) => {
                         pending.preliminary_stop_algo_id = Some(algo_id);
+                        pending.preliminary_stop_price = Some(trigger);
                         self.state
                             .pending_entries
                             .insert(symbol.clone(), pending.clone());
@@ -3366,7 +3475,7 @@ impl BinanceDemoExecution {
         let sign = plan.side.sign();
         let stop_distance = sign * (plan.reference_price - plan.stop_price)
             / plan.reference_price.max(f64::EPSILON);
-        let stop_price = entry_price * (1.0 - sign * stop_distance);
+        let planned_stop_price = entry_price * (1.0 - sign * stop_distance);
         let take_profit_prices: Vec<_> = plan
             .take_profit_prices
             .iter()
@@ -3376,31 +3485,40 @@ impl BinanceDemoExecution {
             })
             .collect();
 
-        let exact_stop = self
-            .place_close_all_trigger(
-                &plan.symbol,
-                plan.side.opposite(),
-                "STOP_MARKET",
-                stop_price,
-                rules,
-                client_order_id("stop", &plan.candidate_id),
-            )
-            .await;
-        let stop_algo_id = match exact_stop {
-            Ok(value) => value,
-            Err(error) => {
-                return self
-                    .finish_failed_pending_entry(
-                        pending,
-                        executed,
-                        rules,
-                        completed_ms,
-                        format!("exact_protection_failed: {error}"),
-                    )
-                    .await;
-            }
+        // A sub-threshold partial fill is already guarded by a close-all stop.
+        // Reuse it during promotion instead of briefly duplicating (and often
+        // conflicting with) another Binance closePosition order. The stored
+        // trigger is the authoritative risk price for this position.
+        let (stop_algo_id, stop_price) = match pending.preliminary_stop_algo_id {
+            Some(value) => (
+                value,
+                pending.preliminary_stop_price.unwrap_or(planned_stop_price),
+            ),
+            None => match self
+                .place_close_all_trigger(
+                    &plan.symbol,
+                    plan.side.opposite(),
+                    "STOP_MARKET",
+                    planned_stop_price,
+                    rules,
+                    client_order_id("stop", &plan.candidate_id),
+                )
+                .await
+            {
+                Ok(value) => (value, planned_stop_price),
+                Err(error) => {
+                    return self
+                        .finish_failed_pending_entry(
+                            pending,
+                            executed,
+                            rules,
+                            completed_ms,
+                            format!("exact_protection_failed: {error:#}"),
+                        )
+                        .await;
+                }
+            },
         };
-        self.cancel_pending_stop(&plan.symbol, &pending).await;
         let mut take_profit_order_ids = Vec::new();
         for (index, (target, fraction)) in take_profit_prices.iter().enumerate() {
             match self
@@ -3521,7 +3639,10 @@ impl BinanceDemoExecution {
     ) -> Result<ExchangeEvent> {
         if executed > f64::EPSILON {
             let close_id = client_order_id("attemptclose", &pending.plan.candidate_id);
-            self.flatten_entry_quantity(
+            // Remove staged regular targets but keep the close-all stop alive
+            // until the emergency reduce-only close is confirmed.
+            self.cancel_regular_orders(&pending.plan.symbol).await?;
+            self.flatten_entry_or_confirm_flat(
                 &pending.plan.symbol,
                 pending.plan.side,
                 executed,
@@ -4018,22 +4139,24 @@ impl BinanceDemoExecution {
         let (stop_algo_id, take_profit_order_ids) = match protective {
             Ok(value) => value,
             Err(error) => {
-                self.cancel_all(&plan.symbol).await.ok();
-                self.signed(
-                    Method::POST,
-                    "/fapi/v1/order",
-                    vec![
-                        ("symbol".into(), plan.symbol.clone()),
-                        ("side".into(), side_name(plan.side.opposite()).into()),
-                        ("type".into(), "MARKET".into()),
-                        ("quantity".into(), decimal(executed, rules.quantity_step)),
-                        ("reduceOnly".into(), "true".into()),
-                    ],
+                // Preserve the conditional stop while removing any staged
+                // regular targets and flattening the entry. This guarantees a
+                // protection API failure cannot turn into a naked position if
+                // the emergency market request itself times out.
+                self.cancel_regular_orders(&plan.symbol).await.ok();
+                let close_id = client_order_id("protectfail", &plan.candidate_id);
+                self.flatten_entry_or_confirm_flat(
+                    &plan.symbol,
+                    plan.side,
+                    executed,
+                    rules.quantity_step,
+                    &close_id,
                 )
                 .await
                 .with_context(|| {
                     format!("protective order failed ({error}); emergency close also failed")
                 })?;
+                self.cancel_all(&plan.symbol).await.ok();
                 return Err(anyhow!(
                     "protective order failed; entry was immediately closed: {error}"
                 ));
@@ -4356,21 +4479,11 @@ impl BinanceDemoExecution {
     }
 
     async fn cancel_or_reconcile_entry(&self, symbol: &str, client_id: &str) -> Result<Value> {
-        match self
-            .signed(
-                Method::DELETE,
-                "/fapi/v1/order",
-                vec![
-                    ("symbol".into(), symbol.into()),
-                    ("origClientOrderId".into(), client_id.into()),
-                ],
-            )
-            .await
-        {
-            Ok(value) => Ok(value),
-            Err(cancel_error) => self
+        let mut last_error = None;
+        for attempt in 0..3 {
+            let cancel_detail = match self
                 .signed(
-                    Method::GET,
+                    Method::DELETE,
                     "/fapi/v1/order",
                     vec![
                         ("symbol".into(), symbol.into()),
@@ -4378,12 +4491,43 @@ impl BinanceDemoExecution {
                     ],
                 )
                 .await
-                .with_context(|| {
-                    format!(
-                        "post-only cancel failed ({cancel_error}) and final reconciliation failed"
-                    )
-                }),
+            {
+                Ok(value) if order_value_is_terminal(&value) => return Ok(value),
+                Ok(value) => format!(
+                    "cancel response status {}",
+                    value["status"].as_str().unwrap_or("UNKNOWN")
+                ),
+                Err(error) => format!("cancel request failed: {error:#}"),
+            };
+
+            match self
+                .signed_read(
+                    "/fapi/v1/order",
+                    vec![
+                        ("symbol".into(), symbol.into()),
+                        ("origClientOrderId".into(), client_id.into()),
+                    ],
+                )
+                .await
+            {
+                Ok(value) if order_value_is_terminal(&value) => return Ok(value),
+                Ok(value) => {
+                    last_error = Some(anyhow!(
+                        "{cancel_detail}; order remains active after cancel attempt {} with status {}",
+                        attempt + 1,
+                        value["status"].as_str().unwrap_or("UNKNOWN")
+                    ));
+                }
+                Err(error) => {
+                    last_error = Some(anyhow!(
+                        "{cancel_detail}; cancellation reconciliation failed: {error:#}"
+                    ));
+                }
+            }
+            tokio::time::sleep(Duration::from_millis(250)).await;
         }
+        Err(last_error.unwrap_or_else(|| anyhow!("entry cancellation could not be verified")))
+            .with_context(|| format!("could not freeze pending entry {client_id} on {symbol}"))
     }
 
     async fn place_close_all_trigger(
@@ -4544,13 +4688,7 @@ impl BinanceDemoExecution {
     }
 
     async fn cancel_all(&self, symbol: &str) -> Result<()> {
-        let regular = self
-            .signed(
-                Method::DELETE,
-                "/fapi/v1/allOpenOrders",
-                vec![("symbol".into(), symbol.into())],
-            )
-            .await;
+        let regular = self.cancel_regular_orders(symbol).await;
         let algo = self
             .signed(
                 Method::DELETE,
@@ -4560,6 +4698,16 @@ impl BinanceDemoExecution {
             .await;
         regular.context("cancel regular open orders")?;
         algo.context("cancel conditional algo orders")?;
+        Ok(())
+    }
+
+    async fn cancel_regular_orders(&self, symbol: &str) -> Result<()> {
+        self.signed(
+            Method::DELETE,
+            "/fapi/v1/allOpenOrders",
+            vec![("symbol".into(), symbol.into())],
+        )
+        .await?;
         Ok(())
     }
 
@@ -4646,23 +4794,102 @@ impl BinanceDemoExecution {
             .rules
             .get(&position.symbol)
             .ok_or_else(|| anyhow!("missing exchange rules for {}", position.symbol))?;
-        self.cancel_all(&position.symbol).await?;
-        self.signed(
-            Method::POST,
-            "/fapi/v1/order",
+        // Cancel regular take-profits first so they cannot race the requested
+        // full close, but retain the conditional stop until Binance has
+        // definitely accepted the reduce-only market order.
+        self.cancel_regular_orders(&position.symbol).await?;
+        let latest = self.signed_read("/fapi/v2/account", vec![]).await?;
+        let latest_positions = parse_account(&latest)?.positions;
+        let Some(latest_position) = latest_positions.get(&position.symbol) else {
+            self.cancel_all(&position.symbol).await.ok();
+            return Ok(());
+        };
+        if latest_position.side != position.side {
+            return Err(anyhow!(
+                "{} changed from {:?} to {:?} while its close was prepared",
+                position.symbol,
+                position.side,
+                latest_position.side
+            ));
+        }
+
+        // The stable id makes an ambiguous response queryable without risking
+        // a duplicate close after a network timeout.
+        let close_id = client_order_id(
+            "close",
+            &format!(
+                "{}:{:?}:{:.12}:{:.12}:{}",
+                position.symbol,
+                latest_position.side,
+                latest_position.entry_price,
+                latest_position.quantity,
+                chrono::Utc::now().timestamp_millis()
+            ),
+        );
+        self.submit_or_lookup(
+            &position.symbol,
+            &close_id,
             vec![
                 ("symbol".into(), position.symbol.clone()),
                 ("side".into(), side_name(position.side.opposite()).into()),
                 ("type".into(), "MARKET".into()),
                 (
                     "quantity".into(),
-                    decimal(position.quantity.abs(), rules.quantity_step),
+                    decimal(latest_position.quantity.abs(), rules.quantity_step),
                 ),
                 ("reduceOnly".into(), "true".into()),
+                ("newClientOrderId".into(), close_id.clone()),
+                ("newOrderRespType".into(), "RESULT".into()),
             ],
         )
         .await?;
+        // Once the close is accepted, stale stops/targets must not survive the
+        // flat position. A later reconciliation retries this cleanup if the
+        // network drops here, so cleanup failure must not misreport the close
+        // itself as rejected.
+        self.cancel_all(&position.symbol).await.ok();
         Ok(())
+    }
+
+    async fn flatten_entry_or_confirm_flat(
+        &self,
+        symbol: &str,
+        side: Side,
+        fallback_quantity: f64,
+        quantity_step: f64,
+        client_id: &str,
+    ) -> Result<()> {
+        let latest = self.signed_read("/fapi/v2/account", vec![]).await?;
+        let positions = parse_account(&latest)?.positions;
+        let quantity = match positions.get(symbol) {
+            Some(position) if position.side == side => position.quantity.abs(),
+            Some(position) => {
+                return Err(anyhow!(
+                    "{symbol} changed from {side:?} to {:?}; refusing to flatten an operator-owned reverse position",
+                    position.side
+                ));
+            }
+            // Account snapshots can briefly lag a just-returned fill. Submit
+            // the known executed amount; an exchange-confirmed flat state is
+            // accepted below if Binance rejects the redundant reduce-only order.
+            None => fallback_quantity,
+        };
+        match self
+            .flatten_entry_quantity(symbol, side, quantity, quantity_step, client_id)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(close_error) => {
+                let refreshed = self.signed_read("/fapi/v2/account", vec![]).await?;
+                let refreshed_positions = parse_account(&refreshed)?.positions;
+                if refreshed_positions.contains_key(symbol) {
+                    Err(close_error)
+                        .context("reduce-only close failed and the position remains open")
+                } else {
+                    Ok(())
+                }
+            }
+        }
     }
 
     async fn flatten_entry_quantity(
@@ -5342,6 +5569,16 @@ fn pending_fill_needs_provisional_stop(
     executed > f64::EPSILON && !terminal && !wait_satisfied && !deadline && !invalidated
 }
 
+fn order_status_is_terminal(status: &str) -> bool {
+    matches!(status, "FILLED" | "CANCELED" | "EXPIRED" | "REJECTED")
+}
+
+fn order_value_is_terminal(order: &Value) -> bool {
+    order["status"]
+        .as_str()
+        .is_some_and(order_status_is_terminal)
+}
+
 fn hex_bytes(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
@@ -5743,6 +5980,7 @@ mod tests {
                 first_fill_ms: Some(30),
                 first_fill_time_source: Some("exchange_user_trade_time".into()),
                 preliminary_stop_algo_id: Some(123),
+                preliminary_stop_price: Some(98.75),
                 guard_unavailable_since_ms: None,
                 micro_reversal_since_ms: None,
             },
@@ -5843,6 +6081,9 @@ mod tests {
             "pendingstop",
             "stop",
             "attemptclose",
+            "raceclose",
+            "protectfail",
+            "close",
             "persistfail",
             "underfill",
         ] {
@@ -5876,6 +6117,42 @@ mod tests {
         assert!(!pending_fill_needs_provisional_stop(
             0.0, false, false, false, false
         ));
+    }
+
+    #[test]
+    fn cancel_reconciliation_accepts_only_terminal_order_states() {
+        for status in ["FILLED", "CANCELED", "EXPIRED", "REJECTED"] {
+            assert!(order_value_is_terminal(
+                &serde_json::json!({"status":status})
+            ));
+        }
+        for status in ["NEW", "PARTIALLY_FILLED", "PENDING_CANCEL", "UNKNOWN"] {
+            assert!(!order_value_is_terminal(
+                &serde_json::json!({"status":status})
+            ));
+        }
+        assert!(!order_value_is_terminal(&serde_json::json!({})));
+    }
+
+    #[test]
+    fn legacy_pending_state_without_stop_price_remains_compatible() {
+        let plan = guarded_plan(Side::Buy);
+        let pending: PendingEntryState = serde_json::from_value(serde_json::json!({
+            "plan":plan,
+            "recipe":"trend_continuation",
+            "signal_ms":10,
+            "size_multiplier":1.0,
+            "requested_quantity":10.0,
+            "active_client_id":"greed-entry-1",
+            "passive_price":99.0,
+            "order_submitted_ms":20,
+            "deadline_ms":120000,
+            "next_reprice_ms":35000,
+            "preliminary_stop_algo_id":123
+        }))
+        .expect("old pending states must deserialize after the stop-price field is added");
+        assert_eq!(pending.preliminary_stop_algo_id, Some(123));
+        assert_eq!(pending.preliminary_stop_price, None);
     }
 
     #[test]
