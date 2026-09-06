@@ -493,6 +493,7 @@ fn is_trade_event(value: &Value) -> bool {
         value["kind"].as_str(),
         Some(
             "exchange_entry"
+                | "exchange_entry_attempt_closed"
                 | "exchange_partial_exit"
                 | "exchange_runner_activated"
                 | "exchange_exit"
@@ -749,5 +750,17 @@ mod tests {
         assert!(!valid_symbol("promusdt"));
         assert!(!valid_symbol("BTCUSDC"));
         assert!(!valid_symbol("BTC/USDT"));
+    }
+
+    #[test]
+    fn filled_attempt_exit_is_exposed_as_a_trade_event() {
+        assert!(is_trade_event(&json!({
+            "kind":"exchange_entry_attempt_closed",
+            "payload":{
+                "candidate_id":"trend_continuation:NEARUSDT:1",
+                "attempt_entry_quantity":229.0,
+                "attempt_net_pnl_usd":1.49
+            }
+        })));
     }
 }
