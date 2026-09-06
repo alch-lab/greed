@@ -645,7 +645,12 @@ impl BinanceDemoExecution {
                                 kind: "exchange_pending_entry_error".into(),
                                 payload: serde_json::json!({
                                     "ts_ms":now_ms,
-                                    "reason":error.to_string(),
+                                    // Preserve the full anyhow chain. `to_string()` only
+                                    // exposes the outer context and previously hid the
+                                    // actual Binance rejection (for example an invalid
+                                    // clientAlgoId), making a protection failure impossible
+                                    // to diagnose from a production bundle.
+                                    "reason":format!("{error:#}"),
                                     "pending_entries":self.state.pending_entries.len(),
                                     "existing_position_management_continued":true,
                                     "venue":"binance_demo",
@@ -1841,6 +1846,7 @@ impl BinanceDemoExecution {
             .iter()
             .map(|(symbol, position)| {
                 let meta = self.state.positions.get(symbol);
+                let pending = self.state.pending_entries.get(symbol);
                 let notional = position.quantity.abs() * position.mark_price;
                 let entry_notional = position.quantity.abs() * position.entry_price;
                 (
@@ -1848,23 +1854,39 @@ impl BinanceDemoExecution {
                     DemoPositionSnapshot {
                         candidate_id: meta
                             .map(|value| value.candidate_id.clone())
+                            .or_else(|| pending.map(|value| value.plan.candidate_id.clone()))
                             .unwrap_or_default(),
                         recipe: meta
                             .map(|value| value.recipe.clone())
+                            .or_else(|| pending.map(|value| value.recipe.clone()))
                             .unwrap_or_else(|| "external".into()),
                         symbol: symbol.clone(),
                         side: position.side,
                         entry_ms: meta
                             .map(ExecutionMeta::holding_started_ms)
+                            .or_else(|| {
+                                pending.map(|value| {
+                                    value.first_fill_ms.unwrap_or(value.order_submitted_ms)
+                                })
+                            })
                             .unwrap_or_default(),
-                        signal_ms: meta.map(|value| value.signal_ms).unwrap_or_default(),
+                        signal_ms: meta
+                            .map(|value| value.signal_ms)
+                            .or_else(|| pending.map(|value| value.signal_ms))
+                            .unwrap_or_default(),
                         order_submitted_ms: meta
                             .map(|value| value.order_submitted_ms)
+                            .or_else(|| pending.map(|value| value.order_submitted_ms))
                             .unwrap_or_default(),
-                        first_fill_ms: meta.and_then(|value| value.first_fill_ms),
+                        first_fill_ms: meta
+                            .and_then(|value| value.first_fill_ms)
+                            .or_else(|| pending.and_then(|value| value.first_fill_ms)),
                         entry_completed_ms: meta.and_then(|value| value.entry_completed_ms),
                         entry_time_source: meta
                             .map(|value| value.holding_time_source().to_string())
+                            .or_else(|| {
+                                pending.and_then(|value| value.first_fill_time_source.clone())
+                            })
                             .unwrap_or_else(|| "unavailable".into()),
                         entry_price: position.entry_price,
                         quantity: position.quantity.abs(),
@@ -2894,25 +2916,8 @@ impl BinanceDemoExecution {
                 pending.first_fill_ms = Some(fill_ms);
                 pending.first_fill_time_source = Some(source.into());
                 self.record_filled_attempt(&pending.plan.candidate_id, &pending.recipe);
-            }
-            if executed > f64::EPSILON && pending.preliminary_stop_algo_id.is_none() {
-                let stop_distance = pending.plan.side.sign()
-                    * (pending.plan.reference_price - pending.plan.stop_price)
-                    / pending.plan.reference_price.max(f64::EPSILON);
-                let trigger =
-                    pending.passive_price * (1.0 - pending.plan.side.sign() * stop_distance);
-                pending.preliminary_stop_algo_id = Some(
-                    self.place_close_all_trigger(
-                        &symbol,
-                        pending.plan.side.opposite(),
-                        "STOP_MARKET",
-                        trigger,
-                        &rules,
-                        client_order_id("pendingstop", &pending.plan.candidate_id),
-                    )
-                    .await
-                    .context("re-arm provisional stop for a recovered partial fill")?,
-                );
+                // The fill timestamp and ownership must survive even when the
+                // following protection request fails or the process restarts.
                 self.state
                     .pending_entries
                     .insert(symbol.clone(), pending.clone());
@@ -3059,7 +3064,7 @@ impl BinanceDemoExecution {
                     }
                 }
 
-                if let Some(reason) = invalidation {
+                if let Some(reason) = invalidation.as_ref() {
                     events.push(
                         self.finish_failed_pending_entry(
                             pending,
@@ -3113,6 +3118,113 @@ impl BinanceDemoExecution {
                     );
                 }
                 continue;
+            }
+
+            // Only a genuinely resting, sub-threshold partial fill needs a
+            // provisional close-all stop. A filled/terminal order must proceed
+            // directly to finalization above; the old ordering tried to create
+            // a provisional stop first and a single rejection permanently
+            // prevented the formal stop and take-profit orders from being
+            // installed.
+            if pending_fill_needs_provisional_stop(
+                executed,
+                terminal,
+                wait_satisfied,
+                deadline,
+                invalidation.is_some(),
+            ) && pending.preliminary_stop_algo_id.is_none()
+            {
+                let stop_distance = pending.plan.side.sign()
+                    * (pending.plan.reference_price - pending.plan.stop_price)
+                    / pending.plan.reference_price.max(f64::EPSILON);
+                let trigger =
+                    pending.passive_price * (1.0 - pending.plan.side.sign() * stop_distance);
+                match self
+                    .place_close_all_trigger(
+                        &symbol,
+                        pending.plan.side.opposite(),
+                        "STOP_MARKET",
+                        trigger,
+                        &rules,
+                        client_order_id("pendingstop", &pending.plan.candidate_id),
+                    )
+                    .await
+                {
+                    Ok(algo_id) => {
+                        pending.preliminary_stop_algo_id = Some(algo_id);
+                        self.state
+                            .pending_entries
+                            .insert(symbol.clone(), pending.clone());
+                        self.save()?;
+                    }
+                    Err(protection_error) => {
+                        // Do not leave an already-filled entry in an endless
+                        // retry loop without formal management. Freeze the
+                        // remaining entry quantity, reconcile the cancel race,
+                        // then either promote the actual fill to a protected
+                        // position or flatten it as an accounted failed attempt.
+                        let canceled = match self
+                            .cancel_or_reconcile_entry(&symbol, &pending.active_client_id)
+                            .await
+                        {
+                            Ok(value) => value,
+                            Err(cancel_error) => {
+                                let reason = format!(
+                                    "provisional stop failed ({protection_error:#}); entry cancellation could not be reconciled ({cancel_error:#})"
+                                );
+                                self.state.execution_halt_reason = Some(reason.clone());
+                                self.state
+                                    .pending_entries
+                                    .insert(symbol.clone(), pending.clone());
+                                self.save().ok();
+                                return Err(anyhow!(reason));
+                            }
+                        };
+                        executed = reconciled_executed_quantity(executed, &canceled);
+                        if executed > f64::EPSILON && pending.first_fill_ms.is_none() {
+                            let order_id = canceled["orderId"].as_i64().unwrap_or_default();
+                            let (fill_ms, source) = self
+                                .resolve_first_fill_time(
+                                    &symbol,
+                                    order_id,
+                                    &canceled,
+                                    pending.plan.side,
+                                    now_ms,
+                                )
+                                .await;
+                            pending.first_fill_ms = Some(fill_ms);
+                            pending.first_fill_time_source = Some(source.into());
+                            self.record_filled_attempt(&pending.plan.candidate_id, &pending.recipe);
+                        }
+                        self.state
+                            .pending_entries
+                            .insert(symbol.clone(), pending.clone());
+                        self.save()?;
+                        let manageable = partial_fill_is_manageable(
+                            executed,
+                            pending.requested_quantity,
+                            entry_price_hint(&canceled, pending.passive_price),
+                            pending.plan.min_managed_fill_ratio,
+                            &rules,
+                            &pending.plan.take_profit_prices,
+                        );
+                        let event = if manageable {
+                            self.finalize_pending_entry(pending, canceled, executed, &rules, now_ms)
+                                .await?
+                        } else {
+                            self.finish_failed_pending_entry(
+                                pending,
+                                executed,
+                                &rules,
+                                now_ms,
+                                format!("provisional_protection_failed: {protection_error:#}"),
+                            )
+                            .await?
+                        };
+                        events.push(event);
+                        continue;
+                    }
+                }
             }
 
             if executed <= f64::EPSILON
@@ -5208,7 +5320,26 @@ fn reprice_client_id(base: &str, attempt: u8) -> String {
 }
 fn client_order_id(prefix: &str, candidate_id: &str) -> String {
     let digest = hex_bytes(&Sha256::digest(candidate_id.as_bytes()));
-    format!("greed-{prefix}-{}", &digest[..20])
+    const MAX_CLIENT_ORDER_ID_LEN: usize = 36;
+    let stem = format!("greed-{prefix}-");
+    // Keep the historical 20-hex suffix whenever it already fits so a
+    // restart can still reconcile orders created by older binaries. Only the
+    // long internal prefixes (pendingstop/attemptclose/persistfail) need a
+    // shorter suffix to satisfy Binance's 36-character maximum.
+    let digest_len = 20usize
+        .min(MAX_CLIENT_ORDER_ID_LEN.saturating_sub(stem.len()))
+        .min(digest.len());
+    format!("{stem}{}", &digest[..digest_len])
+}
+
+fn pending_fill_needs_provisional_stop(
+    executed: f64,
+    terminal: bool,
+    wait_satisfied: bool,
+    deadline: bool,
+    invalidated: bool,
+) -> bool {
+    executed > f64::EPSILON && !terminal && !wait_satisfied && !deadline && !invalidated
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {
@@ -5702,6 +5833,49 @@ mod tests {
         let base = client_order_id("entry", "alt.recipe:test:cycle-123");
         let repriced = reprice_client_id(&base, MAX_MAKER_REPRICES);
         assert!(repriced.len() <= 36);
+    }
+
+    #[test]
+    fn every_execution_client_id_stays_within_binance_limit() {
+        for prefix in [
+            "entry",
+            "fallback",
+            "pendingstop",
+            "stop",
+            "attemptclose",
+            "persistfail",
+            "underfill",
+        ] {
+            let value = client_order_id(prefix, "trend_continuation:1000BONKUSDT:1788703199999");
+            assert!(
+                value.len() <= 36,
+                "{prefix} generated an invalid {}-character id: {value}",
+                value.len()
+            );
+            assert!(value.starts_with(&format!("greed-{prefix}-")));
+        }
+    }
+
+    #[test]
+    fn completed_or_actionable_fills_skip_provisional_protection() {
+        assert!(pending_fill_needs_provisional_stop(
+            10.0, false, false, false, false
+        ));
+        assert!(!pending_fill_needs_provisional_stop(
+            10.0, true, false, false, false
+        ));
+        assert!(!pending_fill_needs_provisional_stop(
+            80.0, false, true, false, false
+        ));
+        assert!(!pending_fill_needs_provisional_stop(
+            10.0, false, false, true, false
+        ));
+        assert!(!pending_fill_needs_provisional_stop(
+            10.0, false, false, false, true
+        ));
+        assert!(!pending_fill_needs_provisional_stop(
+            0.0, false, false, false, false
+        ));
     }
 
     #[test]
