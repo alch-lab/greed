@@ -86,6 +86,17 @@ fn strong_opposing_microstructure(
         })
 }
 
+fn usable_microstructure(
+    instrument: &greed_kernel::InstrumentFrame,
+    now_ms: i64,
+) -> (&'static str, Option<f64>, Option<f64>) {
+    match instrument.microstructure.as_ref() {
+        None => ("missing", None, None),
+        Some(micro) if !micro.meta.usable_at(now_ms) => ("stale", None, None),
+        Some(micro) => ("fresh", micro.trade_imbalance(), micro.mid_return_bps_10s),
+    }
+}
+
 impl StrategyNode for TrendContinuationNode {
     fn id(&self) -> &str {
         &self.id
@@ -223,14 +234,11 @@ impl StrategyNode for TrendContinuationNode {
             let volume_ratio = hour_volume / baseline.max(1.0);
             let post_signal_extension_bps =
                 post_signal_extension_bps(side, bar.close, instrument.price);
-            let live_trade_imbalance = instrument
-                .microstructure
-                .as_ref()
-                .and_then(|value| value.trade_imbalance());
-            let live_mid_return_bps = instrument
-                .microstructure
-                .as_ref()
-                .and_then(|value| value.mid_return_bps_10s);
+            // Microstructure is an optional veto, not a structural input. A
+            // stale observation must behave like unavailable data rather than
+            // silently vetoing a fresh 15m setup with an old flow value.
+            let (live_microstructure_status, live_trade_imbalance, live_mid_return_bps) =
+                usable_microstructure(instrument, ctx.frame.as_of_ms);
             let strong_live_reversal = strong_opposing_microstructure(
                 side,
                 live_trade_imbalance,
@@ -391,11 +399,19 @@ impl StrategyNode for TrendContinuationNode {
                 ),
                 (
                     "live_trade_imbalance".into(),
-                    live_trade_imbalance.unwrap_or_default().to_string(),
+                    live_trade_imbalance
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "null".into()),
                 ),
                 (
                     "live_mid_return_bps_10s".into(),
-                    live_mid_return_bps.unwrap_or_default().to_string(),
+                    live_mid_return_bps
+                        .map(|value| value.to_string())
+                        .unwrap_or_else(|| "null".into()),
+                ),
+                (
+                    "live_microstructure_status".into(),
+                    live_microstructure_status.into(),
                 ),
             ]);
             if verdict == Verdict::Pass {
@@ -588,6 +604,9 @@ impl StrategyNode for TrendContinuationNode {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use greed_kernel::{
+        CandleSeries, InstrumentFrame, MarketKind, MicrostructureState, ObservationMeta,
+    };
 
     #[test]
     fn market_median_handles_even_and_odd_universes() {
@@ -656,6 +675,72 @@ mod tests {
             Side::Sell,
             None,
             Some(8.0),
+            0.15,
+            3.0
+        ));
+    }
+
+    fn instrument_with_micro(expires_ms: i64) -> InstrumentFrame {
+        let series = CandleSeries {
+            venue: "test".into(),
+            market: MarketKind::Perpetual,
+            interval_ms: 900_000,
+            meta: ObservationMeta {
+                event_ms: 1_000,
+                received_ms: 1_000,
+                expires_ms,
+                source: "test".into(),
+                quality: DataQuality::Complete,
+            },
+            values: vec![],
+        };
+        InstrumentFrame {
+            symbol: "TESTUSDT".into(),
+            price: 100.0,
+            perpetual: series,
+            hourly_perpetual: None,
+            fast_perpetual: None,
+            micro_perpetual: None,
+            open_interest: None,
+            book: None,
+            microstructure: Some(MicrostructureState {
+                meta: ObservationMeta {
+                    event_ms: 1_000,
+                    received_ms: 1_000,
+                    expires_ms,
+                    source: "test".into(),
+                    quality: DataQuality::Complete,
+                },
+                buy_notional_60s: 10.0,
+                sell_notional_60s: 90.0,
+                long_liquidations_60s: 0.0,
+                short_liquidations_60s: 0.0,
+                snapshot_ofi_10s: None,
+                snapshot_ofi_60s: None,
+                mid_return_bps_10s: Some(-8.0),
+                mid_return_bps_60s: None,
+                price_impact_bps_per_ofi_10s: None,
+                book_updates_10s: 10,
+                book_updates_60s: 60,
+            }),
+        }
+    }
+
+    #[test]
+    fn stale_microstructure_is_not_used_as_a_trend_veto() {
+        let stale = instrument_with_micro(1_500);
+        let (status, flow, response) = usable_microstructure(&stale, 2_000);
+        assert_eq!(status, "stale");
+        assert_eq!(flow, None);
+        assert_eq!(response, None);
+
+        let fresh = instrument_with_micro(2_500);
+        let (status, flow, response) = usable_microstructure(&fresh, 2_000);
+        assert_eq!(status, "fresh");
+        assert!(strong_opposing_microstructure(
+            Side::Buy,
+            flow,
+            response,
             0.15,
             3.0
         ));

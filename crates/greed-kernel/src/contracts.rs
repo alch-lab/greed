@@ -157,6 +157,12 @@ pub struct InstrumentFrame {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenInterestPoint {
     pub timestamp_ms: i64,
+    /// Raw contract/token quantity reported by Binance as `sumOpenInterest`.
+    /// Historical records did not contain this field, so absence must remain
+    /// distinguishable from a genuine zero reading.
+    #[serde(default)]
+    pub quantity: Option<f64>,
+    /// Quote-value open interest reported as `sumOpenInterestValue`.
     pub value_usd: f64,
 }
 

@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use greed_kernel::{Candle, CandleSeries, MarketFrame, MarketKind};
+use greed_kernel::{BookState, Candle, CandleSeries, DataQuality, MarketFrame, MarketKind};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
@@ -14,6 +14,7 @@ const SNAPSHOT_INTERVAL_MS: i64 = 60_000;
 const JOURNAL_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const JOURNAL_ROTATIONS: usize = 4;
 const FORWARD_HORIZONS_MS: [i64; 6] = [10_000, 30_000, 60_000, 180_000, 300_000, 900_000];
+const RESEARCH_LABEL_VERSION: u32 = 2;
 
 #[derive(Default)]
 pub struct SampleRecorder {
@@ -64,6 +65,7 @@ impl SampleRecorder {
                         "last_1m":instrument.micro_perpetual.as_ref().and_then(|series|series.values.last()),
                         "open_interest":instrument.open_interest.as_ref().and_then(|series|series.values.last().map(|latest|serde_json::json!({
                                 "timestamp_ms":latest.timestamp_ms,
+                                "quantity":latest.quantity,
                                 "value_usd":latest.value_usd,
                                 "quality":series.meta.quality,
                             }))),
@@ -83,10 +85,63 @@ impl SampleRecorder {
 struct PendingResearchSample {
     sample_ms: i64,
     reference_price: f64,
+    reference_price_source: &'static str,
+    entry_quote: Option<ResearchQuote>,
+    entry_quote_status: &'static str,
     min_price: f64,
     max_price: f64,
     next_horizon: usize,
     forward: Vec<Value>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+struct ResearchQuote {
+    bid: f64,
+    ask: f64,
+    event_ms: i64,
+    received_ms: i64,
+    quality: DataQuality,
+}
+
+fn research_quote(book: Option<&BookState>, now_ms: i64) -> (Option<ResearchQuote>, &'static str) {
+    match book {
+        None => (None, "missing"),
+        Some(book) if !book.meta.usable_at(now_ms) => (None, "stale"),
+        Some(book)
+            if !book.bid.is_finite()
+                || !book.ask.is_finite()
+                || book.bid <= 0.0
+                || book.ask < book.bid =>
+        {
+            (None, "invalid")
+        }
+        Some(book) => (
+            Some(ResearchQuote {
+                bid: book.bid,
+                ask: book.ask,
+                event_ms: book.meta.event_ms,
+                received_ms: book.meta.received_ms,
+                quality: book.meta.quality,
+            }),
+            "fresh",
+        ),
+    }
+}
+
+fn forward_label_tolerance_ms(horizon_ms: i64, snapshot_interval_ms: i64) -> i64 {
+    (snapshot_interval_ms * 2).max(horizon_ms / 4)
+}
+
+fn executable_returns_bps(
+    entry: Option<ResearchQuote>,
+    exit: Option<ResearchQuote>,
+) -> (Option<f64>, Option<f64>) {
+    entry.zip(exit).map_or((None, None), |(entry, exit)| {
+        (
+            Some((exit.bid / entry.ask - 1.0) * 10_000.0),
+            Some((entry.bid / exit.ask - 1.0) * 10_000.0),
+        )
+    })
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -237,6 +292,8 @@ impl ResearchRecorder {
             }
 
             let price = instrument.price;
+            let (exit_quote, exit_quote_status) =
+                research_quote(instrument.book.as_ref(), frame.as_of_ms);
             let queue = self.pending.entry(instrument.symbol.clone()).or_default();
             for sample in queue.iter_mut() {
                 sample.min_price = sample.min_price.min(price);
@@ -246,10 +303,44 @@ impl ResearchRecorder {
                     && elapsed_ms >= FORWARD_HORIZONS_MS[sample.next_horizon]
                 {
                     let horizon_ms = FORWARD_HORIZONS_MS[sample.next_horizon];
+                    let target_ms = sample.sample_ms + horizon_ms;
+                    let observed_ms = frame.as_of_ms;
+                    let lateness_ms = observed_ms.saturating_sub(target_ms);
+                    let tolerance_ms =
+                        forward_label_tolerance_ms(horizon_ms, self.snapshot_interval_ms);
+                    let timing_valid = lateness_ms <= tolerance_ms;
+                    let raw_reference_return_bps =
+                        (price / sample.reference_price - 1.0) * 10_000.0;
+                    let (raw_long_executable_return_bps, raw_short_executable_return_bps) =
+                        executable_returns_bps(sample.entry_quote, exit_quote);
+                    let executable_valid = timing_valid
+                        && raw_long_executable_return_bps.is_some()
+                        && raw_short_executable_return_bps.is_some();
                     sample.forward.push(serde_json::json!({
                         "horizon_ms":horizon_ms,
-                        "observed_ms":frame.as_of_ms,
-                        "return_bps":(price/sample.reference_price-1.0)*10_000.0,
+                        "target_ms":target_ms,
+                        "observed_ms":observed_ms,
+                        "lateness_ms":lateness_ms,
+                        "tolerance_ms":tolerance_ms,
+                        "valid":timing_valid,
+                        "return_bps":timing_valid.then_some(raw_reference_return_bps),
+                        "raw_return_bps":raw_reference_return_bps,
+                        "executable_valid":executable_valid,
+                        "long_executable_return_bps":executable_valid.then_some(raw_long_executable_return_bps).flatten(),
+                        "short_executable_return_bps":executable_valid.then_some(raw_short_executable_return_bps).flatten(),
+                        "raw_long_executable_return_bps":raw_long_executable_return_bps,
+                        "raw_short_executable_return_bps":raw_short_executable_return_bps,
+                        "entry_quote":sample.entry_quote,
+                        "entry_quote_status":sample.entry_quote_status,
+                        "exit_quote":exit_quote,
+                        "exit_quote_status":exit_quote_status,
+                        "invalid_reason":if !timing_valid {
+                            Some("observation_arrived_after_horizon_tolerance")
+                        } else if !executable_valid {
+                            Some("fresh_executable_quote_unavailable")
+                        } else {
+                            None
+                        },
                     }));
                     sample.next_horizon += 1;
                 }
@@ -263,11 +354,21 @@ impl ResearchRecorder {
                     "research_forward_label".to_string(),
                     serde_json::json!({
                         "symbol":instrument.symbol,
+                        "label_version":RESEARCH_LABEL_VERSION,
                         "sample_ms":sample.sample_ms,
                         "reference_price":sample.reference_price,
+                        "reference_price_source":sample.reference_price_source,
                         "forward":sample.forward,
-                        "max_favorable_bps":(sample.max_price/sample.reference_price-1.0)*10_000.0,
-                        "max_adverse_bps":(sample.min_price/sample.reference_price-1.0)*10_000.0,
+                        "sampled_max_favorable_bps":(sample.max_price/sample.reference_price-1.0)*10_000.0,
+                        "sampled_max_adverse_bps":(sample.min_price/sample.reference_price-1.0)*10_000.0,
+                        "extrema_sampling":"discrete_research_snapshots_not_continuous_ticks",
+                        "snapshot_interval_ms":self.snapshot_interval_ms,
+                        "cost_scope":{
+                            "spread_included_in_executable_returns":true,
+                            "fees_included":false,
+                            "slippage_beyond_top_of_book_included":false,
+                            "funding_included":false,
+                        },
                     }),
                 ));
                 self.labels_written += 1;
@@ -283,6 +384,9 @@ impl ResearchRecorder {
                     "expected_buy_slippage_bps":book.expected_buy_slippage_bps,
                     "expected_sell_slippage_bps":book.expected_sell_slippage_bps,
                     "event_age_ms":frame.as_of_ms-book.meta.event_ms,
+                    "event_ms":book.meta.event_ms,
+                    "received_ms":book.meta.received_ms,
+                    "usable":book.meta.usable_at(frame.as_of_ms),
                     "quality":book.meta.quality,
                 })
             });
@@ -309,6 +413,7 @@ impl ResearchRecorder {
                 Some(serde_json::json!({
                     "interval_ms":series.interval_ms,
                     "timestamp_ms":latest.timestamp_ms,
+                    "quantity":latest.quantity,
                     "value_usd":latest.value_usd,
                     "event_age_ms":frame.as_of_ms-series.meta.event_ms,
                     "quality":series.meta.quality,
@@ -320,6 +425,7 @@ impl ResearchRecorder {
                     "as_of_ms":frame.as_of_ms,
                     "symbol":instrument.symbol,
                     "price":price,
+                    "reference_price_source":"instrument.price",
                     "book":book,
                     "flow":flow,
                     "open_interest":open_interest,
@@ -328,6 +434,9 @@ impl ResearchRecorder {
             queue.push_back(PendingResearchSample {
                 sample_ms: frame.as_of_ms,
                 reference_price: price,
+                reference_price_source: "instrument.price",
+                entry_quote: exit_quote,
+                entry_quote_status: exit_quote_status,
                 min_price: price,
                 max_price: price,
                 next_horizon: 0,
@@ -658,6 +767,32 @@ impl StatusWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn quote(bid: f64, ask: f64) -> ResearchQuote {
+        ResearchQuote {
+            bid,
+            ask,
+            event_ms: 1_000,
+            received_ms: 1_001,
+            quality: DataQuality::Complete,
+        }
+    }
+
+    #[test]
+    fn executable_forward_returns_pay_the_spread_in_both_directions() {
+        let unchanged = quote(99.0, 101.0);
+        let (long, short) = executable_returns_bps(Some(unchanged), Some(unchanged));
+        assert!(long.unwrap() < 0.0);
+        assert!(short.unwrap() < 0.0);
+        assert!((long.unwrap() - short.unwrap()).abs() < 1e-9);
+    }
+
+    #[test]
+    fn late_forward_observations_exceed_a_bounded_tolerance() {
+        assert_eq!(forward_label_tolerance_ms(10_000, 15_000), 30_000);
+        assert_eq!(forward_label_tolerance_ms(900_000, 15_000), 225_000);
+        assert!(8 * 60 * 60 * 1_000 > forward_label_tolerance_ms(900_000, 15_000));
+    }
 
     #[test]
     fn journal_rotates_before_exceeding_its_bound() {

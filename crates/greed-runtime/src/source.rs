@@ -784,8 +784,14 @@ impl BinanceMarketSource {
                 .and_then(Value::as_str)
                 .ok_or_else(|| anyhow!("open-interest value is missing"))?
                 .parse()?;
+            let quantity = row
+                .get("sumOpenInterest")
+                .and_then(Value::as_str)
+                .map(str::parse)
+                .transpose()?;
             points.push(OpenInterestPoint {
                 timestamp_ms,
+                quantity,
                 value_usd,
             });
         }
