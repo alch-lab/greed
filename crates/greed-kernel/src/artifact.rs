@@ -116,6 +116,10 @@ pub struct PositionPlan {
     #[serde(default)]
     pub early_failure_max_favorable_pct: f64,
     pub max_hold_ms: i64,
+    /// A fixed-horizon research position must close at `max_hold_ms` without
+    /// inheriting recipe-specific grace periods or adaptive hold extensions.
+    #[serde(default)]
+    pub fixed_time_exit: bool,
 }
 
 /// A strategy-level request to flatten its positions when the market state

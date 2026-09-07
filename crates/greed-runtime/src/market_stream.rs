@@ -40,6 +40,17 @@ struct BookFlowObservation {
 }
 
 #[derive(Debug, Clone)]
+struct LiquidationObservation {
+    event_ms: i64,
+    received_ms: i64,
+    is_long_liquidation: bool,
+    notional_usd: f64,
+    pressure_depth_usd: f64,
+    mid: f64,
+    book_received_ms: i64,
+}
+
+#[derive(Debug, Clone)]
 pub struct StreamTicker {
     pub received_ms: i64,
     pub price: f64,
@@ -106,7 +117,7 @@ struct StreamState {
     /// Binance liquidation stream snapshots. Binance publishes at most the
     /// largest forced order per symbol in each 1s window, so these values are
     /// useful event context but are not complete liquidation volume.
-    liquidations: BTreeMap<String, VecDeque<(i64, bool, f64)>>,
+    liquidations: BTreeMap<String, VecDeque<LiquidationObservation>>,
     desired_symbols: BTreeSet<String>,
     symbol_admitted_ms: BTreeMap<String, i64>,
     market_connections: [bool; MARKET_STREAM_SHARDS],
@@ -218,15 +229,20 @@ impl MarketStreamHub {
         let mut long_liquidations = 0.0;
         let mut short_liquidations = 0.0;
         if let Some(values) = state.liquidations.get(&symbol) {
-            for (_, is_long, notional) in values.iter().filter(|(ts, _, _)| *ts >= now_ms - 60_000)
+            for value in values
+                .iter()
+                .filter(|value| value.received_ms >= now_ms - 60_000)
             {
-                if *is_long {
-                    long_liquidations += notional;
+                if value.is_long_liquidation {
+                    long_liquidations += value.notional_usd;
                 } else {
-                    short_liquidations += notional;
+                    short_liquidations += value.notional_usd;
                 }
             }
         }
+        let liquidation_3s = state.liquidations.get(&symbol).and_then(|values| {
+            aggregate_liquidation_window(values, state.book_flow.get(&symbol), 3_000)
+        });
         let flow_10s = state
             .book_flow
             .get(&symbol)
@@ -251,6 +267,16 @@ impl MarketStreamHub {
             sell_notional_60s: sell,
             long_liquidations_60s: long_liquidations,
             short_liquidations_60s: short_liquidations,
+            long_liquidations_3s: liquidation_3s.as_ref().map(|value| value.long_notional_usd),
+            short_liquidations_3s: liquidation_3s
+                .as_ref()
+                .map(|value| value.short_notional_usd),
+            liquidation_dominance_3s: liquidation_3s.as_ref().map(|value| value.dominance),
+            liquidation_depth_ratio_3s: liquidation_3s.as_ref().map(|value| value.depth_ratio),
+            liquidation_aligned_return_bps_3s: liquidation_3s
+                .as_ref()
+                .and_then(|value| value.aligned_return_bps),
+            liquidation_event_ms: liquidation_3s.as_ref().map(|value| value.event_ms),
             snapshot_ofi_10s: flow_10s.as_ref().map(|value| value.normalized_ofi),
             snapshot_ofi_60s: flow_60s.as_ref().map(|value| value.normalized_ofi),
             mid_return_bps_10s: flow_10s.as_ref().map(|value| value.mid_return_bps),
@@ -570,31 +596,41 @@ async fn run_dynamic_connection(
     }
 }
 
-/// A public-depth reconnect invalidates the short OFI window for only the
-/// symbols assigned to that shard. Keep those symbols in an explicit warm-up
-/// state until fresh snapshots arrive instead of reporting every old book as
-/// an independent data failure.
+/// A reconnect invalidates only the short windows owned by that route. Never
+/// join pre-disconnect force orders, trades, or depth snapshots to fresh data;
+/// doing so can manufacture a liquidation event that never existed.
 fn mark_route_recovering(
     state: &Arc<RwLock<StreamState>>,
     route: StreamRoute,
     symbols: &[String],
     now_ms: i64,
 ) {
-    let StreamRoute::Public(shard) = route else {
-        return;
-    };
     let mut state = state.write().expect("stream state poisoned");
-    for symbol in symbols {
-        if symbol_shard(
-            &format!("{}@depth20@500ms", symbol.to_lowercase()),
-            PUBLIC_STREAM_SHARDS,
-        ) == shard
-        {
-            state
-                .symbol_admitted_ms
-                .insert(symbol.to_uppercase(), now_ms);
-            state.book_flow.remove(&symbol.to_uppercase());
+    match route {
+        StreamRoute::Public(shard) => {
+            for symbol in symbols {
+                if symbol_shard(
+                    &format!("{}@depth20@500ms", symbol.to_lowercase()),
+                    PUBLIC_STREAM_SHARDS,
+                ) == shard
+                {
+                    state
+                        .symbol_admitted_ms
+                        .insert(symbol.to_uppercase(), now_ms);
+                    state.book_flow.remove(&symbol.to_uppercase());
+                }
+            }
         }
+        StreamRoute::Trade(shard) => {
+            for symbol in symbols {
+                let normalized = symbol.to_uppercase();
+                if symbol_shard(&symbol.to_lowercase(), TRADE_STREAM_SHARDS) == shard {
+                    state.trades.remove(&normalized);
+                    state.liquidations.remove(&normalized);
+                }
+            }
+        }
+        StreamRoute::Market(_) | StreamRoute::Radar => {}
     }
 }
 
@@ -838,11 +874,31 @@ fn update_liquidation(
         .and_then(Value::as_i64)
         .unwrap_or(received_ms);
     let mut state = state.write().expect("stream state poisoned");
+    let book = state.books.get(&symbol);
+    let (pressure_depth_usd, mid, book_received_ms) = book.map_or((0.0, 0.0, 0), |book| {
+        (
+            if is_long_liquidation {
+                book.bid_depth_usd
+            } else {
+                book.ask_depth_usd
+            },
+            (book.bid + book.ask) * 0.5,
+            book.meta.received_ms,
+        )
+    });
     let values = state.liquidations.entry(symbol).or_default();
-    values.push_back((event_ms, is_long_liquidation, price * quantity));
+    values.push_back(LiquidationObservation {
+        event_ms,
+        received_ms,
+        is_long_liquidation,
+        notional_usd: price * quantity,
+        pressure_depth_usd,
+        mid,
+        book_received_ms,
+    });
     while values
         .front()
-        .is_some_and(|(ts, _, _)| *ts < received_ms - 120_000)
+        .is_some_and(|value| value.received_ms < received_ms - 120_000)
     {
         values.pop_front();
     }
@@ -1078,6 +1134,107 @@ struct BookFlowAggregate {
     normalized_ofi: f64,
     mid_return_bps: f64,
     updates: u32,
+}
+
+struct LiquidationWindowAggregate {
+    event_ms: i64,
+    long_notional_usd: f64,
+    short_notional_usd: f64,
+    dominance: f64,
+    depth_ratio: f64,
+    aligned_return_bps: Option<f64>,
+}
+
+fn aggregate_liquidation_window(
+    values: &VecDeque<LiquidationObservation>,
+    book_flow: Option<&VecDeque<BookFlowObservation>>,
+    window_ms: i64,
+) -> Option<LiquidationWindowAggregate> {
+    let latest = values.back()?;
+    let start_ms = latest.received_ms.saturating_sub(window_ms);
+    let selected: Vec<_> = values
+        .iter()
+        .filter(|value| value.received_ms >= start_ms && value.received_ms <= latest.received_ms)
+        .collect();
+    let long_notional_usd = selected
+        .iter()
+        .filter(|value| value.is_long_liquidation)
+        .map(|value| value.notional_usd)
+        .sum::<f64>();
+    let short_notional_usd = selected
+        .iter()
+        .filter(|value| !value.is_long_liquidation)
+        .map(|value| value.notional_usd)
+        .sum::<f64>();
+    let total = long_notional_usd + short_notional_usd;
+    if total <= f64::EPSILON {
+        return None;
+    }
+    let long_dominant = long_notional_usd >= short_notional_usd;
+    let directional_notional = long_notional_usd.max(short_notional_usd);
+    let pressure_depth_usd = selected
+        .iter()
+        .rev()
+        .find(|value| {
+            value.is_long_liquidation == long_dominant
+                && value.pressure_depth_usd > 0.0
+                && value
+                    .received_ms
+                    .saturating_sub(value.book_received_ms)
+                    .abs()
+                    <= 2_000
+        })
+        .map(|value| value.pressure_depth_usd)
+        .unwrap_or_default();
+    let start_mid = book_flow.and_then(|observations| {
+        observations
+            .iter()
+            .filter(|value| {
+                value.received_ms <= start_ms && start_ms.saturating_sub(value.received_ms) <= 1_500
+            })
+            .next_back()
+            .or_else(|| {
+                observations.iter().find(|value| {
+                    value.received_ms >= start_ms
+                        && value.received_ms.saturating_sub(start_ms) <= 1_500
+                })
+            })
+            .map(|value| value.mid)
+    });
+    let end_mid = (latest.mid > 0.0
+        && latest
+            .received_ms
+            .saturating_sub(latest.book_received_ms)
+            .abs()
+            <= 2_000)
+        .then_some(latest.mid)
+        .or_else(|| {
+            book_flow.and_then(|observations| {
+                observations
+                    .iter()
+                    .filter(|value| value.received_ms <= latest.received_ms)
+                    .next_back()
+                    .map(|value| value.mid)
+            })
+        });
+    let aligned_return_bps = start_mid.zip(end_mid).and_then(|(start, end)| {
+        (start > 0.0 && end > 0.0)
+            .then_some((if long_dominant { -1.0 } else { 1.0 }) * (end / start - 1.0) * 10_000.0)
+    });
+    Some(LiquidationWindowAggregate {
+        event_ms: latest.event_ms,
+        long_notional_usd,
+        short_notional_usd,
+        dominance: directional_notional / total,
+        // Missing event-time depth is not evidence of an infinitely strong
+        // liquidation. Score it as unavailable/zero so the strategy blocks.
+        depth_ratio: if pressure_depth_usd > f64::EPSILON {
+            directional_notional / pressure_depth_usd
+        } else {
+            0.0
+        },
+        aligned_return_bps,
+    })
 }
 
 fn aggregate_book_flow(
@@ -1330,7 +1487,10 @@ mod tests {
         assert_eq!(locked.tickers.len(), 1);
         assert_eq!(locked.candles.len(), 1);
         assert_eq!(locked.books["YBUSDT"].bid, 1.9);
-        assert_eq!(locked.liquidations["YBUSDT"].back().unwrap().2, 16.8);
+        assert_eq!(
+            locked.liquidations["YBUSDT"].back().unwrap().notional_usd,
+            16.8
+        );
     }
 
     #[test]
@@ -1589,6 +1749,47 @@ mod tests {
     }
 
     #[test]
+    fn trade_reconnect_drops_only_affected_short_windows() {
+        let symbols = vec![
+            "BTCUSDT".to_string(),
+            "ETHUSDT".to_string(),
+            "SOLUSDT".to_string(),
+            "XRPUSDT".to_string(),
+        ];
+        let shard = symbol_shard("btcusdt", TRADE_STREAM_SHARDS);
+        let state = Arc::new(RwLock::new(StreamState::default()));
+        {
+            let mut inner = state.write().unwrap();
+            for symbol in &symbols {
+                inner
+                    .trades
+                    .insert(symbol.clone(), VecDeque::from([(1_000, true, 10.0)]));
+                inner.liquidations.insert(
+                    symbol.clone(),
+                    VecDeque::from([LiquidationObservation {
+                        event_ms: 1_000,
+                        received_ms: 1_001,
+                        is_long_liquidation: true,
+                        notional_usd: 100.0,
+                        pressure_depth_usd: 200.0,
+                        mid: 1.0,
+                        book_received_ms: 1_000,
+                    }]),
+                );
+            }
+        }
+
+        mark_route_recovering(&state, StreamRoute::Trade(shard), &symbols, 2_000);
+
+        let inner = state.read().unwrap();
+        for symbol in &symbols {
+            let affected = symbol_shard(&symbol.to_lowercase(), TRADE_STREAM_SHARDS) == shard;
+            assert_eq!(inner.trades.contains_key(symbol), !affected);
+            assert_eq!(inner.liquidations.contains_key(symbol), !affected);
+        }
+    }
+
+    #[test]
     fn snapshot_ofi_is_positive_when_bid_queue_grows() {
         let previous = test_book(1_000, 99.0, 10.0, 101.0, 10.0);
         let mut current = test_book(1_500, 99.0, 20.0, 101.0, 10.0);
@@ -1626,5 +1827,58 @@ mod tests {
         assert!((aggregate.normalized_ofi - 0.3).abs() < 1e-9);
         assert!((aggregate.mid_return_bps - 10.0).abs() < 1e-9);
         assert_eq!(aggregate.updates, 2);
+    }
+
+    #[test]
+    fn liquidation_window_uses_directional_depth_and_aligned_price_move() {
+        let books = VecDeque::from([
+            BookFlowObservation {
+                received_ms: 7_000,
+                raw_ofi_usd: 0.0,
+                visible_top_usd: 10_000.0,
+                mid: 100.0,
+            },
+            BookFlowObservation {
+                received_ms: 10_000,
+                raw_ofi_usd: -1_000.0,
+                visible_top_usd: 10_000.0,
+                mid: 99.9,
+            },
+        ]);
+        let liquidations = VecDeque::from([
+            LiquidationObservation {
+                event_ms: 8_000,
+                received_ms: 8_000,
+                is_long_liquidation: true,
+                notional_usd: 6_000.0,
+                pressure_depth_usd: 10_000.0,
+                mid: 99.96,
+                book_received_ms: 8_000,
+            },
+            LiquidationObservation {
+                event_ms: 10_000,
+                received_ms: 10_000,
+                is_long_liquidation: true,
+                notional_usd: 3_000.0,
+                pressure_depth_usd: 10_000.0,
+                mid: 99.9,
+                book_received_ms: 10_000,
+            },
+            LiquidationObservation {
+                event_ms: 10_000,
+                received_ms: 10_000,
+                is_long_liquidation: false,
+                notional_usd: 1_000.0,
+                pressure_depth_usd: 10_000.0,
+                mid: 99.9,
+                book_received_ms: 10_000,
+            },
+        ]);
+        let aggregate = aggregate_liquidation_window(&liquidations, Some(&books), 3_000).unwrap();
+        assert_eq!(aggregate.long_notional_usd, 9_000.0);
+        assert_eq!(aggregate.short_notional_usd, 1_000.0);
+        assert!((aggregate.dominance - 0.9).abs() < 1e-9);
+        assert!((aggregate.depth_ratio - 0.9).abs() < 1e-9);
+        assert!((aggregate.aligned_return_bps.unwrap() - 10.0).abs() < 1e-9);
     }
 }

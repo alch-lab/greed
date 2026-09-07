@@ -104,6 +104,22 @@ pub struct MicrostructureState {
     pub sell_notional_60s: f64,
     pub long_liquidations_60s: f64,
     pub short_liquidations_60s: f64,
+    /// Binance force-order snapshots aggregated over the three-second window
+    /// ending at the most recent liquidation event. These fields are optional
+    /// so journals and persisted fixtures written before the liquidation lane
+    /// remain readable.
+    #[serde(default)]
+    pub long_liquidations_3s: Option<f64>,
+    #[serde(default)]
+    pub short_liquidations_3s: Option<f64>,
+    #[serde(default)]
+    pub liquidation_dominance_3s: Option<f64>,
+    #[serde(default)]
+    pub liquidation_depth_ratio_3s: Option<f64>,
+    #[serde(default)]
+    pub liquidation_aligned_return_bps_3s: Option<f64>,
+    #[serde(default)]
+    pub liquidation_event_ms: Option<i64>,
     /// Cont-style top-of-book order-flow imbalance derived from consecutive
     /// 500ms depth snapshots and normalized by average visible top-level
     /// notional. This is snapshot OFI, not exchange tick-by-tick L2 OFI.

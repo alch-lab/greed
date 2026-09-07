@@ -29,6 +29,7 @@ const ENTRY_GUARD_REVERSAL_CONFIRM_MS: i64 = 15_000;
 const MIN_PERFORMANCE_FILL_RATIO: f64 = 0.20;
 const PERFORMANCE_BASIS_VERSION: u32 = 3;
 const TREND_REENTRY_RECIPE: &str = "trend_continuation_reentry";
+const LIQUIDATION_REVERSAL_RECIPE: &str = "liquidation_exhaustion_reversal";
 
 pub struct ExchangeEvent {
     pub kind: String,
@@ -132,6 +133,8 @@ struct ExecutionMeta {
     #[serde(default)]
     early_failure_max_favorable_pct: f64,
     max_hold_ms: i64,
+    #[serde(default)]
+    fixed_time_exit: bool,
     /// Number of causal deadline reviews already granted. Older state files
     /// deserialize to zero, so upgrading cannot silently invent a grace
     /// period that was already consumed.
@@ -318,6 +321,7 @@ pub struct DemoPositionSnapshot {
     pub isolated: bool,
     pub isolated_wallet_usd: f64,
     pub max_hold_ms: i64,
+    pub fixed_time_exit: bool,
     pub break_even_armed: bool,
     pub profit_shield_activation_pct: Option<f64>,
     pub extreme_price: Option<f64>,
@@ -1179,7 +1183,8 @@ impl BinanceDemoExecution {
                                 *stop
                                     && (*take
                                         || self.state.positions.get(*symbol).is_some_and(|meta| {
-                                            meta.break_even_armed
+                                            meta.fixed_time_exit
+                                                || meta.break_even_armed
                                                 || meta.last_observed_quantity
                                                     < meta.initial_quantity - f64::EPSILON
                                         }))
@@ -1985,6 +1990,7 @@ impl BinanceDemoExecution {
                         isolated: position.isolated,
                         isolated_wallet_usd: position.isolated_wallet_usd,
                         max_hold_ms: meta.map(|value| value.max_hold_ms).unwrap_or_default(),
+                        fixed_time_exit: meta.map(|value| value.fixed_time_exit).unwrap_or(false),
                         break_even_armed: meta.map(|value| value.break_even_armed).unwrap_or(false),
                         profit_shield_activation_pct: meta
                             .and_then(|value| value.profit_shield_activation_pct),
@@ -2043,6 +2049,95 @@ impl BinanceDemoExecution {
             let recipe = candidate
                 .map(|value| value.recipe.clone())
                 .unwrap_or_else(|| "unknown".into());
+            if recipe == LIQUIDATION_REVERSAL_RECIPE {
+                if liquidation_cooldown_active(
+                    &self.state.seen,
+                    &plan.symbol,
+                    signal_ms_from_candidate(candidate, frame.as_of_ms),
+                    i64::from(self.lanes.liquidation_cooldown_seconds) * 1_000,
+                ) {
+                    self.state.seen.insert(plan.candidate_id.clone());
+                    events.push(ExchangeEvent {
+                        kind: "exchange_plan_rejected".into(),
+                        payload: serde_json::json!({
+                            "ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,
+                            "recipe":recipe,"symbol":plan.symbol,"side":plan.side,
+                            "reason":"liquidation_symbol_cooldown","venue":"binance_demo",
+                            "paper_only":true
+                        }),
+                    });
+                    continue;
+                }
+                if self
+                    .state
+                    .pending_entries
+                    .get(&plan.symbol)
+                    .is_some_and(|pending| pending.recipe != LIQUIDATION_REVERSAL_RECIPE)
+                {
+                    let pending = self
+                        .state
+                        .pending_entries
+                        .get(&plan.symbol)
+                        .cloned()
+                        .expect("pending entry was checked");
+                    let Some(rules) = self.rules.get(&plan.symbol).cloned() else {
+                        events.push(ExchangeEvent {
+                            kind: "exchange_order_rejected".into(),
+                            payload: serde_json::json!({
+                                "ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,
+                                "recipe":recipe,"symbol":plan.symbol,
+                                "reason":"cannot safely supersede pending order without exchange rules",
+                                "stage":"pending_priority","venue":"binance_demo","paper_only":true
+                            }),
+                        });
+                        continue;
+                    };
+                    match self
+                        .cancel_or_reconcile_entry(&plan.symbol, &pending.active_client_id)
+                        .await
+                    {
+                        Ok(order) => {
+                            let executed = parse_f64(&order, "executedQty").unwrap_or_default();
+                            match self
+                                .finish_failed_pending_entry(
+                                    pending,
+                                    executed,
+                                    &rules,
+                                    frame.as_of_ms,
+                                    "superseded_by_liquidation_exhaustion_reversal".into(),
+                                )
+                                .await
+                            {
+                                Ok(event) => events.push(event),
+                                Err(error) => {
+                                    events.push(ExchangeEvent {
+                                        kind: "exchange_order_rejected".into(),
+                                        payload: serde_json::json!({
+                                            "ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,
+                                            "recipe":recipe,"symbol":plan.symbol,
+                                            "reason":format!("pending strategy order could not be safely superseded: {error:#}"),
+                                            "stage":"pending_priority","venue":"binance_demo","paper_only":true
+                                        }),
+                                    });
+                                    continue;
+                                }
+                            }
+                        }
+                        Err(error) => {
+                            events.push(ExchangeEvent {
+                                kind: "exchange_order_rejected".into(),
+                                payload: serde_json::json!({
+                                    "ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,
+                                    "recipe":recipe,"symbol":plan.symbol,
+                                    "reason":format!("pending strategy order cancellation was not reconciled: {error:#}"),
+                                    "stage":"pending_priority","venue":"binance_demo","paper_only":true
+                                }),
+                            });
+                            continue;
+                        }
+                    }
+                }
+            }
             let rotates_existing_tail = recipe == "btc_key_zone"
                 && self.state.positions.get(&plan.symbol).is_some_and(|meta| {
                     let remaining_fraction =
@@ -2107,6 +2202,20 @@ impl BinanceDemoExecution {
             }) {
                 continue;
             }
+            // A fresh liquidation shock is the higher-priority, short-lived
+            // signal. Once the account is confirmed flat for this symbol it
+            // may retire an older trend re-entry campaign; otherwise that
+            // stale campaign would silently consume the 12-second event.
+            if recipe == LIQUIDATION_REVERSAL_RECIPE {
+                if let Some(campaign) = self.state.trend_reentries.remove(&plan.symbol) {
+                    events.push(reentry_state_event(
+                        frame.as_of_ms,
+                        &campaign,
+                        "superseded_by_liquidation_exhaustion_reversal",
+                        serde_json::json!({"candidate_id":plan.candidate_id}),
+                    ));
+                }
+            }
             // A profitable first leg hands this symbol to the persisted re-entry
             // campaign until it confirms, expires, or makes its single attempt.
             // Without ownership here, a fresh 15m candidate could bypass the
@@ -2153,9 +2262,10 @@ impl BinanceDemoExecution {
                 });
                 continue;
             }
-            if self
-                .symbol_loss_cooldown_until(&plan.symbol)
-                .is_some_and(|until_ms| frame.as_of_ms < until_ms)
+            if recipe != LIQUIDATION_REVERSAL_RECIPE
+                && self
+                    .symbol_loss_cooldown_until(&plan.symbol)
+                    .is_some_and(|until_ms| frame.as_of_ms < until_ms)
             {
                 self.state.seen.insert(plan.candidate_id.clone());
                 events.push(ExchangeEvent {
@@ -2296,6 +2406,7 @@ impl BinanceDemoExecution {
                             early_failure_adverse_pct: plan.early_failure_adverse_pct,
                             early_failure_max_favorable_pct: plan.early_failure_max_favorable_pct,
                             max_hold_ms: plan.max_hold_ms,
+                            fixed_time_exit: plan.fixed_time_exit,
                             max_hold_reviews: 0,
                             exit_requested: false,
                             pending_exit_reason: None,
@@ -3665,6 +3776,7 @@ impl BinanceDemoExecution {
                 early_failure_adverse_pct: plan.early_failure_adverse_pct,
                 early_failure_max_favorable_pct: plan.early_failure_max_favorable_pct,
                 max_hold_ms: plan.max_hold_ms,
+                fixed_time_exit: plan.fixed_time_exit,
                 max_hold_reviews: 0,
                 exit_requested: false,
                 pending_exit_reason: None,
@@ -4001,7 +4113,7 @@ impl BinanceDemoExecution {
                 "order is below Binance quantity or notional minimum"
             ));
         }
-        if plan.take_profit_prices.is_empty() {
+        if plan.take_profit_prices.is_empty() && !plan.fixed_time_exit {
             return Err(anyhow!("position plan requires at least one take profit"));
         }
         let take_profit_fraction = plan
@@ -5242,6 +5354,9 @@ fn max_hold_review(meta: &ExecutionMeta, mark_price: f64, now_ms: i64) -> MaxHol
     {
         return MaxHoldReview::NotApplicable;
     }
+    if meta.fixed_time_exit {
+        return MaxHoldReview::Exit;
+    }
     if meta.recipe != "fast_trend_activation" || meta.entry_price <= f64::EPSILON {
         return MaxHoldReview::Exit;
     }
@@ -5638,7 +5753,7 @@ fn validate_entry_quantity_and_exits(
             "order is below Binance quantity or notional minimum"
         ));
     }
-    if plan.take_profit_prices.is_empty() {
+    if plan.take_profit_prices.is_empty() && !plan.fixed_time_exit {
         return Err(anyhow!("position plan requires at least one take profit"));
     }
     let take_profit_fraction = plan
@@ -5672,6 +5787,26 @@ fn validate_entry_quantity_and_exits(
 fn reprice_client_id(base: &str, attempt: u8) -> String {
     format!("{}-r{attempt}", &base[..base.len().min(32)])
 }
+
+fn signal_ms_from_candidate(candidate: Option<&TradeCandidate>, fallback_ms: i64) -> i64 {
+    candidate.map_or(fallback_ms, |value| value.signal_ms)
+}
+
+fn liquidation_cooldown_active(
+    seen: &BTreeSet<String>,
+    symbol: &str,
+    signal_ms: i64,
+    cooldown_ms: i64,
+) -> bool {
+    let prefix = format!("{LIQUIDATION_REVERSAL_RECIPE}:{symbol}:");
+    seen.iter()
+        .filter_map(|candidate_id| candidate_id.strip_prefix(&prefix))
+        .filter_map(|value| value.parse::<i64>().ok())
+        .any(|previous_ms| {
+            previous_ms < signal_ms && signal_ms.saturating_sub(previous_ms) < cooldown_ms
+        })
+}
+
 fn client_order_id(prefix: &str, candidate_id: &str) -> String {
     let digest = hex_bytes(&Sha256::digest(candidate_id.as_bytes()));
     const MAX_CLIENT_ORDER_ID_LEN: usize = 36;
@@ -5772,6 +5907,7 @@ mod tests {
             early_failure_adverse_pct: 0.00625,
             early_failure_max_favorable_pct: 0.0025,
             max_hold_ms: 0,
+            fixed_time_exit: false,
         }
     }
 
@@ -6090,6 +6226,37 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(max_hold_review(&meta, 99.8, 1_801_000), MaxHoldReview::Exit);
+    }
+
+    #[test]
+    fn fixed_horizon_position_never_receives_a_hold_extension() {
+        let meta: ExecutionMeta = serde_json::from_value(serde_json::json!({
+            "candidate_id":"liquidation_exhaustion_reversal:ALTUSDT:1000",
+            "recipe":"liquidation_exhaustion_reversal","side":"buy",
+            "entry_ms":1_000,"first_fill_ms":1_000,"entry_price":100.0,
+            "extreme_price":110.0,"stop_price":98.0,"break_even_armed":true,
+            "profit_shield_activation_pct":0.001,"max_hold_ms":900_000,
+            "fixed_time_exit":true
+        }))
+        .unwrap();
+        assert_eq!(max_hold_review(&meta, 110.0, 901_000), MaxHoldReview::Exit);
+    }
+
+    #[test]
+    fn liquidation_cooldown_is_symbol_scoped_and_restart_safe() {
+        let seen = BTreeSet::from([
+            "liquidation_exhaustion_reversal:ALTUSDT:1000".to_string(),
+            "liquidation_exhaustion_reversal:OTHERUSDT:29000".to_string(),
+        ]);
+        assert!(liquidation_cooldown_active(
+            &seen, "ALTUSDT", 20_000, 30_000
+        ));
+        assert!(!liquidation_cooldown_active(
+            &seen, "ALTUSDT", 31_000, 30_000
+        ));
+        assert!(!liquidation_cooldown_active(
+            &seen, "NEWUSDT", 20_000, 30_000
+        ));
     }
 
     #[test]

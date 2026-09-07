@@ -1,6 +1,8 @@
 use crate::{
     recipes::{
-        fast_trend_activation::FastTrendActivationNode, trend_continuation::TrendContinuationNode,
+        fast_trend_activation::FastTrendActivationNode,
+        liquidation_exhaustion_reversal::LiquidationExhaustionReversalNode,
+        trend_continuation::TrendContinuationNode,
     },
     risk::PositionPlannerNode,
     StrategyConfig,
@@ -19,6 +21,13 @@ pub fn build_graph(config: &StrategyConfig) -> Result<StrategyGraph, GraphError>
             config.lanes.clone(),
         )));
         lanes.push("lane.fast_trend_activation".into());
+    }
+    if config.lanes.liquidation_reversal_enabled {
+        nodes.push(Box::new(LiquidationExhaustionReversalNode::new(
+            &config.symbols,
+            config.lanes.clone(),
+        )));
+        lanes.push("lane.liquidation_exhaustion_reversal".into());
     }
     nodes.push(Box::new(PositionPlannerNode::new(
         lanes,

@@ -266,7 +266,8 @@ fn strategy_funnels_demo(
     };
     serde_json::json!({
         "trend_continuation":build("trend_continuation"),
-        "fast_trend_activation":build("fast_trend_activation")
+        "fast_trend_activation":build("fast_trend_activation"),
+        "liquidation_exhaustion_reversal":build("liquidation_exhaustion_reversal")
     })
 }
 
@@ -391,7 +392,8 @@ async fn main() -> Result<()> {
             println!(
                 "valid: {} seed symbols, {} funded alpha lane(s), paper_only=true, execution={:?}",
                 config.strategy.symbols.len(),
-                1 + usize::from(config.strategy.lanes.fast_activation_enabled),
+                1 + usize::from(config.strategy.lanes.fast_activation_enabled)
+                    + usize::from(config.strategy.lanes.liquidation_reversal_enabled),
                 config.execution.mode,
             );
             Ok(())
