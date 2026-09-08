@@ -118,6 +118,11 @@ pub struct MicrostructureState {
     pub liquidation_depth_ratio_3s: Option<f64>,
     #[serde(default)]
     pub liquidation_aligned_return_bps_3s: Option<f64>,
+    /// Executable midpoint recovery after the most recent liquidation event,
+    /// measured opposite to the forced flow. A positive value is evidence of
+    /// absorption; zero is only a missing value when this Option is None.
+    #[serde(default)]
+    pub liquidation_reversal_bps: Option<f64>,
     #[serde(default)]
     pub liquidation_event_ms: Option<i64>,
     /// Cont-style top-of-book order-flow imbalance derived from consecutive

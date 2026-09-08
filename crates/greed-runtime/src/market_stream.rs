@@ -241,7 +241,12 @@ impl MarketStreamHub {
             }
         }
         let liquidation_3s = state.liquidations.get(&symbol).and_then(|values| {
-            aggregate_liquidation_window(values, state.book_flow.get(&symbol), 3_000)
+            aggregate_liquidation_window(
+                values,
+                state.book_flow.get(&symbol),
+                state.books.get(&symbol),
+                3_000,
+            )
         });
         let flow_10s = state
             .book_flow
@@ -276,6 +281,7 @@ impl MarketStreamHub {
             liquidation_aligned_return_bps_3s: liquidation_3s
                 .as_ref()
                 .and_then(|value| value.aligned_return_bps),
+            liquidation_reversal_bps: liquidation_3s.as_ref().and_then(|value| value.reversal_bps),
             liquidation_event_ms: liquidation_3s.as_ref().map(|value| value.event_ms),
             snapshot_ofi_10s: flow_10s.as_ref().map(|value| value.normalized_ofi),
             snapshot_ofi_60s: flow_60s.as_ref().map(|value| value.normalized_ofi),
@@ -1143,11 +1149,13 @@ struct LiquidationWindowAggregate {
     dominance: f64,
     depth_ratio: f64,
     aligned_return_bps: Option<f64>,
+    reversal_bps: Option<f64>,
 }
 
 fn aggregate_liquidation_window(
     values: &VecDeque<LiquidationObservation>,
     book_flow: Option<&VecDeque<BookFlowObservation>>,
+    current_book: Option<&BookState>,
     window_ms: i64,
 ) -> Option<LiquidationWindowAggregate> {
     let latest = values.back()?;
@@ -1221,6 +1229,40 @@ fn aggregate_liquidation_window(
         (start > 0.0 && end > 0.0)
             .then_some((if long_dominant { -1.0 } else { 1.0 }) * (end / start - 1.0) * 10_000.0)
     });
+    let current_mid = current_book.and_then(|book| {
+        (book.bid > 0.0
+            && book.ask > book.bid
+            && book.meta.received_ms >= latest.received_ms
+            && book.meta.received_ms.saturating_sub(latest.received_ms) <= 30_000)
+            .then_some((book.bid + book.ask) * 0.5)
+    });
+    let reversal_bps = current_mid.and_then(|current| {
+        let mut observed = vec![latest.mid];
+        if let Some(values) = book_flow {
+            observed.extend(
+                values
+                    .iter()
+                    .filter(|value| {
+                        value.received_ms >= latest.received_ms
+                            && current_book
+                                .is_some_and(|book| value.received_ms <= book.meta.received_ms)
+                    })
+                    .map(|value| value.mid),
+            );
+        }
+        observed.retain(|value| *value > 0.0 && value.is_finite());
+        if observed.is_empty() {
+            return None;
+        }
+        let value = if long_dominant {
+            let low = observed.iter().copied().fold(f64::INFINITY, f64::min);
+            (current / low - 1.0) * 10_000.0
+        } else {
+            let high = observed.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            (high / current - 1.0) * 10_000.0
+        };
+        value.is_finite().then_some(value.max(0.0))
+    });
     Some(LiquidationWindowAggregate {
         event_ms: latest.event_ms,
         long_notional_usd,
@@ -1234,6 +1276,7 @@ fn aggregate_liquidation_window(
             0.0
         },
         aligned_return_bps,
+        reversal_bps,
     })
 }
 
@@ -1874,11 +1917,15 @@ mod tests {
                 book_received_ms: 10_000,
             },
         ]);
-        let aggregate = aggregate_liquidation_window(&liquidations, Some(&books), 3_000).unwrap();
+        let current = test_book(11_000, 99.99, 10.0, 100.01, 10.0);
+        let aggregate =
+            aggregate_liquidation_window(&liquidations, Some(&books), Some(&current), 3_000)
+                .unwrap();
         assert_eq!(aggregate.long_notional_usd, 9_000.0);
         assert_eq!(aggregate.short_notional_usd, 1_000.0);
         assert!((aggregate.dominance - 0.9).abs() < 1e-9);
         assert!((aggregate.depth_ratio - 0.9).abs() < 1e-9);
         assert!((aggregate.aligned_return_bps.unwrap() - 10.0).abs() < 1e-9);
+        assert!((aggregate.reversal_bps.unwrap() - 10.01001001).abs() < 1e-6);
     }
 }

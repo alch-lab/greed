@@ -41,6 +41,7 @@ impl StrategyNode for LiquidationExhaustionReversalNode {
         let mut direction_hits = 0_u64;
         let mut depth_hits = 0_u64;
         let mut price_hits = 0_u64;
+        let mut reversal_hits = 0_u64;
 
         for symbol in self.symbols.iter().filter(|symbol| !is_major(symbol)) {
             let Some(instrument) = ctx.frame.instrument(symbol) else {
@@ -59,6 +60,7 @@ impl StrategyNode for LiquidationExhaustionReversalNode {
             let dominance = micro.liquidation_dominance_3s.unwrap_or_default();
             let depth_ratio = micro.liquidation_depth_ratio_3s.unwrap_or_default();
             let aligned_return_bps = micro.liquidation_aligned_return_bps_3s;
+            let reversal_bps = micro.liquidation_reversal_bps;
             let long_dominant = long_liquidations >= short_liquidations;
             // Forced long liquidation is aggressive selling, so exhaustion is
             // bought. Forced short liquidation is aggressive buying, so the
@@ -73,6 +75,9 @@ impl StrategyNode for LiquidationExhaustionReversalNode {
             price_hits += u64::from(
                 aligned_return_bps
                     .is_some_and(|value| value >= self.config.liquidation_min_aligned_return_bps),
+            );
+            reversal_hits += u64::from(
+                reversal_bps.is_some_and(|value| value >= self.config.liquidation_min_reversal_bps),
             );
 
             let mut blockers = Vec::new();
@@ -118,15 +123,27 @@ impl StrategyNode for LiquidationExhaustionReversalNode {
                 None => blockers.push("three-second midpoint path is incomplete".into()),
                 _ => {}
             }
+            match reversal_bps {
+                Some(value) if value < self.config.liquidation_min_reversal_bps => {
+                    blockers.push(format!(
+                        "post-liquidation recovery {value:.1} bps is below {:.1} bps",
+                        self.config.liquidation_min_reversal_bps
+                    ));
+                }
+                None => blockers.push("post-liquidation recovery path is incomplete".into()),
+                _ => {}
+            }
 
             let verdict = if blockers.is_empty() {
                 Verdict::Pass
             } else {
                 Verdict::Block
             };
-            let progress = (5_usize.saturating_sub(blockers.len()).min(5) as f64) / 5.0;
-            let score =
-                dominance * depth_ratio.min(10.0) * aligned_return_bps.unwrap_or_default().max(0.0);
+            let progress = (6_usize.saturating_sub(blockers.len()).min(6) as f64) / 6.0;
+            let score = dominance
+                * depth_ratio.min(10.0)
+                * aligned_return_bps.unwrap_or_default().max(0.0)
+                * reversal_bps.unwrap_or_default().max(0.0);
             let candidate = TradeCandidate {
                 id: format!("liquidation_exhaustion_reversal:{symbol}:{event_ms}"),
                 recipe: "liquidation_exhaustion_reversal".into(),
@@ -174,6 +191,10 @@ impl StrategyNode for LiquidationExhaustionReversalNode {
                     (
                         "liquidation_aligned_return_bps_3s".into(),
                         aligned_return_bps.unwrap_or_default().to_string(),
+                    ),
+                    (
+                        "liquidation_reversal_bps".into(),
+                        reversal_bps.unwrap_or_default().to_string(),
                     ),
                     (
                         "stop_pct".into(),
@@ -243,6 +264,7 @@ impl StrategyNode for LiquidationExhaustionReversalNode {
                     ("dominance_hits".into(), direction_hits as f64),
                     ("depth_hits".into(), depth_hits as f64),
                     ("aligned_price_hits".into(), price_hits as f64),
+                    ("reversal_hits".into(), reversal_hits as f64),
                     ("pass_candidates".into(), passed.len() as f64),
                 ]),
                 meta: meta(
@@ -332,8 +354,9 @@ mod tests {
                         long_liquidations_3s: Some(long_liquidations),
                         short_liquidations_3s: Some(short_liquidations),
                         liquidation_dominance_3s: Some(0.90),
-                        liquidation_depth_ratio_3s: Some(0.60),
+                        liquidation_depth_ratio_3s: Some(1.30),
                         liquidation_aligned_return_bps_3s: Some(4.0),
+                        liquidation_reversal_bps: Some(15.0),
                         liquidation_event_ms: Some(8_000),
                         snapshot_ofi_10s: None,
                         snapshot_ofi_60s: None,
@@ -394,5 +417,33 @@ mod tests {
             .find_map(|record| record.artifact.candidate())
             .unwrap();
         assert_eq!(candidate.side, Side::Sell);
+    }
+
+    #[test]
+    fn forced_move_without_recovery_remains_observation_only() {
+        let mut market = frame(9_000.0, 1_000.0);
+        market
+            .instruments
+            .get_mut("ALTUSDT")
+            .and_then(|instrument| instrument.microstructure.as_mut())
+            .unwrap()
+            .liquidation_reversal_bps = Some(4.0);
+        let mut node =
+            LiquidationExhaustionReversalNode::new(&["ALTUSDT".into()], LaneConfig::default());
+        let records = node
+            .evaluate(&NodeContext {
+                frame: &market,
+                artifacts: &BTreeMap::new(),
+            })
+            .unwrap();
+        let candidate = records
+            .iter()
+            .find_map(|record| record.artifact.candidate())
+            .unwrap();
+        assert_eq!(candidate.verdict, Verdict::Block);
+        assert!(candidate
+            .blockers
+            .iter()
+            .any(|reason| reason.contains("post-liquidation recovery")));
     }
 }

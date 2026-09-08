@@ -73,6 +73,7 @@ pub struct LaneConfig {
     pub liquidation_min_dominance: f64,
     pub liquidation_min_depth_ratio: f64,
     pub liquidation_min_aligned_return_bps: f64,
+    pub liquidation_min_reversal_bps: f64,
     pub liquidation_min_entry_delay_seconds: u32,
     pub liquidation_max_signal_age_seconds: u32,
     pub liquidation_cooldown_seconds: u32,
@@ -138,13 +139,14 @@ impl Default for LaneConfig {
             liquidation_reversal_enabled: true,
             liquidation_window_seconds: 3,
             liquidation_min_dominance: 0.80,
-            liquidation_min_depth_ratio: 0.50,
+            liquidation_min_depth_ratio: 1.20,
             liquidation_min_aligned_return_bps: 3.0,
+            liquidation_min_reversal_bps: 12.0,
             liquidation_min_entry_delay_seconds: 1,
             liquidation_max_signal_age_seconds: 12,
             liquidation_cooldown_seconds: 30,
             liquidation_stop_pct: 0.020,
-            liquidation_hold_minutes: 15,
+            liquidation_hold_minutes: 1,
             liquidation_risk_per_trade_pct: 0.010,
             trend_min_return_4h: 0.025,
             trend_min_efficiency: 0.45,
@@ -294,12 +296,13 @@ impl StrategyConfig {
             || !(0.50..=1.0).contains(&lanes.liquidation_min_dominance)
             || !(0.10..=5.0).contains(&lanes.liquidation_min_depth_ratio)
             || !(1.0..=50.0).contains(&lanes.liquidation_min_aligned_return_bps)
+            || !(0.0..=50.0).contains(&lanes.liquidation_min_reversal_bps)
             || !(1..=5).contains(&lanes.liquidation_min_entry_delay_seconds)
             || lanes.liquidation_max_signal_age_seconds <= lanes.liquidation_min_entry_delay_seconds
             || lanes.liquidation_max_signal_age_seconds > 30
             || !(10..=600).contains(&lanes.liquidation_cooldown_seconds)
             || !(0.005..=0.03).contains(&lanes.liquidation_stop_pct)
-            || !(5..=60).contains(&lanes.liquidation_hold_minutes)
+            || !(1..=60).contains(&lanes.liquidation_hold_minutes)
             || !(0.001..=0.01).contains(&lanes.liquidation_risk_per_trade_pct)
             || !(0.02..=0.20).contains(&lanes.trend_min_return_4h)
             || !(0.10..=0.90).contains(&lanes.trend_min_efficiency)
