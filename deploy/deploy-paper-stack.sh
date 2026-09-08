@@ -26,6 +26,7 @@ activate_build_toolchains() {
   local candidate
   local node_major
   local npm_major
+  local original_path
 
   # systemd/root shells often omit rustup even when cargo is installed.
   for candidate in /root/.cargo/bin /usr/local/cargo/bin; do
@@ -34,6 +35,7 @@ activate_build_toolchains() {
       break
     fi
   done
+  original_path="${PATH}"
 
   node_major="$(node --version 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/' || true)"
   npm_major="$(npm --version 2>/dev/null | sed -E 's/^([0-9]+).*/\1/' || true)"
@@ -46,14 +48,17 @@ activate_build_toolchains() {
   # package-lock v3 needs npm >= 7 and Vite 6 needs Node >= 18.
   for candidate in /root/.nvm/versions/node/*/bin; do
     [[ -x "${candidate}/node" && -x "${candidate}/npm" ]] || continue
-    node_major="$("${candidate}/node" --version | sed -E 's/^v([0-9]+).*/\1/')"
-    npm_major="$("${candidate}/npm" --version | sed -E 's/^([0-9]+).*/\1/')"
+    # npm uses `#!/usr/bin/env node`; put its matching Node first before
+    # invoking npm or an old distribution Node may execute the new npm CLI.
+    PATH="${candidate}:${original_path}"
+    node_major="$(node --version 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/' || true)"
+    npm_major="$(npm --version 2>/dev/null | sed -E 's/^([0-9]+).*/\1/' || true)"
     if [[ "${node_major}" -ge 18 && "${npm_major}" -ge 7 ]]; then
-      PATH="${candidate}:${PATH}"
       export PATH
       return
     fi
   done
+  PATH="${original_path}"
 }
 
 fail() {
