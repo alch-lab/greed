@@ -22,6 +22,40 @@ readonly LOCK_FILE="/tmp/greed-paper-deploy.lock"
 BACKEND_BACKUP=""
 FRONTEND_BACKUP=""
 
+activate_build_toolchains() {
+  local candidate
+  local node_major
+  local npm_major
+
+  # systemd/root shells often omit rustup even when cargo is installed.
+  for candidate in /root/.cargo/bin /usr/local/cargo/bin; do
+    if [[ -x "${candidate}/cargo" ]]; then
+      PATH="${candidate}:${PATH}"
+      break
+    fi
+  done
+
+  node_major="$(node --version 2>/dev/null | sed -E 's/^v([0-9]+).*/\1/' || true)"
+  npm_major="$(npm --version 2>/dev/null | sed -E 's/^([0-9]+).*/\1/' || true)"
+  if [[ "${node_major:-0}" -ge 18 && "${npm_major:-0}" -ge 7 ]]; then
+    export PATH
+    return
+  fi
+
+  # Prefer an installed NVM runtime over an obsolete distribution package.
+  # package-lock v3 needs npm >= 7 and Vite 6 needs Node >= 18.
+  for candidate in /root/.nvm/versions/node/*/bin; do
+    [[ -x "${candidate}/node" && -x "${candidate}/npm" ]] || continue
+    node_major="$("${candidate}/node" --version | sed -E 's/^v([0-9]+).*/\1/')"
+    npm_major="$("${candidate}/npm" --version | sed -E 's/^([0-9]+).*/\1/')"
+    if [[ "${node_major}" -ge 18 && "${npm_major}" -ge 7 ]]; then
+      PATH="${candidate}:${PATH}"
+      export PATH
+      return
+    fi
+  done
+}
+
 fail() {
   printf 'DEPLOY FAILED: %s\n' "$*" >&2
   exit 1
@@ -65,9 +99,14 @@ rollback_backend() {
 trap 'printf "\nFailed at line %s. Runtime data was not deleted.\n" "$LINENO" >&2' ERR
 
 [[ "${EUID}" -eq 0 ]] || fail "run this script with sudo"
-for command in git cargo npm curl systemctl flock install grep seq cp mv rm sed sleep; do
+activate_build_toolchains
+for command in git cargo node npm curl systemctl flock install grep seq cp mv rm sed sleep; do
   require_command "${command}"
 done
+node_major="$(node --version | sed -E 's/^v([0-9]+).*/\1/')"
+npm_major="$(npm --version | sed -E 's/^([0-9]+).*/\1/')"
+[[ "${node_major}" -ge 18 ]] || fail "Node.js >= 18 is required (found $(node --version))"
+[[ "${npm_major}" -ge 7 ]] || fail "npm >= 7 is required for package-lock v3 (found $(npm --version))"
 [[ -d "${BACKEND_DIR}/.git" ]] || fail "backend checkout not found: ${BACKEND_DIR}"
 [[ -d "${FRONTEND_DIR}/.git" ]] || fail "frontend checkout not found: ${FRONTEND_DIR}"
 
