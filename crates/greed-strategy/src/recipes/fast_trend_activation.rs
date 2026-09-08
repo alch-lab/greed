@@ -72,23 +72,32 @@ fn oi_change(values: &[(i64, f64)], at_ms: i64, lookback_ms: i64) -> Option<f64>
 }
 
 #[allow(clippy::too_many_arguments)]
-fn is_ignition(
+fn ignition_pattern(
     breakout: bool,
-    body_return: f64,
+    directional_body_return: f64,
     volume_ratio: f64,
-    flow: Option<f64>,
+    directional_flow: Option<f64>,
     compression_ratio: f64,
-    prebreak_return_1h: f64,
-    return_4h: f64,
+    directional_prebreak_return_1h: f64,
+    directional_return_4h: f64,
     config: &LaneConfig,
-) -> bool {
-    breakout
-        && body_return >= config.fast_min_body_return_5m
+) -> Option<&'static str> {
+    let common = breakout
+        && directional_body_return >= config.fast_min_body_return_5m
         && volume_ratio >= config.fast_min_volume_ratio_5m
-        && flow.is_some_and(|value| value >= config.fast_min_flow_5m)
-        && compression_ratio <= config.fast_max_compression_ratio
-        && prebreak_return_1h <= config.fast_max_prebreak_return_1h
-        && return_4h <= config.fast_max_return_4h
+        && directional_flow.is_some_and(|value| value >= config.fast_min_flow_5m)
+        && directional_prebreak_return_1h <= config.fast_max_prebreak_return_1h
+        && directional_return_4h <= config.fast_max_return_4h;
+    if common && compression_ratio <= config.fast_max_compression_ratio {
+        return Some("compression_breakout");
+    }
+    (common
+        && config.fast_reacceleration_enabled
+        && compression_ratio <= config.fast_reacceleration_max_compression_ratio
+        && directional_body_return >= config.fast_reacceleration_min_body_return_5m
+        && volume_ratio >= config.fast_reacceleration_min_volume_ratio_5m
+        && directional_flow.is_some_and(|value| value >= config.fast_reacceleration_min_flow_5m))
+    .then_some("trend_reacceleration")
 }
 
 impl StrategyNode for FastTrendActivationNode {
@@ -122,9 +131,6 @@ impl StrategyNode for FastTrendActivationNode {
             market_returns.iter().filter(|value| **value > 0.0).count() as f64
                 / market_returns.len() as f64
         };
-        let market_ready = market_return_1h >= self.config.fast_min_market_return_1h
-            && market_breadth >= self.config.fast_min_market_breadth;
-
         let mut passed = Vec::new();
         let mut observations = Vec::new();
         let mut inspected = 0_u64;
@@ -147,8 +153,24 @@ impl StrategyNode for FastTrendActivationNode {
             let index = closed.len() - 1;
             let bar = closed[index];
             let prior = &closed[index - 12..index];
-            let breakout_level = prior.iter().map(|value| value.high).fold(0.0, f64::max);
+            let breakout_high = prior.iter().map(|value| value.high).fold(0.0, f64::max);
+            let breakout_low = prior
+                .iter()
+                .map(|value| value.low)
+                .fold(f64::INFINITY, f64::min);
             let body_return = bar.close / bar.open.max(f64::EPSILON) - 1.0;
+            let side = if bar.close < breakout_low {
+                Side::Sell
+            } else {
+                Side::Buy
+            };
+            let sign = side.sign();
+            let breakout_level = if side == Side::Buy {
+                breakout_high
+            } else {
+                breakout_low
+            };
+            let directional_body_return = sign * body_return;
             let baseline_volume = median(
                 closed[index - 36..index]
                     .iter()
@@ -159,6 +181,7 @@ impl StrategyNode for FastTrendActivationNode {
             let flow = bar
                 .taker_buy_quote
                 .map(|buy| 2.0 * buy / bar.quote_volume.max(1.0) - 1.0);
+            let directional_flow = flow.map(|value| sign * value);
             let current_range = price_range(prior);
             let compression_ratio = current_range
                 / median((1..=6).map(|window| {
@@ -169,16 +192,37 @@ impl StrategyNode for FastTrendActivationNode {
                 .max(f64::EPSILON);
             let prebreak_return_1h = bar.open / closed[index - 12].open - 1.0;
             let return_4h = bar.close / closed[index - 48].close - 1.0;
-            let ignition = is_ignition(
-                bar.close > breakout_level,
-                body_return,
+            let directional_prebreak_return_1h = sign * prebreak_return_1h;
+            let directional_return_4h = sign * return_4h;
+            let directional_market_return_1h = sign * market_return_1h;
+            let directional_market_breadth = if market_returns.is_empty() {
+                0.0
+            } else {
+                market_returns
+                    .iter()
+                    .filter(|value| sign * **value > 0.0)
+                    .count() as f64
+                    / market_returns.len() as f64
+            };
+            let market_ready = directional_market_return_1h
+                >= self.config.fast_min_market_return_1h
+                && directional_market_breadth >= self.config.fast_min_market_breadth;
+            let breakout = if side == Side::Buy {
+                bar.close > breakout_level
+            } else {
+                bar.close < breakout_level
+            };
+            let ignition_pattern = ignition_pattern(
+                breakout,
+                directional_body_return,
                 volume_ratio,
-                flow,
+                directional_flow,
                 compression_ratio,
-                prebreak_return_1h,
-                return_4h,
+                directional_prebreak_return_1h,
+                directional_return_4h,
                 &self.config,
             );
+            let ignition = ignition_pattern.is_some();
             ignition_hits += u64::from(ignition);
 
             let confirmation = instrument
@@ -196,9 +240,15 @@ impl StrategyNode for FastTrendActivationNode {
                         .taker_buy_quote
                         .map(|buy| 2.0 * buy / minute.quote_volume.max(1.0) - 1.0)
                         .unwrap_or(-1.0);
-                    minute.low <= breakout_level * 1.0015
-                        && minute.close >= breakout_level
-                        && minute_flow >= 0.02
+                    if side == Side::Buy {
+                        minute.low <= breakout_level * 1.0015
+                            && minute.close >= breakout_level
+                            && minute_flow >= 0.02
+                    } else {
+                        minute.high >= breakout_level * 0.9985
+                            && minute.close <= breakout_level
+                            && minute_flow <= -0.02
+                    }
                 });
             confirmation_hits += u64::from(ignition && confirmation.is_some());
 
@@ -223,24 +273,24 @@ impl StrategyNode for FastTrendActivationNode {
             let mut blockers = Vec::new();
             if !market_ready {
                 blockers.push(format!(
-                    "altcoin market 1h median {:.2}% / breadth {:.0}% is below the risk-on gate",
-                    market_return_1h * 100.0,
-                    market_breadth * 100.0
+                    "altcoin market directional 1h median {:.2}% / breadth {:.0}% is below the gate",
+                    directional_market_return_1h * 100.0,
+                    directional_market_breadth * 100.0
                 ));
             }
-            if bar.close <= breakout_level {
+            if !breakout {
                 blockers.push("waiting for a completed 5m range breakout".into());
             }
-            if body_return < self.config.fast_min_body_return_5m {
+            if directional_body_return < self.config.fast_min_body_return_5m {
                 blockers.push(format!(
                     "5m body {:.2}% is below activation",
-                    body_return * 100.0
+                    directional_body_return * 100.0
                 ));
             }
             if volume_ratio < self.config.fast_min_volume_ratio_5m {
                 blockers.push(format!("5m volume {volume_ratio:.2}x is below activation"));
             }
-            match flow {
+            match directional_flow {
                 Some(value) if value < self.config.fast_min_flow_5m => blockers.push(format!(
                     "5m taker pressure {:.0}% is below activation",
                     value * 100.0
@@ -248,13 +298,20 @@ impl StrategyNode for FastTrendActivationNode {
                 None => blockers.push("5m taker flow is warming".into()),
                 _ => {}
             }
-            if compression_ratio > self.config.fast_max_compression_ratio {
+            let compressed = compression_ratio <= self.config.fast_max_compression_ratio;
+            let strong_reacceleration = self.config.fast_reacceleration_enabled
+                && compression_ratio <= self.config.fast_reacceleration_max_compression_ratio
+                && directional_body_return >= self.config.fast_reacceleration_min_body_return_5m
+                && volume_ratio >= self.config.fast_reacceleration_min_volume_ratio_5m
+                && directional_flow
+                    .is_some_and(|value| value >= self.config.fast_reacceleration_min_flow_5m);
+            if !compressed && !strong_reacceleration {
                 blockers.push(format!(
-                    "prior range {compression_ratio:.2}x is not compressed"
+                    "prior range {compression_ratio:.2}x is neither compressed nor backed by a strong reacceleration"
                 ));
             }
-            if prebreak_return_1h > self.config.fast_max_prebreak_return_1h
-                || return_4h > self.config.fast_max_return_4h
+            if directional_prebreak_return_1h > self.config.fast_max_prebreak_return_1h
+                || directional_return_4h > self.config.fast_max_return_4h
             {
                 blockers.push("move is already mature; the fast lane will not chase it".into());
             }
@@ -294,17 +351,20 @@ impl StrategyNode for FastTrendActivationNode {
             };
             let stop_pct =
                 (1.25 * atr(&closed, index, 20) / reference_price.max(f64::EPSILON)).max(0.0035);
-            let score = body_return.max(0.0)
+            let score = directional_body_return.max(0.0)
                 * volume_ratio
-                * (1.0 + flow.unwrap_or_default().max(0.0))
-                * (1.0 + market_return_1h * 10.0);
+                * (1.0 + directional_flow.unwrap_or_default().max(0.0))
+                * (1.0 + directional_market_return_1h * 10.0);
             let progress = (11_usize.saturating_sub(blockers.len()).min(11) as f64) / 11.0;
             let mut tags = BTreeMap::from([
                 ("lane".into(), "fast_trend_activation".into()),
                 ("priority".into(), "0.8".into()),
                 ("entry_pattern".into(), "one_minute_shallow_reclaim".into()),
                 ("market_return_1h".into(), market_return_1h.to_string()),
-                ("market_breadth_1h".into(), market_breadth.to_string()),
+                (
+                    "market_breadth_1h".into(),
+                    directional_market_breadth.to_string(),
+                ),
                 ("body_return_5m".into(), body_return.to_string()),
                 ("volume_ratio_5m".into(), volume_ratio.to_string()),
                 (
@@ -314,6 +374,10 @@ impl StrategyNode for FastTrendActivationNode {
                 ("compression_ratio".into(), compression_ratio.to_string()),
                 ("prebreak_return_1h".into(), prebreak_return_1h.to_string()),
                 ("return_4h".into(), return_4h.to_string()),
+                (
+                    "ignition_pattern".into(),
+                    ignition_pattern.unwrap_or("none").into(),
+                ),
                 (
                     "oi_change_15m".into(),
                     oi_15m.unwrap_or_default().to_string(),
@@ -359,17 +423,22 @@ impl StrategyNode for FastTrendActivationNode {
             ]);
             if verdict == Verdict::Pass {
                 if let Some(book) = instrument.book.as_ref() {
-                    tags.insert(
-                        "entry_limit".into(),
-                        (reference_price * 0.9996).min(book.bid).to_string(),
-                    );
+                    let entry_limit = if side == Side::Buy {
+                        (reference_price * 0.9996).min(book.bid)
+                    } else {
+                        (reference_price * 1.0004).max(book.ask)
+                    };
+                    tags.insert("entry_limit".into(), entry_limit.to_string());
+                    tags.insert("taker_fallback".into(), "true".into());
+                    tags.insert("taker_fallback_max_adverse_bps".into(), "6".into());
+                    tags.insert("taker_fallback_size_multiplier".into(), "0.5".into());
                 }
             }
             let candidate = TradeCandidate {
                 id: format!("fast_trend_activation:{symbol}:{signal_ms}"),
                 recipe: "fast_trend_activation".into(),
                 symbol: symbol.clone(),
-                side: Side::Buy,
+                side,
                 signal_ms,
                 expires_ms: signal_ms + 120_000,
                 reference_price,
@@ -420,7 +489,7 @@ impl StrategyNode for FastTrendActivationNode {
                     .map(|value| value.0)
                     .or_else(|| observations.first().map(|value| value.1))
                     .unwrap_or_default(),
-                side: Some(Side::Buy),
+                side: passed.first().map(|value| value.1.side),
                 verdict: if actionable {
                     Verdict::Pass
                 } else {
@@ -431,7 +500,6 @@ impl StrategyNode for FastTrendActivationNode {
                     ("inspected_symbols".into(), inspected as f64),
                     ("market_return_1h".into(), market_return_1h),
                     ("market_breadth_1h".into(), market_breadth),
-                    ("market_ready".into(), if market_ready { 1.0 } else { 0.0 }),
                     ("ignition_hits".into(), ignition_hits as f64),
                     ("confirmation_hits".into(), confirmation_hits as f64),
                     ("oi_ready_symbols".into(), oi_ready as f64),
@@ -486,16 +554,28 @@ mod tests {
     #[test]
     fn early_surge_thresholds_admit_the_first_4usdt_leg() {
         let config = LaneConfig::default();
-        assert!(is_ignition(
-            true,
-            0.0092,
-            2.1,
-            Some(0.20),
-            1.033,
-            0.029,
-            0.052,
-            &config,
-        ));
+        assert_eq!(
+            ignition_pattern(true, 0.0092, 2.1, Some(0.20), 1.033, 0.029, 0.052, &config,),
+            Some("compression_breakout")
+        );
         assert!(0.0233 <= config.fast_max_oi_change_15m);
+    }
+
+    #[test]
+    fn strong_reacceleration_does_not_require_compression() {
+        let config = LaneConfig::default();
+        assert_eq!(
+            ignition_pattern(true, 0.010, 5.0, Some(0.30), 2.2, 0.015, 0.04, &config,),
+            Some("trend_reacceleration")
+        );
+    }
+
+    #[test]
+    fn directional_inputs_make_short_ignition_symmetric() {
+        let config = LaneConfig::default();
+        assert_eq!(
+            ignition_pattern(true, 0.0092, 2.1, Some(0.20), 1.033, 0.029, 0.052, &config,),
+            Some("compression_breakout")
+        );
     }
 }

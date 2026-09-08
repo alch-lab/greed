@@ -213,6 +213,13 @@ impl StrategyNode for LiquidationExhaustionReversalNode {
                         (i64::from(self.config.liquidation_hold_minutes) * 60_000).to_string(),
                     ),
                     ("entry_timeout_ms".into(), "0".into()),
+                    (
+                        "max_entry_adverse_bps".into(),
+                        self.config
+                            .liquidation_max_execution_divergence_bps
+                            .to_string(),
+                    ),
+                    ("bounded_taker_ioc".into(), "true".into()),
                     ("min_fill_ratio".into(), "1.0".into()),
                     ("min_managed_fill_ratio".into(), "0.0".into()),
                     (

@@ -74,6 +74,14 @@ fast_min_body_return_5m = 0.005
 fast_min_volume_ratio_5m = 2.0
 fast_min_flow_5m = 0.15
 fast_max_compression_ratio = 1.05
+# A second mutually-exclusive entry shape handles a fresh acceleration inside
+# an existing trend. It must be materially stronger than the compressed
+# breakout, so this is not a blanket relaxation of the original gate.
+fast_reacceleration_enabled = true
+fast_reacceleration_max_compression_ratio = 3.0
+fast_reacceleration_min_body_return_5m = 0.0075
+fast_reacceleration_min_volume_ratio_5m = 4.0
+fast_reacceleration_min_flow_5m = 0.25
 # Stay early without demanding a perfectly flat pre-break hour. 4USDT on
 # 2026-09-05 began its persistent leg with +2.9% pre-break, +5.2% over 4h and
 # +2.3% OI over 15m, then supplied the required 1m reclaim.
@@ -85,10 +93,10 @@ fast_min_fill_ratio = 0.80
 fast_min_managed_fill_ratio = 0.20
 # Frozen paper-validation lane: fade a three-second one-sided liquidation
 # cascade only after the price has moved with the forced flow. It is evaluated
-# from Binance public force-order and top-20 depth streams, enters at market
-# after at least one second, holds exactly 15 minutes, and carries only a 2%
-# exchange-side catastrophe stop. It intentionally does not inherit the trend
-# lanes' staged targets, trailing exits, or adaptive max-hold extension.
+# from Binance public force-order and top-20 depth streams, enters through a
+# bounded IOC after at least one second, holds exactly one minute, and carries
+# only a 2% exchange-side catastrophe stop. It intentionally does not inherit
+# the trend lanes' staged targets, trailing exits, or adaptive hold extension.
 liquidation_reversal_enabled = true
 liquidation_window_seconds = 3
 liquidation_min_dominance = 0.80
@@ -100,7 +108,14 @@ liquidation_max_signal_age_seconds = 12
 liquidation_cooldown_seconds = 30
 liquidation_stop_pct = 0.020
 liquidation_hold_minutes = 1
-liquidation_risk_per_trade_pct = 0.010
+# The corrected production-aware replay is close to flat but not yet a funded
+# alpha (18 trades, PF 0.79). Keep collecting real fills at probe risk without
+# letting this high-frequency lane dominate the profitable trend lanes.
+liquidation_risk_per_trade_pct = 0.0025
+# Mainnet produces the signal while Binance Demo executes it. Refuse the
+# trade when the Demo top-of-book differs by more than 15 bps, and use an IOC
+# limit so an accepted order cannot slip through that boundary.
+liquidation_max_execution_divergence_bps = 15.0
 trend_min_return_4h = 0.025
 trend_min_efficiency = 0.45
 trend_min_hour_volume_ratio = 0.65
@@ -210,6 +225,6 @@ rolling_pf_floor = 1.00
 rolling_pf_cooldown_minutes = 360
 loss_cooldown_minutes = 180
 rolling_pf_probe_size_multiplier = 1.00
-# Epoch 17 starts a clean $5,000 virtual performance window after the protection
-# incident. Historical journals remain on disk; only the live baseline and gates reset.
-rolling_pf_epoch = 17
+# Epoch 18 starts a clean $5,000 virtual performance window after the execution
+# repairs. Historical journals remain on disk; only the live baseline and gates reset.
+rolling_pf_epoch = 18

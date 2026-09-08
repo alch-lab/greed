@@ -30,6 +30,7 @@ const MIN_PERFORMANCE_FILL_RATIO: f64 = 0.20;
 const PERFORMANCE_BASIS_VERSION: u32 = 3;
 const TREND_REENTRY_RECIPE: &str = "trend_continuation_reentry";
 const LIQUIDATION_REVERSAL_RECIPE: &str = "liquidation_exhaustion_reversal";
+const LIQUIDATION_EXECUTION_BASIS_VERSION: u32 = 1;
 
 pub struct ExchangeEvent {
     pub kind: String,
@@ -54,6 +55,8 @@ pub struct RecipeGateStatus {
 struct SymbolRules {
     quantity_step: f64,
     min_quantity: f64,
+    max_limit_quantity: f64,
+    max_market_quantity: f64,
     price_tick: f64,
     min_notional: f64,
 }
@@ -261,6 +264,10 @@ struct DemoState {
     trend_reentries: BTreeMap<String, TrendReentryCampaign>,
     performance_epoch: u32,
     performance_basis_version: u32,
+    /// Version the adaptive gate independently when a lane's execution
+    /// contract changes. Old outcomes remain available for history while the
+    /// corrected lane starts with an uncontaminated performance window.
+    liquidation_execution_basis_version: u32,
     execution_halt_reason: Option<String>,
     entry_attempt_ids: BTreeSet<String>,
     filled_entry_attempt_ids: BTreeSet<String>,
@@ -463,6 +470,8 @@ impl BinanceDemoExecution {
             .unwrap_or_default();
         let performance_epoch_reset = state.performance_epoch != risk.rolling_pf_epoch;
         let performance_basis_reset = state.performance_basis_version != PERFORMANCE_BASIS_VERSION;
+        let liquidation_execution_basis_reset =
+            state.liquidation_execution_basis_version != LIQUIDATION_EXECUTION_BASIS_VERSION;
         let mut value = Self {
             client,
             config,
@@ -512,6 +521,7 @@ impl BinanceDemoExecution {
             value.state.recipe_execution_counts.clear();
             value.state.performance_epoch = value.risk.rolling_pf_epoch;
             value.state.performance_basis_version = PERFORMANCE_BASIS_VERSION;
+            value.state.liquidation_execution_basis_version = LIQUIDATION_EXECUTION_BASIS_VERSION;
             value.state.execution_halt_reason = None;
             let wallet = value
                 .account
@@ -530,6 +540,20 @@ impl BinanceDemoExecution {
             // baseline, run history, PnL curve, symbol cooldowns and exits stay.
             value.state.recipe_outcomes.clear();
             value.state.performance_basis_version = PERFORMANCE_BASIS_VERSION;
+            value.save()?;
+        }
+        if !value.performance_epoch_reset && liquidation_execution_basis_reset {
+            if value
+                .state
+                .execution_halt_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("could not establish protection"))
+            {
+                // The bounded IOC migration fixes the diagnosed venue mismatch.
+                // Resume only that halt; unrelated operator/risk stops survive.
+                value.state.execution_halt_reason = None;
+            }
+            value.state.liquidation_execution_basis_version = LIQUIDATION_EXECUTION_BASIS_VERSION;
             value.save()?;
         }
         Ok(value)
@@ -1846,6 +1870,9 @@ impl BinanceDemoExecution {
         let count_key = recipe
             .strip_suffix(":buy")
             .or_else(|| recipe.strip_suffix(":sell"))
+            .unwrap_or(recipe)
+            .split('@')
+            .next()
             .unwrap_or(recipe);
         let counts = self
             .state
@@ -1893,6 +1920,7 @@ impl BinanceDemoExecution {
             "trend_continuation",
             TREND_REENTRY_RECIPE,
             "fast_trend_activation",
+            LIQUIDATION_REVERSAL_RECIPE,
             "intraday_sweep_reversal",
             "early_ignition",
         ]
@@ -2544,7 +2572,9 @@ impl BinanceDemoExecution {
                             "reason":failure,
                             "attempt_exit_price":attempt.as_ref().map(|value| value.exit_price),
                             "attempt_exit_quantity":attempt.as_ref().map(|value| value.exit_quantity),
+                            "attempt_entry_price":attempt.as_ref().map(|value| value.entry_price),
                             "attempt_entry_quantity":attempt.as_ref().map(|value| value.entry_quantity),
+                            "attempt_entry_notional_usd":attempt.as_ref().map(|value| value.entry_price * value.entry_quantity),
                             "attempt_fill_ratio":attempt.as_ref().map(|value| value.entry_quantity / (plan.notional_usd * size_multiplier / plan.reference_price.max(f64::EPSILON)).max(f64::EPSILON)),
                             "attempt_initial_risk_usd":attempt.as_ref().map(|value| value.entry_quantity * (value.entry_price - plan.stop_price * value.entry_price / plan.reference_price.max(f64::EPSILON)).abs()),
                             "attempt_fee_usd":attempt.as_ref().map(|value| value.fees_usd),
@@ -2733,10 +2763,15 @@ impl BinanceDemoExecution {
             .get(&plan.symbol)
             .cloned()
             .ok_or_else(|| anyhow!("missing exchange rules for {}", plan.symbol))?;
-        let quantity = floor_step(
+        let desired_quantity = floor_step(
             plan.notional_usd * size_multiplier / plan.reference_price,
             rules.quantity_step,
         );
+        let quantity = cap_entry_quantity(
+            desired_quantity,
+            rules.max_limit_quantity,
+            rules.quantity_step,
+        )?;
         validate_entry_quantity_and_exits(plan, quantity, plan.reference_price, &rules)?;
         match self.pending_entry_guard(plan, chrono::Utc::now().timestamp_millis()) {
             EntryGuardState::Healthy | EntryGuardState::MicroReversal(_) => {}
@@ -3306,6 +3341,13 @@ impl BinanceDemoExecution {
                         pending.plan.reference_price,
                     );
                     if adverse <= pending.plan.taker_fallback_max_adverse_bps {
+                        let fallback_limit = bounded_taker_ioc_price(
+                            pending.plan.side,
+                            pending.plan.reference_price,
+                            executable,
+                            pending.plan.taker_fallback_max_adverse_bps,
+                            rules.price_tick,
+                        )?;
                         let fallback_size =
                             pending.plan.taker_fallback_size_multiplier.clamp(0.01, 1.0);
                         let fallback_quantity = bounded_fallback_quantity(
@@ -3327,11 +3369,13 @@ impl BinanceDemoExecution {
                                 vec![
                                     ("symbol".into(), symbol.clone()),
                                     ("side".into(), side_name(pending.plan.side).into()),
-                                    ("type".into(), "MARKET".into()),
+                                    ("type".into(), "LIMIT".into()),
+                                    ("timeInForce".into(), "IOC".into()),
                                     (
                                         "quantity".into(),
                                         decimal(fallback_quantity, rules.quantity_step),
                                     ),
+                                    ("price".into(), decimal(fallback_limit, rules.price_tick)),
                                     ("newClientOrderId".into(), fallback_id.clone()),
                                     ("newOrderRespType".into(), "RESULT".into()),
                                 ],
@@ -4104,10 +4148,23 @@ impl BinanceDemoExecution {
             .rules
             .get(&plan.symbol)
             .ok_or_else(|| anyhow!("missing exchange rules for {}", plan.symbol))?;
-        let quantity = floor_step(
+        let bounded_taker_ioc = plan
+            .signal_context
+            .get("bounded_taker_ioc")
+            .is_some_and(|value| value == "true");
+        let desired_quantity = floor_step(
             plan.notional_usd * size_multiplier / plan.reference_price,
             rules.quantity_step,
         );
+        let quantity = cap_entry_quantity(
+            desired_quantity,
+            if bounded_taker_ioc {
+                rules.max_limit_quantity
+            } else {
+                rules.max_market_quantity
+            },
+            rules.quantity_step,
+        )?;
         if quantity < rules.min_quantity || quantity * plan.reference_price < rules.min_notional {
             return Err(anyhow!(
                 "order is below Binance quantity or notional minimum"
@@ -4179,29 +4236,68 @@ impl BinanceDemoExecution {
                 "maker plans must be advanced by the persistent pending-entry state machine"
             ));
         }
+        let execution_limit = if bounded_taker_ioc {
+            let quote = self
+                .public_get_params(
+                    "/fapi/v1/ticker/bookTicker",
+                    &[("symbol", plan.symbol.as_str())],
+                )
+                .await
+                .with_context(|| format!("read {} execution-venue quote", plan.symbol))?;
+            let executable_quote = match plan.side {
+                Side::Buy => parse_f64(&quote, "askPrice"),
+                Side::Sell => parse_f64(&quote, "bidPrice"),
+            }
+            .filter(|value| value.is_finite() && *value > f64::EPSILON)
+            .ok_or_else(|| {
+                anyhow!(
+                    "{} execution-venue quote is missing or invalid",
+                    plan.symbol
+                )
+            })?;
+            let limit = bounded_taker_ioc_price(
+                plan.side,
+                plan.reference_price,
+                executable_quote,
+                plan.max_entry_adverse_bps,
+                rules.price_tick,
+            )?;
+            Some(limit)
+        } else {
+            None
+        };
         let client_id = client_order_id("entry", &plan.candidate_id);
         let order_submitted_ms = chrono::Utc::now().timestamp_millis();
+        let mut entry_parameters = vec![
+            ("symbol".into(), plan.symbol.clone()),
+            ("side".into(), side_name(plan.side).into()),
+            ("quantity".into(), decimal(quantity, rules.quantity_step)),
+            ("newClientOrderId".into(), client_id.clone()),
+            ("newOrderRespType".into(), "RESULT".into()),
+        ];
+        if let Some(limit) = execution_limit {
+            entry_parameters.extend([
+                ("type".into(), "LIMIT".into()),
+                ("timeInForce".into(), "IOC".into()),
+                ("price".into(), decimal(limit, rules.price_tick)),
+            ]);
+        } else {
+            entry_parameters.push(("type".into(), "MARKET".into()));
+        }
         let entry = EntryExecution {
             order: self
-                .submit_or_lookup(
-                    &plan.symbol,
-                    &client_id,
-                    vec![
-                        ("symbol".into(), plan.symbol.clone()),
-                        ("side".into(), side_name(plan.side).into()),
-                        ("type".into(), "MARKET".into()),
-                        ("quantity".into(), decimal(quantity, rules.quantity_step)),
-                        ("newClientOrderId".into(), client_id.clone()),
-                        ("newOrderRespType".into(), "RESULT".into()),
-                    ],
-                )
+                .submit_or_lookup(&plan.symbol, &client_id, entry_parameters)
                 .await?,
             requested_quantity: quantity,
-            mode: "taker_market",
+            mode: if bounded_taker_ioc {
+                "bounded_taker_ioc"
+            } else {
+                "taker_market"
+            },
             maker_attempted: false,
             maker_wait_ms: 0,
             maker_reprices: 0,
-            final_maker_limit: None,
+            final_maker_limit: execution_limit,
             size_multiplier: 1.0,
         };
         let mut executed =
@@ -4271,6 +4367,31 @@ impl BinanceDemoExecution {
             .resolve_entry_price(&plan.symbol, order_id, &entry.order, plan.side)
             .await
             .unwrap_or((plan.reference_price, "strategy_reference_fallback"));
+        if bounded_taker_ioc {
+            let adverse_bps = entry_adverse_bps(plan.side, entry_price, plan.reference_price);
+            let tick_tolerance_bps =
+                rules.price_tick / plan.reference_price.max(f64::EPSILON) * 10_000.0 + 0.1;
+            if adverse_bps > plan.max_entry_adverse_bps + tick_tolerance_bps {
+                let close_id = client_order_id("priceguard", &plan.candidate_id);
+                self.flatten_entry_or_confirm_flat(
+                    &plan.symbol,
+                    plan.side,
+                    executed,
+                    rules.quantity_step,
+                    &close_id,
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "bounded IOC filled {adverse_bps:.1} bps beyond the strategy reference and emergency close failed"
+                    )
+                })?;
+                return Err(anyhow!(
+                    "bounded IOC execution invariant failed: fill was {adverse_bps:.1} bps adverse (max {:.1}); entry was immediately closed",
+                    plan.max_entry_adverse_bps
+                ));
+            }
+        }
         let (first_fill_ms, entry_time_source) = self
             .resolve_first_fill_time(
                 &plan.symbol,
@@ -5129,6 +5250,7 @@ impl BinanceDemoExecution {
             "performance_epoch_reset": self.performance_epoch_reset,
             "performance_basis":"risk_r_v1",
             "performance_basis_reset":self.performance_basis_reset,
+            "liquidation_execution_basis_version":self.state.liquidation_execution_basis_version,
             "pending_entries":self.state.pending_entries.len(),
             "pending_accounting":self.state.pending_accounting.len(),
             "recipe_execution_counts":self.state.recipe_execution_counts,
@@ -5441,6 +5563,13 @@ fn parse_rules(value: &Value) -> Result<BTreeMap<String, SymbolRules>> {
             SymbolRules {
                 quantity_step: filter("LOT_SIZE", "stepSize").unwrap_or(1.0),
                 min_quantity: filter("LOT_SIZE", "minQty").unwrap_or(0.0),
+                max_limit_quantity: filter("LOT_SIZE", "maxQty")
+                    .filter(|value| *value > 0.0)
+                    .unwrap_or(f64::INFINITY),
+                max_market_quantity: filter("MARKET_LOT_SIZE", "maxQty")
+                    .filter(|value| *value > 0.0)
+                    .or_else(|| filter("LOT_SIZE", "maxQty").filter(|value| *value > 0.0))
+                    .unwrap_or(f64::INFINITY),
                 price_tick: filter("PRICE_FILTER", "tickSize").unwrap_or(0.01),
                 min_notional: filter("MIN_NOTIONAL", "notional").unwrap_or(5.0),
             },
@@ -5516,6 +5645,11 @@ fn side_name(side: Side) -> &'static str {
     }
 }
 fn gate_key(recipe: &str, side: Side) -> String {
+    let recipe = if recipe == LIQUIDATION_REVERSAL_RECIPE {
+        format!("{recipe}@{LIQUIDATION_EXECUTION_BASIS_VERSION}")
+    } else {
+        recipe.to_owned()
+    };
     format!(
         "{recipe}:{}",
         match side {
@@ -5664,6 +5798,52 @@ fn passive_price_improves(side: Side, current: f64, proposed: f64, tick: f64) ->
 fn entry_adverse_bps(side: Side, executable: f64, reference: f64) -> f64 {
     side.sign() * (executable / reference.max(f64::EPSILON) - 1.0) * 10_000.0
 }
+fn absolute_price_divergence_bps(executable: f64, reference: f64) -> f64 {
+    (executable / reference.max(f64::EPSILON) - 1.0).abs() * 10_000.0
+}
+fn bounded_taker_ioc_price(
+    side: Side,
+    reference: f64,
+    executable_quote: f64,
+    max_divergence_bps: f64,
+    tick: f64,
+) -> Result<f64> {
+    if !reference.is_finite()
+        || reference <= f64::EPSILON
+        || !executable_quote.is_finite()
+        || executable_quote <= f64::EPSILON
+        || !tick.is_finite()
+        || tick <= f64::EPSILON
+    {
+        return Err(anyhow!("bounded IOC received an invalid price or tick"));
+    }
+    if max_divergence_bps <= 0.0 {
+        return Err(anyhow!("bounded IOC requires a positive divergence limit"));
+    }
+    let divergence_bps = absolute_price_divergence_bps(executable_quote, reference);
+    if divergence_bps > max_divergence_bps {
+        return Err(anyhow!(
+            "execution venue quote {executable_quote} diverged {divergence_bps:.1} bps from strategy reference {reference} (max {max_divergence_bps:.1}); entry skipped"
+        ));
+    }
+    let distance = max_divergence_bps / 10_000.0;
+    let limit = match side {
+        // The limit is marketable at the quote already checked above, while
+        // floor/ceil preserve the adverse-price boundary after tick rounding.
+        Side::Buy => floor_step(reference * (1.0 + distance), tick),
+        Side::Sell => ceil_step(reference * (1.0 - distance), tick),
+    };
+    let marketable = match side {
+        Side::Buy => limit + tick * 0.5 >= executable_quote,
+        Side::Sell => limit <= executable_quote + tick * 0.5,
+    };
+    if !marketable {
+        return Err(anyhow!(
+            "execution venue moved outside the bounded IOC price before submission"
+        ));
+    }
+    Ok(limit)
+}
 fn pending_entry_guard_state(
     plan: &greed_kernel::PositionPlan,
     signal_mid: f64,
@@ -5742,6 +5922,20 @@ fn partial_fill_is_manageable(
     ratio_ok && position_ok && exits_ok
 }
 
+fn cap_entry_quantity(desired: f64, maximum: f64, quantity_step: f64) -> Result<f64> {
+    let capped = floor_step(desired.min(maximum), quantity_step);
+    if desired > f64::EPSILON && capped + quantity_step * 0.5 < desired {
+        let supported_ratio = capped / desired;
+        if supported_ratio < 0.50 {
+            return Err(anyhow!(
+                "Binance maximum quantity supports only {:.1}% of the planned position; entry skipped",
+                supported_ratio * 100.0
+            ));
+        }
+    }
+    Ok(capped)
+}
+
 fn validate_entry_quantity_and_exits(
     plan: &greed_kernel::PositionPlan,
     quantity: f64,
@@ -5752,6 +5946,9 @@ fn validate_entry_quantity_and_exits(
         return Err(anyhow!(
             "order is below Binance quantity or notional minimum"
         ));
+    }
+    if quantity > rules.max_limit_quantity + rules.quantity_step * 0.5 {
+        return Err(anyhow!("order exceeds Binance maximum quantity"));
     }
     if plan.take_profit_prices.is_empty() && !plan.fixed_time_exit {
         return Err(anyhow!("position plan requires at least one take profit"));
@@ -5919,10 +6116,39 @@ mod tests {
     }
 
     #[test]
+    fn bounded_taker_rejects_a_demo_quote_far_from_the_strategy_market() {
+        let error = bounded_taker_ioc_price(Side::Sell, 0.009641, 0.009167, 15.0, 0.000001)
+            .expect_err("a 4.9% venue mismatch must never reach the exchange");
+        assert!(error.to_string().contains("diverged"));
+    }
+
+    #[test]
+    fn bounded_taker_limit_is_marketable_without_crossing_the_adverse_cap() {
+        let buy = bounded_taker_ioc_price(Side::Buy, 100.0, 100.08, 15.0, 0.01).unwrap();
+        let sell = bounded_taker_ioc_price(Side::Sell, 100.0, 99.92, 15.0, 0.01).unwrap();
+        assert!((buy - 100.15).abs() < 1e-9);
+        assert!((sell - 99.85).abs() < 1e-9);
+        assert!(buy >= 100.08);
+        assert!(sell <= 99.92);
+    }
+
+    #[test]
     fn client_ids_are_stable_and_within_binance_limit() {
         let value = client_order_id("entry", "alt.recipe:test:cycle-123");
         assert_eq!(value, client_order_id("entry", "alt.recipe:test:cycle-123"));
         assert!(value.len() <= 36);
+    }
+
+    #[test]
+    fn liquidation_gate_uses_a_versioned_execution_basis() {
+        assert_eq!(
+            gate_key(LIQUIDATION_REVERSAL_RECIPE, Side::Buy),
+            "liquidation_exhaustion_reversal@1:buy"
+        );
+        assert_eq!(
+            gate_key("trend_continuation", Side::Sell),
+            "trend_continuation:sell"
+        );
     }
 
     #[test]
@@ -6264,6 +6490,8 @@ mod tests {
         let rules = SymbolRules {
             quantity_step: 1.0,
             min_quantity: 1.0,
+            max_limit_quantity: 1_000.0,
+            max_market_quantity: 1_000.0,
             price_tick: 0.01,
             min_notional: 5.0,
         };
@@ -6286,6 +6514,8 @@ mod tests {
         let coarse = SymbolRules {
             quantity_step: 10.0,
             min_quantity: 10.0,
+            max_limit_quantity: 1_000.0,
+            max_market_quantity: 1_000.0,
             price_tick: 0.01,
             min_notional: 5.0,
         };
@@ -6297,6 +6527,25 @@ mod tests {
             &coarse,
             &[(1.02, 0.33), (1.04, 0.67)]
         ));
+    }
+
+    #[test]
+    fn exchange_max_quantity_is_capped_only_when_the_remaining_trade_is_meaningful() {
+        let rules = SymbolRules {
+            quantity_step: 1.0,
+            min_quantity: 1.0,
+            max_limit_quantity: 600.0,
+            max_market_quantity: 600.0,
+            price_tick: 0.01,
+            min_notional: 5.0,
+        };
+        assert_eq!(
+            cap_entry_quantity(1_000.0, rules.max_limit_quantity, rules.quantity_step).unwrap(),
+            600.0
+        );
+        let error = cap_entry_quantity(2_000.0, rules.max_market_quantity, rules.quantity_step)
+            .expect_err("a tiny exchange-capped position should be skipped");
+        assert!(error.to_string().contains("30.0%"));
     }
 
     #[test]

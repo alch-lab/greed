@@ -97,7 +97,12 @@ def close_signal(signal: Signal, now_ms: int, bid: float, ask: float, stop_pct: 
     return True
 
 
-def replay_file(path_text: str, stop_pct: float) -> dict[float, list[dict]]:
+def replay_file(
+    path_text: str,
+    stop_pct: float,
+    evaluation_start_ms: int | None = None,
+    evaluation_end_ms: int | None = None,
+) -> dict[float, list[dict]]:
     path = Path(path_text)
     manifest = json.loads(Path(str(path).replace(".jsonl.zst", ".manifest.json")).read_text())
     symbols = set(manifest.get("symbols", ())) - MAJORS
@@ -148,13 +153,17 @@ def replay_file(path_text: str, stop_pct: float) -> dict[float, list[dict]]:
                         continue
                     gross = signal.side * (signal.exit / signal.entry - 1.0)
                     net = gross - FEE_RATE * (1.0 + signal.exit / signal.entry)
-                    completed[key].append(
-                        {
-                            **signal.__dict__,
-                            "return": net,
-                            "gross_return": gross,
-                        }
-                    )
+                    if (
+                        (evaluation_start_ms is None or signal.entry_ms >= evaluation_start_ms)
+                        and (evaluation_end_ms is None or signal.entry_ms <= evaluation_end_ms)
+                    ):
+                        completed[key].append(
+                            {
+                                **signal.__dict__,
+                                "return": net,
+                                "gross_return": gross,
+                            }
+                        )
                 opened[key] = keep
 
             event = pending.get(symbol)
@@ -204,6 +213,10 @@ def replay_file(path_text: str, stop_pct: float) -> dict[float, list[dict]]:
                         if key in seen[variant]:
                             continue
                         seen[variant].add(key)
+                        if any(position.symbol == symbol for position in opened[variant]):
+                            # Match production: another signal may not stack on
+                            # a symbol while its previous position is open.
+                            continue
                         if now_ms - last_entry[variant].get(symbol, -10**18) < 30_000:
                             continue
                         last_entry[variant][symbol] = now_ms
@@ -281,7 +294,25 @@ def main() -> None:
     parser.add_argument("--end", default="2026-09-08")
     parser.add_argument("--workers", type=int, default=min(6, os.cpu_count() or 1))
     parser.add_argument("--stop-pct", type=float, default=0.02)
+    parser.add_argument(
+        "--evaluation-start",
+        help="optional inclusive ISO-8601 entry timestamp inside the selected file days",
+    )
+    parser.add_argument(
+        "--evaluation-end",
+        help="optional inclusive ISO-8601 entry timestamp inside the selected file days",
+    )
     args = parser.parse_args()
+    evaluation_start_ms = (
+        int(parse_started(args.evaluation_start).timestamp() * 1_000)
+        if args.evaluation_start
+        else None
+    )
+    evaluation_end_ms = (
+        int(parse_started(args.evaluation_end).timestamp() * 1_000)
+        if args.evaluation_end
+        else None
+    )
     files = eligible_files(args.root, args.start, args.end)
     aggregate = {
         (mode, threshold, hold): []
@@ -290,7 +321,16 @@ def main() -> None:
         for hold in HOLD_MINUTES
     }
     with concurrent.futures.ProcessPoolExecutor(max_workers=args.workers) as pool:
-        futures = [pool.submit(replay_file, str(path), args.stop_pct) for path in files]
+        futures = [
+            pool.submit(
+                replay_file,
+                str(path),
+                args.stop_pct,
+                evaluation_start_ms,
+                evaluation_end_ms,
+            )
+            for path in files
+        ]
         for future in concurrent.futures.as_completed(futures):
             result = future.result()
             for key, rows in result.items():
@@ -300,6 +340,8 @@ def main() -> None:
         "period": [args.start, args.end],
         "files": len(files),
         "stop_pct": args.stop_pct,
+        "evaluation_start": args.evaluation_start,
+        "evaluation_end": args.evaluation_end,
         "fee_rate_per_leg": FEE_RATE,
         "grid": {
             f"{mode}_{threshold:g}bps_{hold}m": {
@@ -308,6 +350,17 @@ def main() -> None:
             }
             for (mode, threshold, hold), rows in aggregate.items()
         },
+        "selected_trades": [
+            {
+                "symbol": row["symbol"],
+                "side": row["side"],
+                "entry_ms": row["entry_ms"],
+                "exit_ms": row["exit_ms"],
+                "return": row["return"],
+            }
+            for row in aggregate[("reversal", 12.0, 1)]
+            if row["depth_ratio"] >= 1.2
+        ],
     }
     print(json.dumps(report, indent=2, ensure_ascii=False))
 

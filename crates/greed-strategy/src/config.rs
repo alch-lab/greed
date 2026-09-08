@@ -62,6 +62,14 @@ pub struct LaneConfig {
     pub fast_min_volume_ratio_5m: f64,
     pub fast_min_flow_5m: f64,
     pub fast_max_compression_ratio: f64,
+    /// A second, stricter ignition shape for a market that is already
+    /// trending. This avoids forcing every valid acceleration through the
+    /// compression-breakout gate while still refusing weak late chases.
+    pub fast_reacceleration_enabled: bool,
+    pub fast_reacceleration_max_compression_ratio: f64,
+    pub fast_reacceleration_min_body_return_5m: f64,
+    pub fast_reacceleration_min_volume_ratio_5m: f64,
+    pub fast_reacceleration_min_flow_5m: f64,
     pub fast_max_prebreak_return_1h: f64,
     pub fast_max_return_4h: f64,
     pub fast_max_oi_change_15m: f64,
@@ -80,6 +88,11 @@ pub struct LaneConfig {
     pub liquidation_stop_pct: f64,
     pub liquidation_hold_minutes: u32,
     pub liquidation_risk_per_trade_pct: f64,
+    /// Maximum absolute difference between the strategy reference and the
+    /// executable quote on the configured execution venue. This is primarily
+    /// an execution-safety boundary for Demo, whose altcoin books can diverge
+    /// materially from mainnet market data.
+    pub liquidation_max_execution_divergence_bps: f64,
     pub trend_min_return_4h: f64,
     pub trend_min_efficiency: f64,
     pub trend_min_hour_volume_ratio: f64,
@@ -130,6 +143,11 @@ impl Default for LaneConfig {
             fast_min_volume_ratio_5m: 2.0,
             fast_min_flow_5m: 0.15,
             fast_max_compression_ratio: 1.05,
+            fast_reacceleration_enabled: true,
+            fast_reacceleration_max_compression_ratio: 3.0,
+            fast_reacceleration_min_body_return_5m: 0.0075,
+            fast_reacceleration_min_volume_ratio_5m: 4.0,
+            fast_reacceleration_min_flow_5m: 0.25,
             fast_max_prebreak_return_1h: 0.03,
             fast_max_return_4h: 0.06,
             fast_max_oi_change_15m: 0.03,
@@ -147,7 +165,8 @@ impl Default for LaneConfig {
             liquidation_cooldown_seconds: 30,
             liquidation_stop_pct: 0.020,
             liquidation_hold_minutes: 1,
-            liquidation_risk_per_trade_pct: 0.010,
+            liquidation_risk_per_trade_pct: 0.0025,
+            liquidation_max_execution_divergence_bps: 15.0,
             trend_min_return_4h: 0.025,
             trend_min_efficiency: 0.45,
             trend_min_hour_volume_ratio: 0.65,
@@ -286,6 +305,13 @@ impl StrategyConfig {
             || !(1.0..=10.0).contains(&lanes.fast_min_volume_ratio_5m)
             || !(0.0..=0.80).contains(&lanes.fast_min_flow_5m)
             || !(0.5..=1.5).contains(&lanes.fast_max_compression_ratio)
+            || !(lanes.fast_max_compression_ratio..=4.0)
+                .contains(&lanes.fast_reacceleration_max_compression_ratio)
+            || !(lanes.fast_min_body_return_5m..=0.03)
+                .contains(&lanes.fast_reacceleration_min_body_return_5m)
+            || !(lanes.fast_min_volume_ratio_5m..=15.0)
+                .contains(&lanes.fast_reacceleration_min_volume_ratio_5m)
+            || !(lanes.fast_min_flow_5m..=0.80).contains(&lanes.fast_reacceleration_min_flow_5m)
             || !(0.0..=0.05).contains(&lanes.fast_max_prebreak_return_1h)
             || !(0.01..=0.10).contains(&lanes.fast_max_return_4h)
             || !(0.001..=0.05).contains(&lanes.fast_max_oi_change_15m)
@@ -304,6 +330,7 @@ impl StrategyConfig {
             || !(0.005..=0.03).contains(&lanes.liquidation_stop_pct)
             || !(1..=60).contains(&lanes.liquidation_hold_minutes)
             || !(0.001..=0.01).contains(&lanes.liquidation_risk_per_trade_pct)
+            || !(1.0..=50.0).contains(&lanes.liquidation_max_execution_divergence_bps)
             || !(0.02..=0.20).contains(&lanes.trend_min_return_4h)
             || !(0.10..=0.90).contains(&lanes.trend_min_efficiency)
             || lanes.trend_min_hour_volume_ratio <= 0.0
