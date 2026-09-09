@@ -24,6 +24,7 @@ pub struct ExecutionConfig {
     pub api_secret_env: String,
     pub recv_window_ms: u64,
     pub leverage: u8,
+    pub executable_profit_guard: bool,
 }
 
 impl Default for ExecutionConfig {
@@ -35,6 +36,7 @@ impl Default for ExecutionConfig {
             api_secret_env: "BINANCE_DEMO_API_SECRET".into(),
             recv_window_ms: 5_000,
             leverage: 5,
+            executable_profit_guard: false,
         }
     }
 }

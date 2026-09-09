@@ -205,9 +205,44 @@ impl StrategyNode for LiquidationExhaustionReversalNode {
                         self.config.liquidation_risk_per_trade_pct.to_string(),
                     ),
                     ("max_notional_multiple".into(), "1.0".into()),
-                    ("disable_take_profit".into(), "true".into()),
+                    // This lane has no fixed price target, but it is not an
+                    // unmanaged fixed-horizon bet: favorable excursion owns
+                    // a profit shield and a trailing stop before the deadline.
+                    (
+                        "managed_exit_only".into(),
+                        self.config.liquidation_managed_exit_enabled.to_string(),
+                    ),
+                    (
+                        "disable_take_profit".into(),
+                        (!self.config.liquidation_managed_exit_enabled).to_string(),
+                    ),
                     ("take_profit_fraction".into(), "1.0".into()),
-                    ("fixed_time_exit".into(), "true".into()),
+                    (
+                        "fixed_time_exit".into(),
+                        (!self.config.liquidation_managed_exit_enabled).to_string(),
+                    ),
+                    (
+                        "profit_shield_activation_r".into(),
+                        (self.config.liquidation_profit_shield_activation_bps
+                            / 10_000.0
+                            / self.config.liquidation_stop_pct)
+                            .to_string(),
+                    ),
+                    (
+                        "break_even_buffer_pct".into(),
+                        (self.config.liquidation_profit_shield_floor_bps / 10_000.0).to_string(),
+                    ),
+                    (
+                        "pre_tp_trailing_activation_r".into(),
+                        (self.config.liquidation_trailing_activation_bps
+                            / 10_000.0
+                            / self.config.liquidation_stop_pct)
+                            .to_string(),
+                    ),
+                    (
+                        "trailing_distance_pct".into(),
+                        (self.config.liquidation_trailing_distance_bps / 10_000.0).to_string(),
+                    ),
                     (
                         "max_hold_ms".into(),
                         (i64::from(self.config.liquidation_hold_minutes) * 60_000).to_string(),
@@ -388,10 +423,16 @@ mod tests {
     }
 
     #[test]
-    fn long_liquidation_exhaustion_creates_a_fixed_horizon_buy() {
+    fn long_liquidation_exhaustion_creates_a_managed_horizon_buy() {
         let market = frame(9_000.0, 1_000.0);
-        let mut node =
-            LiquidationExhaustionReversalNode::new(&["ALTUSDT".into()], LaneConfig::default());
+        let mut node = LiquidationExhaustionReversalNode::new(
+            &["ALTUSDT".into()],
+            LaneConfig {
+                liquidation_managed_exit_enabled: true,
+                liquidation_hold_minutes: 15,
+                ..LaneConfig::default()
+            },
+        );
         let records = node
             .evaluate(&NodeContext {
                 frame: &market,
@@ -404,8 +445,9 @@ mod tests {
             .expect("qualifying event should produce a candidate");
         assert_eq!(candidate.verdict, Verdict::Pass);
         assert_eq!(candidate.side, Side::Buy);
-        assert_eq!(candidate.tags["fixed_time_exit"], "true");
-        assert_eq!(candidate.tags["disable_take_profit"], "true");
+        assert_eq!(candidate.tags["fixed_time_exit"], "false");
+        assert_eq!(candidate.tags["managed_exit_only"], "true");
+        assert_eq!(candidate.tags["break_even_buffer_pct"], "0.001");
     }
 
     #[test]

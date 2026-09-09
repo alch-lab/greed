@@ -87,6 +87,11 @@ pub struct LaneConfig {
     pub liquidation_cooldown_seconds: u32,
     pub liquidation_stop_pct: f64,
     pub liquidation_hold_minutes: u32,
+    pub liquidation_managed_exit_enabled: bool,
+    pub liquidation_profit_shield_activation_bps: f64,
+    pub liquidation_profit_shield_floor_bps: f64,
+    pub liquidation_trailing_activation_bps: f64,
+    pub liquidation_trailing_distance_bps: f64,
     pub liquidation_risk_per_trade_pct: f64,
     /// Maximum absolute difference between the strategy reference and the
     /// executable quote on the configured execution venue. This is primarily
@@ -165,6 +170,11 @@ impl Default for LaneConfig {
             liquidation_cooldown_seconds: 30,
             liquidation_stop_pct: 0.020,
             liquidation_hold_minutes: 1,
+            liquidation_managed_exit_enabled: false,
+            liquidation_profit_shield_activation_bps: 25.0,
+            liquidation_profit_shield_floor_bps: 10.0,
+            liquidation_trailing_activation_bps: 50.0,
+            liquidation_trailing_distance_bps: 30.0,
             liquidation_risk_per_trade_pct: 0.0025,
             liquidation_max_execution_divergence_bps: 15.0,
             trend_min_return_4h: 0.025,
@@ -329,6 +339,13 @@ impl StrategyConfig {
             || !(10..=600).contains(&lanes.liquidation_cooldown_seconds)
             || !(0.005..=0.03).contains(&lanes.liquidation_stop_pct)
             || !(1..=60).contains(&lanes.liquidation_hold_minutes)
+            || !(5.0..=100.0).contains(&lanes.liquidation_profit_shield_activation_bps)
+            || !(0.0..lanes.liquidation_profit_shield_activation_bps)
+                .contains(&lanes.liquidation_profit_shield_floor_bps)
+            || !(lanes.liquidation_profit_shield_activation_bps..=200.0)
+                .contains(&lanes.liquidation_trailing_activation_bps)
+            || !(5.0..=100.0).contains(&lanes.liquidation_trailing_distance_bps)
+            || lanes.liquidation_trailing_distance_bps >= lanes.liquidation_trailing_activation_bps
             || !(0.001..=0.01).contains(&lanes.liquidation_risk_per_trade_pct)
             || !(1.0..=50.0).contains(&lanes.liquidation_max_execution_divergence_bps)
             || !(0.02..=0.20).contains(&lanes.trend_min_return_4h)
@@ -380,7 +397,7 @@ impl StrategyConfig {
             || !(0.5..=4.0).contains(&risk.max_total_gross_multiple)
             || !(0.05..=0.50).contains(&risk.max_book_participation_pct)
             || !(1.0..=25.0).contains(&risk.max_book_slippage_bps)
-            || !(0.25..=1.0).contains(&risk.min_liquidity_size_ratio)
+            || !(0.10..=1.0).contains(&risk.min_liquidity_size_ratio)
             || !(0.05..=0.50).contains(&risk.min_liquidity_notional_multiple)
             || !(1..=5).contains(&risk.max_positions)
             || !(0.003..=0.03).contains(&risk.initial_stop_pct)

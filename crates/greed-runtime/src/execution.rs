@@ -114,6 +114,8 @@ struct ExecutionMeta {
     #[serde(default)]
     runner_active: bool,
     #[serde(default)]
+    executable_profit: Option<crate::profit_guard::ProfitGuard>,
+    #[serde(default)]
     break_even_after_fraction: Option<f64>,
     #[serde(default)]
     break_even_buffer_pct: f64,
@@ -343,6 +345,8 @@ pub struct DemoPositionSnapshot {
     pub fixed_time_exit: bool,
     pub break_even_armed: bool,
     pub profit_shield_activation_pct: Option<f64>,
+    pub executable_profit: Option<crate::profit_guard::ProfitGuard>,
+    pub executable_profit_guard_enabled: bool,
     pub extreme_price: Option<f64>,
     pub trailing_activation_pct: Option<f64>,
     pub trailing_distance_pct: Option<f64>,
@@ -1024,12 +1028,81 @@ impl BinanceDemoExecution {
                         }),
                     }
                 }
+                // Concurrent, bounded READS only. Account mutation/exit submission
+                // remains serialized in this owner; one slow symbol cannot add
+                // a full REST timeout per position to the management loop.
+                let mut quote_tasks = tokio::task::JoinSet::new();
+                if self.config.executable_profit_guard {
+                    for (symbol, position) in &account.positions {
+                        let Some(meta) = self.state.positions.get(symbol) else {
+                            continue;
+                        };
+                        if meta.exit_requested
+                            || meta.runner_active
+                            || meta.fixed_time_exit
+                            || meta.profit_shield_activation_pct.is_none()
+                        {
+                            continue;
+                        }
+                        let client = self.client.clone();
+                        let url = format!(
+                            "{}/fapi/v1/depth",
+                            self.config.base_url.trim_end_matches('/')
+                        );
+                        let symbol = symbol.clone();
+                        let side = position.side;
+                        let quantity = position.quantity.abs();
+                        let offset = self.clock_offset_ms;
+                        quote_tasks.spawn(async move {
+                            let read = async {
+                                let value: Value = client
+                                    .get(url)
+                                    .query(&[("symbol", symbol.as_str()), ("limit", "100")])
+                                    .send()
+                                    .await?
+                                    .error_for_status()?
+                                    .json()
+                                    .await?;
+                                crate::profit_guard::quote(
+                                    &value,
+                                    side,
+                                    quantity,
+                                    chrono::Utc::now().timestamp_millis(),
+                                    offset,
+                                )
+                            };
+                            let result = match tokio::time::timeout(
+                                Duration::from_millis(750),
+                                read,
+                            )
+                            .await
+                            {
+                                Ok(result) => result,
+                                Err(_) => Err(anyhow!("execution depth request exceeded 750 ms")),
+                            };
+                            (symbol, result)
+                        });
+                    }
+                }
+                let mut executable_quotes = BTreeMap::new();
+                while let Some(result) = quote_tasks.join_next().await {
+                    if let Ok((symbol, result)) = result {
+                        match result {
+                            Ok(quote) => { executable_quotes.insert(symbol,quote); }
+                            Err(error) => events.push(ExchangeEvent {
+                                kind:"executable_profit_unscorable".into(),
+                                payload:serde_json::json!({"ts_ms":now_ms,"symbol":symbol,"reason":error.to_string(),"hard_stop_retained":true}),
+                            }),
+                        }
+                    }
+                }
+                let mut executable_exits = Vec::new();
                 let mut early_failures = Vec::new();
                 for (symbol, position) in &account.positions {
                     let Some(meta) = self.state.positions.get_mut(symbol) else {
                         continue;
                     };
-                    if meta.runner_active {
+                    if meta.runner_active || meta.exit_requested {
                         continue;
                     }
                     meta.extreme_price = if meta.extreme_price <= 0.0 {
@@ -1054,8 +1127,42 @@ impl BinanceDemoExecution {
                     let partial_shield_hit = meta
                         .break_even_after_fraction
                         .is_some_and(|threshold| closed_fraction + 1e-6 >= threshold);
-                    let favorable = meta.side.sign()
-                        * (meta.extreme_price / meta.entry_price.max(f64::EPSILON) - 1.0);
+                    let executable_mode = self.config.executable_profit_guard
+                        && !meta.fixed_time_exit
+                        && meta.profit_shield_activation_pct.is_some();
+                    let fresh_quote = executable_quotes.get(symbol).filter(|q| {
+                        chrono::Utc::now().timestamp_millis() + self.clock_offset_ms - q.exchange_ms
+                            <= crate::profit_guard::MAX_QUOTE_AGE_MS
+                    });
+                    if executable_mode {
+                        if let Some(quote) = fresh_quote {
+                            let exit = crate::profit_guard::observe(
+                                &mut meta.executable_profit,
+                                *quote,
+                                meta.side,
+                                meta.entry_price,
+                                position.quantity.abs(),
+                                crate::profit_guard::Protection {
+                                    activation: meta.profit_shield_activation_pct,
+                                    floor: meta.break_even_buffer_pct,
+                                    trailing_activation: meta.trailing_activation_pct,
+                                    trailing_distance: meta.trailing_distance_pct,
+                                    partial_activated: partial_shield_hit,
+                                },
+                            );
+                            events.push(ExchangeEvent {kind:"executable_profit_observation".into(),payload:serde_json::json!({
+                                "ts_ms":now_ms,"symbol":symbol,"candidate_id":meta.candidate_id,
+                                "recipe":meta.recipe,"mark_price":position.mark_price,"entry_price":meta.entry_price,
+                                "remaining_quantity":position.quantity.abs(),"guard":meta.executable_profit,
+                                "cost_reserve_bps":crate::profit_guard::COST_RESERVE*10000.0,
+                                "quote_source":"execution_venue_depth","exit_requested":exit,
+                            })});
+                            if exit {
+                                executable_exits.push((symbol.clone(), position.clone()));
+                                continue;
+                            }
+                        }
+                    }
                     if !meta.exit_requested
                         && early_failure_triggered(
                             meta.side,
@@ -1073,6 +1180,25 @@ impl BinanceDemoExecution {
                         early_failures.push((symbol.clone(), position.clone()));
                         continue;
                     }
+                    // Missing/stale execution quotes cannot arm/ratchet profit
+                    // protection using another venue or a mark-price peak.
+                    if executable_mode && fresh_quote.is_none() {
+                        continue;
+                    }
+                    let protective_extreme = if executable_mode {
+                        let net_peak = meta
+                            .executable_profit
+                            .as_ref()
+                            .map(|s| s.peak_net_return)
+                            .unwrap_or(0.0);
+                        meta.entry_price
+                            * (1.0
+                                + meta.side.sign() * (net_peak + crate::profit_guard::COST_RESERVE))
+                    } else {
+                        meta.extreme_price
+                    };
+                    let favorable = meta.side.sign()
+                        * (protective_extreme / meta.entry_price.max(f64::EPSILON) - 1.0);
                     let profit_shield_hit = meta
                         .profit_shield_activation_pct
                         .is_some_and(|activation| favorable >= activation);
@@ -1095,7 +1221,7 @@ impl BinanceDemoExecution {
                             .is_some_and(|activation| favorable >= activation)
                     {
                         if let Some(distance) = meta.trailing_distance_pct {
-                            let trailing = meta.extreme_price * (1.0 - meta.side.sign() * distance);
+                            let trailing = protective_extreme * (1.0 - meta.side.sign() * distance);
                             desired_stop = Some(match (meta.side, desired_stop) {
                                 (Side::Buy, Some(current)) => current.max(trailing),
                                 (Side::Sell, Some(current)) => current.min(trailing),
@@ -1120,6 +1246,28 @@ impl BinanceDemoExecution {
                                 stop_orders.get(symbol).copied(),
                             ));
                         }
+                    }
+                }
+                // Persist causal peaks before issuing exits. Hosted stops stay
+                // active; close_market re-reads quantity and uses reduce-only.
+                if self.config.executable_profit_guard {
+                    self.save()?;
+                }
+                for (symbol, position) in executable_exits {
+                    match self.close_market(&position).await {
+                        Ok(()) => {
+                            if let Some(meta) = self.state.positions.get_mut(&symbol) {
+                                meta.exit_requested = true;
+                                meta.pending_exit_reason = Some("executable_profit_protection".into());
+                            }
+                            self.save()?;
+                            events.push(ExchangeEvent {kind:"exchange_exit_requested".into(),payload:serde_json::json!({
+                                "ts_ms":chrono::Utc::now().timestamp_millis(),"symbol":symbol,"reason":"executable_profit_protection",
+                            })});
+                        }
+                        Err(error) => events.push(ExchangeEvent {kind:"exchange_order_rejected".into(),payload:serde_json::json!({
+                            "ts_ms":now_ms,"symbol":symbol,"reason":format!("executable profit close failed: {error:#}"),"hard_stop_retained":true,
+                        })}),
                     }
                 }
                 for (symbol, position) in early_failures {
@@ -1220,6 +1368,13 @@ impl BinanceDemoExecution {
                                     && (*take
                                         || self.state.positions.get(*symbol).is_some_and(|meta| {
                                             meta.fixed_time_exit
+                                                || managed_stop_only_exit(
+                                                    meta.max_hold_ms,
+                                                    meta.profit_shield_activation_pct,
+                                                    meta.break_even_buffer_pct,
+                                                    meta.trailing_activation_pct,
+                                                    meta.trailing_distance_pct,
+                                                )
                                                 || meta.break_even_armed
                                                 || meta.last_observed_quantity
                                                     < meta.initial_quantity - f64::EPSILON
@@ -1261,6 +1416,14 @@ impl BinanceDemoExecution {
                     }
                 }
                 for symbol in expired {
+                    if self
+                        .state
+                        .positions
+                        .get(&symbol)
+                        .is_some_and(|meta| meta.exit_requested)
+                    {
+                        continue;
+                    }
                     if let Some(position) = account.positions.get(&symbol) {
                         match self.close_market(position).await {
                             Ok(()) => {
@@ -1351,7 +1514,10 @@ impl BinanceDemoExecution {
                         });
                         if self.lanes.trend_reentry_enabled
                             && meta.recipe == "trend_continuation"
-                            && exit_reason == "profit_shield_stop"
+                            && matches!(
+                                exit_reason.as_str(),
+                                "profit_shield_stop" | "executable_profit_protection"
+                            )
                             && summary
                                 .as_ref()
                                 .is_some_and(|value| value.net_pnl_usd > 0.0)
@@ -2060,7 +2226,10 @@ impl BinanceDemoExecution {
                         stop_price: meta.map(|value| value.stop_price).unwrap_or_default(),
                         take_profit_prices: meta
                             .map(|value| {
-                                if value.take_profit_prices.is_empty() {
+                                if value.take_profit_prices.is_empty()
+                                    && value.take_profit_price.is_finite()
+                                    && value.take_profit_price > 0.0
+                                {
                                     vec![(value.take_profit_price, 1.0)]
                                 } else {
                                     value.take_profit_prices.clone()
@@ -2077,6 +2246,13 @@ impl BinanceDemoExecution {
                         break_even_armed: meta.map(|value| value.break_even_armed).unwrap_or(false),
                         profit_shield_activation_pct: meta
                             .and_then(|value| value.profit_shield_activation_pct),
+                        executable_profit: meta.and_then(|value| value.executable_profit.clone()),
+                        executable_profit_guard_enabled: self.config.executable_profit_guard
+                            && meta.is_some_and(|value| {
+                                !value.fixed_time_exit
+                                    && !value.runner_active
+                                    && value.profit_shield_activation_pct.is_some()
+                            }),
                         extreme_price: meta.map(|value| value.extreme_price),
                         trailing_activation_pct: meta
                             .and_then(|value| value.trailing_activation_pct),
@@ -2465,6 +2641,7 @@ impl BinanceDemoExecution {
                             take_profit_prices: fill.take_profit_prices.clone(),
                             unprotected_runner_fraction: plan.unprotected_runner_fraction,
                             runner_active: false,
+                            executable_profit: None,
                             break_even_after_fraction: plan.break_even_after_fraction.map(
                                 |fraction| {
                                     self.rules
@@ -3860,6 +4037,7 @@ impl BinanceDemoExecution {
                 take_profit_prices: take_profit_prices.clone(),
                 unprotected_runner_fraction: plan.unprotected_runner_fraction,
                 runner_active: false,
+                executable_profit: None,
                 break_even_after_fraction: plan.break_even_after_fraction.map(|fraction| {
                     floor_step(executed * fraction, rules.quantity_step)
                         / executed.max(f64::EPSILON)
@@ -4225,7 +4403,10 @@ impl BinanceDemoExecution {
                 "order is below Binance quantity or notional minimum"
             ));
         }
-        if plan.take_profit_prices.is_empty() && !plan.fixed_time_exit {
+        if plan.take_profit_prices.is_empty()
+            && !plan.fixed_time_exit
+            && !plan_has_managed_exit(plan)
+        {
             return Err(anyhow!("position plan requires at least one take profit"));
         }
         let take_profit_fraction = plan
@@ -5207,10 +5388,20 @@ impl BinanceDemoExecution {
             ],
         )
         .await?;
-        // Once the close is accepted, stale stops/targets must not survive the
-        // flat position. A later reconciliation retries this cleanup if the
-        // network drops here, so cleanup failure must not misreport the close
-        // itself as rejected.
+        // Acceptance is not proof of flatness. Preserve the hosted stop on a
+        // partial fill or uncertain account read; the next serialized sync
+        // retries against the then-current quantity, never the old quantity.
+        let confirmed = self.signed_read("/fapi/v2/account", vec![]).await?;
+        if parse_account(&confirmed)?
+            .positions
+            .contains_key(&position.symbol)
+        {
+            return Err(anyhow!(
+                "{} close accepted but flatness not yet confirmed; hosted stop retained",
+                position.symbol
+            ));
+        }
+        // Only verified flatness permits removing the remaining protection.
         self.cancel_all(&position.symbol).await.ok();
         Ok(())
     }
@@ -5992,6 +6183,41 @@ fn cap_entry_quantity(desired: f64, maximum: f64, quantity_step: f64) -> Result<
     Ok(capped)
 }
 
+// Infer from persisted numerical settings, not an ephemeral candidate tag.
+// A real exchange stop is still mandatory in the account protection check.
+fn managed_stop_only_exit(
+    max_hold_ms: i64,
+    shield: Option<f64>,
+    floor: f64,
+    activation: Option<f64>,
+    distance: Option<f64>,
+) -> bool {
+    match (shield, activation, distance) {
+        (Some(shield), Some(activation), Some(distance)) => {
+            max_hold_ms > 0
+                && [shield, floor, activation, distance]
+                    .iter()
+                    .all(|v| v.is_finite())
+                && floor >= 0.0
+                && shield > floor
+                && activation >= shield
+                && distance > 0.0
+                && distance < activation
+        }
+        _ => false,
+    }
+}
+
+fn plan_has_managed_exit(plan: &greed_kernel::PositionPlan) -> bool {
+    managed_stop_only_exit(
+        plan.max_hold_ms,
+        plan.profit_shield_activation_pct,
+        plan.break_even_buffer_pct,
+        plan.trailing_activation_pct,
+        plan.trailing_distance_pct,
+    )
+}
+
 fn validate_entry_quantity_and_exits(
     plan: &greed_kernel::PositionPlan,
     quantity: f64,
@@ -6006,7 +6232,7 @@ fn validate_entry_quantity_and_exits(
     if quantity > rules.max_limit_quantity + rules.quantity_step * 0.5 {
         return Err(anyhow!("order exceeds Binance maximum quantity"));
     }
-    if plan.take_profit_prices.is_empty() && !plan.fixed_time_exit {
+    if plan.take_profit_prices.is_empty() && !plan.fixed_time_exit && !plan_has_managed_exit(plan) {
         return Err(anyhow!("position plan requires at least one take profit"));
     }
     let take_profit_fraction = plan
@@ -6541,6 +6767,68 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(max_hold_review(&meta, 110.0, 901_000), MaxHoldReview::Exit);
+    }
+
+    #[test]
+    fn managed_stop_only_plan_requires_complete_protection_and_survives_restart() {
+        let mut plan = guarded_plan(Side::Buy);
+        plan.take_profit_prices.clear();
+        plan.fixed_time_exit = false;
+        plan.max_hold_ms = 900_000;
+        plan.profit_shield_activation_pct = Some(0.0025);
+        plan.break_even_buffer_pct = 0.001;
+        plan.trailing_activation_pct = Some(0.005);
+        plan.trailing_distance_pct = Some(0.003);
+        let rules = SymbolRules {
+            quantity_step: 1.0,
+            min_quantity: 1.0,
+            max_limit_quantity: 1_000.0,
+            max_market_quantity: 1_000.0,
+            price_tick: 0.01,
+            min_notional: 5.0,
+        };
+        assert!(validate_entry_quantity_and_exits(&plan, 10.0, 100.0, &rules).is_ok());
+        plan.trailing_distance_pct = None;
+        assert!(validate_entry_quantity_and_exits(&plan, 10.0, 100.0, &rules).is_err());
+        assert!(!managed_stop_only_exit(
+            900_000,
+            Some(f64::NAN),
+            0.001,
+            Some(0.005),
+            Some(0.003)
+        ));
+        assert!(!managed_stop_only_exit(
+            900_000,
+            Some(0.0025),
+            0.003,
+            Some(0.005),
+            Some(0.003)
+        ));
+        let meta: ExecutionMeta = serde_json::from_value(serde_json::json!({
+            "candidate_id":"liq:test", "recipe":"liquidation_exhaustion_reversal",
+            "side":"buy", "entry_ms":1000, "first_fill_ms":1000,
+            "stop_price":98.0, "max_hold_ms":900000,
+            "profit_shield_activation_pct":0.0025, "break_even_buffer_pct":0.001,
+            "trailing_activation_pct":0.005, "trailing_distance_pct":0.003
+        }))
+        .unwrap();
+        let restored: ExecutionMeta =
+            serde_json::from_str(&serde_json::to_string(&meta).unwrap()).unwrap();
+        assert!(managed_stop_only_exit(
+            restored.max_hold_ms,
+            restored.profit_shield_activation_pct,
+            restored.break_even_buffer_pct,
+            restored.trailing_activation_pct,
+            restored.trailing_distance_pct
+        ));
+        assert_ne!(
+            max_hold_review(&restored, 100.0, 61_000),
+            MaxHoldReview::Exit
+        );
+        assert_eq!(
+            max_hold_review(&restored, 100.0, 901_000),
+            MaxHoldReview::Exit
+        );
     }
 
     #[test]

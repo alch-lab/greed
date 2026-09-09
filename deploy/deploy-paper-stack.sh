@@ -10,6 +10,7 @@ set -Eeuo pipefail
 #   CADDY_SERVICE=caddy
 #   DEPLOY_BRANCH=main
 #   RUN_TESTS=1
+#   EXPECTED_EPOCH=19 (optional assertion; deployment refuses an epoch change)
 
 readonly BACKEND_DIR="${BACKEND_DIR:-/opt/greed}"
 readonly FRONTEND_DIR="${FRONTEND_DIR:-/opt/greed-web}"
@@ -121,10 +122,19 @@ flock -n 9 || fail "another greed deployment is already running"
 require_clean_checkout "${BACKEND_DIR}"
 require_clean_checkout "${FRONTEND_DIR}"
 
+# Refuse unintended accounting resets before building/restarting. Capture this
+# before pull; callers updating this script first can pass EXPECTED_EPOCH.
+epoch_before="$(sed -nE 's/^rolling_pf_epoch[[:space:]]*=[[:space:]]*([0-9]+).*$/\1/p' "${BACKEND_DIR}/config/demo.toml")"
+expected_epoch="${EXPECTED_EPOCH:-${epoch_before}}"
+[[ "${expected_epoch}" =~ ^[0-9]+$ ]] || fail "could not determine the epoch to preserve"
+
 step "Update backend"
 git -C "${BACKEND_DIR}" fetch origin
 git -C "${BACKEND_DIR}" checkout "${DEPLOY_BRANCH}"
 git -C "${BACKEND_DIR}" pull --ff-only origin "${DEPLOY_BRANCH}"
+
+epoch_after="$(sed -nE 's/^rolling_pf_epoch[[:space:]]*=[[:space:]]*([0-9]+).*$/\1/p' "${BACKEND_DIR}/config/demo.toml")"
+[[ "${epoch_after}" == "${expected_epoch}" ]] || fail "epoch would change from ${expected_epoch} to ${epoch_after}; backend was NOT restarted"
 
 if [[ -x "${BACKEND_DIR}/target/release/greed" ]]; then
   BACKEND_BACKUP="${BACKEND_DIR}/target/release/greed.deploy-backup"

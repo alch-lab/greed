@@ -3,6 +3,7 @@ mod execution;
 mod journal;
 mod market_stream;
 mod monitor;
+mod profit_guard;
 mod report;
 mod source;
 

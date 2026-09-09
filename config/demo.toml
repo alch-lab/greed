@@ -40,6 +40,8 @@ api_key_env = "BINANCE_DEMO_API_KEY"
 api_secret_env = "BINANCE_DEMO_API_SECRET"
 recv_window_ms = 5000
 leverage = 5
+# Fresh execution-venue depth only; exchange-hosted hard stops remain active.
+executable_profit_guard = true
 
 [strategy]
 # Always subscribed and retained; dynamic discovery fills the remaining slots.
@@ -94,9 +96,9 @@ fast_min_managed_fill_ratio = 0.20
 # Frozen paper-validation lane: fade a three-second one-sided liquidation
 # cascade only after the price has moved with the forced flow. It is evaluated
 # from Binance public force-order and top-20 depth streams, enters through a
-# bounded IOC after at least one second, holds exactly one minute, and carries
-# only a 2% exchange-side catastrophe stop. It intentionally does not inherit
-# the trend lanes' staged targets, trailing exits, or adaptive hold extension.
+# bounded IOC after at least one second. A 2% exchange-side stop covers the
+# catastrophe case. Paper validation enables the managed lifecycle: protect
+# 10 bps after a 25 bps move, trail by 30 bps from 50 bps, exit by 15 minutes.
 liquidation_reversal_enabled = true
 liquidation_window_seconds = 3
 liquidation_min_dominance = 0.80
@@ -107,10 +109,15 @@ liquidation_min_entry_delay_seconds = 1
 liquidation_max_signal_age_seconds = 12
 liquidation_cooldown_seconds = 30
 liquidation_stop_pct = 0.020
-liquidation_hold_minutes = 1
-# The corrected production-aware replay is close to flat but not yet a funded
-# alpha (18 trades, PF 0.79). Keep collecting real fills at probe risk without
-# letting this high-frequency lane dominate the profitable trend lanes.
+liquidation_hold_minutes = 15
+# Enabled for Binance Demo; existing positions retain persisted exit settings.
+liquidation_managed_exit_enabled = true
+liquidation_profit_shield_activation_bps = 25.0
+liquidation_profit_shield_floor_bps = 10.0
+liquidation_trailing_activation_bps = 50.0
+liquidation_trailing_distance_bps = 30.0
+# Keep this higher-frequency lane at probe risk until the larger sample confirms
+# the lifecycle replay without letting it dominate the trend lane.
 liquidation_risk_per_trade_pct = 0.0025
 # Mainnet produces the signal while Binance Demo executes it. Refuse the
 # trade when the Demo top-of-book differs by more than 15 bps, and use an IOC

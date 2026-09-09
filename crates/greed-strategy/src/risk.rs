@@ -24,10 +24,10 @@ fn cost_aware_profit_shield_buffer(
     let Some(exit_slippage_bps) = expected_exit_slippage_bps else {
         return configured_buffer_pct;
     };
-    let cost_floor_pct = (PROFIT_SHIELD_ROUND_TRIP_FEE_BPS
-        + exit_slippage_bps.max(0.0) * PROFIT_SHIELD_SLIPPAGE_STRESS_MULTIPLIER
-        + PROFIT_SHIELD_MIN_NET_BPS)
-        / 10_000.0;
+    let stressed_exit_bps = exit_slippage_bps.max(0.0) * PROFIT_SHIELD_SLIPPAGE_STRESS_MULTIPLIER;
+    let cost_floor_pct =
+        (PROFIT_SHIELD_ROUND_TRIP_FEE_BPS + stressed_exit_bps + PROFIT_SHIELD_MIN_NET_BPS)
+            / 10_000.0;
     configured_buffer_pct.max(cost_floor_pct).min(0.003)
 }
 
@@ -402,6 +402,7 @@ impl StrategyNode for PositionPlannerNode {
             let configured_ladder = take_profit_ladder(c);
             let fixed_time_exit = tag_bool(c, "fixed_time_exit");
             let disable_take_profit = tag_bool(c, "disable_take_profit");
+            let managed_exit_only = tag_bool(c, "managed_exit_only");
             let mut take_profit_prices = configured_ladder
                 .as_ref()
                 .map(|legs| {
@@ -415,10 +416,11 @@ impl StrategyNode for PositionPlannerNode {
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_else(|| vec![(tp1, take_fraction)]);
-            if disable_take_profit {
+            if disable_take_profit || managed_exit_only {
                 take_profit_prices.clear();
             }
             if !disable_take_profit
+                && !managed_exit_only
                 && configured_ladder.is_none()
                 && take_fraction < 1.0
                 && self.config.runner_take_profit_r > 0.0
@@ -436,6 +438,9 @@ impl StrategyNode for PositionPlannerNode {
                 .first()
                 .map(|value| value.1)
                 .unwrap_or_default();
+            let break_even_after_fraction = (!take_profit_prices.is_empty()
+                && staged_exit_fraction < 1.0 - 1e-6)
+                .then_some(first_exit_fraction);
             let mut signal_context = c.tags.clone();
             signal_context.insert(
                 "effective_profit_shield_buffer_pct".into(),
@@ -491,14 +496,12 @@ impl StrategyNode for PositionPlannerNode {
                 .unwrap_or_default(),
                 stop_price: stop,
                 take_profit_prices,
-                break_even_after_fraction: (!disable_take_profit
-                    && staged_exit_fraction < 1.0 - 1e-6)
-                    .then_some(first_exit_fraction),
+                break_even_after_fraction,
                 unprotected_runner_fraction: tag_f64(c, "unprotected_runner_fraction")
                     .filter(|fraction| (0.01..=0.25).contains(fraction)),
                 break_even_buffer_pct,
                 profit_shield_activation_pct: (!fixed_time_exit
-                    && !disable_take_profit
+                    && (!disable_take_profit || managed_exit_only)
                     && (take_fraction < 1.0 || explicit_profit_protection)
                     && !c.tags.contains_key("unprotected_runner_fraction")
                     && profit_shield_activation_r > 0.0)
@@ -507,12 +510,12 @@ impl StrategyNode for PositionPlannerNode {
                 // position could reach roughly +1R, miss the 2R partial, and
                 // surrender almost all open profit back to the cost shield.
                 trailing_activation_pct: (!fixed_time_exit
-                    && !disable_take_profit
+                    && (!disable_take_profit || managed_exit_only)
                     && (take_fraction < 1.0 || explicit_profit_protection)
                     && !c.tags.contains_key("unprotected_runner_fraction"))
                 .then_some(stop_pct * trailing_activation_r),
                 trailing_distance_pct: (!fixed_time_exit
-                    && !disable_take_profit
+                    && (!disable_take_profit || managed_exit_only)
                     && (take_fraction < 1.0 || explicit_profit_protection)
                     && !c.tags.contains_key("unprotected_runner_fraction"))
                 .then_some(trailing_distance_pct),
@@ -676,6 +679,10 @@ mod tests {
     }
 
     fn planned_output_for_bid_depth(bid_depth_usd: f64) -> Vec<ArtifactRecord> {
+        planned_output_with_risk(bid_depth_usd, RiskConfig::default())
+    }
+
+    fn planned_output_with_risk(bid_depth_usd: f64, risk: RiskConfig) -> Vec<ArtifactRecord> {
         let mut record = candidate("trend:ALT", "trend_continuation", "ALTUSDT", 1);
         let Artifact::Candidate(value) = &mut record.artifact else {
             panic!("candidate fixture must contain a candidate");
@@ -704,7 +711,7 @@ mod tests {
                 open_positions: 0,
             },
         };
-        PositionPlannerNode::new(vec![], RiskConfig::default())
+        PositionPlannerNode::new(vec![], risk)
             .evaluate(&NodeContext {
                 frame: &frame,
                 artifacts: &artifacts,
@@ -748,6 +755,27 @@ mod tests {
             .expect("liquidity state");
         assert_eq!(state.state, "too_thin");
         assert_eq!(state.verdict, Verdict::Block);
+    }
+
+    #[test]
+    fn smaller_liquidity_size_keeps_depth_caps_and_rejects_dust() {
+        let risk = RiskConfig {
+            min_liquidity_size_ratio: 0.15,
+            min_liquidity_notional_multiple: 0.10,
+            ..RiskConfig::default()
+        };
+        let output = planned_output_with_risk(6_000.0, risk.clone());
+        let plan = output
+            .iter()
+            .find_map(|r| match &r.artifact {
+                Artifact::PositionPlan(p) => Some(p),
+                _ => None,
+            })
+            .expect("meaningful downsized plan");
+        assert!((plan.notional_usd - 2_100.0).abs() < 1e-6);
+        assert!(!planned_output_with_risk(1_000.0, risk)
+            .iter()
+            .any(|r| matches!(r.artifact, Artifact::PositionPlan(_))));
     }
 
     #[test]
@@ -942,7 +970,7 @@ mod tests {
     }
 
     #[test]
-    fn liquidation_plan_has_stop_only_and_a_fixed_deadline() {
+    fn liquidation_plan_has_state_protection_and_a_bounded_deadline() {
         let mut record = candidate(
             "liquidation_exhaustion_reversal:ALTUSDT:1000",
             "liquidation_exhaustion_reversal",
@@ -956,8 +984,12 @@ mod tests {
             ("stop_pct".into(), "0.02".into()),
             ("risk_per_trade_pct".into(), "0.01".into()),
             ("max_notional_multiple".into(), "1.0".into()),
-            ("disable_take_profit".into(), "true".into()),
-            ("fixed_time_exit".into(), "true".into()),
+            ("managed_exit_only".into(), "true".into()),
+            ("fixed_time_exit".into(), "false".into()),
+            ("profit_shield_activation_r".into(), "0.125".into()),
+            ("break_even_buffer_pct".into(), "0.001".into()),
+            ("pre_tp_trailing_activation_r".into(), "0.25".into()),
+            ("trailing_distance_pct".into(), "0.003".into()),
             ("max_hold_ms".into(), "900000".into()),
         ]));
         let artifacts = BTreeMap::from([(record.key.clone(), record)]);
@@ -990,11 +1022,12 @@ mod tests {
             .unwrap();
         assert!((plan.notional_usd - 2_500.0).abs() < 1e-9);
         assert!(plan.take_profit_prices.is_empty());
+        assert_eq!(plan.break_even_after_fraction, None);
         assert_eq!(plan.max_hold_ms, 900_000);
-        assert!(plan.fixed_time_exit);
-        assert_eq!(plan.profit_shield_activation_pct, None);
-        assert_eq!(plan.trailing_activation_pct, None);
-        assert_eq!(plan.trailing_distance_pct, None);
+        assert!(!plan.fixed_time_exit);
+        assert_eq!(plan.profit_shield_activation_pct, Some(0.0025));
+        assert_eq!(plan.trailing_activation_pct, Some(0.005));
+        assert_eq!(plan.trailing_distance_pct, Some(0.003));
         assert_eq!(plan.early_failure_after_ms, 0);
         assert_eq!(plan.early_failure_adverse_pct, 0.0);
         assert_eq!(plan.early_failure_max_favorable_pct, 0.0);
