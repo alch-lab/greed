@@ -37,6 +37,11 @@ pub enum ControlCommand {
         requested_ms: i64,
         response: oneshot::Sender<Result<Value, String>>,
     },
+    ResetRiskGuard {
+        actor: String,
+        requested_ms: i64,
+        response: oneshot::Sender<Result<Value, String>>,
+    },
 }
 
 pub struct Monitor {
@@ -139,6 +144,7 @@ pub async fn start(config: &RuntimeConfig) -> Result<Monitor> {
         .route("/api/auth/session", get(session))
         .route("/api/control/pause", post(pause))
         .route("/api/control/resume", post(resume))
+        .route("/api/control/risk/reset", post(reset_risk_guard))
         .route("/api/positions/{symbol}/close", post(manual_close))
         .with_state(state);
     let task = tokio::spawn(async move {
@@ -220,6 +226,38 @@ async fn pause(State(state): State<ApiState>, headers: HeaderMap) -> Response {
 
 async fn resume(State(state): State<ApiState>, headers: HeaderMap) -> Response {
     set_paused(state, headers, false).await
+}
+
+async fn reset_risk_guard(State(state): State<ApiState>, headers: HeaderMap) -> Response {
+    let Some(actor) = operator_actor(&state, &headers) else {
+        return api_error(StatusCode::UNAUTHORIZED, "operator login required");
+    };
+    let requested_ms = chrono::Utc::now().timestamp_millis();
+    let (response_tx, response_rx) = oneshot::channel();
+    if state
+        .command_tx
+        .send(ControlCommand::ResetRiskGuard {
+            actor,
+            requested_ms,
+            response: response_tx,
+        })
+        .await
+        .is_err()
+    {
+        return api_error(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "strategy runtime is unavailable",
+        );
+    }
+    match tokio::time::timeout(std::time::Duration::from_secs(10), response_rx).await {
+        Ok(Ok(Ok(value))) => Json(value).into_response(),
+        Ok(Ok(Err(error))) => api_error(StatusCode::CONFLICT, &error),
+        Ok(Err(_)) => api_error(StatusCode::SERVICE_UNAVAILABLE, "strategy runtime stopped"),
+        Err(_) => api_error(
+            StatusCode::GATEWAY_TIMEOUT,
+            "risk reset is still pending; refresh strategy status",
+        ),
+    }
 }
 
 async fn set_paused(state: ApiState, headers: HeaderMap, paused: bool) -> Response {

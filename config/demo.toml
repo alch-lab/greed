@@ -30,7 +30,7 @@ execution_state_path = "data/runtime/binance-alpha-state.json"
 http_listen = "127.0.0.1:8088"
 
 [portfolio]
-initial_equity_usd = 5000.0
+initial_equity_usd = 10000.0
 max_positions = 3
 
 [execution]
@@ -226,6 +226,6 @@ rolling_pf_floor = 1.00
 rolling_pf_cooldown_minutes = 360
 loss_cooldown_minutes = 180
 rolling_pf_probe_size_multiplier = 1.00
-# Epoch 18 starts a clean $5,000 virtual performance window after the execution
-# repairs. Historical journals remain on disk; only the live baseline and gates reset.
-rolling_pf_epoch = 18
+# Epoch 19 starts a clean $10,000 virtual performance window. Historical journals
+# remain on disk; only the live baseline and adaptive performance gates reset.
+rolling_pf_epoch = 19

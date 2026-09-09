@@ -616,6 +616,44 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                         }
                     }
                 }
+                monitor::ControlCommand::ResetRiskGuard {
+                    actor,
+                    requested_ms,
+                    response,
+                } => {
+                    let result = {
+                        let mut execution = execution.lock().await;
+                        execution.reset_risk_guard(&actor, requested_ms)
+                    };
+                    match result {
+                        Ok(event) => {
+                            let payload = with_run_id(event.payload, &identity);
+                            history.append(&event.kind, payload.clone())?;
+                            journal.append(&event.kind, payload.clone())?;
+                            let _ = response.send(Ok(serde_json::json!({
+                                "ok":true,
+                                "risk_day_start_equity_usd":payload["risk_day_start_equity_usd"],
+                                "peak_equity_usd":payload["peak_equity_usd"],
+                            })));
+                        }
+                        Err(error) => {
+                            let message = error.to_string();
+                            let payload = with_run_id(
+                                serde_json::json!({
+                                    "ts_ms":requested_ms,
+                                    "reason":message,
+                                    "operator_action":true,
+                                    "actor":actor,
+                                    "paper_only":true,
+                                }),
+                                &identity,
+                            );
+                            history.append("operator_risk_reset_failed", payload.clone())?;
+                            journal.append("operator_risk_reset_failed", payload)?;
+                            let _ = response.send(Err(message));
+                        }
+                    }
+                }
             }
         }
         let refresh_ms = i64::from(config.strategy.universe.refresh_seconds) * 1_000;

@@ -278,6 +278,18 @@ struct DemoState {
     pending_accounting: BTreeMap<String, PendingAccountingState>,
 }
 
+fn reset_portfolio_risk_baselines(
+    state: &mut DemoState,
+    equity: f64,
+    risk_day: String,
+) -> (Option<f64>, Option<f64>) {
+    let previous = (state.risk_day_start_equity_usd, state.peak_equity_usd);
+    state.risk_day = risk_day;
+    state.risk_day_start_equity_usd = Some(equity);
+    state.peak_equity_usd = Some(equity);
+    previous
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
 struct ExecutionOutcome {
     #[serde(default)]
@@ -1467,6 +1479,48 @@ impl BinanceDemoExecution {
             risk_day_start_equity_usd: self.state.risk_day_start_equity_usd.unwrap_or(equity),
             gross_exposure_usd: gross,
             open_positions: account.positions.len(),
+        })
+    }
+
+    /// Forgive the current paper-session drawdown without touching positions,
+    /// orders, PnL history, or execution-safety halts. This is deliberately an
+    /// operator-only simulation control; the monitor serializes it through the
+    /// same execution lock as reconciliation and order management.
+    pub fn reset_risk_guard(&mut self, actor: &str, requested_ms: i64) -> Result<ExchangeEvent> {
+        let account = self
+            .account
+            .as_ref()
+            .ok_or_else(|| anyhow!("demo account not synchronized"))?;
+        if self.state.execution_halt_reason.is_some() {
+            return Err(anyhow!(
+                "execution safety halt cannot be cleared by resetting the portfolio risk guard"
+            ));
+        }
+        let baseline = self
+            .state
+            .baseline_wallet_usd
+            .unwrap_or(account.wallet_balance);
+        let equity = self.portfolio.initial_equity_usd + account.margin_balance - baseline;
+        let (previous_day_start, previous_peak) = reset_portfolio_risk_baselines(
+            &mut self.state,
+            equity,
+            chrono::Utc::now().format("%Y-%m-%d").to_string(),
+        );
+        self.save()?;
+        Ok(ExchangeEvent {
+            kind: "operator_risk_reset".into(),
+            payload: serde_json::json!({
+                "ts_ms":requested_ms,
+                "actor":actor,
+                "operator_action":true,
+                "paper_only":true,
+                "previous_risk_day_start_equity_usd":previous_day_start,
+                "previous_peak_equity_usd":previous_peak,
+                "risk_day_start_equity_usd":equity,
+                "peak_equity_usd":equity,
+                "positions_unchanged":true,
+                "history_unchanged":true,
+            }),
         })
     }
 
@@ -5247,6 +5301,7 @@ impl BinanceDemoExecution {
             "execution_halted": self.state.execution_halt_reason.is_some(),
             "remote_matching": true,
             "leverage": self.config.leverage,
+            "initial_equity_usd":self.portfolio.initial_equity_usd,
             "performance_epoch": self.state.performance_epoch,
             "performance_epoch_reset": self.performance_epoch_reset,
             "performance_basis":"risk_r_v1",
@@ -6052,6 +6107,25 @@ fn hex_bytes(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn operator_risk_reset_changes_only_the_loss_baselines() {
+        let mut state = DemoState {
+            risk_day: "2026-09-08".into(),
+            risk_day_start_equity_usd: Some(10_000.0),
+            peak_equity_usd: Some(10_250.0),
+            seen: BTreeSet::from(["candidate-1".into()]),
+            execution_halt_reason: None,
+            ..DemoState::default()
+        };
+        let previous = reset_portfolio_risk_baselines(&mut state, 9_700.0, "2026-09-09".into());
+        assert_eq!(previous, (Some(10_000.0), Some(10_250.0)));
+        assert_eq!(state.risk_day, "2026-09-09");
+        assert_eq!(state.risk_day_start_equity_usd, Some(9_700.0));
+        assert_eq!(state.peak_equity_usd, Some(9_700.0));
+        assert!(state.seen.contains("candidate-1"));
+        assert!(state.execution_halt_reason.is_none());
+    }
 
     fn five_minute_bar(
         open_ms: i64,
