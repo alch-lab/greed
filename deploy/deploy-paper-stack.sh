@@ -178,18 +178,22 @@ if [[ -d "${FRONTEND_DIR}/dist" ]]; then
 fi
 mv "${FRONTEND_DIR}/dist.next" "${FRONTEND_DIR}/dist"
 
-step "Validate and reload Caddy"
+step "Validate Caddy and confirm the static server is running"
 if command -v caddy >/dev/null 2>&1; then
   caddy validate --config /etc/caddy/Caddyfile
 fi
-systemctl reload "${CADDY_SERVICE}"
+# The deployment changes files under the existing static root; Caddy reads
+# those files per request and does not need a configuration reload. Some older
+# Caddy systemd units cannot execute ExecReload (status=226), which previously
+# made an otherwise successful deployment look failed.
+systemctl is-active --quiet "${CADDY_SERVICE}" \
+  || fail "${CADDY_SERVICE} is not running"
 
 if ! curl -fsS --max-time 5 http://127.0.0.1:9527/paper \
   | grep -q '/assets/'; then
   if [[ -n "${FRONTEND_BACKUP}" && -d "${FRONTEND_BACKUP}" ]]; then
     rm -rf -- "${FRONTEND_DIR}/dist"
     mv "${FRONTEND_BACKUP}" "${FRONTEND_DIR}/dist"
-    systemctl reload "${CADDY_SERVICE}"
   fi
   fail "frontend verification failed; previous dist restored"
 fi
