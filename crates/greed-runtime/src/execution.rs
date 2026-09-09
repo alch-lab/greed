@@ -1685,6 +1685,7 @@ impl BinanceDemoExecution {
                             "break_even_buffer_pct".into(),
                             self.lanes.trend_profit_shield_buffer_pct.to_string(),
                         ),
+                        ("cost_aware_profit_shield".into(), "true".into()),
                         (
                             "pre_tp_trailing_activation_r".into(),
                             (self.lanes.trend_reentry_trailing_activation_pct / signal.stop_pct)

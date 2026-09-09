@@ -157,8 +157,9 @@ trend_max_opposing_micro_return_bps = 3.0
 # about $6,000 and the full-stop loss is about $75 before gap/slippage.
 trend_risk_per_trade_pct = 0.015
 # Keep the entire position when price first proves the trade. At +0.32R
-# (about +0.40% with the 1.25% stop), move the exchange-side stop to +0.15%
-# above entry. This protects a small net gain without clipping the right tail.
+# (about +0.40% with the 1.25% stop), move the exchange-side stop to at least
+# +0.15% above entry. Thin books raise that floor only enough to cover stressed
+# expected exit impact, round-trip fees, and a 2 bps net margin (capped +0.30%).
 trend_profit_shield_activation_r = 0.32
 trend_profit_shield_buffer_pct = 0.0015
 # Do not tighten the peak-following trail until +1R. Before then the fixed

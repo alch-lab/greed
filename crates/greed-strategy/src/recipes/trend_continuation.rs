@@ -475,6 +475,7 @@ impl StrategyNode for TrendContinuationNode {
                         "break_even_buffer_pct".into(),
                         self.config.trend_profit_shield_buffer_pct.to_string(),
                     );
+                    tags.insert("cost_aware_profit_shield".into(), "true".into());
                     tags.insert(
                         "pre_tp_trailing_activation_r".into(),
                         self.config.trend_pre_tp_trailing_activation_r.to_string(),

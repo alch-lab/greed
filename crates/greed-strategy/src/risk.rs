@@ -13,6 +13,24 @@ struct LiquiditySizing {
     expected_exit_slippage_bps: Option<f64>,
 }
 
+const PROFIT_SHIELD_ROUND_TRIP_FEE_BPS: f64 = 7.0;
+const PROFIT_SHIELD_SLIPPAGE_STRESS_MULTIPLIER: f64 = 1.5;
+const PROFIT_SHIELD_MIN_NET_BPS: f64 = 2.0;
+
+fn cost_aware_profit_shield_buffer(
+    configured_buffer_pct: f64,
+    expected_exit_slippage_bps: Option<f64>,
+) -> f64 {
+    let Some(exit_slippage_bps) = expected_exit_slippage_bps else {
+        return configured_buffer_pct;
+    };
+    let cost_floor_pct = (PROFIT_SHIELD_ROUND_TRIP_FEE_BPS
+        + exit_slippage_bps.max(0.0) * PROFIT_SHIELD_SLIPPAGE_STRESS_MULTIPLIER
+        + PROFIT_SHIELD_MIN_NET_BPS)
+        / 10_000.0;
+    configured_buffer_pct.max(cost_floor_pct).min(0.003)
+}
+
 fn sweep_slippage_bps(levels: &[PriceLevel], notional_usd: f64, reference: f64) -> Option<f64> {
     if levels.is_empty() || notional_usd <= 0.0 || reference <= 0.0 {
         return None;
@@ -276,7 +294,7 @@ impl StrategyNode for PositionPlannerNode {
                 .clamp(0.1, 1.0);
             let profit_shield_activation_r = tag_f64(c, "profit_shield_activation_r")
                 .unwrap_or(self.config.profit_shield_activation_r);
-            let break_even_buffer_pct = tag_f64(c, "break_even_buffer_pct")
+            let mut break_even_buffer_pct = tag_f64(c, "break_even_buffer_pct")
                 .unwrap_or(self.config.break_even_buffer_pct)
                 .clamp(0.0, 0.01);
             let trailing_activation_r = tag_f64(c, "pre_tp_trailing_activation_r")
@@ -303,6 +321,12 @@ impl StrategyNode for PositionPlannerNode {
             let notional = desired_notional.min(liquidity.notional_cap_usd);
             let liquidity_ok = notional + 1e-6 >= minimum_notional;
             let was_scaled = liquidity_ok && notional + 1e-6 < desired_notional;
+            if tag_bool(c, "cost_aware_profit_shield") {
+                break_even_buffer_pct = cost_aware_profit_shield_buffer(
+                    break_even_buffer_pct,
+                    liquidity.expected_exit_slippage_bps,
+                );
+            }
             let liquidity_reason = if !liquidity_ok {
                 Some(format!(
                     "{} exit liquidity supports ${notional:.0} / minimum ${minimum_notional:.0} (wanted ${desired_notional:.0})",
@@ -413,6 +437,10 @@ impl StrategyNode for PositionPlannerNode {
                 .map(|value| value.1)
                 .unwrap_or_default();
             let mut signal_context = c.tags.clone();
+            signal_context.insert(
+                "effective_profit_shield_buffer_pct".into(),
+                break_even_buffer_pct.to_string(),
+            );
             signal_context.insert("desired_notional_usd".into(), desired_notional.to_string());
             signal_context.insert(
                 "liquidity_cap_usd".into(),
@@ -845,6 +873,15 @@ mod tests {
             Some("0.006")
         );
         assert!(!plan.taker_fallback);
+    }
+
+    #[test]
+    fn cost_aware_profit_shield_reserves_stressed_exit_cost() {
+        assert!((cost_aware_profit_shield_buffer(0.0015, None) - 0.0015).abs() < 1e-12);
+        // 7 bps fees + 1.5 * 8 bps expected exit impact + 2 bps desired net.
+        assert!((cost_aware_profit_shield_buffer(0.0015, Some(8.0)) - 0.0021).abs() < 1e-12);
+        assert!((cost_aware_profit_shield_buffer(0.0025, Some(2.0)) - 0.0025).abs() < 1e-12);
+        assert_eq!(cost_aware_profit_shield_buffer(0.0015, Some(80.0)), 0.003);
     }
 
     #[test]
