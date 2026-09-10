@@ -1151,6 +1151,7 @@ impl BinanceDemoExecution {
                     });
                     if executable_mode {
                         if let Some(quote) = fresh_quote {
+                            let trailing_activation = effective_trailing_activation(meta);
                             let exit = crate::profit_guard::observe(
                                 &mut meta.executable_profit,
                                 *quote,
@@ -1160,7 +1161,7 @@ impl BinanceDemoExecution {
                                 crate::profit_guard::Protection {
                                     activation: meta.profit_shield_activation_pct,
                                     floor: meta.break_even_buffer_pct,
-                                    trailing_activation: meta.trailing_activation_pct,
+                                    trailing_activation,
                                     trailing_distance: meta.trailing_distance_pct,
                                     partial_activated: partial_shield_hit,
                                 },
@@ -1231,8 +1232,7 @@ impl BinanceDemoExecution {
                         );
                     }
                     if shield_hit
-                        && meta
-                            .trailing_activation_pct
+                        && effective_trailing_activation(meta)
                             .is_some_and(|activation| favorable >= activation)
                     {
                         if let Some(distance) = meta.trailing_distance_pct {
@@ -2391,8 +2391,7 @@ impl BinanceDemoExecution {
                             .unwrap_or_default(),
                         max_profit_reversals: MAX_PROFIT_REVERSALS_PER_CHAIN,
                         extreme_price: meta.map(|value| value.extreme_price),
-                        trailing_activation_pct: meta
-                            .and_then(|value| value.trailing_activation_pct),
+                        trailing_activation_pct: meta.and_then(effective_trailing_activation),
                         trailing_distance_pct: meta.and_then(|value| value.trailing_distance_pct),
                         early_failure_after_ms: meta
                             .map(|value| value.early_failure_after_ms)
@@ -5757,6 +5756,23 @@ fn protective_exit_reason(meta: &ExecutionMeta) -> &str {
         None if meta.break_even_armed => "trailing_or_protected_stop",
         None => "initial_stop",
     }
+}
+
+/// Existing positions retain their entry-time parameters in the restart
+/// journal. Apply the new continuous-profit threshold at runtime as well, so
+/// deploying the fix protects an already-open second/reversal leg instead of
+/// waiting for the next position chain.
+fn effective_trailing_activation(meta: &ExecutionMeta) -> Option<f64> {
+    meta.trailing_activation_pct.map(|activation| {
+        if matches!(
+            meta.recipe.as_str(),
+            TREND_REENTRY_RECIPE | TREND_PROFIT_REVERSAL_RECIPE
+        ) {
+            activation.min(0.010)
+        } else {
+            activation
+        }
+    })
 }
 
 fn next_profit_reversal_count(current: u8, exit_reason: &str) -> Option<u8> {

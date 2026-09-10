@@ -210,7 +210,7 @@ impl Default for LaneConfig {
             trend_reentry_min_stop_pct: 0.003,
             trend_reentry_max_stop_pct: 0.0125,
             trend_reentry_profit_shield_pct: 0.008,
-            trend_reentry_trailing_activation_pct: 0.0125,
+            trend_reentry_trailing_activation_pct: 0.010,
             trend_reentry_trailing_distance_pct: 0.005,
             trend_reentry_entry_timeout_seconds: 30,
         }

@@ -189,10 +189,10 @@ trend_reentry_min_body_pct = 0.002
 trend_reentry_min_flow = 0.05
 trend_reentry_min_stop_pct = 0.003
 trend_reentry_max_stop_pct = 0.0125
-# The second leg has its own wider protection lifecycle. It does not inherit
-# the first leg's aggressive +0.4% shield, which would churn a resumed trend.
+# The second leg arms profit protection at 0.8%, starts continuous trailing at
+# 1.0%, and then locks the executable peak less a 0.5% giveback.
 trend_reentry_profit_shield_pct = 0.008
-trend_reentry_trailing_activation_pct = 0.0125
+trend_reentry_trailing_activation_pct = 0.010
 trend_reentry_trailing_distance_pct = 0.005
 trend_reentry_entry_timeout_seconds = 30
 [strategy.risk]
