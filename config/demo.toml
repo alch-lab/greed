@@ -98,7 +98,10 @@ fast_min_managed_fill_ratio = 0.20
 # from Binance public force-order and top-20 depth streams, enters through a
 # bounded IOC after at least one second. A 2% exchange-side stop covers the
 # catastrophe case. Paper validation enables the managed lifecycle: protect
-# 10 bps after a 25 bps move, trail by 30 bps from 50 bps, exit by 15 minutes.
+# 22 bps after a 45 bps move, trail by 50 bps from 90 bps, exit by 15 minutes.
+# The wider lifecycle retained the same entries while improving both the
+# earlier calibration days and the later validation days in executable-book
+# replay; the 2% catastrophe stop and all admission gates remain unchanged.
 liquidation_reversal_enabled = true
 liquidation_window_seconds = 3
 liquidation_min_dominance = 0.80
@@ -112,10 +115,10 @@ liquidation_stop_pct = 0.020
 liquidation_hold_minutes = 15
 # Enabled for Binance Demo; existing positions retain persisted exit settings.
 liquidation_managed_exit_enabled = true
-liquidation_profit_shield_activation_bps = 25.0
-liquidation_profit_shield_floor_bps = 10.0
-liquidation_trailing_activation_bps = 50.0
-liquidation_trailing_distance_bps = 30.0
+liquidation_profit_shield_activation_bps = 45.0
+liquidation_profit_shield_floor_bps = 22.0
+liquidation_trailing_activation_bps = 90.0
+liquidation_trailing_distance_bps = 50.0
 # Keep this higher-frequency lane at probe risk until the larger sample confirms
 # the lifecycle replay without letting it dominate the trend lane.
 liquidation_risk_per_trade_pct = 0.0025
