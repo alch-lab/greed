@@ -146,7 +146,11 @@ fn strategy_funnels_demo(
     let build = |lane: &str| {
         let is_lane = |recipe: &str| {
             recipe == lane
-                || (lane == "trend_continuation" && recipe == "trend_continuation_reentry")
+                || (lane == "trend_continuation"
+                    && matches!(
+                        recipe,
+                        "trend_continuation_reentry" | "trend_profit_reversal"
+                    ))
         };
         let candidates: Vec<_> = evaluation
             .artifacts

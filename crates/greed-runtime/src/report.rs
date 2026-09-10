@@ -616,6 +616,8 @@ fn recipe_from_id(id: &str) -> &'static str {
         "breadth_momentum"
     } else if id.contains("sfp_reversal") {
         "sfp_reversal"
+    } else if id.contains("trend_profit_reversal") {
+        "trend_profit_reversal"
     } else if id.contains("trend_continuation_reentry") {
         "trend_continuation_reentry"
     } else if id.contains("trend_continuation") {
@@ -636,7 +638,9 @@ fn lane_for_recipe(recipe: &str) -> &'static str {
         "btc_key_zone" => "btc_key_zone",
         "breadth_momentum" => "breadth_momentum",
         "sfp_reversal" => "sfp_reversal",
-        "trend_continuation" | "trend_continuation_reentry" => "trend_continuation",
+        "trend_continuation" | "trend_continuation_reentry" | "trend_profit_reversal" => {
+            "trend_continuation"
+        }
         "fast_trend_activation" => "fast_trend_activation",
         "intraday_sweep_reversal" => "intraday_sweep_reversal",
         "early_ignition" => "early_ignition",
@@ -877,6 +881,14 @@ mod tests {
         );
         assert_eq!(
             lane_for_recipe("trend_continuation_reentry"),
+            "trend_continuation"
+        );
+        assert_eq!(
+            recipe_from_id("trend_profit_reversal:HYPEUSDT:1:1"),
+            "trend_profit_reversal"
+        );
+        assert_eq!(
+            lane_for_recipe("trend_profit_reversal"),
             "trend_continuation"
         );
     }

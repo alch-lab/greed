@@ -29,6 +29,8 @@ const ENTRY_GUARD_REVERSAL_CONFIRM_MS: i64 = 15_000;
 const MIN_PERFORMANCE_FILL_RATIO: f64 = 0.20;
 const PERFORMANCE_BASIS_VERSION: u32 = 3;
 const TREND_REENTRY_RECIPE: &str = "trend_continuation_reentry";
+const TREND_PROFIT_REVERSAL_RECIPE: &str = "trend_profit_reversal";
+const MAX_PROFIT_REVERSALS_PER_CHAIN: u8 = 2;
 const LIQUIDATION_REVERSAL_RECIPE: &str = "liquidation_exhaustion_reversal";
 const LIQUIDATION_EXECUTION_BASIS_VERSION: u32 = 1;
 
@@ -159,6 +161,11 @@ struct ExecutionMeta {
     stop_reason: Option<String>,
     #[serde(default)]
     take_profit_order_ids: Vec<i64>,
+    /// Number of immediate direction changes already executed in the current
+    /// position chain. A fresh strategy entry starts at zero; the counter is
+    /// persisted so a restart cannot bypass the two-reversal ceiling.
+    #[serde(default)]
+    profit_reversal_count: u8,
 }
 
 impl ExecutionMeta {
@@ -197,6 +204,12 @@ struct TrendReentryCampaign {
     last_evaluated_bar_ms: i64,
     #[serde(default)]
     signal: Option<TrendReentrySignal>,
+    /// Immediate reversals are armed by a confirmed executable-profit exit and
+    /// do not wait for the ordinary second-leg reset/confirmation sequence.
+    #[serde(default)]
+    immediate_profit_reversal: bool,
+    #[serde(default)]
+    profit_reversal_count: u8,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -347,6 +360,8 @@ pub struct DemoPositionSnapshot {
     pub profit_shield_activation_pct: Option<f64>,
     pub executable_profit: Option<crate::profit_guard::ProfitGuard>,
     pub executable_profit_guard_enabled: bool,
+    pub profit_reversal_count: u8,
+    pub max_profit_reversals: u8,
     pub extreme_price: Option<f64>,
     pub trailing_activation_pct: Option<f64>,
     pub trailing_distance_pct: Option<f64>,
@@ -1512,33 +1527,68 @@ impl BinanceDemoExecution {
                                     }
                                 })
                         });
-                        if self.lanes.trend_reentry_enabled
-                            && meta.recipe == "trend_continuation"
+                        let executable_reversal = exit_reason == "executable_profit_protection"
                             && matches!(
-                                exit_reason.as_str(),
-                                "profit_shield_stop" | "executable_profit_protection"
+                                meta.recipe.as_str(),
+                                "trend_continuation"
+                                    | TREND_REENTRY_RECIPE
+                                    | TREND_PROFIT_REVERSAL_RECIPE
                             )
+                            && next_profit_reversal_count(meta.profit_reversal_count, &exit_reason)
+                                .is_some();
+                        let ordinary_second_leg = self.lanes.trend_reentry_enabled
+                            && meta.recipe == "trend_continuation"
+                            && exit_reason == "profit_shield_stop"
                             && summary
                                 .as_ref()
                                 .is_some_and(|value| value.net_pnl_usd > 0.0)
-                            && meta.extreme_price > f64::EPSILON
-                        {
+                            && meta.extreme_price > f64::EPSILON;
+                        if executable_reversal || ordinary_second_leg {
                             let first_exit_price = summary
                                 .as_ref()
                                 .map(|value| value.last_exit_price)
                                 .unwrap_or(meta.stop_price);
+                            let reversal_count = if executable_reversal {
+                                next_profit_reversal_count(meta.profit_reversal_count, &exit_reason)
+                                    .expect("executable reversal was checked above")
+                            } else {
+                                0
+                            };
+                            let stop_pct = (meta.initial_risk_usd.unwrap_or_default()
+                                / (meta.entry_price * meta.initial_quantity).max(f64::EPSILON))
+                            .clamp(
+                                self.lanes.trend_reentry_min_stop_pct,
+                                self.lanes.trend_reentry_max_stop_pct,
+                            );
                             let campaign = TrendReentryCampaign {
                                 source_candidate_id: meta.candidate_id.clone(),
                                 symbol: symbol.clone(),
-                                side: meta.side,
+                                side: if executable_reversal {
+                                    meta.side.opposite()
+                                } else {
+                                    meta.side
+                                },
                                 armed_ms: now_ms,
-                                expires_ms: now_ms
-                                    + i64::from(self.lanes.trend_reentry_window_minutes) * 60_000,
+                                expires_ms: if executable_reversal {
+                                    now_ms + 60_000
+                                } else {
+                                    now_ms
+                                        + i64::from(self.lanes.trend_reentry_window_minutes)
+                                            * 60_000
+                                },
                                 favorable_extreme: meta.extreme_price,
                                 first_exit_price,
-                                reset_ms: None,
+                                reset_ms: executable_reversal.then_some(now_ms),
                                 last_evaluated_bar_ms: now_ms,
-                                signal: None,
+                                signal: executable_reversal.then_some(TrendReentrySignal {
+                                    signal_ms: now_ms,
+                                    reference_price: first_exit_price,
+                                    stop_pct,
+                                    body_pct: 0.0,
+                                    directional_flow: 0.0,
+                                }),
+                                immediate_profit_reversal: executable_reversal,
+                                profit_reversal_count: reversal_count,
                             };
                             self.state
                                 .trend_reentries
@@ -1547,15 +1597,36 @@ impl BinanceDemoExecution {
                                 kind: "trend_reentry_state".into(),
                                 payload: serde_json::json!({
                                     "ts_ms":now_ms,
-                                    "recipe":TREND_REENTRY_RECIPE,
+                                    "recipe":if executable_reversal { TREND_PROFIT_REVERSAL_RECIPE } else { TREND_REENTRY_RECIPE },
                                     "source_candidate_id":campaign.source_candidate_id,
                                     "symbol":campaign.symbol,
                                     "side":campaign.side,
-                                    "stage":"waiting_for_reset",
+                                    "stage":if executable_reversal { "ready_to_reverse" } else { "waiting_for_reset" },
+                                    "immediate_profit_reversal":executable_reversal,
+                                    "profit_reversal_count":reversal_count,
+                                    "max_profit_reversals":MAX_PROFIT_REVERSALS_PER_CHAIN,
                                     "favorable_extreme":campaign.favorable_extreme,
                                     "first_exit_price":campaign.first_exit_price,
                                     "reset_required_pct":self.lanes.trend_reentry_reset_pct,
                                     "expires_ms":campaign.expires_ms,
+                                    "venue":"binance_demo",
+                                    "paper_only":true,
+                                }),
+                            });
+                        } else if exit_reason == "executable_profit_protection"
+                            && meta.profit_reversal_count >= MAX_PROFIT_REVERSALS_PER_CHAIN
+                        {
+                            events.push(ExchangeEvent {
+                                kind: "trend_reentry_state".into(),
+                                payload: serde_json::json!({
+                                    "ts_ms":now_ms,
+                                    "recipe":TREND_PROFIT_REVERSAL_RECIPE,
+                                    "source_candidate_id":meta.candidate_id,
+                                    "symbol":symbol,
+                                    "side":meta.side.opposite(),
+                                    "stage":"reversal_chain_complete",
+                                    "profit_reversal_count":meta.profit_reversal_count,
+                                    "max_profit_reversals":MAX_PROFIT_REVERSALS_PER_CHAIN,
                                     "venue":"binance_demo",
                                     "paper_only":true,
                                 }),
@@ -1822,7 +1893,11 @@ impl BinanceDemoExecution {
                 confirmed_count += 1;
             }
             let stage = if campaign.signal.is_some() {
-                "confirmed"
+                if campaign.immediate_profit_reversal {
+                    "ready_to_reverse"
+                } else {
+                    "confirmed"
+                }
             } else if campaign.reset_ms.is_some() {
                 "waiting_for_resume"
             } else {
@@ -1854,6 +1929,10 @@ impl BinanceDemoExecution {
                             "waiting for a completed 5m close through the prior {} bars",
                             self.lanes.trend_reentry_lookback_bars
                         ),
+                        "ready_to_reverse" => format!(
+                            "executable-profit exit confirmed; reverse leg {}/{} is ready",
+                            campaign.profit_reversal_count, MAX_PROFIT_REVERSALS_PER_CHAIN
+                        ),
                         _ => "second-leg entry is confirmed".into(),
                     }],
                     metrics: BTreeMap::from([
@@ -1881,14 +1960,35 @@ impl BinanceDemoExecution {
                     .and_then(|instrument| instrument.book.as_ref())
                     .filter(|book| book.meta.usable_at(frame.as_of_ms))
                 {
+                    let recipe = if campaign.immediate_profit_reversal {
+                        TREND_PROFIT_REVERSAL_RECIPE
+                    } else {
+                        TREND_REENTRY_RECIPE
+                    };
                     let mut tags = BTreeMap::from([
-                        ("lane".into(), TREND_REENTRY_RECIPE.into()),
-                        ("priority".into(), "1.2".into()),
+                        ("lane".into(), recipe.into()),
+                        (
+                            "priority".into(),
+                            if campaign.immediate_profit_reversal {
+                                "1.4"
+                            } else {
+                                "1.2"
+                            }
+                            .into(),
+                        ),
                         (
                             "parent_candidate_id".into(),
                             campaign.source_candidate_id.clone(),
                         ),
                         ("second_leg".into(), "true".into()),
+                        (
+                            "profit_reversal_count".into(),
+                            campaign.profit_reversal_count.to_string(),
+                        ),
+                        (
+                            "immediate_profit_reversal".into(),
+                            campaign.immediate_profit_reversal.to_string(),
+                        ),
                         (
                             "risk_per_trade_pct".into(),
                             self.lanes.trend_risk_per_trade_pct.to_string(),
@@ -1921,9 +2021,25 @@ impl BinanceDemoExecution {
                                 .to_string(),
                         ),
                         ("taker_fallback".into(), "true".into()),
-                        ("taker_fallback_max_adverse_bps".into(), "8".into()),
+                        (
+                            "taker_fallback_max_adverse_bps".into(),
+                            if campaign.immediate_profit_reversal {
+                                "20"
+                            } else {
+                                "8"
+                            }
+                            .into(),
+                        ),
                         ("taker_fallback_size_multiplier".into(), "1".into()),
-                        ("max_entry_adverse_bps".into(), "8".into()),
+                        (
+                            "max_entry_adverse_bps".into(),
+                            if campaign.immediate_profit_reversal {
+                                "20"
+                            } else {
+                                "8"
+                            }
+                            .into(),
+                        ),
                         ("min_fill_ratio".into(), "0.8".into()),
                         (
                             "min_managed_fill_ratio".into(),
@@ -1947,35 +2063,51 @@ impl BinanceDemoExecution {
                             signal.directional_flow.to_string(),
                         ),
                     ]);
-                    tags.insert(
-                        "entry_limit".into(),
-                        if campaign.side == Side::Buy {
-                            book.bid
-                        } else {
-                            book.ask
-                        }
-                        .to_string(),
-                    );
+                    if campaign.immediate_profit_reversal {
+                        tags.insert("bounded_taker_ioc".into(), "true".into());
+                    } else {
+                        tags.insert(
+                            "entry_limit".into(),
+                            if campaign.side == Side::Buy {
+                                book.bid
+                            } else {
+                                book.ask
+                            }
+                            .to_string(),
+                        );
+                    }
                     let candidate = TradeCandidate {
                         id: format!(
-                            "{TREND_REENTRY_RECIPE}:{}:{}",
-                            campaign.symbol, signal.signal_ms
+                            "{recipe}:{}:{}:{}",
+                            campaign.symbol, signal.signal_ms, campaign.profit_reversal_count
                         ),
-                        recipe: TREND_REENTRY_RECIPE.into(),
+                        recipe: recipe.into(),
                         symbol: campaign.symbol.clone(),
                         side: campaign.side,
                         signal_ms: signal.signal_ms,
                         expires_ms: (signal.signal_ms + 300_000).min(campaign.expires_ms),
                         reference_price: signal.reference_price,
-                        score: signal.body_pct * signal.directional_flow.max(0.0),
-                        confidence: (0.70
-                            + signal.body_pct.min(0.01) * 10.0
-                            + signal.directional_flow.min(0.30) * 0.30)
-                            .min(0.95),
+                        score: if campaign.immediate_profit_reversal {
+                            1.0
+                        } else {
+                            signal.body_pct * signal.directional_flow.max(0.0)
+                        },
+                        confidence: if campaign.immediate_profit_reversal {
+                            0.85
+                        } else {
+                            (0.70
+                                + signal.body_pct.min(0.01) * 10.0
+                                + signal.directional_flow.min(0.30) * 0.30)
+                                .min(0.95)
+                        },
                         verdict: Verdict::Pass,
                         blockers: vec![],
                         evidence: vec![
-                            format!("{}.binance_5m_second_leg", campaign.symbol),
+                            if campaign.immediate_profit_reversal {
+                                format!("{}.confirmed_executable_profit_exit", campaign.symbol)
+                            } else {
+                                format!("{}.binance_5m_second_leg", campaign.symbol)
+                            },
                             format!("{}.binance_ws_microstructure", campaign.symbol),
                             format!("{}.book", campaign.symbol),
                         ],
@@ -2140,6 +2272,7 @@ impl BinanceDemoExecution {
             "sfp_reversal",
             "trend_continuation",
             TREND_REENTRY_RECIPE,
+            TREND_PROFIT_REVERSAL_RECIPE,
             "fast_trend_activation",
             LIQUIDATION_REVERSAL_RECIPE,
             "intraday_sweep_reversal",
@@ -2253,6 +2386,10 @@ impl BinanceDemoExecution {
                                     && !value.runner_active
                                     && value.profit_shield_activation_pct.is_some()
                             }),
+                        profit_reversal_count: meta
+                            .map(|value| value.profit_reversal_count)
+                            .unwrap_or_default(),
+                        max_profit_reversals: MAX_PROFIT_REVERSALS_PER_CHAIN,
                         extreme_price: meta.map(|value| value.extreme_price),
                         trailing_activation_pct: meta
                             .and_then(|value| value.trailing_activation_pct),
@@ -2479,8 +2616,10 @@ impl BinanceDemoExecution {
             // campaign until it confirms, expires, or makes its single attempt.
             // Without ownership here, a fresh 15m candidate could bypass the
             // required reset and compete with the dedicated 5m second leg.
-            if recipe != TREND_REENTRY_RECIPE
-                && self.state.trend_reentries.contains_key(&plan.symbol)
+            if !matches!(
+                recipe.as_str(),
+                TREND_REENTRY_RECIPE | TREND_PROFIT_REVERSAL_RECIPE
+            ) && self.state.trend_reentries.contains_key(&plan.symbol)
             {
                 self.state.seen.insert(plan.candidate_id.clone());
                 events.push(ExchangeEvent {
@@ -2510,10 +2649,12 @@ impl BinanceDemoExecution {
             // A candle that predates this symbol's latest exit belongs to the
             // same episode we just traded. Reusing it caused an immediate PROM
             // re-entry after a profitable trailing exit.
-            if candidate.is_some_and(|value| {
-                self.latest_symbol_exit_ms(&plan.symbol)
-                    .is_some_and(|exit_ms| value.signal_ms <= exit_ms)
-            }) {
+            if recipe != TREND_PROFIT_REVERSAL_RECIPE
+                && candidate.is_some_and(|value| {
+                    self.latest_symbol_exit_ms(&plan.symbol)
+                        .is_some_and(|exit_ms| value.signal_ms <= exit_ms)
+                })
+            {
                 self.state.seen.insert(plan.candidate_id.clone());
                 events.push(ExchangeEvent {
                     kind: "exchange_plan_rejected".into(),
@@ -2521,10 +2662,12 @@ impl BinanceDemoExecution {
                 });
                 continue;
             }
-            if recipe != LIQUIDATION_REVERSAL_RECIPE
-                && self
-                    .symbol_loss_cooldown_until(&plan.symbol)
-                    .is_some_and(|until_ms| frame.as_of_ms < until_ms)
+            if !matches!(
+                recipe.as_str(),
+                LIQUIDATION_REVERSAL_RECIPE | TREND_PROFIT_REVERSAL_RECIPE
+            ) && self
+                .symbol_loss_cooldown_until(&plan.symbol)
+                .is_some_and(|until_ms| frame.as_of_ms < until_ms)
             {
                 self.state.seen.insert(plan.candidate_id.clone());
                 events.push(ExchangeEvent {
@@ -2550,7 +2693,10 @@ impl BinanceDemoExecution {
                 1.0
             };
             let cost = plan_cost_diagnostics(frame, plan);
-            if recipe == TREND_REENTRY_RECIPE {
+            if matches!(
+                recipe.as_str(),
+                TREND_REENTRY_RECIPE | TREND_PROFIT_REVERSAL_RECIPE
+            ) {
                 if let Some(campaign) = self.state.trend_reentries.remove(&plan.symbol) {
                     events.push(reentry_state_event(
                         frame.as_of_ms,
@@ -2675,6 +2821,11 @@ impl BinanceDemoExecution {
                             stop_algo_id: Some(fill.stop_algo_id),
                             stop_reason: Some("initial_stop".into()),
                             take_profit_order_ids: fill.take_profit_order_ids.clone(),
+                            profit_reversal_count: plan
+                                .signal_context
+                                .get("profit_reversal_count")
+                                .and_then(|value| value.parse().ok())
+                                .unwrap_or_default(),
                         },
                     );
                     self.record_filled_attempt(&plan.candidate_id, &recipe);
@@ -4062,6 +4213,11 @@ impl BinanceDemoExecution {
                 stop_algo_id: Some(stop_algo_id),
                 stop_reason: Some("initial_stop".into()),
                 take_profit_order_ids: take_profit_order_ids.clone(),
+                profit_reversal_count: plan
+                    .signal_context
+                    .get("profit_reversal_count")
+                    .and_then(|value| value.parse().ok())
+                    .unwrap_or_default(),
             },
         );
         self.state.pending_entries.remove(&plan.symbol);
@@ -5603,21 +5759,34 @@ fn protective_exit_reason(meta: &ExecutionMeta) -> &str {
     }
 }
 
+fn next_profit_reversal_count(current: u8, exit_reason: &str) -> Option<u8> {
+    (exit_reason == "executable_profit_protection" && current < MAX_PROFIT_REVERSALS_PER_CHAIN)
+        .then(|| current + 1)
+}
+
 fn reentry_state_event(
     ts_ms: i64,
     campaign: &TrendReentryCampaign,
     stage: &str,
     detail: Value,
 ) -> ExchangeEvent {
+    let recipe = if campaign.immediate_profit_reversal {
+        TREND_PROFIT_REVERSAL_RECIPE
+    } else {
+        TREND_REENTRY_RECIPE
+    };
     ExchangeEvent {
         kind: "trend_reentry_state".into(),
         payload: serde_json::json!({
             "ts_ms":ts_ms,
-            "recipe":TREND_REENTRY_RECIPE,
+            "recipe":recipe,
             "source_candidate_id":campaign.source_candidate_id,
             "symbol":campaign.symbol,
             "side":campaign.side,
             "stage":stage,
+            "immediate_profit_reversal":campaign.immediate_profit_reversal,
+            "profit_reversal_count":campaign.profit_reversal_count,
+            "max_profit_reversals":MAX_PROFIT_REVERSALS_PER_CHAIN,
             "armed_ms":campaign.armed_ms,
             "expires_ms":campaign.expires_ms,
             "reset_ms":campaign.reset_ms,
@@ -7148,6 +7317,39 @@ mod tests {
             },
         ];
         assert_eq!(loss_cooldown_until(Some(&recovered), 180), None);
+    }
+
+    #[test]
+    fn executable_profit_reversal_chain_stops_after_two_direction_changes() {
+        assert_eq!(
+            next_profit_reversal_count(0, "executable_profit_protection"),
+            Some(1)
+        );
+        assert_eq!(
+            next_profit_reversal_count(1, "executable_profit_protection"),
+            Some(2)
+        );
+        assert_eq!(
+            next_profit_reversal_count(2, "executable_profit_protection"),
+            None
+        );
+        assert_eq!(next_profit_reversal_count(0, "initial_stop"), None);
+    }
+
+    #[test]
+    fn legacy_reentry_campaign_starts_outside_a_profit_reversal_chain() {
+        let campaign: TrendReentryCampaign = serde_json::from_value(serde_json::json!({
+            "source_candidate_id":"trend_continuation:HYPEUSDT:1",
+            "symbol":"HYPEUSDT",
+            "side":"sell",
+            "armed_ms":1,
+            "expires_ms":2,
+            "favorable_extreme":80.0,
+            "first_exit_price":82.0
+        }))
+        .expect("old campaign state should remain readable");
+        assert!(!campaign.immediate_profit_reversal);
+        assert_eq!(campaign.profit_reversal_count, 0);
     }
 
     #[test]
