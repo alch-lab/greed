@@ -54,7 +54,11 @@ impl StrategyNode for LiquidationExhaustionReversalNode {
             if event_ms <= 0 {
                 continue;
             }
-            let age_ms = ctx.frame.as_of_ms.saturating_sub(event_ms);
+            // Exchange clocks are useful for identity and audit, but the
+            // local receive time is the first instant at which an order could
+            // causally react to this event.
+            let received_ms = micro.liquidation_received_ms.unwrap_or(event_ms);
+            let age_ms = ctx.frame.as_of_ms.saturating_sub(received_ms);
             let long_liquidations = micro.long_liquidations_3s.unwrap_or_default();
             let short_liquidations = micro.short_liquidations_3s.unwrap_or_default();
             let dominance = micro.liquidation_dominance_3s.unwrap_or_default();
@@ -81,11 +85,18 @@ impl StrategyNode for LiquidationExhaustionReversalNode {
             );
 
             let mut blockers = Vec::new();
+            let mut executable_reference = None;
+            let mut quote_received_ms = None;
             if !micro.meta.usable_at(ctx.frame.as_of_ms) {
                 blockers.push("trade and liquidation stream is stale".into());
             }
             match instrument.book.as_ref() {
                 Some(book) if book.meta.usable_at(ctx.frame.as_of_ms) => {
+                    executable_reference = Some(match side {
+                        Side::Buy => book.ask,
+                        Side::Sell => book.bid,
+                    });
+                    quote_received_ms = Some(book.meta.received_ms);
                     let spread = (book.ask - book.bid)
                         / ((book.ask + book.bid) * 0.5).max(f64::EPSILON)
                         * 10_000.0;
@@ -149,9 +160,12 @@ impl StrategyNode for LiquidationExhaustionReversalNode {
                 recipe: "liquidation_exhaustion_reversal".into(),
                 symbol: symbol.clone(),
                 side,
-                signal_ms: event_ms,
-                expires_ms: event_ms + max_age_ms,
-                reference_price: instrument.price,
+                signal_ms: received_ms,
+                expires_ms: received_ms + max_age_ms,
+                // This is a seconds-scale taker setup.  A candle close is not
+                // an executable reference and can lag the live book by tens
+                // of bps during the exact shock we are trying to trade.
+                reference_price: executable_reference.unwrap_or(instrument.price),
                 score,
                 confidence: if verdict == Verdict::Pass {
                     0.80
@@ -177,7 +191,21 @@ impl StrategyNode for LiquidationExhaustionReversalNode {
                         self.config.liquidation_window_seconds.to_string(),
                     ),
                     ("liquidation_event_ms".into(), event_ms.to_string()),
+                    ("liquidation_received_ms".into(), received_ms.to_string()),
                     ("signal_age_ms".into(), age_ms.to_string()),
+                    (
+                        "reference_quote_received_ms".into(),
+                        quote_received_ms.unwrap_or_default().to_string(),
+                    ),
+                    (
+                        "reference_price_source".into(),
+                        if executable_reference.is_some() {
+                            "executable_book"
+                        } else {
+                            "candle_fallback_unusable"
+                        }
+                        .into(),
+                    ),
                     (
                         "long_liquidations_3s_usd".into(),
                         long_liquidations.to_string(),
@@ -400,6 +428,7 @@ mod tests {
                         liquidation_aligned_return_bps_3s: Some(4.0),
                         liquidation_reversal_bps: Some(15.0),
                         liquidation_event_ms: Some(8_000),
+                        liquidation_received_ms: Some(8_000),
                         snapshot_ofi_10s: None,
                         snapshot_ofi_60s: None,
                         mid_return_bps_10s: None,
@@ -445,6 +474,9 @@ mod tests {
             .expect("qualifying event should produce a candidate");
         assert_eq!(candidate.verdict, Verdict::Pass);
         assert_eq!(candidate.side, Side::Buy);
+        assert_eq!(candidate.reference_price, 99.91);
+        assert_eq!(candidate.tags["reference_price_source"], "executable_book");
+        assert_eq!(candidate.tags["reference_quote_received_ms"], "8000");
         assert_eq!(candidate.tags["fixed_time_exit"], "false");
         assert_eq!(candidate.tags["managed_exit_only"], "true");
         assert_eq!(candidate.tags["break_even_buffer_pct"], "0.001");
@@ -466,6 +498,7 @@ mod tests {
             .find_map(|record| record.artifact.candidate())
             .unwrap();
         assert_eq!(candidate.side, Side::Sell);
+        assert_eq!(candidate.reference_price, 99.89);
     }
 
     #[test]
@@ -494,5 +527,35 @@ mod tests {
             .blockers
             .iter()
             .any(|reason| reason.contains("post-liquidation recovery")));
+    }
+
+    #[test]
+    fn freshness_uses_causal_receive_time_not_exchange_clock() {
+        let mut market = frame(9_000.0, 1_000.0);
+        let micro = market
+            .instruments
+            .get_mut("ALTUSDT")
+            .and_then(|instrument| instrument.microstructure.as_mut())
+            .unwrap();
+        // Simulate an exchange clock ahead of the local process. The event was
+        // observable locally at 8s, so a 10s frame may safely act on it.
+        micro.liquidation_event_ms = Some(12_000);
+        micro.liquidation_received_ms = Some(8_000);
+        let mut node =
+            LiquidationExhaustionReversalNode::new(&["ALTUSDT".into()], LaneConfig::default());
+        let records = node
+            .evaluate(&NodeContext {
+                frame: &market,
+                artifacts: &BTreeMap::new(),
+            })
+            .unwrap();
+        let candidate = records
+            .iter()
+            .find_map(|record| record.artifact.candidate())
+            .unwrap();
+        assert_eq!(candidate.verdict, Verdict::Pass);
+        assert_eq!(candidate.signal_ms, 8_000);
+        assert_eq!(candidate.tags["liquidation_event_ms"], "12000");
+        assert_eq!(candidate.tags["liquidation_received_ms"], "8000");
     }
 }

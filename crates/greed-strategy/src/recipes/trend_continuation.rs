@@ -727,6 +727,7 @@ mod tests {
                 liquidation_aligned_return_bps_3s: None,
                 liquidation_reversal_bps: None,
                 liquidation_event_ms: None,
+                liquidation_received_ms: None,
                 snapshot_ofi_10s: None,
                 snapshot_ofi_60s: None,
                 mid_return_bps_10s: Some(-8.0),

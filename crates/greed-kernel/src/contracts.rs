@@ -125,6 +125,10 @@ pub struct MicrostructureState {
     pub liquidation_reversal_bps: Option<f64>,
     #[serde(default)]
     pub liquidation_event_ms: Option<i64>,
+    /// Local time at which the newest liquidation snapshot became observable.
+    /// Entry freshness uses this causal clock rather than exchange time.
+    #[serde(default)]
+    pub liquidation_received_ms: Option<i64>,
     /// Cont-style top-of-book order-flow imbalance derived from consecutive
     /// 500ms depth snapshots and normalized by average visible top-level
     /// notional. This is snapshot OFI, not exchange tick-by-tick L2 OFI.

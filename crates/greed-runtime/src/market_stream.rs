@@ -283,6 +283,7 @@ impl MarketStreamHub {
                 .and_then(|value| value.aligned_return_bps),
             liquidation_reversal_bps: liquidation_3s.as_ref().and_then(|value| value.reversal_bps),
             liquidation_event_ms: liquidation_3s.as_ref().map(|value| value.event_ms),
+            liquidation_received_ms: liquidation_3s.as_ref().map(|value| value.received_ms),
             snapshot_ofi_10s: flow_10s.as_ref().map(|value| value.normalized_ofi),
             snapshot_ofi_60s: flow_60s.as_ref().map(|value| value.normalized_ofi),
             mid_return_bps_10s: flow_10s.as_ref().map(|value| value.mid_return_bps),
@@ -293,6 +294,42 @@ impl MarketStreamHub {
             }),
             book_updates_10s: flow_10s.as_ref().map_or(0, |value| value.updates),
             book_updates_60s: flow_60s.as_ref().map_or(0, |value| value.updates),
+        })
+    }
+
+    /// Whether a subscribed symbol has a fresh liquidation burst that already
+    /// clears the event-strength gates. Slow REST cache maintenance yields to
+    /// these plausible setups, without starving on every tiny forced order.
+    pub fn has_recent_liquidation_setup(
+        &self,
+        now_ms: i64,
+        window_ms: i64,
+        max_age_ms: i64,
+        min_dominance: f64,
+        min_depth_ratio: f64,
+    ) -> bool {
+        let state = self.state.read().expect("stream state poisoned");
+        state.desired_symbols.iter().any(|symbol| {
+            let Some(values) = state.liquidations.get(symbol) else {
+                return false;
+            };
+            let Some(event) = values.back() else {
+                return false;
+            };
+            if event.received_ms > now_ms + 1_000
+                || now_ms.saturating_sub(event.received_ms) > max_age_ms
+            {
+                return false;
+            }
+            aggregate_liquidation_window(
+                values,
+                state.book_flow.get(symbol),
+                state.books.get(symbol),
+                window_ms,
+            )
+            .is_some_and(|value| {
+                value.dominance >= min_dominance && value.depth_ratio >= min_depth_ratio
+            })
         })
     }
 
@@ -915,13 +952,12 @@ fn update_trade(state: &Arc<RwLock<StreamState>>, value: &Value, received_ms: i6
     let symbol = string(value, "s")?.to_uppercase();
     let notional = number(value, "p")? * number(value, "q")?;
     let is_taker_buy = !value.get("m").and_then(Value::as_bool).unwrap_or(false);
-    let event_ms = value
-        .get("T")
-        .and_then(Value::as_i64)
-        .unwrap_or(received_ms);
     let mut state = state.write().expect("stream state poisoned");
     let values = state.trades.entry(symbol).or_default();
-    values.push_back((event_ms, is_taker_buy, notional));
+    // This cache drives causal freshness and rolling flow at the local
+    // process. Exchange event clocks can be slightly ahead or behind and must
+    // not make a newly observed trade look future-dated or stale.
+    values.push_back((received_ms, is_taker_buy, notional));
     while values
         .front()
         .is_some_and(|(ts, _, _)| *ts < received_ms - 120_000)
@@ -1144,6 +1180,7 @@ struct BookFlowAggregate {
 
 struct LiquidationWindowAggregate {
     event_ms: i64,
+    received_ms: i64,
     long_notional_usd: f64,
     short_notional_usd: f64,
     dominance: f64,
@@ -1265,6 +1302,7 @@ fn aggregate_liquidation_window(
     });
     Some(LiquidationWindowAggregate {
         event_ms: latest.event_ms,
+        received_ms: latest.received_ms,
         long_notional_usd,
         short_notional_usd,
         dominance: directional_notional / total,
@@ -1833,6 +1871,31 @@ mod tests {
     }
 
     #[test]
+    fn recent_liquidation_preempts_slow_frame_maintenance() {
+        let state = Arc::new(RwLock::new(StreamState::default()));
+        {
+            let mut inner = state.write().unwrap();
+            inner.desired_symbols.insert("ALTUSDT".into());
+            inner.liquidations.insert(
+                "ALTUSDT".into(),
+                VecDeque::from([LiquidationObservation {
+                    event_ms: 9_900,
+                    received_ms: 10_000,
+                    is_long_liquidation: true,
+                    notional_usd: 1_000.0,
+                    pressure_depth_usd: 500.0,
+                    mid: 1.0,
+                    book_received_ms: 10_000,
+                }]),
+            );
+        }
+        let (symbols, _) = watch::channel(Vec::new());
+        let hub = MarketStreamHub { state, symbols };
+        assert!(hub.has_recent_liquidation_setup(15_000, 3_000, 12_000, 0.80, 1.20));
+        assert!(!hub.has_recent_liquidation_setup(22_001, 3_000, 12_000, 0.80, 1.20));
+    }
+
+    #[test]
     fn snapshot_ofi_is_positive_when_bid_queue_grows() {
         let previous = test_book(1_000, 99.0, 10.0, 101.0, 10.0);
         let mut current = test_book(1_500, 99.0, 20.0, 101.0, 10.0);
@@ -1923,6 +1986,7 @@ mod tests {
                 .unwrap();
         assert_eq!(aggregate.long_notional_usd, 9_000.0);
         assert_eq!(aggregate.short_notional_usd, 1_000.0);
+        assert_eq!(aggregate.received_ms, 10_000);
         assert!((aggregate.dominance - 0.9).abs() < 1e-9);
         assert!((aggregate.depth_ratio - 0.9).abs() < 1e-9);
         assert!((aggregate.aligned_return_bps.unwrap() - 10.0).abs() < 1e-9);

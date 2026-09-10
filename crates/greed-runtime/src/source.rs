@@ -925,8 +925,26 @@ impl BinanceMarketSource {
         let mut instruments = BTreeMap::new();
         let mut warnings = Vec::new();
         self.set_stream_symbols(strategy);
-        self.bootstrap_missing_klines(strategy, now).await;
-        self.refresh_open_interest(strategy, now).await;
+        let urgent_liquidation = strategy.lanes.liquidation_reversal_enabled
+            && self.stream.as_ref().is_some_and(|stream| {
+                stream.has_recent_liquidation_setup(
+                    now,
+                    i64::from(strategy.lanes.liquidation_window_seconds) * 1_000,
+                    i64::from(strategy.lanes.liquidation_max_signal_age_seconds) * 1_000,
+                    strategy.lanes.liquidation_min_dominance,
+                    strategy.lanes.liquidation_min_depth_ratio,
+                )
+            });
+        if !urgent_liquidation {
+            self.bootstrap_missing_klines(strategy, now).await;
+            self.refresh_open_interest(strategy, now).await;
+        }
+        // REST bootstrap and OI refresh can take several seconds.  Taking a
+        // websocket snapshot against the timestamp captured before those
+        // awaits made newly arrived liquidation events look as if they came
+        // from the future on one frame and as already expired on the next.
+        // Use one post-await timestamp for every live component in this frame.
+        let snapshot_ms = chrono::Utc::now().timestamp_millis();
         for symbol in &strategy.symbols {
             if !self
                 .candle_cache
@@ -935,7 +953,7 @@ impl BinanceMarketSource {
                 continue;
             }
             let perpetual = match self
-                .streamed_klines(symbol, "15m", self.config.candle_limit, now)
+                .streamed_klines(symbol, "15m", self.config.candle_limit, snapshot_ms)
                 .await
             {
                 Ok(series) => series,
@@ -950,7 +968,12 @@ impl BinanceMarketSource {
                 .contains_key(&(symbol.clone(), "1h".to_string()))
             {
                 match self
-                    .streamed_klines(symbol, "1h", self.config.research_backfill_1h_bars, now)
+                    .streamed_klines(
+                        symbol,
+                        "1h",
+                        self.config.research_backfill_1h_bars,
+                        snapshot_ms,
+                    )
                     .await
                 {
                     Ok(value) => Some(value),
@@ -967,7 +990,12 @@ impl BinanceMarketSource {
                 .contains_key(&(symbol.clone(), "5m".to_string()))
             {
                 match self
-                    .streamed_klines(symbol, "5m", self.config.research_backfill_5m_bars, now)
+                    .streamed_klines(
+                        symbol,
+                        "5m",
+                        self.config.research_backfill_5m_bars,
+                        snapshot_ms,
+                    )
                     .await
                 {
                     Ok(value) => Some(value),
@@ -983,27 +1011,36 @@ impl BinanceMarketSource {
                 .candle_cache
                 .contains_key(&(symbol.clone(), "1m".to_string()))
             {
-                self.streamed_klines(symbol, "1m", self.config.research_backfill_1m_bars, now)
-                    .await
-                    .ok()
+                self.streamed_klines(
+                    symbol,
+                    "1m",
+                    self.config.research_backfill_1m_bars,
+                    snapshot_ms,
+                )
+                .await
+                .ok()
             } else {
-                self.stream_observation_klines(symbol, "1m", 60_000, now)
+                self.stream_observation_klines(symbol, "1m", 60_000, snapshot_ms)
             };
             let book = self
                 .stream
                 .as_ref()
-                .and_then(|stream| stream.book(symbol, now));
+                .and_then(|stream| stream.book(symbol, snapshot_ms));
             let warming = self
                 .stream
                 .as_ref()
-                .is_some_and(|stream| stream.symbol_is_warming(symbol, now));
-            if !warming && book.as_ref().is_none_or(|value| !value.meta.usable_at(now)) {
+                .is_some_and(|stream| stream.symbol_is_warming(symbol, snapshot_ms));
+            if !warming
+                && book
+                    .as_ref()
+                    .is_none_or(|value| !value.meta.usable_at(snapshot_ms))
+            {
                 warnings.push(format!("websocket depth stale or missing {symbol}"));
             }
             let microstructure = self
                 .stream
                 .as_ref()
-                .and_then(|stream| stream.microstructure(symbol, now));
+                .and_then(|stream| stream.microstructure(symbol, snapshot_ms));
             instruments.insert(
                 symbol.clone(),
                 InstrumentFrame {
@@ -1023,7 +1060,7 @@ impl BinanceMarketSource {
             self.last_error = Some(warnings.join(" | "));
         }
         Ok(MarketFrame {
-            as_of_ms: now,
+            as_of_ms: snapshot_ms,
             instruments,
             account,
         })
