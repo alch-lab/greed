@@ -372,6 +372,7 @@ async fn one_frame(
                 risk_day_start_equity_usd: config.portfolio.initial_equity_usd,
                 gross_exposure_usd: 0.0,
                 open_positions: 0,
+                active_slots_by_recipe: BTreeMap::new(),
             },
         )
         .await?;

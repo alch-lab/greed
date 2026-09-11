@@ -113,6 +113,7 @@ pub struct LaneConfig {
     pub trend_min_managed_fill_ratio: f64,
     pub trend_entry_invalidation_bps: f64,
     pub trend_max_post_signal_extension_bps: f64,
+    pub trend_max_post_signal_favorable_bps: f64,
     pub trend_max_opposing_micro_flow: f64,
     pub trend_max_opposing_micro_return_bps: f64,
     pub trend_risk_per_trade_pct: f64,
@@ -120,6 +121,8 @@ pub struct LaneConfig {
     pub trend_profit_shield_buffer_pct: f64,
     pub trend_pre_tp_trailing_activation_r: f64,
     pub trend_early_failure_seconds: u32,
+    pub trend_early_failure_grace_seconds: u32,
+    pub trend_early_failure_grace_min_body_atr: f64,
     pub trend_early_failure_adverse_r: f64,
     pub trend_early_failure_max_mfe_r: f64,
     pub trend_reentry_enabled: bool,
@@ -192,6 +195,7 @@ impl Default for LaneConfig {
             trend_min_managed_fill_ratio: 0.20,
             trend_entry_invalidation_bps: 30.0,
             trend_max_post_signal_extension_bps: 12.0,
+            trend_max_post_signal_favorable_bps: 30.0,
             trend_max_opposing_micro_flow: 0.10,
             trend_max_opposing_micro_return_bps: 3.0,
             trend_risk_per_trade_pct: 0.015,
@@ -199,6 +203,8 @@ impl Default for LaneConfig {
             trend_profit_shield_buffer_pct: 0.0015,
             trend_pre_tp_trailing_activation_r: 1.0,
             trend_early_failure_seconds: 180,
+            trend_early_failure_grace_seconds: 180,
+            trend_early_failure_grace_min_body_atr: 2.0,
             trend_early_failure_adverse_r: 0.50,
             trend_early_failure_max_mfe_r: 0.32,
             trend_reentry_enabled: true,
@@ -362,6 +368,7 @@ impl StrategyConfig {
             || !(0.0..=lanes.trend_min_fill_ratio).contains(&lanes.trend_min_managed_fill_ratio)
             || !(5.0..=100.0).contains(&lanes.trend_entry_invalidation_bps)
             || !(0.0..=100.0).contains(&lanes.trend_max_post_signal_extension_bps)
+            || !(0.0..=200.0).contains(&lanes.trend_max_post_signal_favorable_bps)
             || !(0.0..=0.80).contains(&lanes.trend_max_opposing_micro_flow)
             || !(0.0..=25.0).contains(&lanes.trend_max_opposing_micro_return_bps)
             || !(0.001..=0.015).contains(&lanes.trend_risk_per_trade_pct)
@@ -369,6 +376,9 @@ impl StrategyConfig {
             || !(0.0005..=0.003).contains(&lanes.trend_profit_shield_buffer_pct)
             || !(0.5..=2.0).contains(&lanes.trend_pre_tp_trailing_activation_r)
             || !(60..=900).contains(&lanes.trend_early_failure_seconds)
+            || !(lanes.trend_early_failure_seconds..=900)
+                .contains(&lanes.trend_early_failure_grace_seconds)
+            || !(0.5..=5.0).contains(&lanes.trend_early_failure_grace_min_body_atr)
             || !(0.1..=0.9).contains(&lanes.trend_early_failure_adverse_r)
             || !(0.0..=0.5).contains(&lanes.trend_early_failure_max_mfe_r)
             || lanes.trend_early_failure_max_mfe_r > lanes.trend_profit_shield_activation_r

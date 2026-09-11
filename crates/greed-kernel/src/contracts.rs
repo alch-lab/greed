@@ -207,6 +207,10 @@ pub struct AccountFrame {
     pub risk_day_start_equity_usd: f64,
     pub gross_exposure_usd: f64,
     pub open_positions: usize,
+    /// Locally attributed open or pending execution slots by recipe. Older
+    /// serialized frames remain compatible and are treated as unattributed.
+    #[serde(default)]
+    pub active_slots_by_recipe: BTreeMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

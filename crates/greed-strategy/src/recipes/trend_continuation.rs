@@ -71,6 +71,27 @@ fn post_signal_extension_bps(side: Side, signal_close: f64, live_price: f64) -> 
     side.sign() * (live_price / signal_close.max(f64::EPSILON) - 1.0) * 10_000.0
 }
 
+fn effective_early_failure_seconds(
+    configured_seconds: u32,
+    grace_seconds: u32,
+    reclaim_body_atr: f64,
+    min_grace_body_atr: f64,
+    side: Side,
+    live_trade_imbalance: Option<f64>,
+    max_opposing_flow: f64,
+) -> (u32, &'static str) {
+    let fresh_flow_supports_room =
+        live_trade_imbalance.is_some_and(|flow| side.sign() * flow >= -max_opposing_flow);
+    if reclaim_body_atr >= min_grace_body_atr && fresh_flow_supports_room {
+        (
+            configured_seconds.max(grace_seconds),
+            "strong_fresh_impulse",
+        )
+    } else {
+        (configured_seconds, "standard")
+    }
+}
+
 fn strong_opposing_microstructure(
     side: Side,
     trade_imbalance: Option<f64>,
@@ -282,6 +303,13 @@ impl StrategyNode for TrendContinuationNode {
                     self.config.trend_max_post_signal_extension_bps
                 ));
             }
+            if post_signal_extension_bps < -self.config.trend_max_post_signal_favorable_bps {
+                blockers.push(format!(
+                    "price already moved {:.1} bps with the signal; a passive fill would require too much reversal / max {:.1} bps",
+                    -post_signal_extension_bps,
+                    self.config.trend_max_post_signal_favorable_bps
+                ));
+            }
             if strong_live_reversal {
                 blockers.push(format!(
                     "live flow {:.0}% and 10s price response {:.1} bps oppose the entry",
@@ -416,6 +444,16 @@ impl StrategyNode for TrendContinuationNode {
             ]);
             if verdict == Verdict::Pass {
                 if let Some(book) = instrument.book.as_ref() {
+                    let (early_failure_seconds, early_failure_mode) =
+                        effective_early_failure_seconds(
+                            self.config.trend_early_failure_seconds,
+                            self.config.trend_early_failure_grace_seconds,
+                            reclaim_body_atr,
+                            self.config.trend_early_failure_grace_min_body_atr,
+                            side,
+                            live_trade_imbalance,
+                            self.config.trend_max_opposing_micro_flow,
+                        );
                     // A fresh 15m reclaim is the signal, not the executable
                     // price. Rest one level deeper for a brief retest and do
                     // not chase when the continuation leaves without us.
@@ -482,8 +520,9 @@ impl StrategyNode for TrendContinuationNode {
                     );
                     tags.insert(
                         "early_failure_after_ms".into(),
-                        (i64::from(self.config.trend_early_failure_seconds) * 1_000).to_string(),
+                        (i64::from(early_failure_seconds) * 1_000).to_string(),
                     );
+                    tags.insert("early_failure_mode".into(), early_failure_mode.into());
                     tags.insert(
                         "early_failure_adverse_r".into(),
                         self.config.trend_early_failure_adverse_r.to_string(),
@@ -658,6 +697,26 @@ mod tests {
         assert!((post_signal_extension_bps(Side::Buy, 100.0, 100.12) - 12.0).abs() < 1e-9);
         assert!((post_signal_extension_bps(Side::Sell, 100.0, 99.88) - 12.0).abs() < 1e-9);
         assert!(post_signal_extension_bps(Side::Buy, 100.0, 99.9) < 0.0);
+    }
+
+    #[test]
+    fn strong_fresh_impulse_gets_room_but_opposing_or_missing_flow_does_not() {
+        assert_eq!(
+            effective_early_failure_seconds(60, 180, 2.2, 2.0, Side::Sell, Some(0.0), 0.10),
+            (180, "strong_fresh_impulse")
+        );
+        assert_eq!(
+            effective_early_failure_seconds(60, 180, 2.2, 2.0, Side::Sell, Some(0.20), 0.10),
+            (60, "standard")
+        );
+        assert_eq!(
+            effective_early_failure_seconds(60, 180, 2.2, 2.0, Side::Sell, None, 0.10),
+            (60, "standard")
+        );
+        assert_eq!(
+            effective_early_failure_seconds(60, 180, 1.9, 2.0, Side::Buy, Some(0.20), 0.10),
+            (60, "standard")
+        );
     }
 
     #[test]

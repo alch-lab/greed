@@ -158,6 +158,10 @@ trend_entry_invalidation_bps = 30.0
 # completed 15m reclaim. This avoided the late STX loss in the 2026-08-27
 # Demo counterfactual while preserving the profitable CYS entry.
 trend_max_post_signal_extension_bps = 12.0
+# A passive order is also stale when price has already travelled far in the
+# intended direction: it can then fill only after a sharp reversal back toward
+# the signal. The 30 bps cap removes this observed adverse-selection pattern.
+trend_max_post_signal_favorable_bps = 30.0
 # Veto only when live trade flow and the 10s price response both strongly
 # oppose the completed 15m signal.
 trend_max_opposing_micro_flow = 0.10
@@ -178,6 +182,11 @@ trend_pre_tp_trailing_activation_r = 1.0
 # Below the +0.32R profit-shield handoff, a continuation that reaches -0.5R
 # after one minute has failed; flatten it rather than waiting for -1R.
 trend_early_failure_seconds = 60
+# A large fresh impulse with non-opposing live flow gets one completed
+# three-minute retest window. Ordinary or opposing-flow entries keep the fast
+# 60-second failure cap.
+trend_early_failure_grace_seconds = 180
+trend_early_failure_grace_min_body_atr = 2.0
 trend_early_failure_adverse_r = 0.50
 trend_early_failure_max_mfe_r = 0.32
 # A profitable shield exit keeps one continuation campaign alive. Price must
@@ -206,12 +215,13 @@ max_notional_per_trade_multiple = 1.50
 max_total_gross_multiple = 4.00
 # Size against the actual protective-exit side of the live top-20 book. Orders
 # may shrink, but may not consume more than 35% of visible depth or simulate
-# more than 8 bps of VWAP impact. Reject sizes below half the intended order or
-# 0.20x equity because their expected dollar contribution is immaterial.
+# more than 8 bps of VWAP impact. A valid signal may scale to 15% of desired
+# size, but never below 10% of equity; this keeps thin books from blocking the
+# entire trend lane while refusing economically meaningless dust positions.
 max_book_participation_pct = 0.35
 max_book_slippage_bps = 8.0
-min_liquidity_size_ratio = 0.50
-min_liquidity_notional_multiple = 0.20
+min_liquidity_size_ratio = 0.15
+min_liquidity_notional_multiple = 0.10
 max_positions = 3
 initial_stop_pct = 0.0125
 first_take_profit_r = 2.0

@@ -28,11 +28,25 @@ const ENTRY_GUARD_STALE_GRACE_MS: i64 = 5_000;
 const ENTRY_GUARD_REVERSAL_CONFIRM_MS: i64 = 15_000;
 const MIN_PERFORMANCE_FILL_RATIO: f64 = 0.20;
 const PERFORMANCE_BASIS_VERSION: u32 = 3;
+const FAST_TREND_ACTIVATION_RECIPE: &str = "fast_trend_activation";
 const TREND_REENTRY_RECIPE: &str = "trend_continuation_reentry";
 const TREND_PROFIT_REVERSAL_RECIPE: &str = "trend_profit_reversal";
 const MAX_PROFIT_REVERSALS_PER_CHAIN: u8 = 2;
 const LIQUIDATION_REVERSAL_RECIPE: &str = "liquidation_exhaustion_reversal";
 const LIQUIDATION_EXECUTION_BASIS_VERSION: u32 = 1;
+
+fn recipe_slot_full(
+    recipe: &str,
+    fast_active: usize,
+    standard_active: usize,
+    max_standard: usize,
+) -> bool {
+    if recipe == FAST_TREND_ACTIVATION_RECIPE {
+        fast_active >= 1
+    } else {
+        standard_active >= max_standard
+    }
+}
 
 pub struct ExchangeEvent {
     pub kind: String,
@@ -1708,6 +1722,17 @@ impl BinanceDemoExecution {
             .values()
             .map(|position| position.quantity.abs() * position.mark_price)
             .sum();
+        let mut active_slots_by_recipe = BTreeMap::new();
+        for meta in self.state.positions.values() {
+            *active_slots_by_recipe
+                .entry(meta.recipe.clone())
+                .or_insert(0) += 1;
+        }
+        for pending in self.state.pending_entries.values() {
+            *active_slots_by_recipe
+                .entry(pending.recipe.clone())
+                .or_insert(0) += 1;
+        }
         Ok(AccountFrame {
             equity_usd: equity,
             cash_usd: self.portfolio.initial_equity_usd + account.available_balance - baseline,
@@ -1715,7 +1740,8 @@ impl BinanceDemoExecution {
             peak_equity_usd: peak,
             risk_day_start_equity_usd: self.state.risk_day_start_equity_usd.unwrap_or(equity),
             gross_exposure_usd: gross,
-            open_positions: account.positions.len(),
+            open_positions: account.positions.len() + self.state.pending_entries.len(),
+            active_slots_by_recipe,
         })
     }
 
@@ -2588,12 +2614,42 @@ impl BinanceDemoExecution {
                 // loop. The same unconsumed zone can then create the new leg.
                 continue;
             }
+            let fast_active = self
+                .state
+                .positions
+                .values()
+                .filter(|meta| meta.recipe == FAST_TREND_ACTIVATION_RECIPE)
+                .count()
+                + self
+                    .state
+                    .pending_entries
+                    .values()
+                    .filter(|pending| pending.recipe == FAST_TREND_ACTIVATION_RECIPE)
+                    .count();
+            let locally_active = self.state.positions.len() + self.state.pending_entries.len();
+            let unattributed_exchange_positions = self
+                .account
+                .as_ref()
+                .map(|account| {
+                    account
+                        .positions
+                        .len()
+                        .saturating_sub(self.state.positions.len())
+                })
+                .unwrap_or_default();
+            let standard_active =
+                locally_active.saturating_sub(fast_active) + unattributed_exchange_positions;
+            let slot_full = recipe_slot_full(
+                &recipe,
+                fast_active,
+                standard_active,
+                self.portfolio.max_positions,
+            );
             if self.account.as_ref().is_some_and(|account| {
                 account.positions.contains_key(&plan.symbol)
                     || self.state.positions.contains_key(&plan.symbol)
                     || self.state.pending_entries.contains_key(&plan.symbol)
-                    || self.state.positions.len() + self.state.pending_entries.len()
-                        >= self.portfolio.max_positions
+                    || slot_full
             }) {
                 continue;
             }
@@ -4086,14 +4142,7 @@ impl BinanceDemoExecution {
         let stop_distance = sign * (plan.reference_price - plan.stop_price)
             / plan.reference_price.max(f64::EPSILON);
         let planned_stop_price = entry_price * (1.0 - sign * stop_distance);
-        let take_profit_prices: Vec<_> = plan
-            .take_profit_prices
-            .iter()
-            .map(|(target, fraction)| {
-                let distance = sign * (*target / plan.reference_price.max(f64::EPSILON) - 1.0);
-                (entry_price * (1.0 + sign * distance), *fraction)
-            })
-            .collect();
+        let take_profit_prices = take_profit_prices_from_fill(plan, entry_price, executed);
 
         // A sub-threshold partial fill is already guarded by a close-all stop.
         // Reuse it during promotion instead of briefly duplicating (and often
@@ -4800,14 +4849,7 @@ impl BinanceDemoExecution {
         let stop_distance = sign * (plan.reference_price - plan.stop_price)
             / plan.reference_price.max(f64::EPSILON);
         let stop_price = entry_price * (1.0 - sign * stop_distance);
-        let take_profit_prices: Vec<_> = plan
-            .take_profit_prices
-            .iter()
-            .map(|(target, fraction)| {
-                let distance = sign * (*target / plan.reference_price.max(f64::EPSILON) - 1.0);
-                (entry_price * (1.0 + sign * distance), *fraction)
-            })
-            .collect();
+        let take_profit_prices = take_profit_prices_from_fill(plan, entry_price, executed);
         let protective = async {
             let stop_algo_id = self
                 .place_close_all_trigger(
@@ -6144,6 +6186,53 @@ fn plan_cost_diagnostics(
         target_to_cost_ratio,
     }
 }
+
+fn take_profit_prices_from_fill(
+    plan: &greed_kernel::PositionPlan,
+    entry_price: f64,
+    executed_quantity: f64,
+) -> Vec<(f64, f64)> {
+    let sign = plan.side.sign();
+    let cost_aware = plan
+        .signal_context
+        .get("cost_aware_full_take_profit")
+        .is_some_and(|value| value == "true");
+    let desired_net_usd = plan
+        .signal_context
+        .get("target_account_profit_usd")
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0);
+    let estimated_cost_bps = plan
+        .signal_context
+        .get("estimated_target_cost_bps")
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value >= 0.0);
+
+    if cost_aware && plan.take_profit_prices.len() == 1 {
+        if let (Some(desired_net_usd), Some(estimated_cost_bps)) =
+            (desired_net_usd, estimated_cost_bps)
+        {
+            let actual_notional_usd = entry_price * executed_quantity;
+            if actual_notional_usd.is_finite() && actual_notional_usd > f64::EPSILON {
+                let gross_target_pct =
+                    desired_net_usd / actual_notional_usd + estimated_cost_bps / 10_000.0;
+                return vec![(
+                    entry_price * (1.0 + sign * gross_target_pct),
+                    plan.take_profit_prices[0].1,
+                )];
+            }
+        }
+    }
+
+    plan.take_profit_prices
+        .iter()
+        .map(|(target, fraction)| {
+            let distance = sign * (*target / plan.reference_price.max(f64::EPSILON) - 1.0);
+            (entry_price * (1.0 + sign * distance), *fraction)
+        })
+        .collect()
+}
+
 fn floor_step(value: f64, step: f64) -> f64 {
     (value / step).floor() * step
 }
@@ -6599,6 +6688,26 @@ mod tests {
         assert_eq!(floor_step(1.239, 0.01), 1.23);
         assert_eq!(decimal(1.23, 0.01), "1.23");
         assert_eq!(ceil_step(1.231, 0.01), 1.24);
+    }
+
+    #[test]
+    fn fast_take_profit_retargets_the_actual_fill_to_thirty_dollars_net() {
+        let mut plan = guarded_plan(Side::Buy);
+        plan.take_profit_prices = vec![(100.39, 1.0)];
+        plan.signal_context
+            .insert("cost_aware_full_take_profit".into(), "true".into());
+        plan.signal_context
+            .insert("target_account_profit_usd".into(), "30".into());
+        plan.signal_context
+            .insert("estimated_target_cost_bps".into(), "9".into());
+
+        let full = take_profit_prices_from_fill(&plan, 101.0, 10_000.0 / 101.0);
+        assert!((full[0].0 - 101.3939).abs() < 1e-9);
+        assert_eq!(full[0].1, 1.0);
+
+        let half = take_profit_prices_from_fill(&plan, 101.0, 5_000.0 / 101.0);
+        assert!((half[0].0 - 101.6969).abs() < 1e-9);
+        assert_eq!(half[0].1, 1.0);
     }
 
     #[test]
@@ -7409,5 +7518,13 @@ mod tests {
         assert_eq!(outcome.fill_ratio, None);
         assert!(outcome.performance_eligible());
         assert_eq!(outcome.performance_value(), 2.5);
+    }
+
+    #[test]
+    fn fast_activation_has_one_slot_outside_the_standard_pool() {
+        assert!(!recipe_slot_full(FAST_TREND_ACTIVATION_RECIPE, 0, 3, 3));
+        assert!(recipe_slot_full(FAST_TREND_ACTIVATION_RECIPE, 1, 0, 3));
+        assert!(!recipe_slot_full("trend_continuation", 1, 2, 3));
+        assert!(recipe_slot_full("trend_continuation", 0, 3, 3));
     }
 }

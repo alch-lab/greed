@@ -16,6 +16,9 @@ struct LiquiditySizing {
 const PROFIT_SHIELD_ROUND_TRIP_FEE_BPS: f64 = 7.0;
 const PROFIT_SHIELD_SLIPPAGE_STRESS_MULTIPLIER: f64 = 1.5;
 const PROFIT_SHIELD_MIN_NET_BPS: f64 = 2.0;
+const FAST_TREND_RECIPE: &str = "fast_trend_activation";
+const FAST_DEDICATED_POSITION_SLOTS: usize = 1;
+const ESTIMATED_MAKER_TAKER_FEE_BPS: f64 = 7.0;
 
 fn cost_aware_profit_shield_buffer(
     configured_buffer_pct: f64,
@@ -198,7 +201,6 @@ impl StrategyNode for PositionPlannerNode {
         let gross = a.gross_exposure_usd / a.equity_usd.max(1.0);
         let halted = daily >= self.config.daily_loss_limit_pct
             || dd >= self.config.peak_drawdown_halt_pct
-            || a.open_positions >= self.config.max_positions
             || gross >= self.config.max_total_gross_multiple;
         let mut out = vec![ArtifactRecord {
             key: "portfolio.risk".into(),
@@ -213,7 +215,7 @@ impl StrategyNode for PositionPlannerNode {
                     Verdict::Pass
                 },
                 reasons: if halted {
-                    vec!["daily loss, peak drawdown, position count, or gross exposure limit is active".into()]
+                    vec!["daily loss, peak drawdown, or gross exposure limit is active".into()]
                 } else {
                     vec![]
                 },
@@ -248,14 +250,29 @@ impl StrategyNode for PositionPlannerNode {
                 .then_with(|| b.score.total_cmp(&a.score))
         });
         let mut planned_gross = gross;
-        let mut slots = self.config.max_positions.saturating_sub(a.open_positions);
+        let attributed_slots: usize = a.active_slots_by_recipe.values().sum();
+        let fast_active = a
+            .active_slots_by_recipe
+            .get(FAST_TREND_RECIPE)
+            .copied()
+            .unwrap_or_default();
+        let standard_active = a
+            .active_slots_by_recipe
+            .iter()
+            .filter(|(recipe, _)| recipe.as_str() != FAST_TREND_RECIPE)
+            .map(|(_, count)| *count)
+            .sum::<usize>()
+            + a.open_positions.saturating_sub(attributed_slots);
+        let mut fast_slots = FAST_DEDICATED_POSITION_SLOTS.saturating_sub(fast_active);
+        let mut standard_slots = self.config.max_positions.saturating_sub(standard_active);
         let mut planned_symbols = std::collections::BTreeSet::new();
         let mut suppressed_symbol_conflicts = 0u64;
         let mut liquidity_rejections = 0u64;
         let mut liquidity_scaled_plans = 0u64;
         for c in candidates {
-            if slots == 0 {
-                break;
+            let fast_candidate = c.recipe == FAST_TREND_RECIPE;
+            if (fast_candidate && fast_slots == 0) || (!fast_candidate && standard_slots == 0) {
+                continue;
             }
             // A failed breakout and a continuation signal can coexist briefly
             // in the same frame.  Fund only the higher-priority interpretation
@@ -288,18 +305,18 @@ impl StrategyNode for PositionPlannerNode {
             let stop_pct = tag_f64(c, "stop_pct")
                 .unwrap_or(self.config.initial_stop_pct)
                 .clamp(0.003, 0.10);
-            let target_r = tag_f64(c, "target_r").unwrap_or(self.config.first_take_profit_r);
+            let mut target_r = tag_f64(c, "target_r").unwrap_or(self.config.first_take_profit_r);
             let take_fraction = tag_f64(c, "take_profit_fraction")
                 .unwrap_or(self.config.first_take_profit_fraction)
                 .clamp(0.1, 1.0);
-            let profit_shield_activation_r = tag_f64(c, "profit_shield_activation_r")
+            let mut profit_shield_activation_r = tag_f64(c, "profit_shield_activation_r")
                 .unwrap_or(self.config.profit_shield_activation_r);
             let mut break_even_buffer_pct = tag_f64(c, "break_even_buffer_pct")
                 .unwrap_or(self.config.break_even_buffer_pct)
                 .clamp(0.0, 0.01);
-            let trailing_activation_r = tag_f64(c, "pre_tp_trailing_activation_r")
+            let mut trailing_activation_r = tag_f64(c, "pre_tp_trailing_activation_r")
                 .unwrap_or(self.config.pre_tp_trailing_activation_r);
-            let trailing_distance_pct =
+            let mut trailing_distance_pct =
                 tag_f64(c, "trailing_distance_pct").unwrap_or(self.config.trailing_distance_pct);
             let explicit_profit_protection = c.tags.contains_key("profit_shield_activation_r")
                 || c.tags.contains_key("pre_tp_trailing_activation_r")
@@ -389,13 +406,48 @@ impl StrategyNode for PositionPlannerNode {
                 continue;
             }
             liquidity_scaled_plans += u64::from(was_scaled);
+            let mut effective_full_take_profit_pct = None;
+            let mut estimated_target_cost_bps = None;
+            if tag_bool(c, "cost_aware_full_take_profit") {
+                let target_account_profit_pct = tag_f64(c, "target_account_profit_pct")
+                    .unwrap_or_default()
+                    .clamp(0.0001, 0.02);
+                let mid = (book.bid + book.ask) * 0.5;
+                let spread_bps = if mid > f64::EPSILON {
+                    (book.ask - book.bid) / mid * 10_000.0
+                } else {
+                    0.0
+                };
+                let cost_bps = ESTIMATED_MAKER_TAKER_FEE_BPS
+                    + spread_bps.max(0.0) * 0.5
+                    + liquidity
+                        .expected_exit_slippage_bps
+                        .unwrap_or_default()
+                        .max(0.0);
+                let desired_net_usd = a.equity_usd * target_account_profit_pct;
+                let gross_target_pct = desired_net_usd / notional.max(1.0) + cost_bps / 10_000.0;
+                target_r = gross_target_pct / stop_pct.max(f64::EPSILON);
+                // Arm after roughly 60% of the sprint objective and allow a
+                // 30%-of-target retracement. Expressing both as a fraction of
+                // the liquidity-sized target keeps the dollar behavior stable
+                // when the book forces a smaller position.
+                profit_shield_activation_r = gross_target_pct * 0.60 / stop_pct.max(f64::EPSILON);
+                trailing_activation_r = profit_shield_activation_r;
+                trailing_distance_pct = gross_target_pct * 0.30;
+                effective_full_take_profit_pct = Some(gross_target_pct);
+                estimated_target_cost_bps = Some(cost_bps);
+            }
             let multiple = notional / a.equity_usd.max(1.0);
             if planned_gross + multiple > self.config.max_total_gross_multiple + f64::EPSILON {
                 planned_symbols.remove(&c.symbol);
                 continue;
             }
             planned_gross += multiple;
-            slots -= 1;
+            if fast_candidate {
+                fast_slots -= 1;
+            } else {
+                standard_slots -= 1;
+            }
             let sign = c.side.sign();
             let stop = c.reference_price * (1.0 - sign * stop_pct);
             let tp1 = c.reference_price * (1.0 + sign * stop_pct * target_r);
@@ -452,6 +504,23 @@ impl StrategyNode for PositionPlannerNode {
                 liquidity.notional_cap_usd.to_string(),
             );
             signal_context.insert("liquidity_sized_notional_usd".into(), notional.to_string());
+            if let Some(target_pct) = effective_full_take_profit_pct {
+                signal_context.insert(
+                    "effective_full_take_profit_pct".into(),
+                    target_pct.to_string(),
+                );
+                signal_context.insert(
+                    "target_account_profit_usd".into(),
+                    (a.equity_usd
+                        * tag_f64(c, "target_account_profit_pct")
+                            .unwrap_or_default()
+                            .clamp(0.0001, 0.02))
+                    .to_string(),
+                );
+            }
+            if let Some(cost_bps) = estimated_target_cost_bps {
+                signal_context.insert("estimated_target_cost_bps".into(), cost_bps.to_string());
+            }
             signal_context.insert(
                 "visible_exit_depth_usd".into(),
                 liquidity.visible_exit_depth_usd.to_string(),
@@ -709,6 +778,7 @@ mod tests {
                 risk_day_start_equity_usd: 5_000.0,
                 gross_exposure_usd: 0.0,
                 open_positions: 0,
+                active_slots_by_recipe: BTreeMap::new(),
             },
         };
         PositionPlannerNode::new(vec![], risk)
@@ -803,6 +873,7 @@ mod tests {
                 risk_day_start_equity_usd: 2_000.0,
                 gross_exposure_usd: 0.0,
                 open_positions: 0,
+                active_slots_by_recipe: BTreeMap::new(),
             },
         };
         let mut planner = PositionPlannerNode::new(vec![], RiskConfig::default());
@@ -870,6 +941,7 @@ mod tests {
                 risk_day_start_equity_usd: 2_000.0,
                 gross_exposure_usd: 0.0,
                 open_positions: 0,
+                active_slots_by_recipe: BTreeMap::new(),
             },
         };
         let risk = RiskConfig {
@@ -940,6 +1012,7 @@ mod tests {
                 risk_day_start_equity_usd: 2_000.0,
                 gross_exposure_usd: 0.0,
                 open_positions: 0,
+                active_slots_by_recipe: BTreeMap::new(),
             },
         };
         let mut planner = PositionPlannerNode::new(vec![], RiskConfig::default());
@@ -967,6 +1040,108 @@ mod tests {
         assert_eq!(plan.profit_shield_activation_pct, Some(0.0025));
         assert_eq!(plan.trailing_activation_pct, Some(0.005));
         assert_eq!(plan.trailing_distance_pct, Some(0.0035));
+    }
+
+    #[test]
+    fn fast_sprint_targets_three_tenths_of_equity_after_estimated_cost() {
+        let mut record = candidate("fast:sprint", FAST_TREND_RECIPE, "ALTUSDT", 1);
+        let Artifact::Candidate(value) = &mut record.artifact else {
+            panic!("candidate fixture must contain a candidate");
+        };
+        value.tags.extend(BTreeMap::from([
+            ("stop_pct".into(), "0.005".into()),
+            ("risk_per_trade_pct".into(), "0.005".into()),
+            ("max_notional_multiple".into(), "1.0".into()),
+            ("target_r".into(), "1.0".into()),
+            ("take_profit_fraction".into(), "1.0".into()),
+            ("target_account_profit_pct".into(), "0.003".into()),
+            ("cost_aware_full_take_profit".into(), "true".into()),
+            ("profit_shield_activation_r".into(), "1.0".into()),
+            ("pre_tp_trailing_activation_r".into(), "1.0".into()),
+            ("trailing_distance_pct".into(), "0.001".into()),
+        ]));
+        let artifacts = BTreeMap::from([(record.key.clone(), record)]);
+        let frame = MarketFrame {
+            as_of_ms: 2_000,
+            instruments: BTreeMap::from([("ALTUSDT".into(), instrument("ALTUSDT"))]),
+            account: AccountFrame {
+                equity_usd: 10_000.0,
+                cash_usd: 10_000.0,
+                realized_pnl_usd: 0.0,
+                peak_equity_usd: 10_000.0,
+                risk_day_start_equity_usd: 10_000.0,
+                gross_exposure_usd: 0.0,
+                open_positions: 0,
+                active_slots_by_recipe: BTreeMap::new(),
+            },
+        };
+        let output = PositionPlannerNode::new(vec![], RiskConfig::default())
+            .evaluate(&NodeContext {
+                frame: &frame,
+                artifacts: &artifacts,
+            })
+            .unwrap();
+        let plan = output
+            .iter()
+            .find_map(|record| match &record.artifact {
+                Artifact::PositionPlan(plan) => Some(plan),
+                _ => None,
+            })
+            .expect("fast sprint plan");
+        assert!((plan.notional_usd - 10_000.0).abs() < 1e-9);
+        // 30 USD desired net + 9 bps estimated round-trip cost: 39 bps gross.
+        assert!((plan.take_profit_prices[0].0 - 100.39).abs() < 1e-9);
+        assert_eq!(plan.take_profit_prices[0].1, 1.0);
+        assert!((plan.profit_shield_activation_pct.unwrap() - 0.00234).abs() < 1e-12);
+        assert!((plan.trailing_activation_pct.unwrap() - 0.00234).abs() < 1e-12);
+        assert!((plan.trailing_distance_pct.unwrap() - 0.00117).abs() < 1e-12);
+    }
+
+    #[test]
+    fn fast_and_standard_recipes_use_independent_position_slots() {
+        let records = [
+            candidate("fast:ALT", FAST_TREND_RECIPE, "ALTUSDT", 2),
+            candidate("trend:BTC", "trend_continuation", "BTCUSDT", 1),
+        ];
+        let artifacts = records
+            .into_iter()
+            .map(|record| (record.key.clone(), record))
+            .collect();
+        let frame = MarketFrame {
+            as_of_ms: 2_000,
+            instruments: BTreeMap::from([
+                ("ALTUSDT".into(), instrument("ALTUSDT")),
+                ("BTCUSDT".into(), instrument("BTCUSDT")),
+            ]),
+            account: AccountFrame {
+                equity_usd: 10_000.0,
+                cash_usd: 10_000.0,
+                realized_pnl_usd: 0.0,
+                peak_equity_usd: 10_000.0,
+                risk_day_start_equity_usd: 10_000.0,
+                gross_exposure_usd: 1_000.0,
+                open_positions: 2,
+                active_slots_by_recipe: BTreeMap::from([
+                    (FAST_TREND_RECIPE.into(), 1),
+                    ("trend_continuation".into(), 1),
+                ]),
+            },
+        };
+        let output = PositionPlannerNode::new(vec![], RiskConfig::default())
+            .evaluate(&NodeContext {
+                frame: &frame,
+                artifacts: &artifacts,
+            })
+            .unwrap();
+        let plans: Vec<_> = output
+            .iter()
+            .filter_map(|record| match &record.artifact {
+                Artifact::PositionPlan(plan) => Some(plan.candidate_id.as_str()),
+                _ => None,
+            })
+            .collect();
+        assert!(!plans.contains(&"fast:ALT"));
+        assert!(plans.contains(&"trend:BTC"));
     }
 
     #[test]
@@ -1004,6 +1179,7 @@ mod tests {
                 risk_day_start_equity_usd: 5_000.0,
                 gross_exposure_usd: 0.0,
                 open_positions: 0,
+                active_slots_by_recipe: BTreeMap::new(),
             },
         };
         let mut planner = PositionPlannerNode::new(vec![], RiskConfig::default());

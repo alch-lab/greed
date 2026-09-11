@@ -447,6 +447,7 @@ mod tests {
                 risk_day_start_equity_usd: 5_000.0,
                 gross_exposure_usd: 0.0,
                 open_positions: 0,
+                active_slots_by_recipe: BTreeMap::new(),
             },
         }
     }

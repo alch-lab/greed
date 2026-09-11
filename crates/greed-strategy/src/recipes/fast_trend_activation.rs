@@ -5,10 +5,11 @@ use greed_kernel::{
 };
 use std::collections::BTreeMap;
 
-const FAST_TAKE_PROFIT_LADDER: &str = "1.0:0.30,2.0:0.40";
-const FAST_PROFIT_SHIELD_ACTIVATION_R: &str = "0.5";
-const FAST_TRAILING_ACTIVATION_R: &str = "1.0";
-const FAST_TRAILING_DISTANCE_PCT: &str = "0.0035";
+// Paper-only sprint experiment: close the entire position once its executable
+// profit can contribute roughly 0.30% of the current sleeve equity. The
+// planner converts this account-level objective into a price target after the
+// actual liquidity-sized notional and estimated round-trip cost are known.
+const FAST_TARGET_ACCOUNT_PROFIT_PCT: f64 = 0.003;
 
 pub struct FastTrendActivationNode {
     id: String,
@@ -204,9 +205,13 @@ impl StrategyNode for FastTrendActivationNode {
                     .count() as f64
                     / market_returns.len() as f64
             };
+            // A fast single-name ignition should not require the entire
+            // altcoin market to move first. Keep the market only as a strong
+            // opposing-regime veto; otherwise idiosyncratic leaders are
+            // systematically discovered after their useful move is over.
             let market_ready = directional_market_return_1h
-                >= self.config.fast_min_market_return_1h
-                && directional_market_breadth >= self.config.fast_min_market_breadth;
+                > -self.config.fast_min_market_return_1h
+                || directional_market_breadth >= 1.0 - self.config.fast_min_market_breadth;
             let breakout = if side == Side::Buy {
                 bar.close > breakout_level
             } else {
@@ -235,19 +240,28 @@ impl StrategyNode for FastTrendActivationNode {
                         && minute.close_ms > bar.close_ms
                         && minute.close_ms <= bar.close_ms + 3 * 60_000
                 })
-                .find(|minute| {
+                .find_map(|minute| {
                     let minute_flow = minute
                         .taker_buy_quote
                         .map(|buy| 2.0 * buy / minute.quote_volume.max(1.0) - 1.0)
                         .unwrap_or(-1.0);
-                    if side == Side::Buy {
+                    let directional_minute_flow = sign * minute_flow;
+                    let beyond = if side == Side::Buy {
+                        minute.close >= breakout_level
+                    } else {
+                        minute.close <= breakout_level
+                    };
+                    let touched = if side == Side::Buy {
                         minute.low <= breakout_level * 1.0015
-                            && minute.close >= breakout_level
-                            && minute_flow >= 0.02
                     } else {
                         minute.high >= breakout_level * 0.9985
-                            && minute.close <= breakout_level
-                            && minute_flow <= -0.02
+                    };
+                    if beyond && touched && directional_minute_flow >= 0.02 {
+                        Some((minute, "shallow_reclaim"))
+                    } else if beyond && directional_minute_flow >= 0.08 {
+                        Some((minute, "direct_continuation"))
+                    } else {
+                        None
                     }
                 });
             confirmation_hits += u64::from(ignition && confirmation.is_some());
@@ -265,15 +279,20 @@ impl StrategyNode for FastTrendActivationNode {
                 .unwrap_or_default();
             let oi_15m = oi_change(&oi_values, bar.close_ms, 15 * 60_000);
             let oi_60m = oi_change(&oi_values, bar.close_ms, 60 * 60_000);
+            // Moderate deleveraging can drive a squeeze just as effectively as
+            // fresh positioning. Reject only an oversized OI shock; requiring
+            // OI to be positive discarded both short squeezes and long
+            // liquidation continuations.
             let oi_ok = oi_15m
-                .is_some_and(|value| (0.0..=self.config.fast_max_oi_change_15m).contains(&value))
-                && oi_60m.is_some_and(|value| value >= 0.0);
+                .is_some_and(|value| value.abs() <= self.config.fast_max_oi_change_15m)
+                && oi_60m
+                    .is_some_and(|value| value.abs() <= self.config.fast_max_oi_change_15m * 2.0);
             oi_ready += u64::from(oi_15m.is_some() && oi_60m.is_some());
 
             let mut blockers = Vec::new();
             if !market_ready {
                 blockers.push(format!(
-                    "altcoin market directional 1h median {:.2}% / breadth {:.0}% is below the gate",
+                    "altcoin market strongly opposes the signal: directional 1h median {:.2}% / breadth {:.0}%",
                     directional_market_return_1h * 100.0,
                     directional_market_breadth * 100.0
                 ));
@@ -316,14 +335,15 @@ impl StrategyNode for FastTrendActivationNode {
                 blockers.push("move is already mature; the fast lane will not chase it".into());
             }
             if ignition && confirmation.is_none() {
-                blockers.push("waiting up to 3m for the first 1m shallow reclaim".into());
+                blockers.push("waiting up to 3m for a 1m reclaim or direct continuation".into());
             }
             if oi_15m.is_none() || oi_60m.is_none() {
                 blockers.push("open-interest history is warming".into());
             } else if !oi_ok {
                 blockers.push(format!(
-                    "OI must rise moderately: 15m 0..{:.1}%, 60m non-negative",
-                    self.config.fast_max_oi_change_15m * 100.0
+                    "OI shock is too large: require |15m| <= {:.1}% and |60m| <= {:.1}%",
+                    self.config.fast_max_oi_change_15m * 100.0,
+                    self.config.fast_max_oi_change_15m * 200.0
                 ));
             }
 
@@ -339,11 +359,11 @@ impl StrategyNode for FastTrendActivationNode {
                 _ => blockers.push("order book is warming".into()),
             }
 
-            let signal_ms = confirmation.map_or(bar.close_ms, |value| value.close_ms);
+            let signal_ms = confirmation.map_or(bar.close_ms, |(value, _)| value.close_ms);
             if ctx.frame.as_of_ms - signal_ms > 120_000 {
                 blockers.push("the 1m confirmation expired".into());
             }
-            let reference_price = confirmation.map_or(instrument.price, |value| value.close);
+            let reference_price = confirmation.map_or(instrument.price, |(value, _)| value.close);
             let verdict = if blockers.is_empty() {
                 Verdict::Pass
             } else {
@@ -351,6 +371,9 @@ impl StrategyNode for FastTrendActivationNode {
             };
             let stop_pct =
                 (1.25 * atr(&closed, index, 20) / reference_price.max(f64::EPSILON)).max(0.0035);
+            let entry_pattern = confirmation
+                .map(|(_, pattern)| pattern)
+                .unwrap_or("awaiting_confirmation");
             let score = directional_body_return.max(0.0)
                 * volume_ratio
                 * (1.0 + directional_flow.unwrap_or_default().max(0.0))
@@ -359,7 +382,7 @@ impl StrategyNode for FastTrendActivationNode {
             let mut tags = BTreeMap::from([
                 ("lane".into(), "fast_trend_activation".into()),
                 ("priority".into(), "0.8".into()),
-                ("entry_pattern".into(), "one_minute_shallow_reclaim".into()),
+                ("entry_pattern".into(), entry_pattern.into()),
                 ("market_return_1h".into(), market_return_1h.to_string()),
                 (
                     "market_breadth_1h".into(),
@@ -387,21 +410,19 @@ impl StrategyNode for FastTrendActivationNode {
                     oi_60m.unwrap_or_default().to_string(),
                 ),
                 ("stop_pct".into(), stop_pct.to_string()),
-                ("take_profit_ladder".into(), FAST_TAKE_PROFIT_LADDER.into()),
                 ("target_r".into(), "1.0".into()),
-                ("take_profit_fraction".into(), "0.30".into()),
+                ("take_profit_fraction".into(), "1.0".into()),
                 (
-                    "profit_shield_activation_r".into(),
-                    FAST_PROFIT_SHIELD_ACTIVATION_R.into(),
+                    "target_account_profit_pct".into(),
+                    FAST_TARGET_ACCOUNT_PROFIT_PCT.to_string(),
                 ),
-                (
-                    "pre_tp_trailing_activation_r".into(),
-                    FAST_TRAILING_ACTIVATION_R.into(),
-                ),
-                (
-                    "trailing_distance_pct".into(),
-                    FAST_TRAILING_DISTANCE_PCT.into(),
-                ),
+                ("cost_aware_full_take_profit".into(), "true".into()),
+                // The planner replaces these placeholders with thresholds
+                // derived from the final liquidity-sized dollar target.
+                ("profit_shield_activation_r".into(), "1.0".into()),
+                ("pre_tp_trailing_activation_r".into(), "1.0".into()),
+                ("trailing_distance_pct".into(), "0.001".into()),
+                ("cost_aware_profit_shield".into(), "true".into()),
                 (
                     "risk_per_trade_pct".into(),
                     self.config.fast_risk_per_trade_pct.to_string(),
@@ -419,19 +440,27 @@ impl StrategyNode for FastTrendActivationNode {
                 ("entry_invalidation_bps".into(), "25".into()),
                 ("max_entry_adverse_bps".into(), "6".into()),
                 ("taker_fallback".into(), "false".into()),
-                ("max_hold_ms".into(), (30 * 60_000).to_string()),
+                ("max_hold_ms".into(), (10 * 60_000).to_string()),
             ]);
             if verdict == Verdict::Pass {
                 if let Some(book) = instrument.book.as_ref() {
-                    let entry_limit = if side == Side::Buy {
-                        (reference_price * 0.9996).min(book.bid)
+                    if entry_pattern == "direct_continuation" {
+                        tags.insert("bounded_taker_ioc".into(), "true".into());
+                        tags.insert("max_entry_adverse_bps".into(), "6".into());
+                        tags.insert("entry_timeout_ms".into(), "0".into());
+                        tags.insert("min_fill_ratio".into(), "1.0".into());
+                        tags.insert("min_managed_fill_ratio".into(), "0.0".into());
                     } else {
-                        (reference_price * 1.0004).max(book.ask)
-                    };
-                    tags.insert("entry_limit".into(), entry_limit.to_string());
-                    tags.insert("taker_fallback".into(), "true".into());
-                    tags.insert("taker_fallback_max_adverse_bps".into(), "6".into());
-                    tags.insert("taker_fallback_size_multiplier".into(), "0.5".into());
+                        let entry_limit = if side == Side::Buy {
+                            (reference_price * 0.9996).min(book.bid)
+                        } else {
+                            (reference_price * 1.0004).max(book.ask)
+                        };
+                        tags.insert("entry_limit".into(), entry_limit.to_string());
+                        tags.insert("taker_fallback".into(), "true".into());
+                        tags.insert("taker_fallback_max_adverse_bps".into(), "6".into());
+                        tags.insert("taker_fallback_size_multiplier".into(), "0.5".into());
+                    }
                 }
             }
             let candidate = TradeCandidate {
