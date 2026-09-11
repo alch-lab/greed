@@ -101,6 +101,20 @@ fn ignition_pattern(
     .then_some("trend_reacceleration")
 }
 
+fn direct_confirmation_allowed(
+    pattern: Option<&str>,
+    directional_market_breadth: f64,
+    directional_market_return_1h: f64,
+    directional_extension: f64,
+    config: &LaneConfig,
+) -> bool {
+    pattern != Some("trend_reacceleration")
+        || (directional_market_return_1h >= config.fast_reacceleration_direct_min_market_return_1h
+            && directional_extension <= config.fast_reacceleration_direct_max_extension
+            && (directional_market_breadth >= config.fast_reacceleration_direct_min_market_breadth
+                || directional_extension <= config.fast_reacceleration_direct_early_extension))
+}
+
 impl StrategyNode for FastTrendActivationNode {
     fn id(&self) -> &str {
         &self.id
@@ -230,6 +244,15 @@ impl StrategyNode for FastTrendActivationNode {
             let ignition = ignition_pattern.is_some();
             ignition_hits += u64::from(ignition);
 
+            let directional_extension = directional_prebreak_return_1h + directional_body_return;
+            let direct_reacceleration_ready = direct_confirmation_allowed(
+                ignition_pattern,
+                directional_market_breadth,
+                directional_market_return_1h,
+                directional_extension,
+                &self.config,
+            );
+
             let confirmation = instrument
                 .micro_perpetual
                 .as_ref()
@@ -258,7 +281,10 @@ impl StrategyNode for FastTrendActivationNode {
                     };
                     if beyond && touched && directional_minute_flow >= 0.02 {
                         Some((minute, "shallow_reclaim"))
-                    } else if beyond && directional_minute_flow >= 0.08 {
+                    } else if beyond
+                        && directional_minute_flow >= 0.08
+                        && direct_reacceleration_ready
+                    {
                         Some((minute, "direct_continuation"))
                     } else {
                         None
@@ -335,7 +361,18 @@ impl StrategyNode for FastTrendActivationNode {
                 blockers.push("move is already mature; the fast lane will not chase it".into());
             }
             if ignition && confirmation.is_none() {
-                blockers.push("waiting up to 3m for a 1m reclaim or direct continuation".into());
+                if ignition_pattern == Some("trend_reacceleration") && !direct_reacceleration_ready
+                {
+                    blockers.push(format!(
+                        "late reacceleration requires a 1m touch-and-reclaim: breadth {:.0}%, directional market 1h {:.2}%, extension {:.2}%",
+                        directional_market_breadth * 100.0,
+                        directional_market_return_1h * 100.0,
+                        directional_extension * 100.0
+                    ));
+                } else {
+                    blockers
+                        .push("waiting up to 3m for a 1m reclaim or direct continuation".into());
+                }
             }
             if oi_15m.is_none() || oi_60m.is_none() {
                 blockers.push("open-interest history is warming".into());
@@ -397,6 +434,14 @@ impl StrategyNode for FastTrendActivationNode {
                 ("compression_ratio".into(), compression_ratio.to_string()),
                 ("prebreak_return_1h".into(), prebreak_return_1h.to_string()),
                 ("return_4h".into(), return_4h.to_string()),
+                (
+                    "directional_extension".into(),
+                    directional_extension.to_string(),
+                ),
+                (
+                    "direct_reacceleration_ready".into(),
+                    direct_reacceleration_ready.to_string(),
+                ),
                 (
                     "ignition_pattern".into(),
                     ignition_pattern.unwrap_or("none").into(),
@@ -597,6 +642,39 @@ mod tests {
             ignition_pattern(true, 0.010, 5.0, Some(0.30), 2.2, 0.015, 0.04, &config,),
             Some("trend_reacceleration")
         );
+    }
+
+    #[test]
+    fn late_reacceleration_requires_a_reclaim_instead_of_a_direct_cross() {
+        let config = LaneConfig::default();
+        assert!(!direct_confirmation_allowed(
+            Some("trend_reacceleration"),
+            0.515,
+            0.0008,
+            0.0267,
+            &config,
+        ));
+        assert!(direct_confirmation_allowed(
+            Some("trend_reacceleration"),
+            0.771,
+            0.0262,
+            0.0165,
+            &config,
+        ));
+        assert!(direct_confirmation_allowed(
+            Some("trend_reacceleration"),
+            0.556,
+            0.0054,
+            0.0121,
+            &config,
+        ));
+        assert!(direct_confirmation_allowed(
+            Some("compression_breakout"),
+            0.40,
+            -0.01,
+            0.04,
+            &config,
+        ));
     }
 
     #[test]

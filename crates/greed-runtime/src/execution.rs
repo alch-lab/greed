@@ -766,11 +766,9 @@ impl BinanceDemoExecution {
                 if self.state.baseline_wallet_usd.is_none() {
                     self.state.baseline_wallet_usd = Some(account.wallet_balance);
                 }
-                // A fast activation deadline is a review point, not a reason
-                // to race a position that is about to arm its profit shield.
-                // Grant one bounded grace period when the trade has already
-                // demonstrated useful favorable excursion. Once exchange
-                // protection is armed, let that protection own the exit.
+                // A Fast deadline may be released only after executable-value
+                // protection is genuinely armed. A mark-price excursion alone
+                // is not bankable and must never extend an unprotected trade.
                 let due_for_review: Vec<_> = self
                     .state
                     .positions
@@ -783,17 +781,25 @@ impl BinanceDemoExecution {
                     })
                     .map(|(symbol, _)| symbol.clone())
                     .collect();
+                let mut hold_review_changed = false;
                 for symbol in due_for_review {
-                    let Some(position) = account.positions.get(&symbol) else {
-                        continue;
-                    };
                     let Some(meta) = self.state.positions.get_mut(&symbol) else {
                         continue;
                     };
-                    match max_hold_review(meta, position.mark_price, now_ms) {
-                        MaxHoldReview::NotApplicable | MaxHoldReview::Exit => {}
+                    match max_hold_review(meta, now_ms) {
+                        MaxHoldReview::NotApplicable => {}
+                        MaxHoldReview::Exit => {
+                            // Persist the decision before touching the exchange.
+                            // A failed close must be retried, never reconsidered
+                            // later as a newly eligible hold extension.
+                            if meta.pending_exit_reason.as_deref() != Some("max_hold") {
+                                meta.pending_exit_reason = Some("max_hold".into());
+                                hold_review_changed = true;
+                            }
+                        }
                         MaxHoldReview::ReleaseToProtection => {
                             meta.max_hold_ms = 0;
+                            hold_review_changed = true;
                             events.push(ExchangeEvent {
                                 kind: "exchange_max_hold_released".into(),
                                 payload: serde_json::json!({
@@ -807,29 +813,31 @@ impl BinanceDemoExecution {
                             });
                         }
                         MaxHoldReview::Extend {
-                            favorable_pct,
-                            current_return_pct,
+                            executable_net_pnl_usd,
+                            initial_risk_usd,
                         } => {
-                            meta.max_hold_ms =
-                                meta.max_hold_ms.saturating_add(FAST_TREND_HOLD_GRACE_MS);
+                            meta.max_hold_ms = meta
+                                .max_hold_ms
+                                .saturating_add(FAST_TREND_EXECUTABLE_GRACE_MS);
                             meta.max_hold_reviews = meta.max_hold_reviews.saturating_add(1);
+                            hold_review_changed = true;
                             events.push(ExchangeEvent {
                                 kind: "exchange_max_hold_extended".into(),
                                 payload: serde_json::json!({
-                                    "ts_ms":now_ms,
-                                    "symbol":symbol,
-                                    "recipe":meta.recipe,
-                                    "extension_ms":FAST_TREND_HOLD_GRACE_MS,
-                                    "favorable_pct":favorable_pct,
-                                    "current_return_pct":current_return_pct,
+                                    "ts_ms":now_ms,"symbol":symbol,"recipe":meta.recipe,
+                                    "extension_ms":FAST_TREND_EXECUTABLE_GRACE_MS,
+                                    "executable_net_pnl_usd":executable_net_pnl_usd,
+                                    "initial_risk_usd":initial_risk_usd,
                                     "review_count":meta.max_hold_reviews,
-                                    "reason":"favorable_progress_near_profit_shield",
-                                    "venue":"binance_demo",
-                                    "paper_only":true
+                                    "reason":"fresh_executable_quote_bounded_grace",
+                                    "venue":"binance_demo","paper_only":true
                                 }),
                             });
                         }
                     }
+                }
+                if hold_review_changed {
+                    self.save()?;
                 }
                 let expired: Vec<_> = self
                     .state
@@ -2811,6 +2819,10 @@ impl BinanceDemoExecution {
                         plan.notional_usd * size_multiplier * fill.size_multiplier;
                     let actual_notional_usd = fill.entry_price * fill.quantity;
                     let fill_ratio = actual_notional_usd / planned_notional_usd.max(f64::EPSILON);
+                    let actual_initial_risk_usd =
+                        fill.quantity * (fill.entry_price - fill.stop_price).abs();
+                    let actual_protection =
+                        protection_from_fill(plan, actual_notional_usd, actual_initial_risk_usd);
                     self.state.positions.insert(
                         plan.symbol.clone(),
                         ExecutionMeta {
@@ -2830,9 +2842,7 @@ impl BinanceDemoExecution {
                             cumulative_reported_pnl_usd: 0.0,
                             planned_notional_usd: Some(planned_notional_usd),
                             fill_ratio: Some(fill_ratio),
-                            initial_risk_usd: Some(
-                                fill.quantity * (fill.entry_price - fill.stop_price).abs(),
-                            ),
+                            initial_risk_usd: Some(actual_initial_risk_usd),
                             stop_price: fill.stop_price,
                             take_profit_price: fill
                                 .take_profit_prices
@@ -2857,12 +2867,12 @@ impl BinanceDemoExecution {
                                 },
                             ),
                             break_even_buffer_pct: plan.break_even_buffer_pct,
-                            profit_shield_activation_pct: plan.profit_shield_activation_pct,
+                            profit_shield_activation_pct: actual_protection.activation_pct,
                             break_even_armed: false,
                             extreme_price: fill.entry_price,
                             adverse_price: fill.entry_price,
-                            trailing_activation_pct: plan.trailing_activation_pct,
-                            trailing_distance_pct: plan.trailing_distance_pct,
+                            trailing_activation_pct: actual_protection.activation_pct,
+                            trailing_distance_pct: actual_protection.trailing_distance_pct,
                             early_failure_after_ms: plan.early_failure_after_ms,
                             early_failure_adverse_pct: plan.early_failure_adverse_pct,
                             early_failure_max_favorable_pct: plan.early_failure_max_favorable_pct,
@@ -2891,7 +2901,7 @@ impl BinanceDemoExecution {
                         .unwrap_or_default();
                     events.push(ExchangeEvent {
                         kind: "exchange_entry".into(),
-                        payload: serde_json::json!({"ts_ms":fill.first_fill_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"signal_context":plan.signal_context,"entry_mode":fill.entry_mode,"entry_price_source":fill.entry_price_source,"maker_attempted":fill.maker_attempted,"maker_wait_ms":fill.maker_wait_ms,"maker_reprices":fill.maker_reprices,"requested_limit":plan.entry_limit,"final_maker_limit":fill.final_maker_limit,"entry_price":fill.entry_price,"quantity":fill.quantity,"notional_usd":actual_notional_usd,"actual_notional_usd":actual_notional_usd,"planned_notional_usd":planned_notional_usd,"fill_ratio":fill_ratio,"partial_fill":fill_ratio < 0.999,"probe_size_multiplier":size_multiplier,"entry_size_multiplier":fill.size_multiplier,"margin_type":"isolated","unprotected_runner_fraction":plan.unprotected_runner_fraction,"entry_timing":{"signal_ms":candidate.map(|value|value.signal_ms),"order_submitted_ms":fill.order_submitted_ms,"first_fill_ms":fill.first_fill_ms,"entry_completed_ms":fill.entry_completed_ms,"source":fill.entry_time_source},"entry_guard":{"invalidation_bps":plan.entry_invalidation_bps,"max_opposing_flow":plan.entry_guard_max_opposing_flow,"max_opposing_return_bps":plan.entry_guard_max_opposing_return_bps},"early_failure":{"after_ms":plan.early_failure_after_ms,"adverse_pct":plan.early_failure_adverse_pct,"max_favorable_pct":plan.early_failure_max_favorable_pct},"spread_bps":cost.spread_bps,"expected_exit_slippage_bps":cost.expected_exit_slippage_bps,"estimated_round_trip_cost_bps":cost.estimated_round_trip_cost_bps,"gross_target_bps":cost.gross_target_bps,"target_to_cost_ratio":cost.target_to_cost_ratio,"order_id":fill.order_id,"stop_algo_id":fill.stop_algo_id,"take_profit_order_ids":fill.take_profit_order_ids,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
+                        payload: serde_json::json!({"ts_ms":fill.first_fill_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"signal_context":plan.signal_context,"entry_mode":fill.entry_mode,"entry_price_source":fill.entry_price_source,"maker_attempted":fill.maker_attempted,"maker_wait_ms":fill.maker_wait_ms,"maker_reprices":fill.maker_reprices,"requested_limit":plan.entry_limit,"final_maker_limit":fill.final_maker_limit,"entry_price":fill.entry_price,"quantity":fill.quantity,"notional_usd":actual_notional_usd,"actual_notional_usd":actual_notional_usd,"planned_notional_usd":planned_notional_usd,"fill_ratio":fill_ratio,"partial_fill":fill_ratio < 0.999,"actual_protection":{"initial_risk_usd":actual_initial_risk_usd,"activation_pct":actual_protection.activation_pct,"trailing_distance_pct":actual_protection.trailing_distance_pct},"probe_size_multiplier":size_multiplier,"entry_size_multiplier":fill.size_multiplier,"margin_type":"isolated","unprotected_runner_fraction":plan.unprotected_runner_fraction,"entry_timing":{"signal_ms":candidate.map(|value|value.signal_ms),"order_submitted_ms":fill.order_submitted_ms,"first_fill_ms":fill.first_fill_ms,"entry_completed_ms":fill.entry_completed_ms,"source":fill.entry_time_source},"entry_guard":{"invalidation_bps":plan.entry_invalidation_bps,"max_opposing_flow":plan.entry_guard_max_opposing_flow,"max_opposing_return_bps":plan.entry_guard_max_opposing_return_bps},"early_failure":{"after_ms":plan.early_failure_after_ms,"adverse_pct":plan.early_failure_adverse_pct,"max_favorable_pct":plan.early_failure_max_favorable_pct},"spread_bps":cost.spread_bps,"expected_exit_slippage_bps":cost.expected_exit_slippage_bps,"estimated_round_trip_cost_bps":cost.estimated_round_trip_cost_bps,"gross_target_bps":cost.gross_target_bps,"target_to_cost_ratio":cost.target_to_cost_ratio,"order_id":fill.order_id,"stop_algo_id":fill.stop_algo_id,"take_profit_order_ids":fill.take_profit_order_ids,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
                     });
                 }
                 Err(error) => {
@@ -3482,7 +3492,7 @@ impl BinanceDemoExecution {
                     &plan.symbol,
                     plan.side,
                     executed,
-                    rules.quantity_step,
+                    &rules,
                     &client_order_id("persistfail", &plan.candidate_id),
                 )
                 .await
@@ -3657,7 +3667,7 @@ impl BinanceDemoExecution {
                                 &symbol,
                                 pending.plan.side,
                                 executed - summary.exit_quantity,
-                                rules.quantity_step,
+                                &rules,
                                 &close_id,
                             )
                             .await
@@ -4208,6 +4218,9 @@ impl BinanceDemoExecution {
         let planned_notional_usd = plan.notional_usd * pending.size_multiplier;
         let actual_notional_usd = entry_price * executed;
         let fill_ratio = executed / pending.requested_quantity.max(f64::EPSILON);
+        let actual_initial_risk_usd = executed * (entry_price - stop_price).abs();
+        let actual_protection =
+            protection_from_fill(plan, actual_notional_usd, actual_initial_risk_usd);
         self.state.positions.insert(
             plan.symbol.clone(),
             ExecutionMeta {
@@ -4227,7 +4240,7 @@ impl BinanceDemoExecution {
                 cumulative_reported_pnl_usd: 0.0,
                 planned_notional_usd: Some(planned_notional_usd),
                 fill_ratio: Some(fill_ratio),
-                initial_risk_usd: Some(executed * (entry_price - stop_price).abs()),
+                initial_risk_usd: Some(actual_initial_risk_usd),
                 stop_price,
                 take_profit_price: take_profit_prices
                     .last()
@@ -4242,12 +4255,12 @@ impl BinanceDemoExecution {
                         / executed.max(f64::EPSILON)
                 }),
                 break_even_buffer_pct: plan.break_even_buffer_pct,
-                profit_shield_activation_pct: plan.profit_shield_activation_pct,
+                profit_shield_activation_pct: actual_protection.activation_pct,
                 break_even_armed: false,
                 extreme_price: entry_price,
                 adverse_price: entry_price,
-                trailing_activation_pct: plan.trailing_activation_pct,
-                trailing_distance_pct: plan.trailing_distance_pct,
+                trailing_activation_pct: actual_protection.activation_pct,
+                trailing_distance_pct: actual_protection.trailing_distance_pct,
                 early_failure_after_ms: plan.early_failure_after_ms,
                 early_failure_adverse_pct: plan.early_failure_adverse_pct,
                 early_failure_max_favorable_pct: plan.early_failure_max_favorable_pct,
@@ -4285,6 +4298,9 @@ impl BinanceDemoExecution {
                 "quantity":executed,"notional_usd":actual_notional_usd,
                 "actual_notional_usd":actual_notional_usd,"planned_notional_usd":planned_notional_usd,
                 "fill_ratio":fill_ratio,"partial_fill":fill_ratio < 0.999,
+                "actual_protection":{"initial_risk_usd":actual_initial_risk_usd,
+                    "activation_pct":actual_protection.activation_pct,
+                    "trailing_distance_pct":actual_protection.trailing_distance_pct},
                 "probe_size_multiplier":pending.size_multiplier,"margin_type":"isolated",
                 "entry_timing":{"signal_ms":pending.signal_ms,"order_submitted_ms":pending.order_submitted_ms,
                     "first_fill_ms":first_fill_ms,"entry_completed_ms":completed_ms,"source":time_source},
@@ -4313,7 +4329,7 @@ impl BinanceDemoExecution {
                 &pending.plan.symbol,
                 pending.plan.side,
                 executed,
-                rules.quantity_step,
+                rules,
                 &close_id,
             )
             .await
@@ -4817,7 +4833,7 @@ impl BinanceDemoExecution {
                     &plan.symbol,
                     plan.side,
                     executed,
-                    rules.quantity_step,
+                    rules,
                     &close_id,
                 )
                 .await
@@ -4891,7 +4907,7 @@ impl BinanceDemoExecution {
                     &plan.symbol,
                     plan.side,
                     executed,
-                    rules.quantity_step,
+                    rules,
                     &close_id,
                 )
                 .await
@@ -5540,67 +5556,113 @@ impl BinanceDemoExecution {
         // full close, but retain the conditional stop until Binance has
         // definitely accepted the reduce-only market order.
         self.cancel_regular_orders(&position.symbol).await?;
-        let latest = self.signed_read("/fapi/v2/account", vec![]).await?;
-        let latest_positions = parse_account(&latest)?.positions;
-        let Some(latest_position) = latest_positions.get(&position.symbol) else {
-            self.cancel_all(&position.symbol).await.ok();
-            return Ok(());
-        };
-        if latest_position.side != position.side {
-            return Err(anyhow!(
-                "{} changed from {:?} to {:?} while its close was prepared",
-                position.symbol,
-                position.side,
-                latest_position.side
-            ));
-        }
-
-        // The stable id makes an ambiguous response queryable without risking
-        // a duplicate close after a network timeout.
-        let close_id = client_order_id(
-            "close",
-            &format!(
-                "{}:{:?}:{:.12}:{:.12}:{}",
-                position.symbol,
-                latest_position.side,
-                latest_position.entry_price,
-                latest_position.quantity,
-                chrono::Utc::now().timestamp_millis()
-            ),
-        );
-        self.submit_or_lookup(
-            &position.symbol,
-            &close_id,
-            vec![
-                ("symbol".into(), position.symbol.clone()),
-                ("side".into(), side_name(position.side.opposite()).into()),
-                ("type".into(), "MARKET".into()),
-                (
-                    "quantity".into(),
-                    decimal(latest_position.quantity.abs(), rules.quantity_step),
+        let close_cycle_ms = chrono::Utc::now().timestamp_millis();
+        for sequence in 0..128_u16 {
+            let latest = self.signed_read("/fapi/v2/account", vec![]).await?;
+            let latest_positions = parse_account(&latest)?.positions;
+            let Some(latest_position) = latest_positions.get(&position.symbol) else {
+                self.cancel_all(&position.symbol).await.ok();
+                return Ok(());
+            };
+            if latest_position.side != position.side {
+                return Err(anyhow!(
+                    "{} changed from {:?} to {:?} while its close was prepared",
+                    position.symbol,
+                    position.side,
+                    latest_position.side
+                ));
+            }
+            let before_quantity = latest_position.quantity.abs();
+            let close_quantity = market_close_chunk(before_quantity, rules)?;
+            // Include the observed remaining quantity in the deterministic id.
+            // An ambiguous response can therefore be looked up safely, while a
+            // genuinely reduced remainder receives a distinct child order.
+            let close_id = client_order_id(
+                "close",
+                &format!(
+                    "{}:{:?}:{close_cycle_ms}:{sequence}:{before_quantity:.12}",
+                    position.symbol, latest_position.side
                 ),
-                ("reduceOnly".into(), "true".into()),
-                ("newClientOrderId".into(), close_id.clone()),
-                ("newOrderRespType".into(), "RESULT".into()),
-            ],
-        )
-        .await?;
-        // Acceptance is not proof of flatness. Preserve the hosted stop on a
-        // partial fill or uncertain account read; the next serialized sync
-        // retries against the then-current quantity, never the old quantity.
-        let confirmed = self.signed_read("/fapi/v2/account", vec![]).await?;
-        if parse_account(&confirmed)?
-            .positions
-            .contains_key(&position.symbol)
-        {
-            return Err(anyhow!(
-                "{} close accepted but flatness not yet confirmed; hosted stop retained",
-                position.symbol
-            ));
+            );
+            let submission = self
+                .submit_or_lookup(
+                    &position.symbol,
+                    &close_id,
+                    vec![
+                        ("symbol".into(), position.symbol.clone()),
+                        ("side".into(), side_name(position.side.opposite()).into()),
+                        ("type".into(), "MARKET".into()),
+                        (
+                            "quantity".into(),
+                            decimal(close_quantity, rules.quantity_step),
+                        ),
+                        ("reduceOnly".into(), "true".into()),
+                        ("newClientOrderId".into(), close_id.clone()),
+                        ("newOrderRespType".into(), "RESULT".into()),
+                    ],
+                )
+                .await;
+            if let Err(error) = submission {
+                // The hosted stop may have filled while this child close was
+                // submitted. Reconcile once before declaring the close failed.
+                let refreshed = self.signed_read("/fapi/v2/account", vec![]).await?;
+                let refreshed_positions = parse_account(&refreshed)?.positions;
+                match refreshed_positions.get(&position.symbol) {
+                    None => {
+                        self.cancel_all(&position.symbol).await.ok();
+                        return Ok(());
+                    }
+                    Some(current)
+                        if current.side == position.side
+                            && current.quantity.abs()
+                                < before_quantity - rules.quantity_step * 0.5 =>
+                    {
+                        continue;
+                    }
+                    _ => return Err(error),
+                }
+            }
+
+            let mut reduced = false;
+            for delay_ms in [0, 50, 150, 300, 600] {
+                if delay_ms > 0 {
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                }
+                let confirmed = self.signed_read("/fapi/v2/account", vec![]).await?;
+                let confirmed_positions = parse_account(&confirmed)?.positions;
+                match confirmed_positions.get(&position.symbol) {
+                    None => {
+                        self.cancel_all(&position.symbol).await.ok();
+                        return Ok(());
+                    }
+                    Some(current)
+                        if current.side == position.side
+                            && current.quantity.abs()
+                                < before_quantity - rules.quantity_step * 0.5 =>
+                    {
+                        reduced = true;
+                        break;
+                    }
+                    Some(current) if current.side != position.side => {
+                        return Err(anyhow!(
+                            "{} reversed while a reduce-only close was reconciled",
+                            position.symbol
+                        ));
+                    }
+                    _ => {}
+                }
+            }
+            if !reduced {
+                return Err(anyhow!(
+                    "{} close child accepted but quantity reduction was not observed; hosted stop retained",
+                    position.symbol
+                ));
+            }
         }
-        // Only verified flatness permits removing the remaining protection.
-        self.cancel_all(&position.symbol).await.ok();
-        Ok(())
+        Err(anyhow!(
+            "{} required more than 128 market-close chunks; hosted stop retained",
+            position.symbol
+        ))
     }
 
     async fn flatten_entry_or_confirm_flat(
@@ -5608,13 +5670,15 @@ impl BinanceDemoExecution {
         symbol: &str,
         side: Side,
         fallback_quantity: f64,
-        quantity_step: f64,
+        rules: &SymbolRules,
         client_id: &str,
     ) -> Result<()> {
         let latest = self.signed_read("/fapi/v2/account", vec![]).await?;
         let positions = parse_account(&latest)?.positions;
         let quantity = match positions.get(symbol) {
-            Some(position) if position.side == side => position.quantity.abs(),
+            Some(position) if position.side == side => {
+                return self.close_market(position).await;
+            }
             Some(position) => {
                 return Err(anyhow!(
                     "{symbol} changed from {side:?} to {:?}; refusing to flatten an operator-owned reverse position",
@@ -5627,7 +5691,7 @@ impl BinanceDemoExecution {
             None => fallback_quantity,
         };
         match self
-            .flatten_entry_quantity(symbol, side, quantity, quantity_step, client_id)
+            .flatten_entry_quantity(symbol, side, quantity, rules, client_id)
             .await
         {
             Ok(_) => Ok(()),
@@ -5649,23 +5713,37 @@ impl BinanceDemoExecution {
         symbol: &str,
         side: Side,
         quantity: f64,
-        quantity_step: f64,
+        rules: &SymbolRules,
         client_id: &str,
     ) -> Result<Value> {
-        self.submit_or_lookup(
-            symbol,
-            client_id,
-            vec![
-                ("symbol".into(), symbol.into()),
-                ("side".into(), side_name(side.opposite()).into()),
-                ("type".into(), "MARKET".into()),
-                ("quantity".into(), decimal(quantity, quantity_step)),
-                ("reduceOnly".into(), "true".into()),
-                ("newClientOrderId".into(), client_id.into()),
-                ("newOrderRespType".into(), "RESULT".into()),
-            ],
-        )
-        .await
+        let mut remaining = quantity;
+        let mut last = Value::Null;
+        for sequence in 0..128_u16 {
+            if remaining <= rules.quantity_step * 0.5 {
+                return Ok(last);
+            }
+            let chunk = market_close_chunk(remaining, rules)?;
+            let child_id = client_order_id("attemptclose", &format!("{client_id}:{sequence}"));
+            last = self
+                .submit_or_lookup(
+                    symbol,
+                    &child_id,
+                    vec![
+                        ("symbol".into(), symbol.into()),
+                        ("side".into(), side_name(side.opposite()).into()),
+                        ("type".into(), "MARKET".into()),
+                        ("quantity".into(), decimal(chunk, rules.quantity_step)),
+                        ("reduceOnly".into(), "true".into()),
+                        ("newClientOrderId".into(), child_id.clone()),
+                        ("newOrderRespType".into(), "RESULT".into()),
+                    ],
+                )
+                .await?;
+            remaining = (remaining - chunk).max(0.0);
+        }
+        Err(anyhow!(
+            "{symbol} emergency close required more than 128 market chunks"
+        ))
     }
 
     fn save(&self) -> Result<()> {
@@ -5930,20 +6008,21 @@ fn early_failure_triggered(
     favorable < max_favorable_pct && current <= -adverse_pct
 }
 
-const FAST_TREND_HOLD_GRACE_MS: i64 = 60 * 60_000;
-
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum MaxHoldReview {
     NotApplicable,
     ReleaseToProtection,
     Extend {
-        favorable_pct: f64,
-        current_return_pct: f64,
+        executable_net_pnl_usd: f64,
+        initial_risk_usd: f64,
     },
     Exit,
 }
 
-fn max_hold_review(meta: &ExecutionMeta, mark_price: f64, now_ms: i64) -> MaxHoldReview {
+const FAST_TREND_EXECUTABLE_GRACE_MS: i64 = 15 * 60_000;
+const MAX_STORED_EXECUTABLE_QUOTE_AGE_MS: i64 = 5_000;
+
+fn max_hold_review(meta: &ExecutionMeta, now_ms: i64) -> MaxHoldReview {
     if meta.exit_requested
         || meta.max_hold_ms <= 0
         || now_ms - meta.holding_started_ms() < meta.max_hold_ms
@@ -5956,31 +6035,36 @@ fn max_hold_review(meta: &ExecutionMeta, mark_price: f64, now_ms: i64) -> MaxHol
     if meta.recipe != "fast_trend_activation" || meta.entry_price <= f64::EPSILON {
         return MaxHoldReview::Exit;
     }
-    if meta.break_even_armed {
+    if meta.break_even_armed
+        || meta
+            .executable_profit
+            .as_ref()
+            .is_some_and(|guard| guard.floor_net_return.is_some())
+    {
         return MaxHoldReview::ReleaseToProtection;
     }
-    let Some(shield_activation_pct) = meta.profit_shield_activation_pct else {
-        return MaxHoldReview::Exit;
-    };
-    if shield_activation_pct <= f64::EPSILON || meta.max_hold_reviews > 0 {
+    if meta.pending_exit_reason.as_deref() == Some("max_hold") || meta.max_hold_reviews > 0 {
         return MaxHoldReview::Exit;
     }
-    let observed_extreme = match meta.side {
-        Side::Buy => meta.extreme_price.max(mark_price),
-        Side::Sell => meta.extreme_price.min(mark_price),
+    let Some(guard) = meta.executable_profit.as_ref() else {
+        return MaxHoldReview::Exit;
     };
-    let favorable_pct = meta.side.sign() * (observed_extreme / meta.entry_price - 1.0);
-    let current_return_pct = meta.side.sign() * (mark_price / meta.entry_price - 1.0);
-    // Halfway to the shield is enough evidence for one grace period, while a
-    // position already more than one shield distance underwater is stale.
-    if favorable_pct >= shield_activation_pct * 0.5 && current_return_pct >= -shield_activation_pct
-    {
-        MaxHoldReview::Extend {
-            favorable_pct,
-            current_return_pct,
-        }
-    } else {
-        MaxHoldReview::Exit
+    let Some(initial_risk_usd) = meta.initial_risk_usd.filter(|value| *value > f64::EPSILON) else {
+        return MaxHoldReview::Exit;
+    };
+    if now_ms.saturating_sub(guard.observed_ms) > MAX_STORED_EXECUTABLE_QUOTE_AGE_MS {
+        return MaxHoldReview::Exit;
+    }
+    // Fast activation's nominal horizon is its first review point, not a
+    // blind liquidation timer. One bounded grace window lets a still-live
+    // impulse finish without recreating the old unbounded extension bug. The
+    // quote must be fresh and the second review always exits if protection has
+    // not armed in the meantime.
+    MaxHoldReview::Extend {
+        executable_net_pnl_usd: guard.current_net_return
+            * meta.entry_price
+            * meta.last_observed_quantity.max(0.0),
+        initial_risk_usd,
     }
 }
 
@@ -6233,6 +6317,53 @@ fn take_profit_prices_from_fill(
         .collect()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct FillProtection {
+    activation_pct: Option<f64>,
+    trailing_distance_pct: Option<f64>,
+}
+
+/// Rebase Fast protection on what actually filled. The full target stays at
+/// the requested account-level dollar objective. The lock arms at 55% of that
+/// objective and trails by 25%; both are recomputed from actual notional so a
+/// liquidity-reduced fill cannot inherit thresholds from the planned size.
+fn protection_from_fill(
+    plan: &greed_kernel::PositionPlan,
+    actual_notional_usd: f64,
+    actual_initial_risk_usd: f64,
+) -> FillProtection {
+    let cost_aware = plan
+        .signal_context
+        .get("cost_aware_profit_shield")
+        .is_some_and(|value| value == "true");
+    let desired_net_usd = plan
+        .signal_context
+        .get("target_account_profit_usd")
+        .and_then(|value| value.parse::<f64>().ok())
+        .filter(|value| value.is_finite() && *value > 0.0);
+    if cost_aware
+        && actual_notional_usd.is_finite()
+        && actual_notional_usd > f64::EPSILON
+        && actual_initial_risk_usd.is_finite()
+        && actual_initial_risk_usd > f64::EPSILON
+    {
+        if let Some(desired_net_usd) = desired_net_usd {
+            let activation_usd = desired_net_usd * 0.55;
+            let retracement_usd = desired_net_usd * 0.25;
+            return FillProtection {
+                activation_pct: Some(
+                    crate::profit_guard::COST_RESERVE + activation_usd / actual_notional_usd,
+                ),
+                trailing_distance_pct: Some(retracement_usd / actual_notional_usd),
+            };
+        }
+    }
+    FillProtection {
+        activation_pct: plan.profit_shield_activation_pct,
+        trailing_distance_pct: plan.trailing_distance_pct,
+    }
+}
+
 fn floor_step(value: f64, step: f64) -> f64 {
     (value / step).floor() * step
 }
@@ -6455,6 +6586,26 @@ fn cap_entry_quantity(desired: f64, maximum: f64, quantity_step: f64) -> Result<
         }
     }
     Ok(capped)
+}
+
+fn market_close_chunk(remaining: f64, rules: &SymbolRules) -> Result<f64> {
+    if !remaining.is_finite() || remaining <= f64::EPSILON {
+        return Err(anyhow!("market close has no positive remaining quantity"));
+    }
+    let maximum = if rules.max_market_quantity.is_finite() {
+        rules.max_market_quantity
+    } else {
+        remaining
+    };
+    let chunk = floor_step(remaining.min(maximum), rules.quantity_step);
+    if chunk < rules.min_quantity || chunk <= f64::EPSILON {
+        return Err(anyhow!(
+            "remaining market-close quantity {remaining} cannot satisfy Binance minimum {} at step {}",
+            rules.min_quantity,
+            rules.quantity_step
+        ));
+    }
+    Ok(chunk)
 }
 
 // Infer from persisted numerical settings, not an ephemeral candidate tag.
@@ -6708,6 +6859,38 @@ mod tests {
         let half = take_profit_prices_from_fill(&plan, 101.0, 5_000.0 / 101.0);
         assert!((half[0].0 - 101.6969).abs() < 1e-9);
         assert_eq!(half[0].1, 1.0);
+    }
+
+    #[test]
+    fn fast_profit_protection_rebases_to_actual_fill_and_initial_risk() {
+        let mut plan = guarded_plan(Side::Buy);
+        plan.signal_context
+            .insert("cost_aware_profit_shield".into(), "true".into());
+        plan.signal_context
+            .insert("target_account_profit_usd".into(), "30".into());
+        let protection = protection_from_fill(&plan, 2_626.0, 18.90);
+        let expected_activation = crate::profit_guard::COST_RESERVE + 30.0 * 0.55 / 2_626.0;
+        let expected_distance = 30.0 * 0.25 / 2_626.0;
+        assert!((protection.activation_pct.unwrap() - expected_activation).abs() < 1e-12);
+        assert!((protection.trailing_distance_pct.unwrap() - expected_distance).abs() < 1e-12);
+
+        let small_fill = protection_from_fill(&plan, 247.0, 1.67);
+        assert!(small_fill.activation_pct.unwrap() > 0.06);
+        assert!(small_fill.trailing_distance_pct.unwrap() > 0.03);
+    }
+
+    #[test]
+    fn market_close_is_split_at_the_exchange_market_quantity_limit() {
+        let rules = SymbolRules {
+            quantity_step: 1.0,
+            min_quantity: 1.0,
+            max_limit_quantity: 100_000.0,
+            max_market_quantity: 20_000.0,
+            price_tick: 0.00001,
+            min_notional: 5.0,
+        };
+        assert_eq!(market_close_chunk(73_882.0, &rules).unwrap(), 20_000.0);
+        assert_eq!(market_close_chunk(13_882.0, &rules).unwrap(), 13_882.0);
     }
 
     #[test]
@@ -7003,23 +7186,15 @@ mod tests {
     }
 
     #[test]
-    fn fast_trend_deadline_extends_once_when_price_has_made_real_progress() {
-        let mut meta: ExecutionMeta = serde_json::from_value(serde_json::json!({
+    fn fast_trend_deadline_does_not_extend_an_unprotected_mark_peak() {
+        let meta: ExecutionMeta = serde_json::from_value(serde_json::json!({
             "candidate_id":"fast:1","recipe":"fast_trend_activation","side":"buy",
             "entry_ms":1_000,"first_fill_ms":1_000,"entry_price":0.01916,
             "extreme_price":0.0192736,"stop_price":0.01892865,
             "profit_shield_activation_pct":0.006037,"max_hold_ms":1_800_000
         }))
         .unwrap();
-        assert!(matches!(
-            max_hold_review(&meta, 0.01908, 1_801_000),
-            MaxHoldReview::Extend { .. }
-        ));
-        meta.max_hold_reviews = 1;
-        assert_eq!(
-            max_hold_review(&meta, 0.01908, 1_801_000),
-            MaxHoldReview::Exit
-        );
+        assert_eq!(max_hold_review(&meta, 1_801_000), MaxHoldReview::Exit);
     }
 
     #[test]
@@ -7032,9 +7207,76 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            max_hold_review(&meta, 100.4, 1_801_000),
+            max_hold_review(&meta, 1_801_000),
             MaxHoldReview::ReleaseToProtection
         );
+    }
+
+    #[test]
+    fn fast_trend_deadline_yields_to_an_executable_floor_before_stop_update() {
+        let meta: ExecutionMeta = serde_json::from_value(serde_json::json!({
+            "candidate_id":"fast:floor","recipe":"fast_trend_activation","side":"buy",
+            "entry_ms":1_000,"first_fill_ms":1_000,"entry_price":100.0,
+            "stop_price":98.0,"profit_shield_activation_pct":0.005,
+            "max_hold_ms":600_000,
+            "executable_profit":{
+                "quantity":10.0,"peak_net_return":0.006,"current_net_return":0.005,
+                "floor_net_return":0.002,"observed_ms":600_000,"exchange_ms":600_000,
+                "exit_vwap":100.6
+            }
+        }))
+        .unwrap();
+        assert_eq!(
+            max_hold_review(&meta, 601_000),
+            MaxHoldReview::ReleaseToProtection
+        );
+    }
+
+    #[test]
+    fn fast_trend_deadline_grants_one_short_grace_for_a_fresh_executable_quote() {
+        let mut meta: ExecutionMeta = serde_json::from_value(serde_json::json!({
+            "candidate_id":"fast:progress","recipe":"fast_trend_activation","side":"buy",
+            "entry_ms":1_000,"first_fill_ms":1_000,"entry_price":100.0,
+            "initial_quantity":10.0,"last_observed_quantity":10.0,
+            "initial_risk_usd":20.0,"stop_price":98.0,
+            "profit_shield_activation_pct":0.03,"max_hold_ms":600_000,
+            "executable_profit":{
+                "quantity":10.0,"peak_net_return":0.006,"current_net_return":0.005,
+                "floor_net_return":null,"observed_ms":600_000,"exchange_ms":600_000,
+                "exit_vwap":100.6
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            max_hold_review(&meta, 601_000),
+            MaxHoldReview::Extend { .. }
+        ));
+        meta.max_hold_reviews = 1;
+        assert_eq!(max_hold_review(&meta, 601_000), MaxHoldReview::Exit);
+        meta.max_hold_reviews = 0;
+        meta.pending_exit_reason = Some("max_hold".into());
+        assert_eq!(max_hold_review(&meta, 601_000), MaxHoldReview::Exit);
+    }
+
+    #[test]
+    fn fast_trend_grace_does_not_require_an_unbankable_mark_profit() {
+        let meta: ExecutionMeta = serde_json::from_value(serde_json::json!({
+            "candidate_id":"fast:fresh-loss","recipe":"fast_trend_activation","side":"buy",
+            "entry_ms":1_000,"first_fill_ms":1_000,"entry_price":100.0,
+            "initial_quantity":10.0,"last_observed_quantity":10.0,
+            "initial_risk_usd":20.0,"stop_price":98.0,
+            "profit_shield_activation_pct":0.03,"max_hold_ms":600_000,
+            "executable_profit":{
+                "quantity":10.0,"peak_net_return":0.001,"current_net_return":-0.003,
+                "floor_net_return":null,"observed_ms":600_000,"exchange_ms":600_000,
+                "exit_vwap":99.8
+            }
+        }))
+        .unwrap();
+        assert!(matches!(
+            max_hold_review(&meta, 601_000),
+            MaxHoldReview::Extend { .. }
+        ));
     }
 
     #[test]
@@ -7046,7 +7288,7 @@ mod tests {
             "profit_shield_activation_pct":0.006,"max_hold_ms":1_800_000
         }))
         .unwrap();
-        assert_eq!(max_hold_review(&meta, 99.8, 1_801_000), MaxHoldReview::Exit);
+        assert_eq!(max_hold_review(&meta, 1_801_000), MaxHoldReview::Exit);
     }
 
     #[test]
@@ -7060,7 +7302,7 @@ mod tests {
             "fixed_time_exit":true
         }))
         .unwrap();
-        assert_eq!(max_hold_review(&meta, 110.0, 901_000), MaxHoldReview::Exit);
+        assert_eq!(max_hold_review(&meta, 901_000), MaxHoldReview::Exit);
     }
 
     #[test]
@@ -7115,14 +7357,8 @@ mod tests {
             restored.trailing_activation_pct,
             restored.trailing_distance_pct
         ));
-        assert_ne!(
-            max_hold_review(&restored, 100.0, 61_000),
-            MaxHoldReview::Exit
-        );
-        assert_eq!(
-            max_hold_review(&restored, 100.0, 901_000),
-            MaxHoldReview::Exit
-        );
+        assert_ne!(max_hold_review(&restored, 61_000), MaxHoldReview::Exit);
+        assert_eq!(max_hold_review(&restored, 901_000), MaxHoldReview::Exit);
     }
 
     #[test]

@@ -84,6 +84,13 @@ fast_reacceleration_max_compression_ratio = 3.0
 fast_reacceleration_min_body_return_5m = 0.0075
 fast_reacceleration_min_volume_ratio_5m = 4.0
 fast_reacceleration_min_flow_5m = 0.25
+# A reacceleration may cross immediately only while the broad tape confirms
+# it and the combined pre-break + ignition extension is still under 2.5%.
+# Otherwise it must print a real one-minute touch-and-reclaim first.
+fast_reacceleration_direct_min_market_breadth = 0.60
+fast_reacceleration_direct_min_market_return_1h = 0.002
+fast_reacceleration_direct_max_extension = 0.025
+fast_reacceleration_direct_early_extension = 0.015
 # Stay early without demanding a perfectly flat pre-break hour. 4USDT on
 # 2026-09-05 began its persistent leg with +2.9% pre-break, +5.2% over 4h and
 # +2.3% OI over 15m, then supplied the required 1m reclaim.

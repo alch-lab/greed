@@ -70,6 +70,14 @@ pub struct LaneConfig {
     pub fast_reacceleration_min_body_return_5m: f64,
     pub fast_reacceleration_min_volume_ratio_5m: f64,
     pub fast_reacceleration_min_flow_5m: f64,
+    /// Directly crossing the spread after an already-running impulse is only
+    /// allowed when the broader altcoin tape confirms the direction and the
+    /// combined pre-break plus ignition move is still bounded. Otherwise the
+    /// recipe must obtain a genuine one-minute reclaim.
+    pub fast_reacceleration_direct_min_market_breadth: f64,
+    pub fast_reacceleration_direct_min_market_return_1h: f64,
+    pub fast_reacceleration_direct_max_extension: f64,
+    pub fast_reacceleration_direct_early_extension: f64,
     pub fast_max_prebreak_return_1h: f64,
     pub fast_max_return_4h: f64,
     pub fast_max_oi_change_15m: f64,
@@ -156,6 +164,10 @@ impl Default for LaneConfig {
             fast_reacceleration_min_body_return_5m: 0.0075,
             fast_reacceleration_min_volume_ratio_5m: 4.0,
             fast_reacceleration_min_flow_5m: 0.25,
+            fast_reacceleration_direct_min_market_breadth: 0.60,
+            fast_reacceleration_direct_min_market_return_1h: 0.002,
+            fast_reacceleration_direct_max_extension: 0.025,
+            fast_reacceleration_direct_early_extension: 0.015,
             fast_max_prebreak_return_1h: 0.03,
             fast_max_return_4h: 0.06,
             fast_max_oi_change_15m: 0.03,
@@ -328,6 +340,13 @@ impl StrategyConfig {
             || !(lanes.fast_min_volume_ratio_5m..=15.0)
                 .contains(&lanes.fast_reacceleration_min_volume_ratio_5m)
             || !(lanes.fast_min_flow_5m..=0.80).contains(&lanes.fast_reacceleration_min_flow_5m)
+            || !(0.50..=0.90).contains(&lanes.fast_reacceleration_direct_min_market_breadth)
+            || !(0.0..=0.02).contains(&lanes.fast_reacceleration_direct_min_market_return_1h)
+            || !(lanes.fast_reacceleration_min_body_return_5m..=0.05)
+                .contains(&lanes.fast_reacceleration_direct_max_extension)
+            || !(lanes.fast_reacceleration_min_body_return_5m
+                ..=lanes.fast_reacceleration_direct_max_extension)
+                .contains(&lanes.fast_reacceleration_direct_early_extension)
             || !(0.0..=0.05).contains(&lanes.fast_max_prebreak_return_1h)
             || !(0.01..=0.10).contains(&lanes.fast_max_return_4h)
             || !(0.001..=0.05).contains(&lanes.fast_max_oi_change_15m)
