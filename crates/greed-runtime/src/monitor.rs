@@ -17,12 +17,36 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, Ordering},
-        Arc,
+        Arc, RwLock,
     },
 };
 use tokio::sync::{mpsc, oneshot};
 
 const MIN_OPERATOR_PASSWORD_LENGTH: usize = 8;
+
+/// Small, in-memory view updated by the execution reconciliation loop. The
+/// dashboard can poll this without parsing the strategy graph or walking the
+/// historical ledger, and it is deliberately not used as trading input.
+#[derive(Clone, Default)]
+pub struct LivePortfolio {
+    value: Arc<RwLock<Value>>,
+}
+
+impl LivePortfolio {
+    pub fn replace(&self, value: Value) {
+        if let Ok(mut current) = self.value.write() {
+            *current = value;
+        }
+    }
+
+    fn snapshot(&self) -> Option<Value> {
+        self.value
+            .read()
+            .ok()
+            .map(|value| value.clone())
+            .filter(|value| !value.is_null())
+    }
+}
 
 pub enum ControlCommand {
     Audit {
@@ -59,6 +83,7 @@ struct ApiState {
     paused: Arc<AtomicBool>,
     operator_password: Option<Arc<str>>,
     operator_token: Option<Arc<str>>,
+    live_portfolio: LivePortfolio,
 }
 
 #[derive(Deserialize)]
@@ -93,7 +118,7 @@ fn default_page_limit() -> usize {
     50
 }
 
-pub async fn start(config: &RuntimeConfig) -> Result<Monitor> {
+pub async fn start(config: &RuntimeConfig, live_portfolio: LivePortfolio) -> Result<Monitor> {
     let listener = tokio::net::TcpListener::bind(&config.http_listen)
         .await
         .with_context(|| format!("bind monitoring API on {}", config.http_listen))?;
@@ -132,10 +157,12 @@ pub async fn start(config: &RuntimeConfig) -> Result<Monitor> {
         paused: paused.clone(),
         operator_password,
         operator_token,
+        live_portfolio,
     };
     let router = Router::new()
         .route("/api/health", get(health))
         .route("/api/status", get(status))
+        .route("/api/positions/live", get(live_positions))
         .route("/api/events", get(events))
         .route("/api/history", get(history))
         .route("/api/trades", get(trades))
@@ -171,7 +198,11 @@ async fn health(State(state): State<ApiState>) -> Json<Value> {
 async fn status(State(state): State<ApiState>) -> Response {
     match read_json(&state.status_path) {
         Ok(mut value) => {
-            reconcile_closed_positions(&mut value, &state.history_path);
+            if let Some(live) = state.live_portfolio.snapshot() {
+                merge_live_portfolio(&mut value, &live);
+            } else {
+                reconcile_closed_positions(&mut value, &state.history_path);
+            }
             value["control"] = control_status(&state);
             Json(value).into_response()
         }
@@ -191,6 +222,28 @@ async fn status(State(state): State<ApiState>) -> Response {
             Json(json!({"error":error.to_string()})),
         )
             .into_response(),
+    }
+}
+
+async fn live_positions(State(state): State<ApiState>) -> Response {
+    match state.live_portfolio.snapshot() {
+        Some(value) => Json(value).into_response(),
+        None => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"error":"live portfolio is warming"})),
+        )
+            .into_response(),
+    }
+}
+
+fn merge_live_portfolio(status: &mut Value, live: &Value) {
+    for key in ["account", "positions", "execution"] {
+        if let Some(value) = live.get(key) {
+            status[key] = value.clone();
+        }
+    }
+    if let Some(value) = live.get("as_of_ms") {
+        status["portfolio_as_of_ms"] = value.clone();
     }
 }
 
@@ -400,7 +453,10 @@ fn hex_digest(value: &[u8]) -> String {
 
 fn reconcile_closed_positions(status: &mut Value, history_path: &Path) {
     let status_ms = status["as_of_ms"].as_i64().unwrap_or_default();
-    let Ok((events, _)) = reverse_jsonl_page(history_path, 500, None, is_trade_event) else {
+    // This is only a cold-start fallback before the in-memory portfolio has
+    // warmed. Bound the read by bytes instead of searching backwards for 500
+    // sparse trade records on every dashboard request.
+    let Ok(events) = tail_jsonl(history_path, 2_000, 2 * 1024 * 1024) else {
         return;
     };
     let mut latest = BTreeMap::<String, &Value>::new();
@@ -776,6 +832,31 @@ mod tests {
         assert_eq!(status["account"]["open_positions"], 0);
         assert_eq!(status["account"]["gross_exposure_usd"], 0.0);
         std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn live_portfolio_replaces_only_the_fast_moving_status_fields() {
+        let mut status = json!({
+            "as_of_ms":100,
+            "graph":{"node_order":["lane.fast_trend_activation"]},
+            "account":{"equity_usd":1000.0},
+            "positions":{},
+            "execution":{"last_sync_ms":100}
+        });
+        let live = json!({
+            "as_of_ms":250,
+            "account":{"equity_usd":1002.0},
+            "positions":{"ALTUSDT":{"current_price":2.0}},
+            "execution":{"last_sync_ms":240}
+        });
+        merge_live_portfolio(&mut status, &live);
+        assert_eq!(status["portfolio_as_of_ms"], 250);
+        assert_eq!(status["account"]["equity_usd"], 1002.0);
+        assert_eq!(status["positions"]["ALTUSDT"]["current_price"], 2.0);
+        assert_eq!(
+            status["graph"]["node_order"][0],
+            "lane.fast_trend_activation"
+        );
     }
 
     #[test]

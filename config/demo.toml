@@ -1,9 +1,10 @@
 [runtime]
 # proxy = "http://127.0.0.1:7890"
 binance_futures_ws_base = "wss://fstream.binance.com"
-# Reconcile Binance account/position state every five seconds. Market discovery
-# remains independently capped by strategy.universe.refresh_seconds.
+# Strategy frames remain on a five-second cadence. Position reconciliation and
+# executable-profit protection run independently every 500 ms.
 poll_seconds = 5
+execution_sync_millis = 500
 stream_warmup_seconds = 20
 request_spacing_ms = 150
 request_timeout_seconds = 8

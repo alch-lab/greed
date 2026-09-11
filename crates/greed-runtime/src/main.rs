@@ -429,11 +429,12 @@ async fn run_paper(config: AppConfig, iterations: u64) -> Result<()> {
 async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
     let started_ms = chrono::Utc::now().timestamp_millis();
     let identity = runtime_identity(&config, started_ms);
+    let live_portfolio = monitor::LivePortfolio::default();
     let monitor::Monitor {
         task: _monitor,
         mut commands,
         paused,
-    } = monitor::start(&config.runtime).await?;
+    } = monitor::start(&config.runtime, live_portfolio.clone()).await?;
     let mut source = BinanceMarketSource::new(config.runtime.clone())?;
     if let Err(error) = source.start_market_stream(&config.strategy).await {
         // The stream hub owns reconnect loops. A cold-start timeout must halt
@@ -453,6 +454,16 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
     .await
     .context("Binance demo execution initialization failed; trading runtime cannot start")?;
     let execution = Arc::new(Mutex::new(execution));
+    {
+        let mut execution = execution.lock().await;
+        live_portfolio.replace(serde_json::json!({
+            "as_of_ms":chrono::Utc::now().timestamp_millis(),
+            "account":execution.account_frame()?,
+            "positions":execution.position_snapshots(),
+            "execution":execution.health(),
+            "latency":{"state":"initializing"},
+        }));
+    }
     let journal = Journal::new(&config.runtime.journal_path)?;
     let history = Journal::new(&config.runtime.history_path)?;
     let research_capacity_bytes = config
@@ -525,17 +536,62 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
     let sync_execution = Arc::clone(&execution);
     let reconciliation_healthy = Arc::new(AtomicBool::new(true));
     let sync_health = Arc::clone(&reconciliation_healthy);
+    let sync_waiting = Arc::new(AtomicBool::new(false));
+    let sync_priority = Arc::clone(&sync_waiting);
+    let sync_live_portfolio = live_portfolio.clone();
+    let execution_sync_millis = config.runtime.execution_sync_millis;
     tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(Duration::from_millis(execution_sync_millis));
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        let mut last_latency_event_ms = 0i64;
         loop {
-            let result = {
-                let mut execution = sync_execution.lock().await;
-                execution.sync().await.map_err(|error| error.to_string())
-            };
+            ticker.tick().await;
+            let requested_ms = chrono::Utc::now().timestamp_millis();
+            sync_priority.store(true, Ordering::SeqCst);
+            let mut execution = sync_execution.lock().await;
+            let acquired_ms = chrono::Utc::now().timestamp_millis();
+            sync_priority.store(false, Ordering::SeqCst);
+            let mut result = execution.sync().await.map_err(|error| error.to_string());
+            let completed_ms = chrono::Utc::now().timestamp_millis();
+            let lock_wait_ms = acquired_ms.saturating_sub(requested_ms);
+            let cycle_ms = completed_ms.saturating_sub(acquired_ms);
+            if result.is_ok() {
+                let account = execution.account_frame().map_err(|error| error.to_string());
+                if let Ok(account) = account {
+                    sync_live_portfolio.replace(serde_json::json!({
+                        "as_of_ms":completed_ms,
+                        "account":account,
+                        "positions":execution.position_snapshots(),
+                        "execution":execution.health(),
+                        "latency":{
+                            "target_interval_ms":execution_sync_millis,
+                            "lock_wait_ms":lock_wait_ms,
+                            "sync_cycle_ms":cycle_ms,
+                            "total_ms":completed_ms.saturating_sub(requested_ms),
+                        },
+                    }));
+                }
+                if completed_ms - last_latency_event_ms >= 10_000 {
+                    if let Ok(events) = result.as_mut() {
+                        events.push(execution::ExchangeEvent {
+                            kind: "execution_latency".into(),
+                            payload: serde_json::json!({
+                                "ts_ms":completed_ms,
+                                "target_interval_ms":execution_sync_millis,
+                                "lock_wait_ms":lock_wait_ms,
+                                "sync_cycle_ms":cycle_ms,
+                                "total_ms":completed_ms.saturating_sub(requested_ms),
+                            }),
+                        });
+                    }
+                    last_latency_event_ms = completed_ms;
+                }
+            }
+            drop(execution);
             sync_health.store(result.is_ok(), Ordering::SeqCst);
             if sync_tx.send(result).is_err() {
                 break;
             }
-            tokio::time::sleep(Duration::from_secs(1)).await;
         }
     });
     loop {
@@ -798,6 +854,16 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                 }
                 let entries_enabled =
                     !paused.load(Ordering::SeqCst) && reconciliation_healthy.load(Ordering::SeqCst);
+                // A due position-reconciliation tick gets the execution owner
+                // before new entries. This does not interrupt an in-flight
+                // exchange mutation, but prevents strategy frames from
+                // repeatedly jumping ahead of risk management.
+                let priority_deadline = tokio::time::Instant::now() + Duration::from_secs(1);
+                while sync_waiting.load(Ordering::SeqCst)
+                    && tokio::time::Instant::now() < priority_deadline
+                {
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
                 let order_events = execution
                     .lock()
                     .await

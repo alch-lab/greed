@@ -49,6 +49,10 @@ pub struct RuntimeConfig {
     pub binance_futures_ws_base: String,
     pub proxy: Option<String>,
     pub poll_seconds: u64,
+    /// Cadence of the position/protection reconciliation loop. This is kept
+    /// separate from the slower strategy-frame cadence so candidate research
+    /// and universe refreshes cannot define exit responsiveness.
+    pub execution_sync_millis: u64,
     pub stream_warmup_seconds: u64,
     pub request_spacing_ms: u64,
     pub request_timeout_seconds: u64,
@@ -80,6 +84,7 @@ impl Default for RuntimeConfig {
             binance_futures_ws_base: "wss://fstream.binance.com".into(),
             proxy: None,
             poll_seconds: 15,
+            execution_sync_millis: 500,
             stream_warmup_seconds: 20,
             request_spacing_ms: 150,
             request_timeout_seconds: 8,
@@ -123,6 +128,9 @@ impl AppConfig {
         self.strategy.validate()?;
         if !(5..=60).contains(&self.runtime.poll_seconds) {
             return Err("poll_seconds must be 5..=60".into());
+        }
+        if !(250..=2_000).contains(&self.runtime.execution_sync_millis) {
+            return Err("execution_sync_millis must be 250..=2000".into());
         }
         if !(5..=30).contains(&self.runtime.stream_warmup_seconds) {
             return Err("stream warmup setting is outside safe bounds".into());

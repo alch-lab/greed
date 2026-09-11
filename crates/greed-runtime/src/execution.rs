@@ -1194,6 +1194,12 @@ impl BinanceDemoExecution {
                                 "remaining_quantity":position.quantity.abs(),"guard":meta.executable_profit,
                                 "cost_reserve_bps":crate::profit_guard::COST_RESERVE*10000.0,
                                 "quote_source":"execution_venue_depth","exit_requested":exit,
+                                "latency":{
+                                    "exchange_quote_ms":quote.exchange_ms,
+                                    "quote_observed_ms":quote.observed_ms,
+                                    "decision_ms":chrono::Utc::now().timestamp_millis(),
+                                    "quote_age_ms":chrono::Utc::now().timestamp_millis()+self.clock_offset_ms-quote.exchange_ms,
+                                },
                             })});
                             if exit {
                                 executable_exits.push((symbol.clone(), position.clone()));
@@ -1291,15 +1297,30 @@ impl BinanceDemoExecution {
                     self.save()?;
                 }
                 for (symbol, position) in executable_exits {
+                    let decision_ms = chrono::Utc::now().timestamp_millis();
+                    let trigger_quote = self
+                        .state
+                        .positions
+                        .get(&symbol)
+                        .and_then(|meta| meta.executable_profit.as_ref())
+                        .map(|guard| (guard.exchange_ms, guard.observed_ms));
                     match self.close_market(&position).await {
                         Ok(()) => {
+                            let flat_confirmed_ms = chrono::Utc::now().timestamp_millis();
                             if let Some(meta) = self.state.positions.get_mut(&symbol) {
                                 meta.exit_requested = true;
                                 meta.pending_exit_reason = Some("executable_profit_protection".into());
                             }
                             self.save()?;
                             events.push(ExchangeEvent {kind:"exchange_exit_requested".into(),payload:serde_json::json!({
-                                "ts_ms":chrono::Utc::now().timestamp_millis(),"symbol":symbol,"reason":"executable_profit_protection",
+                                "ts_ms":flat_confirmed_ms,"symbol":symbol,"reason":"executable_profit_protection",
+                                "latency":{
+                                    "trigger_exchange_ms":trigger_quote.map(|value|value.0),
+                                    "trigger_observed_ms":trigger_quote.map(|value|value.1),
+                                    "decision_ms":decision_ms,
+                                    "flat_confirmed_ms":flat_confirmed_ms,
+                                    "decision_to_flat_ms":flat_confirmed_ms.saturating_sub(decision_ms),
+                                },
                             })});
                         }
                         Err(error) => events.push(ExchangeEvent {kind:"exchange_order_rejected".into(),payload:serde_json::json!({
@@ -1337,6 +1358,7 @@ impl BinanceDemoExecution {
                     }
                 }
                 for (symbol, desired, reason, position, stop_order_id) in protection_updates {
+                    let decision_ms = chrono::Utc::now().timestamp_millis();
                     let rules = self
                         .rules
                         .get(&symbol)
@@ -1362,6 +1384,7 @@ impl BinanceDemoExecution {
                     .await;
                     match replacement {
                         Ok(stop_algo_id) => {
+                            let exchange_ack_ms = chrono::Utc::now().timestamp_millis();
                             if let Some(meta) = self.state.positions.get_mut(&symbol) {
                                 meta.stop_price = desired;
                                 meta.break_even_armed = true;
@@ -1370,7 +1393,15 @@ impl BinanceDemoExecution {
                             }
                             events.push(ExchangeEvent {
                                 kind: "exchange_protection_updated".into(),
-                                payload: serde_json::json!({"ts_ms":now_ms,"symbol":symbol,"stop_price":desired,"reason":reason,"venue":"binance_demo"}),
+                                payload: serde_json::json!({
+                                    "ts_ms":exchange_ack_ms,"symbol":symbol,"stop_price":desired,
+                                    "reason":reason,"venue":"binance_demo",
+                                    "latency":{
+                                        "decision_ms":decision_ms,
+                                        "exchange_ack_ms":exchange_ack_ms,
+                                        "decision_to_ack_ms":exchange_ack_ms.saturating_sub(decision_ms),
+                                    },
+                                }),
                             });
                         }
                         Err(error) => {
