@@ -19,6 +19,10 @@ const PROFIT_SHIELD_MIN_NET_BPS: f64 = 2.0;
 const FAST_TREND_RECIPE: &str = "fast_trend_activation";
 const FAST_DEDICATED_POSITION_SLOTS: usize = 1;
 const ESTIMATED_MAKER_TAKER_FEE_BPS: f64 = 7.0;
+// Keep this synchronized with greed-runtime's executable-value guard. The
+// planner expresses activation on gross price while the guard tracks net
+// executable return after this reserve.
+const EXECUTABLE_PROFIT_COST_RESERVE_PCT: f64 = 0.001;
 
 fn cost_aware_profit_shield_buffer(
     configured_buffer_pct: f64,
@@ -427,13 +431,16 @@ impl StrategyNode for PositionPlannerNode {
                 let desired_net_usd = a.equity_usd * target_account_profit_pct;
                 let gross_target_pct = desired_net_usd / notional.max(1.0) + cost_bps / 10_000.0;
                 target_r = gross_target_pct / stop_pct.max(f64::EPSILON);
-                // Arm after roughly 60% of the sprint objective and allow a
-                // 30%-of-target retracement. Expressing both as a fraction of
-                // the liquidity-sized target keeps the dollar behavior stable
-                // when the book forces a smaller position.
-                profit_shield_activation_r = gross_target_pct * 0.60 / stop_pct.max(f64::EPSILON);
+                // Arm at roughly 60% of the desired *net* dollar objective and
+                // allow a 30%-of-target retracement. Expressing both against
+                // the liquidity-sized notional keeps the dollar behavior
+                // stable when the book forces a smaller position.
+                let desired_net_return = desired_net_usd / notional.max(1.0);
+                let shield_activation_pct =
+                    EXECUTABLE_PROFIT_COST_RESERVE_PCT + desired_net_return * 0.60;
+                profit_shield_activation_r = shield_activation_pct / stop_pct.max(f64::EPSILON);
                 trailing_activation_r = profit_shield_activation_r;
-                trailing_distance_pct = gross_target_pct * 0.30;
+                trailing_distance_pct = desired_net_return * 0.30;
                 effective_full_take_profit_pct = Some(gross_target_pct);
                 estimated_target_cost_bps = Some(cost_bps);
             }
@@ -1092,9 +1099,9 @@ mod tests {
         // 30 USD desired net + 9 bps estimated round-trip cost: 39 bps gross.
         assert!((plan.take_profit_prices[0].0 - 100.39).abs() < 1e-9);
         assert_eq!(plan.take_profit_prices[0].1, 1.0);
-        assert!((plan.profit_shield_activation_pct.unwrap() - 0.00234).abs() < 1e-12);
-        assert!((plan.trailing_activation_pct.unwrap() - 0.00234).abs() < 1e-12);
-        assert!((plan.trailing_distance_pct.unwrap() - 0.00117).abs() < 1e-12);
+        assert!((plan.profit_shield_activation_pct.unwrap() - 0.0028).abs() < 1e-12);
+        assert!((plan.trailing_activation_pct.unwrap() - 0.0028).abs() < 1e-12);
+        assert!((plan.trailing_distance_pct.unwrap() - 0.0009).abs() < 1e-12);
     }
 
     #[test]
