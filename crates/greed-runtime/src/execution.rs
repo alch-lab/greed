@@ -83,6 +83,8 @@ enum ProtectiveOrderId {
     Algo(i64),
 }
 
+const PROTECTION_VISIBILITY_GRACE_MS: i64 = 5_000;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ExecutionMeta {
     candidate_id: String,
@@ -171,6 +173,12 @@ struct ExecutionMeta {
     pending_exit_note: Option<String>,
     #[serde(default)]
     stop_algo_id: Option<i64>,
+    /// Local time at which Binance acknowledged the currently stored stop.
+    /// The conditional-order list is eventually consistent on Demo, so a
+    /// freshly acknowledged stop must not be treated as missing merely because
+    /// it has not appeared in `openAlgoOrders` yet.
+    #[serde(default)]
+    protection_ack_ms: Option<i64>,
     #[serde(default)]
     stop_reason: Option<String>,
     #[serde(default)]
@@ -445,6 +453,7 @@ struct BracketExecution {
     stop_price: f64,
     take_profit_prices: Vec<(f64, f64)>,
     stop_algo_id: i64,
+    protection_ack_ms: i64,
     take_profit_order_ids: Vec<i64>,
     entry_mode: &'static str,
     entry_price_source: &'static str,
@@ -864,6 +873,7 @@ impl BinanceDemoExecution {
                     .collect();
                 let mut protected: BTreeMap<String, (bool, bool)> = BTreeMap::new();
                 let mut stop_orders: BTreeMap<String, ProtectiveOrderId> = BTreeMap::new();
+                let mut protection_check_details: BTreeMap<String, String> = BTreeMap::new();
                 for symbol in account.positions.keys() {
                     let open_orders = self
                         .signed_read(
@@ -917,6 +927,65 @@ impl BinanceDemoExecution {
                             }
                             "TAKE_PROFIT_MARKET" => entry.1 = true,
                             _ => {}
+                        }
+                    }
+                    if !protected.get(symbol).is_some_and(|(stop, _)| *stop) {
+                        let known = self.state.positions.get(symbol).and_then(|meta| {
+                            meta.stop_algo_id.map(|algo_id| {
+                                (algo_id, meta.protection_ack_ms.unwrap_or(meta.entry_ms))
+                            })
+                        });
+                        if let Some((algo_id, acknowledged_ms)) = known {
+                            match self
+                                .signed_read(
+                                    "/fapi/v1/algoOrder",
+                                    vec![("algoId".into(), algo_id.to_string())],
+                                )
+                                .await
+                            {
+                                Ok(order) if active_close_all_stop(&order, symbol, algo_id) => {
+                                    protected.entry(symbol.clone()).or_default().0 = true;
+                                    stop_orders
+                                        .insert(symbol.clone(), ProtectiveOrderId::Algo(algo_id));
+                                }
+                                Ok(order) => {
+                                    protection_check_details.insert(
+                                        symbol.clone(),
+                                        format!(
+                                            "known algo {algo_id} is not active ({})",
+                                            algo_status(&order)
+                                        ),
+                                    );
+                                }
+                                Err(error)
+                                    if now_ms.saturating_sub(acknowledged_ms)
+                                        <= PROTECTION_VISIBILITY_GRACE_MS =>
+                                {
+                                    // A successful POST with an algoId is the strongest
+                                    // available acknowledgement during Binance Demo's
+                                    // short read-after-write visibility gap. Keep managing
+                                    // the position and verify again on the next sync.
+                                    protected.entry(symbol.clone()).or_default().0 = true;
+                                    stop_orders
+                                        .insert(symbol.clone(), ProtectiveOrderId::Algo(algo_id));
+                                    events.push(ExchangeEvent {
+                                        kind: "exchange_protection_visibility_pending".into(),
+                                        payload: serde_json::json!({
+                                            "ts_ms":now_ms,"symbol":symbol,"algo_id":algo_id,
+                                            "acknowledged_ms":acknowledged_ms,
+                                            "visibility_age_ms":now_ms.saturating_sub(acknowledged_ms),
+                                            "detail":format!("{error:#}"),
+                                            "venue":"binance_demo","paper_only":true
+                                        }),
+                                    });
+                                }
+                                Err(error) => {
+                                    protection_check_details.insert(
+                                        symbol.clone(),
+                                        format!("known algo {algo_id} lookup failed: {error:#}"),
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -1042,6 +1111,7 @@ impl BinanceDemoExecution {
                                 meta.runner_active = true;
                                 meta.stop_price = 0.0;
                                 meta.stop_algo_id = None;
+                                meta.protection_ack_ms = None;
                                 meta.stop_reason = Some("unprotected_tail_runner".into());
                                 meta.take_profit_order_ids.clear();
                                 meta.profit_shield_activation_pct = None;
@@ -1400,6 +1470,7 @@ impl BinanceDemoExecution {
                                 meta.stop_price = desired;
                                 meta.break_even_armed = true;
                                 meta.stop_algo_id = Some(stop_algo_id);
+                                meta.protection_ack_ms = Some(exchange_ack_ms);
                                 meta.stop_reason = Some(reason.into());
                             }
                             events.push(ExchangeEvent {
@@ -1479,6 +1550,56 @@ impl BinanceDemoExecution {
                         .as_ref()
                         .and_then(|positions| positions.get(&symbol))
                     {
+                        let rearm = self.state.positions.get(&symbol).and_then(|meta| {
+                            self.rules.get(&symbol).cloned().map(|rules| {
+                                (
+                                    meta.side.opposite(),
+                                    meta.stop_price,
+                                    meta.candidate_id.clone(),
+                                    rules,
+                                )
+                            })
+                        });
+                        if let Some((side, stop_price, candidate_id, rules)) = rearm {
+                            let rearm_ack = self
+                                .place_close_all_trigger(
+                                    &symbol,
+                                    side,
+                                    "STOP_MARKET",
+                                    stop_price,
+                                    &rules,
+                                    client_order_id("rearm", &format!("{candidate_id}:{now_ms}")),
+                                )
+                                .await;
+                            if let Ok(algo_id) = rearm_ack {
+                                let exchange_ack_ms = chrono::Utc::now().timestamp_millis();
+                                if let Some(meta) = self.state.positions.get_mut(&symbol) {
+                                    meta.stop_algo_id = Some(algo_id);
+                                    meta.protection_ack_ms = Some(exchange_ack_ms);
+                                }
+                                events.push(ExchangeEvent {
+                                    kind: "exchange_protection_rearmed".into(),
+                                    payload: serde_json::json!({
+                                        "ts_ms":exchange_ack_ms,"symbol":symbol,
+                                        "stop_price":stop_price,"algo_id":algo_id,
+                                        "previous_check":protection_check_details.get(&symbol),
+                                        "venue":"binance_demo","paper_only":true
+                                    }),
+                                });
+                                continue;
+                            }
+                            protection_check_details.insert(
+                                symbol.clone(),
+                                format!(
+                                    "{}; replacement stop also failed: {:#}",
+                                    protection_check_details
+                                        .get(&symbol)
+                                        .map(String::as_str)
+                                        .unwrap_or("no active stop was visible"),
+                                    rearm_ack.unwrap_err()
+                                ),
+                            );
+                        }
                         self.close_market(position).await.with_context(|| {
                             format!(
                                 "unprotected Binance demo position {symbol} could not be closed"
@@ -1490,7 +1611,7 @@ impl BinanceDemoExecution {
                         }
                         events.push(ExchangeEvent {
                             kind: "exchange_exit_requested".into(),
-                            payload: serde_json::json!({"ts_ms":now_ms,"symbol":symbol,"reason":"protection_missing","venue":"binance_demo"}),
+                            payload: serde_json::json!({"ts_ms":now_ms,"symbol":symbol,"reason":"protection_missing","detail":protection_check_details.get(&symbol),"venue":"binance_demo"}),
                         });
                     }
                 }
@@ -2926,6 +3047,7 @@ impl BinanceDemoExecution {
                             pending_exit_actor: None,
                             pending_exit_note: None,
                             stop_algo_id: Some(fill.stop_algo_id),
+                            protection_ack_ms: Some(fill.protection_ack_ms),
                             stop_reason: Some("initial_stop".into()),
                             take_profit_order_ids: fill.take_profit_order_ids.clone(),
                             profit_reversal_count: plan
@@ -4200,10 +4322,11 @@ impl BinanceDemoExecution {
         // Reuse it during promotion instead of briefly duplicating (and often
         // conflicting with) another Binance closePosition order. The stored
         // trigger is the authoritative risk price for this position.
-        let (stop_algo_id, stop_price) = match pending.preliminary_stop_algo_id {
+        let (stop_algo_id, stop_price, protection_ack_ms) = match pending.preliminary_stop_algo_id {
             Some(value) => (
                 value,
                 pending.preliminary_stop_price.unwrap_or(planned_stop_price),
+                None,
             ),
             None => match self
                 .place_close_all_trigger(
@@ -4216,7 +4339,11 @@ impl BinanceDemoExecution {
                 )
                 .await
             {
-                Ok(value) => (value, planned_stop_price),
+                Ok(value) => (
+                    value,
+                    planned_stop_price,
+                    Some(chrono::Utc::now().timestamp_millis()),
+                ),
                 Err(error) => {
                     return self
                         .finish_failed_pending_entry(
@@ -4314,6 +4441,7 @@ impl BinanceDemoExecution {
                 pending_exit_actor: None,
                 pending_exit_note: None,
                 stop_algo_id: Some(stop_algo_id),
+                protection_ack_ms,
                 stop_reason: Some("initial_stop".into()),
                 take_profit_order_ids: take_profit_order_ids.clone(),
                 profit_reversal_count: plan
@@ -4919,6 +5047,7 @@ impl BinanceDemoExecution {
                     client_order_id("stop", &plan.candidate_id),
                 )
                 .await?;
+            let protection_ack_ms = chrono::Utc::now().timestamp_millis();
             let mut take_profit_order_ids = Vec::new();
             for (index, (take_profit, fraction)) in take_profit_prices.iter().enumerate() {
                 take_profit_order_ids.push(
@@ -4933,10 +5062,14 @@ impl BinanceDemoExecution {
                     .await?,
                 );
             }
-            Result::<(i64, Vec<i64>)>::Ok((stop_algo_id, take_profit_order_ids))
+            Result::<(i64, i64, Vec<i64>)>::Ok((
+                stop_algo_id,
+                protection_ack_ms,
+                take_profit_order_ids,
+            ))
         }
         .await;
-        let (stop_algo_id, take_profit_order_ids) = match protective {
+        let (stop_algo_id, protection_ack_ms, take_profit_order_ids) = match protective {
             Ok(value) => value,
             Err(error) => {
                 // Preserve the conditional stop while removing any staged
@@ -4969,6 +5102,7 @@ impl BinanceDemoExecution {
             stop_price,
             take_profit_prices,
             stop_algo_id,
+            protection_ack_ms,
             take_profit_order_ids,
             entry_mode: entry.mode,
             entry_price_source,
@@ -5918,6 +6052,32 @@ fn protective_exit_reason(meta: &ExecutionMeta) -> &str {
         None if meta.break_even_armed => "trailing_or_protected_stop",
         None => "initial_stop",
     }
+}
+
+fn algo_status(order: &Value) -> &str {
+    order["algoStatus"]
+        .as_str()
+        .or_else(|| order["orderStatus"].as_str())
+        .or_else(|| order["status"].as_str())
+        .unwrap_or("unknown")
+}
+
+fn active_close_all_stop(order: &Value, symbol: &str, algo_id: i64) -> bool {
+    let id_matches = order["algoId"]
+        .as_i64()
+        .is_none_or(|value| value == algo_id);
+    let symbol_matches = order["symbol"]
+        .as_str()
+        .is_none_or(|value| value.eq_ignore_ascii_case(symbol));
+    let order_type = order["orderType"]
+        .as_str()
+        .or_else(|| order["type"].as_str())
+        .unwrap_or_default();
+    let active = matches!(
+        algo_status(order).to_ascii_uppercase().as_str(),
+        "NEW" | "ACCEPTED" | "PENDING" | "WORKING" | "TRIGGERING"
+    );
+    id_matches && symbol_matches && order_type == "STOP_MARKET" && active
 }
 
 /// Existing positions retain their entry-time parameters in the restart
@@ -7555,6 +7715,33 @@ mod tests {
             max_hold_review(&restored, 901_000, 100.0),
             MaxHoldReview::Exit
         );
+    }
+
+    #[test]
+    fn direct_algo_lookup_recognizes_an_active_stop_missing_from_the_list() {
+        let order = serde_json::json!({
+            "algoId": 42,
+            "symbol": "LSKUSDT",
+            "orderType": "STOP_MARKET",
+            "algoStatus": "NEW",
+            "closePosition": true
+        });
+        assert!(active_close_all_stop(&order, "LSKUSDT", 42));
+        assert!(!active_close_all_stop(&order, "LSKUSDT", 43));
+        assert!(!active_close_all_stop(&order, "OTHERUSDT", 42));
+    }
+
+    #[test]
+    fn terminal_algo_is_not_accepted_as_live_protection() {
+        for status in ["CANCELED", "EXPIRED", "TRIGGERED", "FINISHED"] {
+            let order = serde_json::json!({
+                "algoId": 42,
+                "symbol": "LSKUSDT",
+                "orderType": "STOP_MARKET",
+                "algoStatus": status
+            });
+            assert!(!active_close_all_stop(&order, "LSKUSDT", 42));
+        }
     }
 
     #[test]
