@@ -818,25 +818,29 @@ impl BinanceDemoExecution {
                             });
                         }
                         MaxHoldReview::Extend {
+                            extension_ms,
+                            progress_r,
+                            current_r,
                             executable_net_pnl_usd,
                             initial_risk_usd,
                             exit_impact_bps,
+                            reason,
                         } => {
-                            meta.max_hold_ms = meta
-                                .max_hold_ms
-                                .saturating_add(FAST_TREND_EXECUTABLE_GRACE_MS);
+                            meta.max_hold_ms = meta.max_hold_ms.saturating_add(extension_ms);
                             meta.max_hold_reviews = meta.max_hold_reviews.saturating_add(1);
                             hold_review_changed = true;
                             events.push(ExchangeEvent {
                                 kind: "exchange_max_hold_extended".into(),
                                 payload: serde_json::json!({
                                     "ts_ms":now_ms,"symbol":symbol,"recipe":meta.recipe,
-                                    "extension_ms":FAST_TREND_EXECUTABLE_GRACE_MS,
+                                    "extension_ms":extension_ms,
+                                    "progress_r":progress_r,
+                                    "current_r":current_r,
                                     "executable_net_pnl_usd":executable_net_pnl_usd,
                                     "initial_risk_usd":initial_risk_usd,
                                     "exit_impact_bps":exit_impact_bps,
                                     "review_count":meta.max_hold_reviews,
-                                    "reason":"profitable_position_with_temporarily_high_exit_impact",
+                                    "reason":reason,
                                     "venue":"binance_demo","paper_only":true
                                 }),
                             });
@@ -6051,14 +6055,22 @@ enum MaxHoldReview {
     NotApplicable,
     ReleaseToProtection,
     Extend {
+        extension_ms: i64,
+        progress_r: f64,
+        current_r: f64,
         executable_net_pnl_usd: f64,
         initial_risk_usd: f64,
         exit_impact_bps: f64,
+        reason: &'static str,
     },
     Exit,
 }
 
 const FAST_TREND_EXECUTABLE_GRACE_MS: i64 = 90_000;
+const FAST_TREND_PROGRESS_REVIEW_MS: i64 = 10 * 60_000;
+const FAST_TREND_MAX_PROGRESS_REVIEWS: u8 = 2;
+const FAST_TREND_MIN_PROGRESS_R: f64 = 0.25;
+const FAST_TREND_MAX_CURRENT_ADVERSE_R: f64 = 0.25;
 const MAX_STORED_EXECUTABLE_QUOTE_AGE_MS: i64 = 5_000;
 const FAST_TREND_HIGH_EXIT_IMPACT_BPS: f64 = 10.0;
 
@@ -6083,13 +6095,58 @@ fn max_hold_review(meta: &ExecutionMeta, now_ms: i64, mark_price: f64) -> MaxHol
     {
         return MaxHoldReview::ReleaseToProtection;
     }
-    if meta.pending_exit_reason.as_deref() == Some("max_hold") || meta.max_hold_reviews > 0 {
+    if meta.pending_exit_reason.as_deref() == Some("max_hold")
+        || meta.max_hold_reviews >= FAST_TREND_MAX_PROGRESS_REVIEWS
+    {
         return MaxHoldReview::Exit;
     }
-    let Some(guard) = meta.executable_profit.as_ref() else {
+    let Some(initial_risk_usd) = meta.initial_risk_usd.filter(|value| *value > f64::EPSILON) else {
         return MaxHoldReview::Exit;
     };
-    let Some(initial_risk_usd) = meta.initial_risk_usd.filter(|value| *value > f64::EPSILON) else {
+    let stop_risk_pct = meta.side.sign() * (meta.entry_price - meta.stop_price)
+        / meta.entry_price.max(f64::EPSILON);
+    if stop_risk_pct <= f64::EPSILON {
+        return MaxHoldReview::Exit;
+    }
+    let favorable_pct = meta.side.sign() * (meta.extreme_price / meta.entry_price - 1.0);
+    let current_pct = meta.side.sign() * (mark_price / meta.entry_price - 1.0);
+    let progress_r = favorable_pct.max(0.0) / stop_risk_pct;
+    let current_r = current_pct / stop_risk_pct;
+    let guard = meta.executable_profit.as_ref();
+
+    // The ten-minute Fast deadline is a review, not an unconditional market
+    // exit. A trade that has already demonstrated meaningful favorable
+    // movement and has not moved materially through its initial risk still
+    // has live continuation optionality. Give it a bounded ten-minute review
+    // window while the exchange-side catastrophe stop remains active. This
+    // also prevents one noisy Demo quote at the deadline from converting a
+    // valid mainnet continuation into an avoidable taker loss.
+    if progress_r >= FAST_TREND_MIN_PROGRESS_R && current_r >= -FAST_TREND_MAX_CURRENT_ADVERSE_R {
+        let executable_net_pnl_usd = guard
+            .map(|value| {
+                value.current_net_return * meta.entry_price * meta.last_observed_quantity.max(0.0)
+            })
+            .unwrap_or_default();
+        let exit_impact_bps = guard
+            .map(|value| match meta.side {
+                Side::Buy => (mark_price - value.exit_vwap) / mark_price,
+                Side::Sell => (value.exit_vwap - mark_price) / mark_price,
+            })
+            .unwrap_or_default()
+            .max(0.0)
+            * 10_000.0;
+        return MaxHoldReview::Extend {
+            extension_ms: FAST_TREND_PROGRESS_REVIEW_MS,
+            progress_r,
+            current_r,
+            executable_net_pnl_usd,
+            initial_risk_usd,
+            exit_impact_bps,
+            reason: "meaningful_progress_with_bounded_adverse_move",
+        };
+    }
+
+    let Some(guard) = guard else {
         return MaxHoldReview::Exit;
     };
     if now_ms.saturating_sub(guard.observed_ms) > MAX_STORED_EXECUTABLE_QUOTE_AGE_MS {
@@ -6111,13 +6168,22 @@ fn max_hold_review(meta: &ExecutionMeta, now_ms: i64, mark_price: f64) -> MaxHol
     if exit_impact_bps < FAST_TREND_HIGH_EXIT_IMPACT_BPS {
         return MaxHoldReview::Exit;
     }
+    // The short liquidity grace is deliberately one-shot. Subsequent reviews
+    // must either qualify through real price progress above or exit.
+    if meta.max_hold_reviews > 0 {
+        return MaxHoldReview::Exit;
+    }
     // Grant one short grace only when the position is already bankably
     // profitable and the current executable VWAP shows unusually high exit
     // impact. The second review always exits if protection has not armed.
     MaxHoldReview::Extend {
+        extension_ms: FAST_TREND_EXECUTABLE_GRACE_MS,
+        progress_r,
+        current_r,
         executable_net_pnl_usd,
         initial_risk_usd,
         exit_impact_bps,
+        reason: "profitable_position_with_temporarily_high_exit_impact",
     }
 }
 
@@ -7312,6 +7378,56 @@ mod tests {
         meta.max_hold_reviews = 0;
         meta.pending_exit_reason = Some("max_hold".into());
         assert_eq!(max_hold_review(&meta, 601_000, 100.8), MaxHoldReview::Exit);
+    }
+
+    #[test]
+    fn fast_trend_deadline_extends_meaningful_progress_through_a_noisy_quote() {
+        let mut meta: ExecutionMeta = serde_json::from_value(serde_json::json!({
+            "candidate_id":"fast:tut","recipe":"fast_trend_activation","side":"sell",
+            "entry_ms":1_000,"first_fill_ms":1_000,"entry_price":0.02053,
+            "initial_quantity":213_938.0,"last_observed_quantity":213_938.0,
+            "initial_risk_usd":37.42,"stop_price":0.0207049148,
+            "extreme_price":0.02046,"max_hold_ms":600_000,
+            "executable_profit":{
+                "quantity":213_938.0,"peak_net_return":0.0025,
+                "current_net_return":-0.003,"floor_net_return":null,
+                "observed_ms":600_000,"exchange_ms":600_000,"exit_vwap":0.02057
+            }
+        }))
+        .unwrap();
+        let review = max_hold_review(&meta, 601_000, 0.02057);
+        assert!(matches!(
+            review,
+            MaxHoldReview::Extend {
+                extension_ms: FAST_TREND_PROGRESS_REVIEW_MS,
+                reason: "meaningful_progress_with_bounded_adverse_move",
+                ..
+            }
+        ));
+
+        meta.max_hold_reviews = FAST_TREND_MAX_PROGRESS_REVIEWS;
+        assert_eq!(
+            max_hold_review(&meta, 601_000, 0.02057),
+            MaxHoldReview::Exit
+        );
+    }
+
+    #[test]
+    fn fast_trend_deadline_exits_when_progress_has_fully_reversed() {
+        let meta: ExecutionMeta = serde_json::from_value(serde_json::json!({
+            "candidate_id":"fast:reversed","recipe":"fast_trend_activation","side":"sell",
+            "entry_ms":1_000,"first_fill_ms":1_000,"entry_price":100.0,
+            "initial_quantity":10.0,"last_observed_quantity":10.0,
+            "initial_risk_usd":20.0,"stop_price":102.0,
+            "extreme_price":99.4,"max_hold_ms":600_000,
+            "executable_profit":{
+                "quantity":10.0,"peak_net_return":0.005,
+                "current_net_return":-0.007,"floor_net_return":null,
+                "observed_ms":600_000,"exchange_ms":600_000,"exit_vwap":100.7
+            }
+        }))
+        .unwrap();
+        assert_eq!(max_hold_review(&meta, 601_000, 100.7), MaxHoldReview::Exit);
     }
 
     #[test]
