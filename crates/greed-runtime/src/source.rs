@@ -136,6 +136,10 @@ fn is_surge_admission(ticker: &StreamTicker, universe: &greed_strategy::Universe
                 .is_some_and(|value| value.abs() >= universe.surge_min_abs_return_15m))
 }
 
+fn depth_gap_is_systemic(missing: usize, total: usize) -> bool {
+    total > 0 && missing.saturating_mul(5) > total
+}
+
 impl BinanceMarketSource {
     pub fn new(config: RuntimeConfig) -> Result<Self> {
         let mut builder = Client::builder()
@@ -924,6 +928,8 @@ impl BinanceMarketSource {
     ) -> Result<MarketFrame> {
         let mut instruments = BTreeMap::new();
         let mut warnings = Vec::new();
+        let mut depth_gap_symbols = Vec::new();
+        let mut depth_symbols_observed = 0usize;
         self.set_stream_symbols(strategy);
         let urgent_liquidation = strategy.lanes.liquidation_reversal_enabled
             && self.stream.as_ref().is_some_and(|stream| {
@@ -1030,12 +1036,13 @@ impl BinanceMarketSource {
                 .stream
                 .as_ref()
                 .is_some_and(|stream| stream.symbol_is_warming(symbol, snapshot_ms));
+            depth_symbols_observed += 1;
             if !warming
                 && book
                     .as_ref()
                     .is_none_or(|value| !value.meta.usable_at(snapshot_ms))
             {
-                warnings.push(format!("websocket depth stale or missing {symbol}"));
+                depth_gap_symbols.push(symbol.clone());
             }
             let microstructure = self
                 .stream
@@ -1055,6 +1062,19 @@ impl BinanceMarketSource {
                     microstructure,
                 },
             );
+        }
+        // Depth snapshots are change-driven: one or two quiet contracts can
+        // legitimately exceed the strict per-symbol TTL while the public
+        // stream and the rest of the universe remain healthy. Those symbols
+        // stay individually blocked by their stale ObservationMeta, but a
+        // small local gap must not masquerade as a system-wide outage.
+        if depth_gap_is_systemic(depth_gap_symbols.len(), depth_symbols_observed) {
+            warnings.push(format!(
+                "websocket depth systemically degraded: {}/{} unavailable ({})",
+                depth_gap_symbols.len(),
+                depth_symbols_observed,
+                depth_gap_symbols.join(",")
+            ));
         }
         if !warnings.is_empty() {
             self.last_error = Some(warnings.join(" | "));
@@ -1110,6 +1130,15 @@ mod tests {
             &ticker(2_100_000.0, 0.07, Some(0.01)),
             &universe
         ));
+    }
+
+    #[test]
+    fn isolated_depth_gaps_do_not_become_a_global_data_outage() {
+        assert!(!depth_gap_is_systemic(0, 36));
+        assert!(!depth_gap_is_systemic(2, 36));
+        assert!(!depth_gap_is_systemic(7, 36));
+        assert!(depth_gap_is_systemic(8, 36));
+        assert!(!depth_gap_is_systemic(1, 0));
     }
 
     #[test]
