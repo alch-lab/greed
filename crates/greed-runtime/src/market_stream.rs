@@ -1051,14 +1051,16 @@ fn update_kline(state: &Arc<RwLock<StreamState>>, value: &Value, received_ms: i6
     let key = (symbol, interval);
     state.candle_update_ms.insert(key.clone(), received_ms);
     let values = state.candles.entry(key).or_default();
-    // A reconnect can miss the final `x=true` update for a candle. Once a
-    // newer interval arrives, the older candle is definitively closed even if
-    // Binance's terminal update was lost. Heal that state here so strategies
-    // do not permanently discard otherwise complete history.
-    for previous in values.iter_mut().filter(|value| {
-        !value.closed && value.open_ms < candle.open_ms && value.close_ms < candle.open_ms
-    }) {
-        previous.closed = true;
+    // Never infer terminality from the arrival of a newer interval. After a
+    // reconnect the last update retained for the previous candle can be an
+    // early, materially incomplete snapshot (especially its taker flow). The
+    // market source reconciles such gaps against REST before a strategy may
+    // consume the candle as closed.
+    if values
+        .back()
+        .is_some_and(|value| value.open_ms == candle.open_ms && value.closed && !candle.closed)
+    {
+        return Ok(());
     }
     if values
         .back()
@@ -1623,7 +1625,7 @@ mod tests {
     }
 
     #[test]
-    fn newer_kline_heals_a_missed_terminal_close_update() {
+    fn newer_kline_does_not_promote_an_incomplete_previous_candle() {
         let state = Arc::new(RwLock::new(StreamState::default()));
         let kline = |open_ms: i64, close_ms: i64, closed: bool| {
             serde_json::json!({"k":{
@@ -1636,8 +1638,29 @@ mod tests {
 
         let locked = state.read().unwrap();
         let values = &locked.candles[&("YBUSDT".to_string(), "15m".to_string())];
-        assert!(values[0].closed);
+        assert!(!values[0].closed);
         assert!(!values[1].closed);
+    }
+
+    #[test]
+    fn delayed_partial_kline_does_not_replace_a_terminal_update() {
+        let state = Arc::new(RwLock::new(StreamState::default()));
+        let kline = |closed: bool, close: &str, quote_volume: &str| {
+            serde_json::json!({"k":{
+                "t":0,"T":59_999,"s":"YBUSDT","i":"1m",
+                "o":"1","c":close,"h":"2","l":"1","q":quote_volume,"Q":"60","x":closed
+            }})
+        };
+        update_kline(&state, &kline(true, "1.7", "175"), 60_001).unwrap();
+        update_kline(&state, &kline(false, "2.0", "100"), 60_002).unwrap();
+
+        let locked = state.read().unwrap();
+        let candle = locked.candles[&("YBUSDT".to_string(), "1m".to_string())]
+            .back()
+            .unwrap();
+        assert!(candle.closed);
+        assert_eq!(candle.close, 1.7);
+        assert_eq!(candle.quote_volume, 175.0);
     }
 
     #[test]

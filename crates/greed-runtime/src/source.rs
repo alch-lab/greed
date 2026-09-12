@@ -55,6 +55,8 @@ pub struct BinanceMarketSource {
     stream: Option<MarketStreamHub>,
     candle_cache: BTreeMap<(String, String), CandleSeries>,
     candle_bootstrap_retry_after: BTreeMap<(String, String), i64>,
+    candle_terminal_repair_retry_after: BTreeMap<(String, String), i64>,
+    rest_repaired_candles: BTreeSet<(String, String, i64)>,
     candle_bootstrap_pending: usize,
     candle_bootstrap_last_error: Option<String>,
     open_interest_cache: BTreeMap<String, OpenInterestSeries>,
@@ -109,17 +111,30 @@ const MAX_KLINE_BOOTSTRAP_REQUESTS_PER_FRAME: usize = 8;
 const KLINE_BOOTSTRAP_CONCURRENCY: usize = 4;
 const KLINE_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5);
 const KLINE_BOOTSTRAP_RETRY_DELAY_MS: i64 = 60_000;
+const KLINE_TERMINAL_GRACE_MS: i64 = 2_000;
+const KLINE_TERMINAL_REPAIR_RETRY_MS: i64 = 15_000;
+const MAX_KLINE_TERMINAL_REPAIRS_PER_FRAME: usize = 8;
 const OI_REFRESH_MS: i64 = 5 * 60_000;
 const MAX_OI_REQUESTS_PER_FRAME: usize = 4;
 const DEPTH_FALLBACK_CONCURRENCY: usize = 8;
 const DEPTH_FALLBACK_TIMEOUT: Duration = Duration::from_secs(2);
 
-fn heal_elapsed_candle_closes(values: &mut [Candle], now_ms: i64) {
-    for candle in values {
-        if !candle.closed && candle.close_ms < now_ms {
-            candle.closed = true;
+fn merge_candles(target: &mut Vec<Candle>, updates: impl IntoIterator<Item = Candle>) {
+    for candle in updates {
+        if let Some(existing) = target
+            .iter_mut()
+            .find(|value| value.open_ms == candle.open_ms)
+        {
+            // A delayed partial websocket snapshot must never replace a
+            // terminal row already obtained from REST or `x=true`.
+            if !existing.closed || candle.closed {
+                *existing = candle;
+            }
+        } else {
+            target.push(candle);
         }
     }
+    target.sort_by_key(|value| value.open_ms);
 }
 
 fn median_abs(values: impl Iterator<Item = Option<f64>>, floor: f64) -> f64 {
@@ -164,6 +179,8 @@ impl BinanceMarketSource {
             stream: None,
             candle_cache: BTreeMap::new(),
             candle_bootstrap_retry_after: BTreeMap::new(),
+            candle_terminal_repair_retry_after: BTreeMap::new(),
+            rest_repaired_candles: BTreeSet::new(),
             candle_bootstrap_pending: 0,
             candle_bootstrap_last_error: None,
             open_interest_cache: BTreeMap::new(),
@@ -629,9 +646,13 @@ impl BinanceMarketSource {
         interval: &str,
         interval_ms: i64,
         limit: usize,
+        start_ms: Option<i64>,
         now: i64,
     ) -> Result<CandleSeries> {
-        let suffix = format!("{path}?symbol={symbol}&interval={interval}&limit={limit}");
+        let start = start_ms
+            .map(|value| format!("&startTime={value}"))
+            .unwrap_or_default();
+        let suffix = format!("{path}?symbol={symbol}&interval={interval}&limit={limit}{start}");
         let values = self.get_from_bases(bases, &suffix).await?;
         let rows = values
             .as_array()
@@ -741,6 +762,7 @@ impl BinanceMarketSource {
                             interval,
                             interval_ms,
                             limit,
+                            None,
                             now,
                         ),
                     )
@@ -795,6 +817,118 @@ impl BinanceMarketSource {
             .count();
     }
 
+    /// Reconcile websocket candles whose terminal `x=true` update was missed.
+    /// An elapsed partial candle is not safe to promote locally: its OHLC,
+    /// volume and taker attribution may all be snapshots from before the real
+    /// close. Until REST returns the final row it remains `closed=false` and is
+    /// therefore invisible to entry recipes.
+    async fn repair_elapsed_candle_terminals(&mut self, now: i64) {
+        let mut requests: Vec<_> = self
+            .candle_cache
+            .iter()
+            .filter_map(|((symbol, interval), series)| {
+                let earliest = series
+                    .values
+                    .iter()
+                    .filter(|candle| {
+                        !candle.closed && candle.close_ms + KLINE_TERMINAL_GRACE_MS < now
+                    })
+                    .map(|candle| candle.open_ms)
+                    .min()?;
+                let key = (symbol.clone(), interval.clone());
+                if self
+                    .candle_terminal_repair_retry_after
+                    .get(&key)
+                    .is_some_and(|retry_after| now < *retry_after)
+                {
+                    return None;
+                }
+                let priority = match interval.as_str() {
+                    "1m" => 0,
+                    "5m" => 1,
+                    "15m" => 2,
+                    _ => 3,
+                };
+                let span = ((now - earliest).max(0) / series.interval_ms.max(1) + 2).clamp(2, 1_000)
+                    as usize;
+                Some((priority, key, series.interval_ms, earliest, span))
+            })
+            .collect();
+        requests.sort_by_key(|(priority, _, _, earliest, _)| (*priority, *earliest));
+        requests.truncate(MAX_KLINE_TERMINAL_REPAIRS_PER_FRAME);
+        if requests.is_empty() {
+            return;
+        }
+
+        let bases = self.futures_bases();
+        let source = &*self;
+        let results = stream::iter(requests)
+            .map(|(_, key, interval_ms, earliest, limit)| {
+                let bases = bases.clone();
+                async move {
+                    let result = tokio::time::timeout(
+                        KLINE_BOOTSTRAP_TIMEOUT,
+                        source.klines_at_interval(
+                            &bases,
+                            "/fapi/v1/klines",
+                            &key.0,
+                            MarketKind::Perpetual,
+                            &key.1,
+                            interval_ms,
+                            limit,
+                            Some(earliest),
+                            now,
+                        ),
+                    )
+                    .await
+                    .map_err(|_| anyhow!("terminal kline REST repair timed out"))
+                    .and_then(|result| result);
+                    (key, result)
+                }
+            })
+            .buffer_unordered(KLINE_BOOTSTRAP_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+
+        for (key, result) in results {
+            match result {
+                Ok(repaired) => {
+                    let repaired_ids: Vec<_> = repaired
+                        .values
+                        .iter()
+                        .filter(|candle| candle.closed)
+                        .map(|candle| candle.open_ms)
+                        .collect();
+                    let unresolved = if let Some(series) = self.candle_cache.get_mut(&key) {
+                        merge_candles(&mut series.values, repaired.values);
+                        series.values.iter().any(|candle| {
+                            !candle.closed && candle.close_ms + KLINE_TERMINAL_GRACE_MS < now
+                        })
+                    } else {
+                        false
+                    };
+                    for open_ms in repaired_ids {
+                        self.rest_repaired_candles
+                            .insert((key.0.clone(), key.1.clone(), open_ms));
+                    }
+                    if unresolved {
+                        self.candle_terminal_repair_retry_after
+                            .insert(key, now + KLINE_TERMINAL_REPAIR_RETRY_MS);
+                    } else {
+                        self.candle_terminal_repair_retry_after.remove(&key);
+                    }
+                }
+                Err(error) => {
+                    tracing::debug!(symbol = %key.0, interval = %key.1, error = %error, "terminal kline repair deferred; incomplete candle remains blocked");
+                    self.candle_terminal_repair_retry_after
+                        .insert(key, now + KLINE_TERMINAL_REPAIR_RETRY_MS);
+                }
+            }
+        }
+        self.rest_repaired_candles
+            .retain(|(_, _, open_ms)| *open_ms >= now - 24 * 60 * 60_000);
+    }
+
     async fn streamed_klines(
         &mut self,
         symbol: &str,
@@ -815,22 +949,7 @@ impl BinanceMarketSource {
             .candle_cache
             .get_mut(&key)
             .expect("candle cache inserted above");
-        for candle in updates {
-            if let Some(existing) = series
-                .values
-                .iter_mut()
-                .find(|value| value.open_ms == candle.open_ms)
-            {
-                *existing = candle;
-            } else {
-                series.values.push(candle);
-            }
-        }
-        // Also recover missed terminal websocket updates by wall clock. This
-        // covers quiet symbols that have not emitted the first update of the
-        // next interval yet after a reconnect.
-        heal_elapsed_candle_closes(&mut series.values, now);
-        series.values.sort_by_key(|value| value.open_ms);
+        merge_candles(&mut series.values, updates);
         if series.values.len() > limit {
             series.values.drain(..series.values.len() - limit);
         }
@@ -839,7 +958,18 @@ impl BinanceMarketSource {
             event_ms: updated_ms.unwrap_or(now),
             received_ms: updated_ms.unwrap_or(now),
             expires_ms: updated_ms.unwrap_or_default() + 15_000,
-            source: "binance_ws_kline".into(),
+            source: if series.values.iter().any(|candle| {
+                candle.closed
+                    && self.rest_repaired_candles.contains(&(
+                        key.0.clone(),
+                        key.1.clone(),
+                        candle.open_ms,
+                    ))
+            }) {
+                "binance_ws_kline+rest_terminal_repair".into()
+            } else {
+                "binance_ws_kline".into()
+            },
             quality: if fresh {
                 DataQuality::Complete
             } else {
@@ -1023,6 +1153,8 @@ impl BinanceMarketSource {
             self.bootstrap_missing_klines(strategy, now).await;
             self.refresh_open_interest(strategy, now).await;
         }
+        self.repair_elapsed_candle_terminals(chrono::Utc::now().timestamp_millis())
+            .await;
         // REST bootstrap and OI refresh can take several seconds.  Taking a
         // websocket snapshot against the timestamp captured before those
         // awaits made newly arrived liquidation events look as if they came
@@ -1277,7 +1409,7 @@ mod tests {
     }
 
     #[test]
-    fn elapsed_candles_are_closed_after_a_missed_websocket_terminal_update() {
+    fn elapsed_partial_candle_stays_blocked_until_terminal_row_is_merged() {
         let mut values = vec![
             Candle {
                 open_ms: 0,
@@ -1303,10 +1435,47 @@ mod tests {
             },
         ];
 
-        heal_elapsed_candle_closes(&mut values, 1_000_000);
+        assert!(!values[0].closed);
+        assert!(!values[1].closed);
+
+        merge_candles(
+            &mut values,
+            [Candle {
+                open_ms: 0,
+                close_ms: 899_999,
+                open: 1.0,
+                high: 2.2,
+                low: 0.9,
+                close: 1.7,
+                quote_volume: 175.0,
+                taker_buy_quote: Some(70.0),
+                closed: true,
+            }],
+        );
 
         assert!(values[0].closed);
+        assert_eq!(values[0].close, 1.7);
+        assert_eq!(values[0].quote_volume, 175.0);
+        assert_eq!(values[0].taker_buy_quote, Some(70.0));
         assert!(!values[1].closed);
+
+        merge_candles(
+            &mut values,
+            [Candle {
+                open_ms: 0,
+                close_ms: 899_999,
+                open: 1.0,
+                high: 2.0,
+                low: 1.0,
+                close: 2.0,
+                quote_volume: 100.0,
+                taker_buy_quote: Some(60.0),
+                closed: false,
+            }],
+        );
+        assert!(values[0].closed);
+        assert_eq!(values[0].close, 1.7);
+        assert_eq!(values[0].quote_volume, 175.0);
     }
 
     #[test]

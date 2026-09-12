@@ -127,6 +127,36 @@ fn direct_confirmation_allowed(
     }
 }
 
+fn confirmation_pattern(
+    minute: &Candle,
+    side: Side,
+    breakout_level: f64,
+    direct_reacceleration_ready: bool,
+) -> Option<(&'static str, f64)> {
+    let sign = side.sign();
+    let minute_flow = minute
+        .taker_buy_quote
+        .map(|buy| 2.0 * buy / minute.quote_volume.max(1.0) - 1.0)?;
+    let directional_minute_flow = sign * minute_flow;
+    let beyond = if side == Side::Buy {
+        minute.close >= breakout_level
+    } else {
+        minute.close <= breakout_level
+    };
+    let touched = if side == Side::Buy {
+        minute.low <= breakout_level * 1.0015
+    } else {
+        minute.high >= breakout_level * 0.9985
+    };
+    if beyond && touched && directional_minute_flow >= 0.02 {
+        Some(("shallow_reclaim", minute_flow))
+    } else if beyond && directional_minute_flow >= 0.08 && direct_reacceleration_ready {
+        Some(("direct_continuation", minute_flow))
+    } else {
+        None
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 fn is_late_exhaustion(
     entry_pattern: &str,
@@ -285,6 +315,11 @@ impl StrategyNode for FastTrendActivationNode {
                 &self.config,
             );
 
+            let confirmation_source = instrument
+                .micro_perpetual
+                .as_ref()
+                .map(|series| series.meta.source.as_str())
+                .unwrap_or("missing");
             let confirmation = instrument
                 .micro_perpetual
                 .as_ref()
@@ -296,35 +331,12 @@ impl StrategyNode for FastTrendActivationNode {
                         && minute.close_ms <= bar.close_ms + 3 * 60_000
                 })
                 .find_map(|minute| {
-                    let minute_flow = minute
-                        .taker_buy_quote
-                        .map(|buy| 2.0 * buy / minute.quote_volume.max(1.0) - 1.0)
-                        .unwrap_or(-1.0);
-                    let directional_minute_flow = sign * minute_flow;
-                    let beyond = if side == Side::Buy {
-                        minute.close >= breakout_level
-                    } else {
-                        minute.close <= breakout_level
-                    };
-                    let touched = if side == Side::Buy {
-                        minute.low <= breakout_level * 1.0015
-                    } else {
-                        minute.high >= breakout_level * 0.9985
-                    };
-                    if beyond && touched && directional_minute_flow >= 0.02 {
-                        Some((minute, "shallow_reclaim"))
-                    } else if beyond
-                        && directional_minute_flow >= 0.08
-                        && direct_reacceleration_ready
-                    {
-                        Some((minute, "direct_continuation"))
-                    } else {
-                        None
-                    }
+                    confirmation_pattern(minute, side, breakout_level, direct_reacceleration_ready)
+                        .map(|(pattern, flow)| (minute, pattern, flow))
                 });
             confirmation_hits += u64::from(ignition && confirmation.is_some());
             let entry_pattern = confirmation
-                .map(|(_, pattern)| pattern)
+                .map(|(_, pattern, _)| pattern)
                 .unwrap_or("awaiting_confirmation");
             let late_exhaustion = is_late_exhaustion(
                 entry_pattern,
@@ -450,13 +462,14 @@ impl StrategyNode for FastTrendActivationNode {
                 _ => blockers.push("order book is warming".into()),
             }
 
-            let signal_ms = confirmation.map_or(bar.close_ms, |(value, _)| value.close_ms);
+            let signal_ms = confirmation.map_or(bar.close_ms, |(value, _, _)| value.close_ms);
             if ctx.frame.as_of_ms - signal_ms
                 > i64::from(self.config.fast_entry_timeout_seconds) * 1_000
             {
                 blockers.push("the 1m confirmation expired".into());
             }
-            let reference_price = confirmation.map_or(instrument.price, |(value, _)| value.close);
+            let reference_price =
+                confirmation.map_or(instrument.price, |(value, _, _)| value.close);
             let verdict = if blockers.is_empty() {
                 Verdict::Pass
             } else {
@@ -473,6 +486,26 @@ impl StrategyNode for FastTrendActivationNode {
                 ("lane".into(), "fast_trend_activation".into()),
                 ("priority".into(), "0.8".into()),
                 ("entry_pattern".into(), entry_pattern.into()),
+                (
+                    "confirmation_flow_1m".into(),
+                    confirmation
+                        .map(|(_, _, flow)| flow.to_string())
+                        .unwrap_or_else(|| "missing".into()),
+                ),
+                (
+                    "confirmation_close_ms".into(),
+                    confirmation
+                        .map(|(minute, _, _)| minute.close_ms.to_string())
+                        .unwrap_or_else(|| "missing".into()),
+                ),
+                (
+                    "confirmation_series_source".into(),
+                    confirmation_source.into(),
+                ),
+                (
+                    "confirmation_terminal_verified".into(),
+                    confirmation.is_some().to_string(),
+                ),
                 ("market_return_1h".into(), market_return_1h.to_string()),
                 (
                     "market_breadth_1h".into(),
@@ -756,6 +789,26 @@ mod tests {
             ignition_pattern(true, 0.0092, 2.1, Some(0.20), 1.033, 0.029, 0.052, &config,),
             Some("compression_breakout")
         );
+    }
+
+    #[test]
+    fn opposing_terminal_minute_flow_cannot_confirm_a_long_reclaim() {
+        let minute = Candle {
+            open_ms: 0,
+            close_ms: 59_999,
+            open: 2.369,
+            high: 2.384,
+            low: 2.369,
+            close: 2.380,
+            quote_volume: 100.0,
+            // Final NEAR-like candle flow is -20%, despite its green body.
+            taker_buy_quote: Some(40.0),
+            closed: true,
+        };
+        assert_eq!(confirmation_pattern(&minute, Side::Buy, 2.370, true), None);
+        let (pattern, flow) = confirmation_pattern(&minute, Side::Sell, 2.390, true).unwrap();
+        assert_eq!(pattern, "direct_continuation");
+        assert!((flow + 0.2).abs() < 1e-9);
     }
 
     #[test]
