@@ -234,6 +234,30 @@ mod tests {
     }
 
     #[test]
+    fn trend_lifecycle_ratchets_after_the_trailing_handoff() {
+        let lifecycle = Protection {
+            activation: Some(0.008),
+            floor: 0.0015,
+            trailing_activation: Some(0.010),
+            trailing_distance: Some(0.005),
+            partial_activated: false,
+        };
+        let mut state = None;
+        // At a 1.15% executable-price gain the conservative 10 bps reserve
+        // leaves 1.05% net. The 1.0% gross handoff has occurred, so the
+        // executable floor follows the peak less the configured giveback.
+        assert!(!observe(
+            &mut state,
+            q(101.15),
+            Side::Buy,
+            100.0,
+            1.0,
+            lifecycle,
+        ));
+        assert!((state.unwrap().floor_net_return.unwrap() - 0.0055).abs() < 1e-12);
+    }
+
+    #[test]
     fn missing_future_and_malformed_depth_never_scores() {
         let mut v = depth();
         v.as_object_mut().unwrap().remove("E");

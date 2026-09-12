@@ -1738,68 +1738,41 @@ impl BinanceDemoExecution {
                                     }
                                 })
                         });
-                        let executable_reversal = exit_reason == "executable_profit_protection"
-                            && matches!(
-                                meta.recipe.as_str(),
-                                "trend_continuation"
-                                    | TREND_REENTRY_RECIPE
-                                    | TREND_PROFIT_REVERSAL_RECIPE
-                            )
-                            && next_profit_reversal_count(meta.profit_reversal_count, &exit_reason)
-                                .is_some();
-                        let ordinary_second_leg = self.lanes.trend_reentry_enabled
-                            && meta.recipe == "trend_continuation"
-                            && exit_reason == "profit_shield_stop"
-                            && summary
-                                .as_ref()
-                                .is_some_and(|value| value.net_pnl_usd > 0.0)
-                            && meta.extreme_price > f64::EPSILON;
-                        if executable_reversal || ordinary_second_leg {
+                        // A protected-profit exit proves that the previous
+                        // impulse lost momentum; it does not, by itself,
+                        // prove that the opposite trend has begun.  The old
+                        // path immediately reversed every such exit and could
+                        // turn an ordinary pullback into two wrong-way trades.
+                        // Keep only the causal, same-side continuation
+                        // campaign.  A genuine opposite trend remains free to
+                        // enter through the normal trend/fast recipes after
+                        // their own confirmation.
+                        let ordinary_second_leg = should_arm_same_side_trend_reentry(
+                            self.lanes.trend_reentry_enabled,
+                            &meta.recipe,
+                            &exit_reason,
+                            summary.as_ref().map(|value| value.net_pnl_usd),
+                            meta.extreme_price,
+                        );
+                        if ordinary_second_leg {
                             let first_exit_price = summary
                                 .as_ref()
                                 .map(|value| value.last_exit_price)
                                 .unwrap_or(meta.stop_price);
-                            let reversal_count = if executable_reversal {
-                                next_profit_reversal_count(meta.profit_reversal_count, &exit_reason)
-                                    .expect("executable reversal was checked above")
-                            } else {
-                                0
-                            };
-                            let stop_pct = (meta.initial_risk_usd.unwrap_or_default()
-                                / (meta.entry_price * meta.initial_quantity).max(f64::EPSILON))
-                            .clamp(
-                                self.lanes.trend_reentry_min_stop_pct,
-                                self.lanes.trend_reentry_max_stop_pct,
-                            );
                             let campaign = TrendReentryCampaign {
                                 source_candidate_id: meta.candidate_id.clone(),
                                 symbol: symbol.clone(),
-                                side: if executable_reversal {
-                                    meta.side.opposite()
-                                } else {
-                                    meta.side
-                                },
+                                side: meta.side,
                                 armed_ms: now_ms,
-                                expires_ms: if executable_reversal {
-                                    now_ms + 60_000
-                                } else {
-                                    now_ms
-                                        + i64::from(self.lanes.trend_reentry_window_minutes)
-                                            * 60_000
-                                },
+                                expires_ms: now_ms
+                                    + i64::from(self.lanes.trend_reentry_window_minutes) * 60_000,
                                 favorable_extreme: meta.extreme_price,
                                 first_exit_price,
-                                reset_ms: executable_reversal.then_some(now_ms),
+                                reset_ms: None,
                                 last_evaluated_bar_ms: now_ms,
-                                signal: executable_reversal.then_some(TrendReentrySignal {
-                                    signal_ms: now_ms,
-                                    reference_price: first_exit_price,
-                                    stop_pct,
-                                    body_pct: 0.0,
-                                    directional_flow: 0.0,
-                                }),
-                                immediate_profit_reversal: executable_reversal,
-                                profit_reversal_count: reversal_count,
+                                signal: None,
+                                immediate_profit_reversal: false,
+                                profit_reversal_count: 0,
                             };
                             self.state
                                 .trend_reentries
@@ -1808,36 +1781,18 @@ impl BinanceDemoExecution {
                                 kind: "trend_reentry_state".into(),
                                 payload: serde_json::json!({
                                     "ts_ms":now_ms,
-                                    "recipe":if executable_reversal { TREND_PROFIT_REVERSAL_RECIPE } else { TREND_REENTRY_RECIPE },
+                                    "recipe":TREND_REENTRY_RECIPE,
                                     "source_candidate_id":campaign.source_candidate_id,
                                     "symbol":campaign.symbol,
                                     "side":campaign.side,
-                                    "stage":if executable_reversal { "ready_to_reverse" } else { "waiting_for_reset" },
-                                    "immediate_profit_reversal":executable_reversal,
-                                    "profit_reversal_count":reversal_count,
+                                    "stage":"waiting_for_reset",
+                                    "immediate_profit_reversal":false,
+                                    "profit_reversal_count":0,
                                     "max_profit_reversals":MAX_PROFIT_REVERSALS_PER_CHAIN,
                                     "favorable_extreme":campaign.favorable_extreme,
                                     "first_exit_price":campaign.first_exit_price,
                                     "reset_required_pct":self.lanes.trend_reentry_reset_pct,
                                     "expires_ms":campaign.expires_ms,
-                                    "venue":"binance_demo",
-                                    "paper_only":true,
-                                }),
-                            });
-                        } else if exit_reason == "executable_profit_protection"
-                            && meta.profit_reversal_count >= MAX_PROFIT_REVERSALS_PER_CHAIN
-                        {
-                            events.push(ExchangeEvent {
-                                kind: "trend_reentry_state".into(),
-                                payload: serde_json::json!({
-                                    "ts_ms":now_ms,
-                                    "recipe":TREND_PROFIT_REVERSAL_RECIPE,
-                                    "source_candidate_id":meta.candidate_id,
-                                    "symbol":symbol,
-                                    "side":meta.side.opposite(),
-                                    "stage":"reversal_chain_complete",
-                                    "profit_reversal_count":meta.profit_reversal_count,
-                                    "max_profit_reversals":MAX_PROFIT_REVERSALS_PER_CHAIN,
                                     "venue":"binance_demo",
                                     "paper_only":true,
                                 }),
@@ -1999,6 +1954,20 @@ impl BinanceDemoExecution {
             let Some(mut campaign) = self.state.trend_reentries.remove(&symbol) else {
                 continue;
             };
+            // State files from the previous schema may contain a queued
+            // immediate opposite leg. Profit protection is no longer treated
+            // as directional evidence, so retire that unsafe intent on first
+            // evaluation after upgrade instead of executing stale behavior.
+            if campaign.immediate_profit_reversal {
+                changed = true;
+                events.push(reentry_state_event(
+                    frame.as_of_ms,
+                    &campaign,
+                    "retired",
+                    serde_json::json!({"reason":"blind_profit_reversal_retired"}),
+                ));
+                continue;
+            }
             if frame.as_of_ms > campaign.expires_ms {
                 changed = true;
                 events.push(reentry_state_event(
@@ -6127,9 +6096,9 @@ fn active_close_all_stop(order: &Value, symbol: &str, algo_id: i64) -> bool {
 }
 
 /// Existing positions retain their entry-time parameters in the restart
-/// journal. Apply the new continuous-profit threshold at runtime as well, so
-/// deploying the fix protects an already-open second/reversal leg instead of
-/// waiting for the next position chain.
+/// journal. Apply the lifecycle threshold at runtime as well, so an older
+/// second leg cannot retain a stale, excessively high trailing handoff after
+/// deployment.
 fn effective_trailing_activation(meta: &ExecutionMeta) -> Option<f64> {
     meta.trailing_activation_pct.map(|activation| {
         if matches!(
@@ -6143,9 +6112,21 @@ fn effective_trailing_activation(meta: &ExecutionMeta) -> Option<f64> {
     })
 }
 
-fn next_profit_reversal_count(current: u8, exit_reason: &str) -> Option<u8> {
-    (exit_reason == "executable_profit_protection" && current < MAX_PROFIT_REVERSALS_PER_CHAIN)
-        .then(|| current + 1)
+fn should_arm_same_side_trend_reentry(
+    enabled: bool,
+    recipe: &str,
+    exit_reason: &str,
+    net_pnl_usd: Option<f64>,
+    favorable_extreme: f64,
+) -> bool {
+    enabled
+        && recipe == "trend_continuation"
+        && matches!(
+            exit_reason,
+            "profit_shield_stop" | "executable_profit_protection"
+        )
+        && net_pnl_usd.is_some_and(|value| value > 0.0)
+        && favorable_extreme > f64::EPSILON
 }
 
 fn reentry_state_event(
@@ -8085,23 +8066,6 @@ mod tests {
     }
 
     #[test]
-    fn executable_profit_reversal_chain_stops_after_two_direction_changes() {
-        assert_eq!(
-            next_profit_reversal_count(0, "executable_profit_protection"),
-            Some(1)
-        );
-        assert_eq!(
-            next_profit_reversal_count(1, "executable_profit_protection"),
-            Some(2)
-        );
-        assert_eq!(
-            next_profit_reversal_count(2, "executable_profit_protection"),
-            None
-        );
-        assert_eq!(next_profit_reversal_count(0, "initial_stop"), None);
-    }
-
-    #[test]
     fn legacy_reentry_campaign_starts_outside_a_profit_reversal_chain() {
         let campaign: TrendReentryCampaign = serde_json::from_value(serde_json::json!({
             "source_candidate_id":"trend_continuation:HYPEUSDT:1",
@@ -8115,6 +8079,31 @@ mod tests {
         .expect("old campaign state should remain readable");
         assert!(!campaign.immediate_profit_reversal);
         assert_eq!(campaign.profit_reversal_count, 0);
+    }
+
+    #[test]
+    fn profit_protection_arms_same_side_confirmation_not_blind_reversal() {
+        assert!(should_arm_same_side_trend_reentry(
+            true,
+            "trend_continuation",
+            "executable_profit_protection",
+            Some(10.0),
+            101.0,
+        ));
+        assert!(!should_arm_same_side_trend_reentry(
+            true,
+            TREND_REENTRY_RECIPE,
+            "executable_profit_protection",
+            Some(10.0),
+            101.0,
+        ));
+        assert!(!should_arm_same_side_trend_reentry(
+            true,
+            "trend_continuation",
+            "initial_stop",
+            Some(-10.0),
+            99.0,
+        ));
     }
 
     #[test]

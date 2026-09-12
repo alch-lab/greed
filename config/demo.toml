@@ -210,8 +210,10 @@ trend_reentry_min_body_pct = 0.002
 trend_reentry_min_flow = 0.05
 trend_reentry_min_stop_pct = 0.003
 trend_reentry_max_stop_pct = 0.0125
-# The second leg arms profit protection at 0.8%, starts continuous trailing at
-# 1.0%, and then locks the executable peak less a 0.5% giveback.
+# The second leg first establishes a small executable profit floor at 0.8%,
+# then changes state at 1.0% and follows the executable peak with a 0.5%
+# giveback. The short handoff avoids reacting to the first noisy pullback,
+# while the 1.0% cap is also applied to positions restored from older state.
 trend_reentry_profit_shield_pct = 0.008
 trend_reentry_trailing_activation_pct = 0.010
 trend_reentry_trailing_distance_pct = 0.005
