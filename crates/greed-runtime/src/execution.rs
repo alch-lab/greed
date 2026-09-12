@@ -29,6 +29,7 @@ const ENTRY_GUARD_REVERSAL_CONFIRM_MS: i64 = 15_000;
 const MIN_PERFORMANCE_FILL_RATIO: f64 = 0.20;
 const PERFORMANCE_BASIS_VERSION: u32 = 3;
 const FAST_TREND_ACTIVATION_RECIPE: &str = "fast_trend_activation";
+const TREND_CONTINUATION_RECIPE: &str = "trend_continuation";
 const TREND_REENTRY_RECIPE: &str = "trend_continuation_reentry";
 const TREND_PROFIT_REVERSAL_RECIPE: &str = "trend_profit_reversal";
 const MAX_PROFIT_REVERSALS_PER_CHAIN: u8 = 2;
@@ -3736,6 +3737,17 @@ impl BinanceDemoExecution {
                     .plan
                     .min_managed_fill_ratio
                     .max(self.lanes.fast_min_managed_fill_ratio);
+            } else if pending.recipe == TREND_CONTINUATION_RECIPE {
+                // A passive trend pullback that has not filled within one
+                // short confirmation window is stale. Long waits select for
+                // fills caused by the trend continuing against our order.
+                let bounded_deadline = pending.order_submitted_ms
+                    + i64::from(self.lanes.trend_entry_timeout_seconds) * 1_000;
+                pending.deadline_ms = pending.deadline_ms.min(bounded_deadline);
+                pending.plan.min_managed_fill_ratio = pending
+                    .plan
+                    .min_managed_fill_ratio
+                    .max(self.lanes.trend_min_managed_fill_ratio);
             }
             let rules = self
                 .rules
@@ -6776,6 +6788,14 @@ fn pending_entry_guard_state(
     if let (Some(flow), Some(response)) = (trade_imbalance, mid_return_bps_10s) {
         let directional_flow = plan.side.sign() * flow;
         let directional_response = plan.side.sign() * response;
+        let extreme_opposing_flow = plan.entry_guard_max_opposing_flow > 0.0
+            && directional_flow < -(plan.entry_guard_max_opposing_flow * 2.5).max(0.25);
+        if extreme_opposing_flow {
+            return EntryGuardState::MicroReversal(format!(
+                "extreme live flow {:.0}% opposes the pending entry",
+                flow * 100.0
+            ));
+        }
         if plan.entry_guard_max_opposing_flow > 0.0
             && plan.entry_guard_max_opposing_return_bps > 0.0
             && directional_flow < -plan.entry_guard_max_opposing_flow
@@ -7896,7 +7916,7 @@ mod tests {
     }
 
     #[test]
-    fn pending_entry_requires_flow_and_price_to_reverse_together() {
+    fn pending_entry_blocks_confirmed_reversal_or_extreme_opposing_flow() {
         let plan = guarded_plan(Side::Buy);
         assert_eq!(
             pending_entry_guard_state(&plan, 99.0, Some(-0.20), Some(2.0)),
@@ -7905,6 +7925,10 @@ mod tests {
         assert!(matches!(
             pending_entry_guard_state(&plan, 99.0, Some(-0.20), Some(-4.0)),
             EntryGuardState::MicroReversal(reason) if reason.contains("live flow")
+        ));
+        assert!(matches!(
+            pending_entry_guard_state(&plan, 99.0, Some(-0.40), Some(2.0)),
+            EntryGuardState::MicroReversal(reason) if reason.contains("extreme live flow")
         ));
         assert_eq!(
             pending_entry_guard_state(&plan, 99.0, None, None),

@@ -105,14 +105,26 @@ fn direct_confirmation_allowed(
     pattern: Option<&str>,
     directional_market_breadth: f64,
     directional_market_return_1h: f64,
+    directional_prebreak_return_1h: f64,
     directional_extension: f64,
     config: &LaneConfig,
 ) -> bool {
-    pattern != Some("trend_reacceleration")
-        || (directional_market_return_1h >= config.fast_reacceleration_direct_min_market_return_1h
-            && directional_extension <= config.fast_reacceleration_direct_max_extension
-            && (directional_market_breadth >= config.fast_reacceleration_direct_min_market_breadth
-                || directional_extension <= config.fast_reacceleration_direct_early_extension))
+    match pattern {
+        Some("compression_breakout") => {
+            // Do not cross immediately on a single bar that merely snaps
+            // against the preceding hour. Require a later touch-and-reclaim;
+            // this is the observed RUNE failure shape.
+            directional_prebreak_return_1h >= -config.fast_min_market_return_1h
+        }
+        Some("trend_reacceleration") => {
+            directional_market_return_1h >= config.fast_reacceleration_direct_min_market_return_1h
+                && directional_extension <= config.fast_reacceleration_direct_max_extension
+                && (directional_market_breadth
+                    >= config.fast_reacceleration_direct_min_market_breadth
+                    || directional_extension <= config.fast_reacceleration_direct_early_extension)
+        }
+        _ => false,
+    }
 }
 
 impl StrategyNode for FastTrendActivationNode {
@@ -249,6 +261,7 @@ impl StrategyNode for FastTrendActivationNode {
                 ignition_pattern,
                 directional_market_breadth,
                 directional_market_return_1h,
+                directional_prebreak_return_1h,
                 directional_extension,
                 &self.config,
             );
@@ -656,6 +669,7 @@ mod tests {
             Some("trend_reacceleration"),
             0.515,
             0.0008,
+            0.01,
             0.0267,
             &config,
         ));
@@ -663,6 +677,7 @@ mod tests {
             Some("trend_reacceleration"),
             0.771,
             0.0262,
+            0.01,
             0.0165,
             &config,
         ));
@@ -670,6 +685,7 @@ mod tests {
             Some("trend_reacceleration"),
             0.556,
             0.0054,
+            0.01,
             0.0121,
             &config,
         ));
@@ -677,7 +693,16 @@ mod tests {
             Some("compression_breakout"),
             0.40,
             -0.01,
+            0.0,
             0.04,
+            &config,
+        ));
+        assert!(!direct_confirmation_allowed(
+            Some("compression_breakout"),
+            0.476,
+            -0.0004,
+            -0.0072,
+            0.0034,
             &config,
         ));
     }

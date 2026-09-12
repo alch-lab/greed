@@ -99,12 +99,18 @@ fn strong_opposing_microstructure(
     max_opposing_flow: f64,
     max_opposing_return_bps: f64,
 ) -> bool {
-    trade_imbalance
-        .zip(mid_return_bps)
-        .is_some_and(|(flow, mid_return)| {
-            side.sign() * flow < -max_opposing_flow
-                && side.sign() * mid_return < -max_opposing_return_bps
-        })
+    let directional_flow = trade_imbalance.map(|flow| side.sign() * flow);
+    // Extreme one-sided flow is independently actionable. Requiring a second
+    // negative price sample let passive trend orders rest while 32%-83% of
+    // live taker flow was already attacking the entry; they then filled only
+    // because the move continued against us. Moderate opposition still needs
+    // price confirmation so an ordinary pullback is not mistaken for failure.
+    directional_flow.is_some_and(|flow| flow < -(max_opposing_flow * 2.5).max(0.25))
+        || directional_flow
+            .zip(mid_return_bps.map(|value| side.sign() * value))
+            .is_some_and(|(flow, mid_return)| {
+                flow < -max_opposing_flow && mid_return < -max_opposing_return_bps
+            })
 }
 
 fn usable_microstructure(
@@ -720,7 +726,7 @@ mod tests {
     }
 
     #[test]
-    fn microstructure_veto_requires_two_opposing_observations() {
+    fn microstructure_veto_accepts_moderate_pullback_but_blocks_extreme_flow() {
         assert!(strong_opposing_microstructure(
             Side::Buy,
             Some(-0.40),
@@ -728,9 +734,16 @@ mod tests {
             0.15,
             3.0
         ));
-        assert!(!strong_opposing_microstructure(
+        assert!(strong_opposing_microstructure(
             Side::Buy,
             Some(-0.40),
+            Some(2.0),
+            0.15,
+            3.0
+        ));
+        assert!(!strong_opposing_microstructure(
+            Side::Buy,
+            Some(-0.20),
             Some(2.0),
             0.15,
             3.0

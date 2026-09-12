@@ -150,15 +150,15 @@ trend_max_signal_age_seconds = 300
 # Start 0.03 ATR behind the completed reclaim, then move the post-only order
 # toward the live passive book every 15 seconds while the signal is still fresh.
 trend_limit_offset_atr = 0.03
-trend_entry_timeout_seconds = 90
+trend_entry_timeout_seconds = 30
 # Reprice the passive maker order toward the live book, but never chase farther
 # than this distance beyond the signal reference price.
 trend_max_entry_adverse_bps = 8.0
 # A timeout with no fill is skipped. Incidental fills below 80% of the planned
-# Stop waiting for the remainder at 80%. At expiry, a smaller fill may still
-# be managed from 20% upward when every protective exit passes exchange rules.
+# Stop waiting for the remainder at 80%. At expiry, retain a partial fill only
+# from 50% upward when every protective exit passes exchange rules.
 trend_min_fill_ratio = 0.80
-trend_min_managed_fill_ratio = 0.20
+trend_min_managed_fill_ratio = 0.50
 # A pullback that trades more than 30 bps through our intended maker limit is
 # no longer a retest. Cancel it immediately instead of filling a rebound after
 # the live signal has already failed.
