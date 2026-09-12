@@ -397,7 +397,9 @@ impl StrategyNode for FastTrendActivationNode {
             }
 
             let signal_ms = confirmation.map_or(bar.close_ms, |(value, _)| value.close_ms);
-            if ctx.frame.as_of_ms - signal_ms > 120_000 {
+            if ctx.frame.as_of_ms - signal_ms
+                > i64::from(self.config.fast_entry_timeout_seconds) * 1_000
+            {
                 blockers.push("the 1m confirmation expired".into());
             }
             let reference_price = confirmation.map_or(instrument.price, |(value, _)| value.close);
@@ -473,7 +475,10 @@ impl StrategyNode for FastTrendActivationNode {
                     self.config.fast_risk_per_trade_pct.to_string(),
                 ),
                 ("max_notional_multiple".into(), "1.0".into()),
-                ("entry_timeout_ms".into(), "120000".into()),
+                (
+                    "entry_timeout_ms".into(),
+                    (i64::from(self.config.fast_entry_timeout_seconds) * 1_000).to_string(),
+                ),
                 (
                     "min_fill_ratio".into(),
                     self.config.fast_min_fill_ratio.to_string(),
@@ -514,7 +519,7 @@ impl StrategyNode for FastTrendActivationNode {
                 symbol: symbol.clone(),
                 side,
                 signal_ms,
-                expires_ms: signal_ms + 120_000,
+                expires_ms: signal_ms + i64::from(self.config.fast_entry_timeout_seconds) * 1_000,
                 reference_price,
                 score,
                 confidence: if verdict == Verdict::Pass {

@@ -82,6 +82,10 @@ pub struct LaneConfig {
     pub fast_max_return_4h: f64,
     pub fast_max_oi_change_15m: f64,
     pub fast_risk_per_trade_pct: f64,
+    /// Maximum lifetime of a passive Fast entry. The signal is derived from
+    /// five-minute ignition plus live microstructure, so a two-minute-old
+    /// quote is no longer the same trade.
+    pub fast_entry_timeout_seconds: u32,
     pub fast_min_fill_ratio: f64,
     pub fast_min_managed_fill_ratio: f64,
     pub liquidation_reversal_enabled: bool,
@@ -172,8 +176,9 @@ impl Default for LaneConfig {
             fast_max_return_4h: 0.06,
             fast_max_oi_change_15m: 0.03,
             fast_risk_per_trade_pct: 0.005,
+            fast_entry_timeout_seconds: 20,
             fast_min_fill_ratio: 0.80,
-            fast_min_managed_fill_ratio: 0.20,
+            fast_min_managed_fill_ratio: 0.50,
             liquidation_reversal_enabled: true,
             liquidation_window_seconds: 3,
             liquidation_min_dominance: 0.80,
@@ -265,8 +270,6 @@ pub struct RiskConfig {
     pub peak_drawdown_halt_pct: f64,
     pub rolling_pf_window: usize,
     pub rolling_pf_min_trades: usize,
-    pub rolling_pf_floor: f64,
-    pub rolling_pf_cooldown_minutes: u32,
     pub loss_cooldown_minutes: u32,
     pub rolling_pf_probe_size_multiplier: f64,
     pub rolling_pf_epoch: u32,
@@ -298,8 +301,6 @@ impl Default for RiskConfig {
             peak_drawdown_halt_pct: 0.10,
             rolling_pf_window: 20,
             rolling_pf_min_trades: 8,
-            rolling_pf_floor: 1.0,
-            rolling_pf_cooldown_minutes: 360,
             loss_cooldown_minutes: 180,
             rolling_pf_probe_size_multiplier: 1.0,
             rolling_pf_epoch: 6,
@@ -351,6 +352,7 @@ impl StrategyConfig {
             || !(0.01..=0.10).contains(&lanes.fast_max_return_4h)
             || !(0.001..=0.05).contains(&lanes.fast_max_oi_change_15m)
             || !(0.001..=0.01).contains(&lanes.fast_risk_per_trade_pct)
+            || !(5..=45).contains(&lanes.fast_entry_timeout_seconds)
             || !(0.50..=1.0).contains(&lanes.fast_min_fill_ratio)
             || !(0.0..=lanes.fast_min_fill_ratio).contains(&lanes.fast_min_managed_fill_ratio)
             || lanes.liquidation_window_seconds != 3

@@ -1571,34 +1571,59 @@ impl BinanceDemoExecution {
                                     client_order_id("rearm", &format!("{candidate_id}:{now_ms}")),
                                 )
                                 .await;
-                            if let Ok(algo_id) = rearm_ack {
-                                let exchange_ack_ms = chrono::Utc::now().timestamp_millis();
-                                if let Some(meta) = self.state.positions.get_mut(&symbol) {
-                                    meta.stop_algo_id = Some(algo_id);
-                                    meta.protection_ack_ms = Some(exchange_ack_ms);
+                            match rearm_ack {
+                                Ok(algo_id) => {
+                                    let exchange_ack_ms = chrono::Utc::now().timestamp_millis();
+                                    if let Some(meta) = self.state.positions.get_mut(&symbol) {
+                                        meta.stop_algo_id = Some(algo_id);
+                                        meta.protection_ack_ms = Some(exchange_ack_ms);
+                                    }
+                                    events.push(ExchangeEvent {
+                                        kind: "exchange_protection_rearmed".into(),
+                                        payload: serde_json::json!({
+                                            "ts_ms":exchange_ack_ms,"symbol":symbol,
+                                            "stop_price":stop_price,"algo_id":algo_id,
+                                            "previous_check":protection_check_details.get(&symbol),
+                                            "venue":"binance_demo","paper_only":true
+                                        }),
+                                    });
+                                    continue;
                                 }
-                                events.push(ExchangeEvent {
-                                    kind: "exchange_protection_rearmed".into(),
-                                    payload: serde_json::json!({
-                                        "ts_ms":exchange_ack_ms,"symbol":symbol,
-                                        "stop_price":stop_price,"algo_id":algo_id,
-                                        "previous_check":protection_check_details.get(&symbol),
-                                        "venue":"binance_demo","paper_only":true
-                                    }),
-                                });
-                                continue;
+                                Err(error)
+                                    if is_existing_close_position_protection_error(&error) =>
+                                {
+                                    // Binance -4130 is authoritative evidence that a
+                                    // closePosition trigger already protects this side. Demo can
+                                    // briefly omit that algo from both list and direct lookup;
+                                    // flattening here turns a reconciliation race into a real loss.
+                                    let exchange_ack_ms = chrono::Utc::now().timestamp_millis();
+                                    if let Some(meta) = self.state.positions.get_mut(&symbol) {
+                                        meta.protection_ack_ms = Some(exchange_ack_ms);
+                                    }
+                                    events.push(ExchangeEvent {
+                                        kind: "exchange_protection_confirmed_by_conflict".into(),
+                                        payload: serde_json::json!({
+                                            "ts_ms":exchange_ack_ms,"symbol":symbol,
+                                            "stop_price":stop_price,"detail":format!("{error:#}"),
+                                            "previous_check":protection_check_details.get(&symbol),
+                                            "venue":"binance_demo","paper_only":true
+                                        }),
+                                    });
+                                    continue;
+                                }
+                                Err(error) => {
+                                    protection_check_details.insert(
+                                        symbol.clone(),
+                                        format!(
+                                            "{}; replacement stop also failed: {error:#}",
+                                            protection_check_details
+                                                .get(&symbol)
+                                                .map(String::as_str)
+                                                .unwrap_or("no active stop was visible"),
+                                        ),
+                                    );
+                                }
                             }
-                            protection_check_details.insert(
-                                symbol.clone(),
-                                format!(
-                                    "{}; replacement stop also failed: {:#}",
-                                    protection_check_details
-                                        .get(&symbol)
-                                        .map(String::as_str)
-                                        .unwrap_or("no active stop was visible"),
-                                    rearm_ack.unwrap_err()
-                                ),
-                            );
                         }
                         self.close_market(position).await.with_context(|| {
                             format!(
@@ -2383,7 +2408,7 @@ impl BinanceDemoExecution {
         self.state.seen.contains(candidate_id)
     }
 
-    pub fn recipe_gate_status(&self, recipe: &str, now_ms: i64) -> RecipeGateStatus {
+    pub fn recipe_gate_status(&self, recipe: &str, _now_ms: i64) -> RecipeGateStatus {
         let outcomes = self
             .state
             .recipe_outcomes
@@ -2407,16 +2432,10 @@ impl BinanceDemoExecution {
             .filter(|value| *value < 0.0)
             .sum::<f64>();
         let rolling_profit_factor = (loss > f64::EPSILON).then_some(profit / loss);
-        let failed = window.len() >= self.risk.rolling_pf_min_trades
-            && loss > f64::EPSILON
-            && rolling_profit_factor.unwrap_or_default() < self.risk.rolling_pf_floor;
-        let next_probe_ms = failed.then(|| {
-            window
-                .last()
-                .map(|outcome| outcome.exit_ms)
-                .unwrap_or_default()
-                + i64::from(self.risk.rolling_pf_cooldown_minutes) * 60_000
-        });
+        // Rolling PF is an attribution/diagnostic metric, not an admission
+        // gate. The former six-hour directional lock discarded fresh setups
+        // because of unrelated earlier trades and made a live lane diverge
+        // sharply from its signal replay.
         let count_key = recipe
             .strip_suffix(":buy")
             .or_else(|| recipe.strip_suffix(":sell"))
@@ -2431,12 +2450,12 @@ impl BinanceDemoExecution {
             .cloned()
             .unwrap_or_default();
         RecipeGateStatus {
-            allowed: !failed || next_probe_ms.is_some_and(|value| now_ms >= value),
+            allowed: true,
             completed_trades: window.len(),
             excluded_partial_trades: outcomes.len().saturating_sub(eligible.len()),
             rolling_profit_factor,
             rolling_net_pnl_usd: window.iter().map(|outcome| outcome.pnl_usd).sum(),
-            next_probe_ms,
+            next_probe_ms: None,
             entry_attempts: counts.entry_attempts,
             filled_entry_attempts: counts.filled_entry_attempts,
             formal_positions: counts.formal_positions,
@@ -2903,16 +2922,7 @@ impl BinanceDemoExecution {
                 continue;
             }
             let performance_gate = self.recipe_gate_status(&performance_key, frame.as_of_ms);
-            if !performance_gate.allowed {
-                self.state.seen.insert(plan.candidate_id.clone());
-                events.push(ExchangeEvent {
-                    kind: "exchange_plan_rejected".into(),
-                    payload: serde_json::json!({"ts_ms":frame.as_of_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"performance_key":performance_key,"symbol":plan.symbol,"side":plan.side,"reason":"rolling_profit_factor_gate","venue":"binance_demo","paper_only":true}),
-                });
-                continue;
-            }
-            let probe = performance_gate.completed_trades < self.risk.rolling_pf_min_trades
-                || performance_gate.next_probe_ms.is_some();
+            let probe = performance_gate.completed_trades < self.risk.rolling_pf_min_trades;
             let size_multiplier = if probe {
                 self.risk.rolling_pf_probe_size_multiplier
             } else {
@@ -3386,7 +3396,12 @@ impl BinanceDemoExecution {
         )?;
         validate_entry_quantity_and_exits(plan, quantity, plan.reference_price, &rules)?;
         match self.pending_entry_guard(plan, chrono::Utc::now().timestamp_millis()) {
-            EntryGuardState::Healthy | EntryGuardState::MicroReversal(_) => {}
+            EntryGuardState::Healthy => {}
+            EntryGuardState::MicroReversal(reason) => {
+                return Err(anyhow!(
+                    "entry microstructure reversed before submission: {reason}"
+                ));
+            }
             EntryGuardState::StructuralInvalidation(reason) => {
                 return Err(anyhow!(
                     "entry signal invalidated before submission: {reason}"
@@ -3709,6 +3724,19 @@ impl BinanceDemoExecution {
             let Some(mut pending) = self.state.pending_entries.get(&symbol).cloned() else {
                 continue;
             };
+            if pending.recipe == FAST_TREND_ACTIVATION_RECIPE {
+                // Apply the bounded Fast lifecycle to entries restored from an
+                // older journal as well. Otherwise a deployment during a
+                // resting 120-second order would preserve the exact stale-fill
+                // bug this release is meant to remove.
+                let bounded_deadline = pending.order_submitted_ms
+                    + i64::from(self.lanes.fast_entry_timeout_seconds) * 1_000;
+                pending.deadline_ms = pending.deadline_ms.min(bounded_deadline);
+                pending.plan.min_managed_fill_ratio = pending
+                    .plan
+                    .min_managed_fill_ratio
+                    .max(self.lanes.fast_min_managed_fill_ratio);
+            }
             let rules = self
                 .rules
                 .get(&symbol)
@@ -4830,10 +4858,16 @@ impl BinanceDemoExecution {
         // without this final gate a valid close can turn into a stale market
         // entry while the request is being prepared.
         match self.pending_entry_guard(plan, chrono::Utc::now().timestamp_millis()) {
-            // A single 10-second flow sample is too noisy to veto a completed
-            // 15-minute setup. The pending-order loop below requires the
-            // reversal to persist before it cancels the passive order.
-            EntryGuardState::Healthy | EntryGuardState::MicroReversal(_) => {}
+            EntryGuardState::Healthy => {}
+            // At the final pre-submit boundary there is no fill to protect and
+            // no benefit in knowingly opening against both live flow and the
+            // ten-second price response. Persistence remains required only
+            // after a passive order is already resting.
+            EntryGuardState::MicroReversal(reason) => {
+                return Err(anyhow!(
+                    "entry microstructure reversed before submission: {reason}"
+                ));
+            }
             EntryGuardState::StructuralInvalidation(reason) => {
                 return Err(anyhow!(
                     "entry signal invalidated before submission: {reason}"
@@ -6553,40 +6587,9 @@ fn plan_cost_diagnostics(
 fn take_profit_prices_from_fill(
     plan: &greed_kernel::PositionPlan,
     entry_price: f64,
-    executed_quantity: f64,
+    _executed_quantity: f64,
 ) -> Vec<(f64, f64)> {
     let sign = plan.side.sign();
-    let cost_aware = plan
-        .signal_context
-        .get("cost_aware_full_take_profit")
-        .is_some_and(|value| value == "true");
-    let desired_net_usd = plan
-        .signal_context
-        .get("target_account_profit_usd")
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value > 0.0);
-    let estimated_cost_bps = plan
-        .signal_context
-        .get("estimated_target_cost_bps")
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value >= 0.0);
-
-    if cost_aware && plan.take_profit_prices.len() == 1 {
-        if let (Some(desired_net_usd), Some(estimated_cost_bps)) =
-            (desired_net_usd, estimated_cost_bps)
-        {
-            let actual_notional_usd = entry_price * executed_quantity;
-            if actual_notional_usd.is_finite() && actual_notional_usd > f64::EPSILON {
-                let gross_target_pct =
-                    desired_net_usd / actual_notional_usd + estimated_cost_bps / 10_000.0;
-                return vec![(
-                    entry_price * (1.0 + sign * gross_target_pct),
-                    plan.take_profit_prices[0].1,
-                )];
-            }
-        }
-    }
-
     plan.take_profit_prices
         .iter()
         .map(|(target, fraction)| {
@@ -6602,41 +6605,15 @@ struct FillProtection {
     trailing_distance_pct: Option<f64>,
 }
 
-/// Rebase Fast protection on what actually filled. The full target stays at
-/// the requested account-level dollar objective. The lock arms at 55% of that
-/// objective and trails by 25%; both are recomputed from actual notional so a
-/// liquidity-reduced fill cannot inherit thresholds from the planned size.
+/// Rebase Fast protection on the actual fill price while preserving the
+/// planned price-space geometry. A partial fill earns proportionally fewer
+/// dollars; it must never be forced to travel proportionally farther merely
+/// because less quantity happened to fill.
 fn protection_from_fill(
     plan: &greed_kernel::PositionPlan,
-    actual_notional_usd: f64,
-    actual_initial_risk_usd: f64,
+    _actual_notional_usd: f64,
+    _actual_initial_risk_usd: f64,
 ) -> FillProtection {
-    let cost_aware = plan
-        .signal_context
-        .get("cost_aware_profit_shield")
-        .is_some_and(|value| value == "true");
-    let desired_net_usd = plan
-        .signal_context
-        .get("target_account_profit_usd")
-        .and_then(|value| value.parse::<f64>().ok())
-        .filter(|value| value.is_finite() && *value > 0.0);
-    if cost_aware
-        && actual_notional_usd.is_finite()
-        && actual_notional_usd > f64::EPSILON
-        && actual_initial_risk_usd.is_finite()
-        && actual_initial_risk_usd > f64::EPSILON
-    {
-        if let Some(desired_net_usd) = desired_net_usd {
-            let activation_usd = desired_net_usd * 0.55;
-            let retracement_usd = desired_net_usd * 0.25;
-            return FillProtection {
-                activation_pct: Some(
-                    crate::profit_guard::COST_RESERVE + activation_usd / actual_notional_usd,
-                ),
-                trailing_distance_pct: Some(retracement_usd / actual_notional_usd),
-            };
-        }
-    }
     FillProtection {
         activation_pct: plan.profit_shield_activation_pct,
         trailing_distance_pct: plan.trailing_distance_pct,
@@ -6706,6 +6683,12 @@ fn is_post_only_rejection(error: &anyhow::Error) -> bool {
 fn is_invalid_symbol_error(error: &anyhow::Error) -> bool {
     let message = error.to_string();
     message.contains("\"code\":-1121") || message.contains("Invalid symbol")
+}
+fn is_existing_close_position_protection_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    message.contains("-4130")
+        && message.contains("closePosition")
+        && (message.contains("existing") || message.contains("exists"))
 }
 fn capped_passive_price(
     side: Side,
@@ -7121,8 +7104,9 @@ mod tests {
     }
 
     #[test]
-    fn fast_take_profit_retargets_the_actual_fill_to_thirty_dollars_net() {
+    fn fast_take_profit_preserves_price_geometry_after_partial_fill() {
         let mut plan = guarded_plan(Side::Buy);
+        plan.notional_usd = 10_000.0;
         plan.take_profit_prices = vec![(100.39, 1.0)];
         plan.signal_context
             .insert("cost_aware_full_take_profit".into(), "true".into());
@@ -7136,26 +7120,26 @@ mod tests {
         assert_eq!(full[0].1, 1.0);
 
         let half = take_profit_prices_from_fill(&plan, 101.0, 5_000.0 / 101.0);
-        assert!((half[0].0 - 101.6969).abs() < 1e-9);
+        assert!((half[0].0 - 101.3939).abs() < 1e-9);
         assert_eq!(half[0].1, 1.0);
     }
 
     #[test]
-    fn fast_profit_protection_rebases_to_actual_fill_and_initial_risk() {
+    fn fast_profit_protection_preserves_price_geometry_after_partial_fill() {
         let mut plan = guarded_plan(Side::Buy);
         plan.signal_context
             .insert("cost_aware_profit_shield".into(), "true".into());
         plan.signal_context
             .insert("target_account_profit_usd".into(), "30".into());
         let protection = protection_from_fill(&plan, 2_626.0, 18.90);
-        let expected_activation = crate::profit_guard::COST_RESERVE + 30.0 * 0.55 / 2_626.0;
-        let expected_distance = 30.0 * 0.25 / 2_626.0;
+        let expected_activation = plan.profit_shield_activation_pct.unwrap();
+        let expected_distance = plan.trailing_distance_pct.unwrap();
         assert!((protection.activation_pct.unwrap() - expected_activation).abs() < 1e-12);
         assert!((protection.trailing_distance_pct.unwrap() - expected_distance).abs() < 1e-12);
 
         let small_fill = protection_from_fill(&plan, 247.0, 1.67);
-        assert!(small_fill.activation_pct.unwrap() > 0.06);
-        assert!(small_fill.trailing_distance_pct.unwrap() > 0.03);
+        assert!((small_fill.activation_pct.unwrap() - expected_activation).abs() < 1e-12);
+        assert!((small_fill.trailing_distance_pct.unwrap() - expected_distance).abs() < 1e-12);
     }
 
     #[test]
@@ -7386,6 +7370,19 @@ mod tests {
             "Binance demo /fapi/v1/order returned 400 Bad Request: {\"code\":-1121,\"msg\":\"Invalid symbol.\"}"
         );
         assert!(is_invalid_symbol_error(&error));
+    }
+
+    #[test]
+    fn recognizes_existing_close_position_protection_conflict() {
+        let error = anyhow!(
+            "{}",
+            "Binance demo /fapi/v1/algoOrder returned 400 Bad Request: {\"code\":-4130,\"msg\":\"An open stop or take profit order with GTE and closePosition in the direction is existing.\"}"
+        )
+        .context("replacement stop failed");
+        assert!(is_existing_close_position_protection_error(&error));
+        assert!(!is_existing_close_position_protection_error(&anyhow!(
+            "ordinary network timeout"
+        )));
     }
 
     #[test]

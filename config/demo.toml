@@ -99,8 +99,9 @@ fast_max_prebreak_return_1h = 0.03
 fast_max_return_4h = 0.06
 fast_max_oi_change_15m = 0.03
 fast_risk_per_trade_pct = 0.005
+fast_entry_timeout_seconds = 20
 fast_min_fill_ratio = 0.80
-fast_min_managed_fill_ratio = 0.20
+fast_min_managed_fill_ratio = 0.50
 # Frozen paper-validation lane: fade a three-second one-sided liquidation
 # cascade only after the price has moved with the forced flow. It is evaluated
 # from Binance public force-order and top-20 depth streams, enters through a
@@ -250,10 +251,8 @@ daily_loss_limit_pct = 0.025
 peak_drawdown_halt_pct = 0.10
 rolling_pf_window = 20
 rolling_pf_min_trades = 8
-rolling_pf_floor = 1.00
-rolling_pf_cooldown_minutes = 360
 loss_cooldown_minutes = 180
 rolling_pf_probe_size_multiplier = 1.00
 # Epoch 19 starts a clean $10,000 virtual performance window. Historical journals
-# remain on disk; only the live baseline and adaptive performance gates reset.
+# remain on disk; only the live performance baseline resets.
 rolling_pf_epoch = 19
