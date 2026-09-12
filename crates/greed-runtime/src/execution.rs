@@ -84,6 +84,13 @@ enum ProtectiveOrderId {
     Algo(i64),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProtectionReplacement {
+    Replaced(i64),
+    ExistingProtection,
+    PositionAlreadyFlat,
+}
+
 const PROTECTION_VISIBILITY_GRACE_MS: i64 = 5_000;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -793,6 +800,11 @@ impl BinanceDemoExecution {
                     .collect();
                 let mut hold_review_changed = false;
                 for symbol in due_for_review {
+                    let hold_context = self.state.positions.get(&symbol).and_then(|meta| {
+                        self.market_stream.as_ref().and_then(|stream| {
+                            fast_trend_hold_context(stream, &symbol, meta.side, now_ms)
+                        })
+                    });
                     let Some(meta) = self.state.positions.get_mut(&symbol) else {
                         continue;
                     };
@@ -801,7 +813,7 @@ impl BinanceDemoExecution {
                         .get(&symbol)
                         .map(|position| position.mark_price)
                         .unwrap_or_default();
-                    match max_hold_review(meta, now_ms, mark_price) {
+                    match max_hold_review(meta, now_ms, mark_price, hold_context) {
                         MaxHoldReview::NotApplicable => {}
                         MaxHoldReview::Exit => {
                             // Persist the decision before touching the exchange.
@@ -834,6 +846,8 @@ impl BinanceDemoExecution {
                             executable_net_pnl_usd,
                             initial_risk_usd,
                             exit_impact_bps,
+                            directional_return_5m,
+                            directional_flow_5m,
                             reason,
                         } => {
                             meta.max_hold_ms = meta.max_hold_ms.saturating_add(extension_ms);
@@ -849,6 +863,8 @@ impl BinanceDemoExecution {
                                     "executable_net_pnl_usd":executable_net_pnl_usd,
                                     "initial_risk_usd":initial_risk_usd,
                                     "exit_impact_bps":exit_impact_bps,
+                                    "directional_return_5m":directional_return_5m,
+                                    "directional_flow_5m":directional_flow_5m,
                                     "review_count":meta.max_hold_reviews,
                                     "reason":reason,
                                     "venue":"binance_demo","paper_only":true
@@ -1439,6 +1455,7 @@ impl BinanceDemoExecution {
                         }),
                     }
                 }
+                let mut protection_state_changed = false;
                 for (symbol, desired, reason, position, stop_order_id) in protection_updates {
                     let decision_ms = chrono::Utc::now().timestamp_millis();
                     let rules = self
@@ -1446,14 +1463,11 @@ impl BinanceDemoExecution {
                         .get(&symbol)
                         .cloned()
                         .ok_or_else(|| anyhow!("missing exchange rules for {symbol}"))?;
-                    let replacement = async {
-                        if let Some(order_id) = stop_order_id {
-                            self.cancel_protective_order(&symbol, order_id).await?;
-                        }
-                        self.place_close_all_trigger(
+                    let replacement = self
+                        .replace_protective_stop(
                             &symbol,
-                            position.side.opposite(),
-                            "STOP_MARKET",
+                            &position,
+                            stop_order_id,
                             desired,
                             &rules,
                             client_order_id(
@@ -1461,11 +1475,9 @@ impl BinanceDemoExecution {
                                 &format!("{symbol}:{desired:.10}:{}", now_ms / 60_000),
                             ),
                         )
-                        .await
-                    }
-                    .await;
+                        .await;
                     match replacement {
-                        Ok(stop_algo_id) => {
+                        Ok(ProtectionReplacement::Replaced(stop_algo_id)) => {
                             let exchange_ack_ms = chrono::Utc::now().timestamp_millis();
                             if let Some(meta) = self.state.positions.get_mut(&symbol) {
                                 meta.stop_price = desired;
@@ -1473,6 +1485,7 @@ impl BinanceDemoExecution {
                                 meta.stop_algo_id = Some(stop_algo_id);
                                 meta.protection_ack_ms = Some(exchange_ack_ms);
                                 meta.stop_reason = Some(reason.into());
+                                protection_state_changed = true;
                             }
                             events.push(ExchangeEvent {
                                 kind: "exchange_protection_updated".into(),
@@ -1484,6 +1497,38 @@ impl BinanceDemoExecution {
                                         "exchange_ack_ms":exchange_ack_ms,
                                         "decision_to_ack_ms":exchange_ack_ms.saturating_sub(decision_ms),
                                     },
+                                }),
+                            });
+                        }
+                        Ok(ProtectionReplacement::ExistingProtection) => {
+                            protected.entry(symbol.clone()).or_default().0 = true;
+                            events.push(ExchangeEvent {
+                                kind: "exchange_protection_replacement_deferred".into(),
+                                payload: serde_json::json!({
+                                    "ts_ms":chrono::Utc::now().timestamp_millis(),
+                                    "symbol":symbol,"desired_stop_price":desired,
+                                    "reason":"exchange_reports_existing_close_position_protection",
+                                    "hard_stop_retained":true,
+                                    "venue":"binance_demo","paper_only":true
+                                }),
+                            });
+                        }
+                        Ok(ProtectionReplacement::PositionAlreadyFlat) => {
+                            // The old trigger won the cancel race. Preserve its
+                            // eventual stop attribution; do not manufacture a
+                            // protection-update failure or send another close.
+                            protected.entry(symbol.clone()).or_default().0 = true;
+                            if let Some(meta) = self.state.positions.get_mut(&symbol) {
+                                meta.exit_requested = true;
+                                protection_state_changed = true;
+                            }
+                            events.push(ExchangeEvent {
+                                kind: "exchange_protection_trigger_reconciled".into(),
+                                payload: serde_json::json!({
+                                    "ts_ms":chrono::Utc::now().timestamp_millis(),
+                                    "symbol":symbol,
+                                    "reason":"position_flat_after_unknown_stop_cancel",
+                                    "venue":"binance_demo","paper_only":true
                                 }),
                             });
                         }
@@ -1499,10 +1544,16 @@ impl BinanceDemoExecution {
                             }
                             events.push(ExchangeEvent {
                                 kind: "exchange_exit_requested".into(),
-                                payload: serde_json::json!({"ts_ms":now_ms,"symbol":symbol,"reason":"protection_update_failed","detail":error.to_string(),"venue":"binance_demo"}),
+                                payload: serde_json::json!({"ts_ms":now_ms,"symbol":symbol,"reason":"protection_update_failed","detail":format!("{error:#}"),"venue":"binance_demo"}),
                             });
                         }
                     }
+                }
+                // A restart between replacing a stop and the normal end-of-sync
+                // checkpoint must not restore the superseded order id/price or
+                // retry an already-triggered stop as an ordinary update.
+                if protection_state_changed {
+                    self.save()?;
                 }
                 let unprotected: Vec<_> = account
                     .positions
@@ -5689,6 +5740,59 @@ impl BinanceDemoExecution {
         Ok(())
     }
 
+    /// Replace a close-all stop without converting Binance's eventually
+    /// consistent conditional-order state into an unnecessary market exit.
+    /// `-2011` after a stop was just observed can mean it triggered or was
+    /// concurrently removed; reconcile the position before submitting the
+    /// deterministic replacement. `-4130` proves another close-position
+    /// trigger still exists, so the position remains protected and the tighter
+    /// update can be retried on the next sync.
+    async fn replace_protective_stop(
+        &self,
+        symbol: &str,
+        position: &RemotePosition,
+        current: Option<ProtectiveOrderId>,
+        desired: f64,
+        rules: &SymbolRules,
+        client_id: String,
+    ) -> Result<ProtectionReplacement> {
+        if let Some(order_id) = current {
+            if let Err(error) = self.cancel_protective_order(symbol, order_id).await {
+                if !is_unknown_order_error(&error) {
+                    return Err(error).context("cancel current protective stop");
+                }
+                let latest = self.signed_read("/fapi/v2/account", vec![]).await?;
+                let positions = parse_account(&latest)?.positions;
+                match positions.get(symbol) {
+                    None => return Ok(ProtectionReplacement::PositionAlreadyFlat),
+                    Some(current) if current.side != position.side => {
+                        return Err(anyhow!(
+                            "{symbol} reversed while its protective stop was being replaced"
+                        ));
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
+        match self
+            .place_close_all_trigger(
+                symbol,
+                position.side.opposite(),
+                "STOP_MARKET",
+                desired,
+                rules,
+                client_id,
+            )
+            .await
+        {
+            Ok(algo_id) => Ok(ProtectionReplacement::Replaced(algo_id)),
+            Err(error) if is_existing_close_position_protection_error(&error) => {
+                Ok(ProtectionReplacement::ExistingProtection)
+            }
+            Err(error) => Err(error).context("submit replacement protective stop"),
+        }
+    }
+
     async fn trade_summary(
         &self,
         symbol: &str,
@@ -6248,6 +6352,8 @@ enum MaxHoldReview {
         executable_net_pnl_usd: f64,
         initial_risk_usd: f64,
         exit_impact_bps: f64,
+        directional_return_5m: Option<f64>,
+        directional_flow_5m: Option<f64>,
         reason: &'static str,
     },
     Exit,
@@ -6258,10 +6364,71 @@ const FAST_TREND_PROGRESS_REVIEW_MS: i64 = 10 * 60_000;
 const FAST_TREND_MAX_PROGRESS_REVIEWS: u8 = 2;
 const FAST_TREND_MIN_PROGRESS_R: f64 = 0.25;
 const FAST_TREND_MAX_CURRENT_ADVERSE_R: f64 = 0.25;
+const FAST_TREND_STRUCTURE_MAX_CURRENT_ADVERSE_R: f64 = 0.30;
+const FAST_TREND_STRUCTURE_MIN_RETURN_5M: f64 = 0.001;
+const FAST_TREND_STRUCTURE_MIN_FLOW_5M: f64 = 0.02;
 const MAX_STORED_EXECUTABLE_QUOTE_AGE_MS: i64 = 5_000;
 const FAST_TREND_HIGH_EXIT_IMPACT_BPS: f64 = 10.0;
 
-fn max_hold_review(meta: &ExecutionMeta, now_ms: i64, mark_price: f64) -> MaxHoldReview {
+#[derive(Debug, Clone, Copy)]
+struct FastTrendHoldContext {
+    directional_return_5m: f64,
+    directional_flow_5m: f64,
+}
+
+fn fast_trend_hold_context(
+    stream: &MarketStreamHub,
+    symbol: &str,
+    side: Side,
+    now_ms: i64,
+) -> Option<FastTrendHoldContext> {
+    let (candles, updated_ms) = stream.candles(symbol, "1m");
+    if now_ms.saturating_sub(updated_ms?) > 15_000 {
+        return None;
+    }
+    fast_trend_hold_context_from_candles(&candles, side, now_ms)
+}
+
+fn fast_trend_hold_context_from_candles(
+    candles: &[Candle],
+    side: Side,
+    now_ms: i64,
+) -> Option<FastTrendHoldContext> {
+    let closed: Vec<_> = candles.iter().filter(|candle| candle.closed).collect();
+    let window = closed.get(closed.len().checked_sub(5)?..)?;
+    let last = *window.last()?;
+    if now_ms.saturating_sub(last.close_ms) > 90_000 {
+        return None;
+    }
+    if !window.windows(2).all(|pair| {
+        pair[1].open_ms == pair[0].open_ms.saturating_add(60_000)
+            && pair[0].close_ms < pair[1].open_ms
+    }) {
+        return None;
+    }
+    let first = *window.first()?;
+    let quote_volume: f64 = window.iter().map(|candle| candle.quote_volume).sum();
+    let taker_buy_quote: f64 = window
+        .iter()
+        .map(|candle| candle.taker_buy_quote)
+        .collect::<Option<Vec<_>>>()?
+        .into_iter()
+        .sum();
+    if first.open <= f64::EPSILON || quote_volume <= f64::EPSILON {
+        return None;
+    }
+    Some(FastTrendHoldContext {
+        directional_return_5m: side.sign() * (last.close / first.open - 1.0),
+        directional_flow_5m: side.sign() * (2.0 * taker_buy_quote / quote_volume - 1.0),
+    })
+}
+
+fn max_hold_review(
+    meta: &ExecutionMeta,
+    now_ms: i64,
+    mark_price: f64,
+    trend: Option<FastTrendHoldContext>,
+) -> MaxHoldReview {
     if meta.exit_requested
         || meta.max_hold_ms <= 0
         || now_ms - meta.holding_started_ms() < meta.max_hold_ms
@@ -6295,11 +6462,57 @@ fn max_hold_review(meta: &ExecutionMeta, now_ms: i64, mark_price: f64) -> MaxHol
     if stop_risk_pct <= f64::EPSILON {
         return MaxHoldReview::Exit;
     }
+    let guard = meta.executable_profit.as_ref();
     let favorable_pct = meta.side.sign() * (meta.extreme_price / meta.entry_price - 1.0);
-    let current_pct = meta.side.sign() * (mark_price / meta.entry_price - 1.0);
+    let executable_price = guard
+        .filter(|value| {
+            now_ms.saturating_sub(value.observed_ms) <= MAX_STORED_EXECUTABLE_QUOTE_AGE_MS
+                && value.exit_vwap.is_finite()
+                && value.exit_vwap > f64::EPSILON
+        })
+        .map(|value| value.exit_vwap);
+    let current_pct =
+        meta.side.sign() * (executable_price.unwrap_or(mark_price) / meta.entry_price - 1.0);
     let progress_r = favorable_pct.max(0.0) / stop_risk_pct;
     let current_r = current_pct / stop_risk_pct;
-    let guard = meta.executable_profit.as_ref();
+
+    // A Fast deadline is allowed to extend a still-live tape even before it
+    // has produced 0.25R of MFE. This is intentionally strict and causal:
+    // five completed one-minute candles must show aggregate agreement between
+    // price and taker flow, the current executable loss must remain inside 0.30R, and the
+    // exchange-side catastrophe stop stays active. RAYS at 00:02 is the
+    // regression case: the short tape remained intact and reached TP shortly
+    // after the old unconditional deadline exit.
+    if let Some(trend) = trend.filter(|trend| {
+        trend.directional_return_5m >= FAST_TREND_STRUCTURE_MIN_RETURN_5M
+            && trend.directional_flow_5m >= FAST_TREND_STRUCTURE_MIN_FLOW_5M
+            && current_r >= -FAST_TREND_STRUCTURE_MAX_CURRENT_ADVERSE_R
+    }) {
+        let executable_net_pnl_usd = guard
+            .map(|value| {
+                value.current_net_return * meta.entry_price * meta.last_observed_quantity.max(0.0)
+            })
+            .unwrap_or_default();
+        let exit_impact_bps = guard
+            .map(|value| match meta.side {
+                Side::Buy => (mark_price - value.exit_vwap) / mark_price.max(f64::EPSILON),
+                Side::Sell => (value.exit_vwap - mark_price) / mark_price.max(f64::EPSILON),
+            })
+            .unwrap_or_default()
+            .max(0.0)
+            * 10_000.0;
+        return MaxHoldReview::Extend {
+            extension_ms: FAST_TREND_PROGRESS_REVIEW_MS,
+            progress_r,
+            current_r,
+            executable_net_pnl_usd,
+            initial_risk_usd,
+            exit_impact_bps,
+            directional_return_5m: Some(trend.directional_return_5m),
+            directional_flow_5m: Some(trend.directional_flow_5m),
+            reason: "fresh_directional_structure_and_flow",
+        };
+    }
 
     // The ten-minute Fast deadline is a review, not an unconditional market
     // exit. A trade that has already demonstrated meaningful favorable
@@ -6329,6 +6542,8 @@ fn max_hold_review(meta: &ExecutionMeta, now_ms: i64, mark_price: f64) -> MaxHol
             executable_net_pnl_usd,
             initial_risk_usd,
             exit_impact_bps,
+            directional_return_5m: trend.map(|value| value.directional_return_5m),
+            directional_flow_5m: trend.map(|value| value.directional_flow_5m),
             reason: "meaningful_progress_with_bounded_adverse_move",
         };
     }
@@ -6370,6 +6585,8 @@ fn max_hold_review(meta: &ExecutionMeta, now_ms: i64, mark_price: f64) -> MaxHol
         executable_net_pnl_usd,
         initial_risk_usd,
         exit_impact_bps,
+        directional_return_5m: trend.map(|value| value.directional_return_5m),
+        directional_flow_5m: trend.map(|value| value.directional_flow_5m),
         reason: "profitable_position_with_temporarily_high_exit_impact",
     }
 }
@@ -6676,6 +6893,10 @@ fn is_post_only_rejection(error: &anyhow::Error) -> bool {
 fn is_invalid_symbol_error(error: &anyhow::Error) -> bool {
     let message = error.to_string();
     message.contains("\"code\":-1121") || message.contains("Invalid symbol")
+}
+fn is_unknown_order_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    message.contains("\"code\":-2011") || message.contains("Unknown order sent")
 }
 fn is_existing_close_position_protection_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
@@ -7062,6 +7283,20 @@ mod tests {
         }
     }
 
+    fn one_minute_bar(open_ms: i64, open: f64, close: f64, buy_share: f64) -> Candle {
+        Candle {
+            open_ms,
+            close_ms: open_ms + 59_999,
+            open,
+            high: open.max(close),
+            low: open.min(close),
+            close,
+            quote_volume: 1_000.0,
+            taker_buy_quote: Some(1_000.0 * buy_share),
+            closed: true,
+        }
+    }
+
     fn guarded_plan(side: Side) -> greed_kernel::PositionPlan {
         greed_kernel::PositionPlan {
             candidate_id: "trend_continuation:TESTUSDT:1".into(),
@@ -7387,6 +7622,17 @@ mod tests {
     }
 
     #[test]
+    fn recognizes_unknown_conditional_order_cancel_race() {
+        let error = anyhow!(
+            "{}",
+            "Binance demo /fapi/v1/algoOrder returned 400 Bad Request: {\"code\":-2011,\"msg\":\"Unknown order sent.\"}"
+        )
+        .context("cancel current protective stop");
+        assert!(is_unknown_order_error(&error));
+        assert!(!is_unknown_order_error(&anyhow!("ordinary timeout")));
+    }
+
+    #[test]
     fn adaptive_maker_reprices_toward_book_with_a_hard_chase_cap() {
         // These are the observed TUTU and ENA cases from 2026-08-27. The old
         // fixed orders stayed 78.2 and 33.8 bps below the reference. A live
@@ -7472,7 +7718,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            max_hold_review(&meta, 1_801_000, 0.01920),
+            max_hold_review(&meta, 1_801_000, 0.01920, None),
             MaxHoldReview::Exit
         );
     }
@@ -7487,7 +7733,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            max_hold_review(&meta, 1_801_000, 101.0),
+            max_hold_review(&meta, 1_801_000, 101.0, None),
             MaxHoldReview::ReleaseToProtection
         );
     }
@@ -7507,7 +7753,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            max_hold_review(&meta, 601_000, 100.8),
+            max_hold_review(&meta, 601_000, 100.8, None),
             MaxHoldReview::ReleaseToProtection
         );
     }
@@ -7528,14 +7774,20 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(
-            max_hold_review(&meta, 601_000, 100.8),
+            max_hold_review(&meta, 601_000, 100.8, None),
             MaxHoldReview::Extend { .. }
         ));
         meta.max_hold_reviews = 1;
-        assert_eq!(max_hold_review(&meta, 601_000, 100.8), MaxHoldReview::Exit);
+        assert_eq!(
+            max_hold_review(&meta, 601_000, 100.8, None),
+            MaxHoldReview::Exit
+        );
         meta.max_hold_reviews = 0;
         meta.pending_exit_reason = Some("max_hold".into());
-        assert_eq!(max_hold_review(&meta, 601_000, 100.8), MaxHoldReview::Exit);
+        assert_eq!(
+            max_hold_review(&meta, 601_000, 100.8, None),
+            MaxHoldReview::Exit
+        );
     }
 
     #[test]
@@ -7553,7 +7805,7 @@ mod tests {
             }
         }))
         .unwrap();
-        let review = max_hold_review(&meta, 601_000, 0.02057);
+        let review = max_hold_review(&meta, 601_000, 0.02057, None);
         assert!(matches!(
             review,
             MaxHoldReview::Extend {
@@ -7565,7 +7817,7 @@ mod tests {
 
         meta.max_hold_reviews = FAST_TREND_MAX_PROGRESS_REVIEWS;
         assert_eq!(
-            max_hold_review(&meta, 601_000, 0.02057),
+            max_hold_review(&meta, 601_000, 0.02057, None),
             MaxHoldReview::Exit
         );
     }
@@ -7585,7 +7837,10 @@ mod tests {
             }
         }))
         .unwrap();
-        assert_eq!(max_hold_review(&meta, 601_000, 100.7), MaxHoldReview::Exit);
+        assert_eq!(
+            max_hold_review(&meta, 601_000, 100.7, None),
+            MaxHoldReview::Exit
+        );
     }
 
     #[test]
@@ -7603,7 +7858,75 @@ mod tests {
             }
         }))
         .unwrap();
-        assert_eq!(max_hold_review(&meta, 601_000, 99.9), MaxHoldReview::Exit);
+        assert_eq!(
+            max_hold_review(&meta, 601_000, 99.9, None),
+            MaxHoldReview::Exit
+        );
+    }
+
+    #[test]
+    fn fast_trend_deadline_extends_rays_like_live_short_structure() {
+        let meta: ExecutionMeta = serde_json::from_value(serde_json::json!({
+            "candidate_id":"fast:rays","recipe":"fast_trend_activation","side":"sell",
+            "entry_ms":1_000,"first_fill_ms":1_000,"entry_price":1.5468,
+            "initial_quantity":4097.8,"last_observed_quantity":4097.8,
+            "initial_risk_usd":50.97,"stop_price":1.5592375,
+            "extreme_price":1.5463,"max_hold_ms":600_000,
+            "executable_profit":{
+                "quantity":4097.8,"peak_net_return":0.00035,"current_net_return":-0.0028,
+                "floor_net_return":null,"observed_ms":600_000,"exchange_ms":600_000,
+                "exit_vwap":1.5496
+            }
+        }))
+        .unwrap();
+        let live_short_tape = FastTrendHoldContext {
+            directional_return_5m: 0.0027,
+            directional_flow_5m: 0.05,
+        };
+        assert!(matches!(
+            max_hold_review(&meta, 601_000, 1.5496, Some(live_short_tape)),
+            MaxHoldReview::Extend {
+                reason: "fresh_directional_structure_and_flow",
+                ..
+            }
+        ));
+        assert_eq!(
+            max_hold_review(
+                &meta,
+                601_000,
+                1.5496,
+                Some(FastTrendHoldContext {
+                    directional_return_5m: -0.001,
+                    directional_flow_5m: -0.10,
+                }),
+            ),
+            MaxHoldReview::Exit
+        );
+    }
+
+    #[test]
+    fn fast_trend_hold_context_requires_fresh_contiguous_terminal_candles() {
+        let start_ms = 1_000_000;
+        let mut candles = vec![
+            one_minute_bar(start_ms, 1.5500, 1.5494, 0.45),
+            one_minute_bar(start_ms + 60_000, 1.5494, 1.5490, 0.46),
+            one_minute_bar(start_ms + 120_000, 1.5490, 1.5482, 0.44),
+            one_minute_bar(start_ms + 180_000, 1.5482, 1.5474, 0.47),
+            one_minute_bar(start_ms + 240_000, 1.5474, 1.5460, 0.43),
+        ];
+        let now_ms = start_ms + 300_000;
+        let context = fast_trend_hold_context_from_candles(&candles, Side::Sell, now_ms).unwrap();
+        assert!(context.directional_return_5m > FAST_TREND_STRUCTURE_MIN_RETURN_5M);
+        assert!(context.directional_flow_5m > FAST_TREND_STRUCTURE_MIN_FLOW_5M);
+
+        candles[2].open_ms += 1;
+        candles[2].close_ms += 1;
+        assert!(fast_trend_hold_context_from_candles(&candles, Side::Sell, now_ms).is_none());
+
+        candles[2].open_ms -= 1;
+        candles[2].close_ms -= 1;
+        candles[4].closed = false;
+        assert!(fast_trend_hold_context_from_candles(&candles, Side::Sell, now_ms).is_none());
     }
 
     #[test]
@@ -7621,7 +7944,10 @@ mod tests {
             }
         }))
         .unwrap();
-        assert_eq!(max_hold_review(&meta, 601_000, 100.65), MaxHoldReview::Exit);
+        assert_eq!(
+            max_hold_review(&meta, 601_000, 100.65, None),
+            MaxHoldReview::Exit
+        );
     }
 
     #[test]
@@ -7634,7 +7960,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            max_hold_review(&meta, 1_801_000, 100.0),
+            max_hold_review(&meta, 1_801_000, 100.0, None),
             MaxHoldReview::Exit
         );
     }
@@ -7650,7 +7976,10 @@ mod tests {
             "fixed_time_exit":true
         }))
         .unwrap();
-        assert_eq!(max_hold_review(&meta, 901_000, 110.0), MaxHoldReview::Exit);
+        assert_eq!(
+            max_hold_review(&meta, 901_000, 110.0, None),
+            MaxHoldReview::Exit
+        );
     }
 
     #[test]
@@ -7706,11 +8035,11 @@ mod tests {
             restored.trailing_distance_pct
         ));
         assert_ne!(
-            max_hold_review(&restored, 61_000, 100.0),
+            max_hold_review(&restored, 61_000, 100.0, None),
             MaxHoldReview::Exit
         );
         assert_eq!(
-            max_hold_review(&restored, 901_000, 100.0),
+            max_hold_review(&restored, 901_000, 100.0, None),
             MaxHoldReview::Exit
         );
     }
