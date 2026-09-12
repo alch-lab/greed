@@ -3,8 +3,8 @@ use crate::market_stream::{MarketStreamHub, StreamTicker};
 use anyhow::{anyhow, Result};
 use futures_util::{stream, StreamExt};
 use greed_kernel::{
-    AccountFrame, Candle, CandleSeries, DataQuality, InstrumentFrame, MarketFrame, MarketKind,
-    ObservationMeta, OpenInterestPoint, OpenInterestSeries,
+    AccountFrame, BookState, Candle, CandleSeries, DataQuality, InstrumentFrame, MarketFrame,
+    MarketKind, ObservationMeta, OpenInterestPoint, OpenInterestSeries, PriceLevel,
 };
 use greed_strategy::StrategyConfig;
 use reqwest::{Client, StatusCode};
@@ -59,6 +59,8 @@ pub struct BinanceMarketSource {
     candle_bootstrap_last_error: Option<String>,
     open_interest_cache: BTreeMap<String, OpenInterestSeries>,
     open_interest_retry_after: BTreeMap<String, i64>,
+    depth_fallbacks_last_frame: usize,
+    depth_fallbacks_total: u64,
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -109,6 +111,8 @@ const KLINE_BOOTSTRAP_TIMEOUT: Duration = Duration::from_secs(5);
 const KLINE_BOOTSTRAP_RETRY_DELAY_MS: i64 = 60_000;
 const OI_REFRESH_MS: i64 = 5 * 60_000;
 const MAX_OI_REQUESTS_PER_FRAME: usize = 4;
+const DEPTH_FALLBACK_CONCURRENCY: usize = 8;
+const DEPTH_FALLBACK_TIMEOUT: Duration = Duration::from_secs(2);
 
 fn heal_elapsed_candle_closes(values: &mut [Candle], now_ms: i64) {
     for candle in values {
@@ -164,6 +168,8 @@ impl BinanceMarketSource {
             candle_bootstrap_last_error: None,
             open_interest_cache: BTreeMap::new(),
             open_interest_retry_after: BTreeMap::new(),
+            depth_fallbacks_last_frame: 0,
+            depth_fallbacks_total: 0,
         })
     }
 
@@ -394,6 +400,10 @@ impl BinanceMarketSource {
                 "pending_requests":self.candle_bootstrap_pending,
                 "last_error":self.candle_bootstrap_last_error,
             },
+            "depth_fallback":{
+                "last_frame":self.depth_fallbacks_last_frame,
+                "total":self.depth_fallbacks_total,
+            },
             "telemetry":telemetry,
             "average_latency_ms":average_latency_ms
         })
@@ -540,6 +550,74 @@ impl BinanceMarketSource {
             source: source.into(),
             quality,
         }
+    }
+
+    async fn depth_book(&self, symbol: &str, now_ms: i64) -> Result<BookState> {
+        let suffix = format!("/fapi/v1/depth?symbol={symbol}&limit=20");
+        let value = self.get_from_bases(&self.futures_bases(), &suffix).await?;
+        let parse_levels = |key: &str| -> Result<Vec<PriceLevel>> {
+            value
+                .get(key)
+                .and_then(Value::as_array)
+                .ok_or_else(|| anyhow!("depth response missing {key}"))?
+                .iter()
+                .map(|row| {
+                    let row = row
+                        .as_array()
+                        .ok_or_else(|| anyhow!("invalid depth {key} row"))?;
+                    let number = |index: usize| -> Result<f64> {
+                        row.get(index)
+                            .and_then(Value::as_str)
+                            .ok_or_else(|| anyhow!("missing depth {key}[{index}]"))?
+                            .parse()
+                            .map_err(Into::into)
+                    };
+                    Ok(PriceLevel {
+                        price: number(0)?,
+                        quantity: number(1)?,
+                    })
+                })
+                .collect()
+        };
+        let bids = parse_levels("bids")?;
+        let asks = parse_levels("asks")?;
+        let bid = bids.first().map_or(0.0, |level| level.price);
+        let ask = asks.first().map_or(0.0, |level| level.price);
+        if bid <= 0.0 || ask <= bid {
+            return Err(anyhow!("invalid REST depth spread for {symbol}"));
+        }
+        let slippage = |levels: &[PriceLevel], reference: f64| -> Option<f64> {
+            let mut remaining = 300.0_f64;
+            let mut quantity = 0.0_f64;
+            let mut cost = 0.0_f64;
+            for level in levels {
+                let take = remaining.min(level.price * level.quantity);
+                quantity += take / level.price;
+                cost += take;
+                remaining -= take;
+                if remaining <= f64::EPSILON {
+                    break;
+                }
+            }
+            (remaining <= f64::EPSILON && quantity > 0.0)
+                .then_some((cost / quantity / reference - 1.0).abs() * 10_000.0)
+        };
+        Ok(BookState {
+            meta: Self::meta(
+                now_ms,
+                15_000,
+                "binance_rest_depth_fallback",
+                DataQuality::Complete,
+            ),
+            bid,
+            ask,
+            bid_depth_usd: bids.iter().map(|level| level.price * level.quantity).sum(),
+            ask_depth_usd: asks.iter().map(|level| level.price * level.quantity).sum(),
+            expected_buy_slippage_bps: slippage(&asks, ask),
+            expected_sell_slippage_bps: slippage(&bids, bid),
+            bids,
+            asks,
+        })
     }
     #[allow(clippy::too_many_arguments)]
     async fn klines_at_interval(
@@ -950,6 +1028,50 @@ impl BinanceMarketSource {
         // awaits made newly arrived liquidation events look as if they came
         // from the future on one frame and as already expired on the next.
         // Use one post-await timestamp for every live component in this frame.
+        let depth_check_ms = chrono::Utc::now().timestamp_millis();
+        let missing_depth_symbols: Vec<_> = strategy
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                self.stream
+                    .as_ref()
+                    .and_then(|stream| stream.book(symbol, depth_check_ms))
+                    .is_none_or(|book| !book.meta.usable_at(depth_check_ms))
+            })
+            .cloned()
+            .collect();
+        let source = &*self;
+        let fallback_results = stream::iter(missing_depth_symbols)
+            .map(|symbol| async move {
+                let result = tokio::time::timeout(
+                    DEPTH_FALLBACK_TIMEOUT,
+                    source.depth_book(&symbol, chrono::Utc::now().timestamp_millis()),
+                )
+                .await
+                .map_err(|_| anyhow!("REST depth fallback timed out"))
+                .and_then(|result| result);
+                (symbol, result)
+            })
+            .buffer_unordered(DEPTH_FALLBACK_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+        let mut fallback_books = BTreeMap::new();
+        let mut fallback_failures = Vec::new();
+        for (symbol, result) in fallback_results {
+            match result {
+                Ok(book) => {
+                    fallback_books.insert(symbol, book);
+                }
+                Err(error) => fallback_failures.push(format!("{symbol}: {error}")),
+            }
+        }
+        self.depth_fallbacks_last_frame = fallback_books.len();
+        self.depth_fallbacks_total = self
+            .depth_fallbacks_total
+            .saturating_add(fallback_books.len() as u64);
+        // REST fallbacks are observed after the initial websocket snapshot.
+        // Advance the frame clock so none of those books appear to come from
+        // the future and all freshness checks use one causal timestamp.
         let snapshot_ms = chrono::Utc::now().timestamp_millis();
         for symbol in &strategy.symbols {
             if !self
@@ -1028,10 +1150,18 @@ impl BinanceMarketSource {
             } else {
                 self.stream_observation_klines(symbol, "1m", 60_000, snapshot_ms)
             };
-            let book = self
+            let stream_book = self
                 .stream
                 .as_ref()
                 .and_then(|stream| stream.book(symbol, snapshot_ms));
+            let book = if stream_book
+                .as_ref()
+                .is_some_and(|book| book.meta.usable_at(snapshot_ms))
+            {
+                stream_book
+            } else {
+                fallback_books.get(symbol).cloned().or(stream_book)
+            };
             let warming = self
                 .stream
                 .as_ref()
@@ -1063,17 +1193,21 @@ impl BinanceMarketSource {
                 },
             );
         }
-        // Depth snapshots are change-driven: one or two quiet contracts can
-        // legitimately exceed the strict per-symbol TTL while the public
-        // stream and the rest of the universe remain healthy. Those symbols
-        // stay individually blocked by their stale ObservationMeta, but a
-        // small local gap must not masquerade as a system-wide outage.
+        // Depth snapshots are change-driven and the public websocket can be
+        // reset by an upstream edge. Stale symbols first receive a bounded
+        // REST depth fallback. Anything still missing remains individually
+        // blocked; only a material residual gap becomes a system-wide issue.
         if depth_gap_is_systemic(depth_gap_symbols.len(), depth_symbols_observed) {
             warnings.push(format!(
-                "websocket depth systemically degraded: {}/{} unavailable ({})",
+                "executable depth systemically degraded after REST fallback: {}/{} unavailable ({}){}",
                 depth_gap_symbols.len(),
                 depth_symbols_observed,
-                depth_gap_symbols.join(",")
+                depth_gap_symbols.join(","),
+                if fallback_failures.is_empty() {
+                    String::new()
+                } else {
+                    format!("; fallback errors: {}", fallback_failures.join(", "))
+                }
             ));
         }
         if !warnings.is_empty() {
@@ -1090,6 +1224,7 @@ impl BinanceMarketSource {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     fn ticker(quote_volume_24h: f64, change_24h: f64, return_15m: Option<f64>) -> StreamTicker {
         StreamTicker {
@@ -1194,5 +1329,41 @@ mod tests {
         assert_eq!(health["telemetry"]["failures"], 1);
         assert_eq!(health["telemetry"]["rate_limits"], 1);
         assert_eq!(health["average_latency_ms"], 20.0);
+    }
+
+    #[tokio::test]
+    async fn rest_depth_fallback_builds_a_fresh_executable_book() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = [0_u8; 2_048];
+            let bytes = socket.read(&mut request).await.unwrap();
+            assert!(String::from_utf8_lossy(&request[..bytes])
+                .contains("/fapi/v1/depth?symbol=YBUSDT&limit=20"));
+            let body = r#"{"lastUpdateId":42,"bids":[["1.00","1000"]],"asks":[["1.01","1000"]]}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        });
+        let config = RuntimeConfig {
+            binance_futures_base: format!("http://{address}"),
+            binance_futures_fallbacks: Vec::new(),
+            request_spacing_ms: 0,
+            ..RuntimeConfig::default()
+        };
+        let source = BinanceMarketSource::new(config).unwrap();
+        let book = source.depth_book("YBUSDT", 10_000).await.unwrap();
+        server.await.unwrap();
+
+        assert_eq!(book.bid, 1.0);
+        assert_eq!(book.ask, 1.01);
+        assert_eq!(book.meta.source, "binance_rest_depth_fallback");
+        assert!(book.meta.usable_at(10_000));
+        assert!(book.expected_buy_slippage_bps.is_some());
+        assert!(book.expected_sell_slippage_bps.is_some());
     }
 }

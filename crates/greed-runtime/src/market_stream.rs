@@ -28,12 +28,10 @@ const STREAM_IDLE_TIMEOUT_SECS: u64 = 5 * 60;
 // the universe instead of simultaneously removing every executable book.
 const MARKET_STREAM_SHARDS: usize = 2;
 const TRADE_STREAM_SHARDS: usize = 2;
-// Depth is an execution-safety dependency. Subscribe every symbol on two
-// independent sockets so a transient peer reset cannot make half of the
-// universe untradeable while that socket reconnects. Four shards keep the
-// per-socket traffic close to the old two-shard/non-redundant layout.
+// Depth snapshots are substantially larger than trades or candles. Keep four
+// small failure domains so a peer reset affects roughly one quarter of the
+// universe without duplicating every high-volume depth stream.
 const PUBLIC_STREAM_SHARDS: usize = 4;
-const PUBLIC_STREAM_REPLICAS: usize = 2;
 const SYMBOL_WARMUP_MS: i64 = 10_000;
 const CLIENT_HEARTBEAT_SECS: u64 = 30;
 
@@ -673,13 +671,19 @@ fn mark_route_recovering(
 ) {
     let mut state = state.write().expect("stream state poisoned");
     match route {
-        StreamRoute::Public(_) => {
-            // Depth is replicated. The surviving route continues refreshing
-            // both the executable book and OFI window, so reconnecting one
-            // replica must not push healthy symbols back into warm-up or
-            // erase their shared flow history. Stale-gap protection lives in
-            // `update_depth` and still prevents joining observations across
-            // a genuine all-replicas outage.
+        StreamRoute::Public(shard) => {
+            // OFI cannot bridge a disconnected route. Keep the last book only
+            // as a short-lived executable snapshot; its TTL will expire
+            // naturally and the first new snapshot will refresh it.
+            for symbol in symbols {
+                if symbol_shard(
+                    &format!("{}@depth20@500ms", symbol.to_lowercase()),
+                    PUBLIC_STREAM_SHARDS,
+                ) == shard
+                {
+                    state.book_flow.remove(&symbol.to_uppercase());
+                }
+            }
         }
         StreamRoute::Trade(shard) => {
             for symbol in symbols {
@@ -853,17 +857,8 @@ fn public_streams(symbols: &[String]) -> BTreeSet<String> {
 fn public_streams_shard(symbols: &[String], shard: usize) -> BTreeSet<String> {
     public_streams(symbols)
         .into_iter()
-        .filter(|stream| public_stream_shards(stream).contains(&shard))
+        .filter(|stream| symbol_shard(stream, PUBLIC_STREAM_SHARDS) == shard)
         .collect()
-}
-
-fn public_stream_shards(stream: &str) -> [usize; PUBLIC_STREAM_REPLICAS] {
-    debug_assert_eq!(PUBLIC_STREAM_REPLICAS, 2);
-    let primary = symbol_shard(stream, PUBLIC_STREAM_SHARDS);
-    // Offset by half the ring. The two copies never share a socket and a
-    // single failed shard always leaves every symbol covered.
-    let secondary = (primary + PUBLIC_STREAM_SHARDS / 2) % PUBLIC_STREAM_SHARDS;
-    [primary, secondary]
 }
 
 fn handle_payload(
@@ -1443,7 +1438,8 @@ fn set_connected(
                 .iter()
                 .filter(|value| **value)
                 .count();
-            refresh_public_connection_health(&mut state);
+            state.telemetry.public_connected =
+                state.telemetry.public_shards_connected == PUBLIC_STREAM_SHARDS;
         }
     }
     if let Some(error) = error {
@@ -1461,12 +1457,8 @@ fn set_connected(
 }
 
 fn refresh_public_connection_health(state: &mut StreamState) {
-    state.telemetry.public_connected = state.desired_symbols.iter().all(|symbol| {
-        let stream = format!("{}@depth20@500ms", symbol.to_lowercase());
-        public_stream_shards(&stream)
-            .into_iter()
-            .any(|shard| state.public_connections[shard])
-    });
+    state.telemetry.public_connected =
+        state.telemetry.public_shards_connected == PUBLIC_STREAM_SHARDS;
 }
 
 fn record_message(state: &Arc<RwLock<StreamState>>, route: StreamRoute, now_ms: i64) {
@@ -1724,7 +1716,7 @@ mod tests {
     }
 
     #[test]
-    fn public_stream_shards_are_redundant_and_complete() {
+    fn public_stream_shards_are_disjoint_and_complete() {
         let symbols = vec![
             "BTCUSDT".to_string(),
             "ETHUSDT".to_string(),
@@ -1735,15 +1727,10 @@ mod tests {
         let mut combined = BTreeSet::new();
         for shard in 0..PUBLIC_STREAM_SHARDS {
             let streams = public_streams_shard(&symbols, shard);
+            assert!(combined.is_disjoint(&streams));
             combined.extend(streams);
         }
         assert_eq!(combined, expected);
-        for stream in expected {
-            let owning_shards = (0..PUBLIC_STREAM_SHARDS)
-                .filter(|shard| public_streams_shard(&symbols, *shard).contains(&stream))
-                .count();
-            assert_eq!(owning_shards, PUBLIC_STREAM_REPLICAS);
-        }
     }
 
     #[test]
@@ -1849,14 +1836,14 @@ mod tests {
     }
 
     #[test]
-    fn public_reconnect_preserves_flow_served_by_the_redundant_route() {
+    fn public_reconnect_clears_only_the_affected_flow_window() {
         let symbols = vec![
             "BTCUSDT".to_string(),
             "ETHUSDT".to_string(),
             "SOLUSDT".to_string(),
             "XRPUSDT".to_string(),
         ];
-        let shard = public_stream_shards("btcusdt@depth20@500ms")[0];
+        let shard = symbol_shard("btcusdt@depth20@500ms", PUBLIC_STREAM_SHARDS);
         let state = Arc::new(RwLock::new(StreamState::default()));
         {
             let mut inner = state.write().unwrap();
@@ -1879,12 +1866,16 @@ mod tests {
         let inner = state.read().unwrap();
         for symbol in &symbols {
             assert_eq!(inner.symbol_admitted_ms[symbol], 1_000);
-            assert!(inner.book_flow.contains_key(symbol));
+            let affected = symbol_shard(
+                &format!("{}@depth20@500ms", symbol.to_lowercase()),
+                PUBLIC_STREAM_SHARDS,
+            ) == shard;
+            assert_eq!(inner.book_flow.contains_key(symbol), !affected);
         }
     }
 
     #[test]
-    fn one_public_shard_failure_keeps_every_symbol_covered() {
+    fn one_public_shard_failure_is_reported_without_affecting_other_routes() {
         let symbols = [
             "BTCUSDT".to_string(),
             "ETHUSDT".to_string(),
@@ -1899,7 +1890,7 @@ mod tests {
         for failed in 0..PUBLIC_STREAM_SHARDS {
             state.public_connections[failed] = false;
             refresh_public_connection_health(&mut state);
-            assert!(state.telemetry.public_connected);
+            assert!(!state.telemetry.public_connected);
             state.public_connections[failed] = true;
         }
     }
