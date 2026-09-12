@@ -786,7 +786,12 @@ impl BinanceDemoExecution {
                     let Some(meta) = self.state.positions.get_mut(&symbol) else {
                         continue;
                     };
-                    match max_hold_review(meta, now_ms) {
+                    let mark_price = account
+                        .positions
+                        .get(&symbol)
+                        .map(|position| position.mark_price)
+                        .unwrap_or_default();
+                    match max_hold_review(meta, now_ms, mark_price) {
                         MaxHoldReview::NotApplicable => {}
                         MaxHoldReview::Exit => {
                             // Persist the decision before touching the exchange.
@@ -815,6 +820,7 @@ impl BinanceDemoExecution {
                         MaxHoldReview::Extend {
                             executable_net_pnl_usd,
                             initial_risk_usd,
+                            exit_impact_bps,
                         } => {
                             meta.max_hold_ms = meta
                                 .max_hold_ms
@@ -828,8 +834,9 @@ impl BinanceDemoExecution {
                                     "extension_ms":FAST_TREND_EXECUTABLE_GRACE_MS,
                                     "executable_net_pnl_usd":executable_net_pnl_usd,
                                     "initial_risk_usd":initial_risk_usd,
+                                    "exit_impact_bps":exit_impact_bps,
                                     "review_count":meta.max_hold_reviews,
-                                    "reason":"fresh_executable_quote_bounded_grace",
+                                    "reason":"profitable_position_with_temporarily_high_exit_impact",
                                     "venue":"binance_demo","paper_only":true
                                 }),
                             });
@@ -6046,14 +6053,16 @@ enum MaxHoldReview {
     Extend {
         executable_net_pnl_usd: f64,
         initial_risk_usd: f64,
+        exit_impact_bps: f64,
     },
     Exit,
 }
 
-const FAST_TREND_EXECUTABLE_GRACE_MS: i64 = 15 * 60_000;
+const FAST_TREND_EXECUTABLE_GRACE_MS: i64 = 90_000;
 const MAX_STORED_EXECUTABLE_QUOTE_AGE_MS: i64 = 5_000;
+const FAST_TREND_HIGH_EXIT_IMPACT_BPS: f64 = 10.0;
 
-fn max_hold_review(meta: &ExecutionMeta, now_ms: i64) -> MaxHoldReview {
+fn max_hold_review(meta: &ExecutionMeta, now_ms: i64, mark_price: f64) -> MaxHoldReview {
     if meta.exit_requested
         || meta.max_hold_ms <= 0
         || now_ms - meta.holding_started_ms() < meta.max_hold_ms
@@ -6086,16 +6095,29 @@ fn max_hold_review(meta: &ExecutionMeta, now_ms: i64) -> MaxHoldReview {
     if now_ms.saturating_sub(guard.observed_ms) > MAX_STORED_EXECUTABLE_QUOTE_AGE_MS {
         return MaxHoldReview::Exit;
     }
-    // Fast activation's nominal horizon is its first review point, not a
-    // blind liquidation timer. One bounded grace window lets a still-live
-    // impulse finish without recreating the old unbounded extension bug. The
-    // quote must be fresh and the second review always exits if protection has
-    // not armed in the meantime.
+    let executable_net_pnl_usd =
+        guard.current_net_return * meta.entry_price * meta.last_observed_quantity.max(0.0);
+    // A losing or flat sprint has already failed by its deadline. Never defer
+    // that loss merely because an executable quote is fresh.
+    if executable_net_pnl_usd <= 0.0 || !mark_price.is_finite() || mark_price <= f64::EPSILON {
+        return MaxHoldReview::Exit;
+    }
+    let exit_impact_pct = match meta.side {
+        Side::Buy => (mark_price - guard.exit_vwap) / mark_price,
+        Side::Sell => (guard.exit_vwap - mark_price) / mark_price,
+    }
+    .max(0.0);
+    let exit_impact_bps = exit_impact_pct * 10_000.0;
+    if exit_impact_bps < FAST_TREND_HIGH_EXIT_IMPACT_BPS {
+        return MaxHoldReview::Exit;
+    }
+    // Grant one short grace only when the position is already bankably
+    // profitable and the current executable VWAP shows unusually high exit
+    // impact. The second review always exits if protection has not armed.
     MaxHoldReview::Extend {
-        executable_net_pnl_usd: guard.current_net_return
-            * meta.entry_price
-            * meta.last_observed_quantity.max(0.0),
+        executable_net_pnl_usd,
         initial_risk_usd,
+        exit_impact_bps,
     }
 }
 
@@ -7225,7 +7247,10 @@ mod tests {
             "profit_shield_activation_pct":0.006037,"max_hold_ms":1_800_000
         }))
         .unwrap();
-        assert_eq!(max_hold_review(&meta, 1_801_000), MaxHoldReview::Exit);
+        assert_eq!(
+            max_hold_review(&meta, 1_801_000, 0.01920),
+            MaxHoldReview::Exit
+        );
     }
 
     #[test]
@@ -7238,7 +7263,7 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            max_hold_review(&meta, 1_801_000),
+            max_hold_review(&meta, 1_801_000, 101.0),
             MaxHoldReview::ReleaseToProtection
         );
     }
@@ -7258,13 +7283,13 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(
-            max_hold_review(&meta, 601_000),
+            max_hold_review(&meta, 601_000, 100.8),
             MaxHoldReview::ReleaseToProtection
         );
     }
 
     #[test]
-    fn fast_trend_deadline_grants_one_short_grace_for_a_fresh_executable_quote() {
+    fn fast_trend_deadline_grants_one_short_grace_for_profitable_high_exit_impact() {
         let mut meta: ExecutionMeta = serde_json::from_value(serde_json::json!({
             "candidate_id":"fast:progress","recipe":"fast_trend_activation","side":"buy",
             "entry_ms":1_000,"first_fill_ms":1_000,"entry_price":100.0,
@@ -7279,18 +7304,18 @@ mod tests {
         }))
         .unwrap();
         assert!(matches!(
-            max_hold_review(&meta, 601_000),
+            max_hold_review(&meta, 601_000, 100.8),
             MaxHoldReview::Extend { .. }
         ));
         meta.max_hold_reviews = 1;
-        assert_eq!(max_hold_review(&meta, 601_000), MaxHoldReview::Exit);
+        assert_eq!(max_hold_review(&meta, 601_000, 100.8), MaxHoldReview::Exit);
         meta.max_hold_reviews = 0;
         meta.pending_exit_reason = Some("max_hold".into());
-        assert_eq!(max_hold_review(&meta, 601_000), MaxHoldReview::Exit);
+        assert_eq!(max_hold_review(&meta, 601_000, 100.8), MaxHoldReview::Exit);
     }
 
     #[test]
-    fn fast_trend_grace_does_not_require_an_unbankable_mark_profit() {
+    fn fast_trend_deadline_never_extends_an_executable_loss() {
         let meta: ExecutionMeta = serde_json::from_value(serde_json::json!({
             "candidate_id":"fast:fresh-loss","recipe":"fast_trend_activation","side":"buy",
             "entry_ms":1_000,"first_fill_ms":1_000,"entry_price":100.0,
@@ -7304,10 +7329,25 @@ mod tests {
             }
         }))
         .unwrap();
-        assert!(matches!(
-            max_hold_review(&meta, 601_000),
-            MaxHoldReview::Extend { .. }
-        ));
+        assert_eq!(max_hold_review(&meta, 601_000, 99.9), MaxHoldReview::Exit);
+    }
+
+    #[test]
+    fn fast_trend_deadline_exits_profitable_positions_when_impact_is_normal() {
+        let meta: ExecutionMeta = serde_json::from_value(serde_json::json!({
+            "candidate_id":"fast:cheap-exit","recipe":"fast_trend_activation","side":"buy",
+            "entry_ms":1_000,"first_fill_ms":1_000,"entry_price":100.0,
+            "initial_quantity":10.0,"last_observed_quantity":10.0,
+            "initial_risk_usd":20.0,"stop_price":98.0,
+            "profit_shield_activation_pct":0.03,"max_hold_ms":600_000,
+            "executable_profit":{
+                "quantity":10.0,"peak_net_return":0.006,"current_net_return":0.005,
+                "floor_net_return":null,"observed_ms":600_000,"exchange_ms":600_000,
+                "exit_vwap":100.6
+            }
+        }))
+        .unwrap();
+        assert_eq!(max_hold_review(&meta, 601_000, 100.65), MaxHoldReview::Exit);
     }
 
     #[test]
@@ -7319,7 +7359,10 @@ mod tests {
             "profit_shield_activation_pct":0.006,"max_hold_ms":1_800_000
         }))
         .unwrap();
-        assert_eq!(max_hold_review(&meta, 1_801_000), MaxHoldReview::Exit);
+        assert_eq!(
+            max_hold_review(&meta, 1_801_000, 100.0),
+            MaxHoldReview::Exit
+        );
     }
 
     #[test]
@@ -7333,7 +7376,7 @@ mod tests {
             "fixed_time_exit":true
         }))
         .unwrap();
-        assert_eq!(max_hold_review(&meta, 901_000), MaxHoldReview::Exit);
+        assert_eq!(max_hold_review(&meta, 901_000, 110.0), MaxHoldReview::Exit);
     }
 
     #[test]
@@ -7388,8 +7431,14 @@ mod tests {
             restored.trailing_activation_pct,
             restored.trailing_distance_pct
         ));
-        assert_ne!(max_hold_review(&restored, 61_000), MaxHoldReview::Exit);
-        assert_eq!(max_hold_review(&restored, 901_000), MaxHoldReview::Exit);
+        assert_ne!(
+            max_hold_review(&restored, 61_000, 100.0),
+            MaxHoldReview::Exit
+        );
+        assert_eq!(
+            max_hold_review(&restored, 901_000, 100.0),
+            MaxHoldReview::Exit
+        );
     }
 
     #[test]
