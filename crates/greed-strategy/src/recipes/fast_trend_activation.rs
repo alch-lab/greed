@@ -127,6 +127,25 @@ fn direct_confirmation_allowed(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn is_late_exhaustion(
+    entry_pattern: &str,
+    directional_extension: f64,
+    directional_return_4h: f64,
+    directional_market_breadth: f64,
+    directional_market_return_1h: f64,
+    directional_flow: Option<f64>,
+    config: &LaneConfig,
+) -> bool {
+    config.fast_late_exhaustion_veto_enabled
+        && entry_pattern == "shallow_reclaim"
+        && directional_extension >= config.fast_late_exhaustion_min_extension
+        && directional_return_4h >= config.fast_late_exhaustion_min_return_4h
+        && directional_market_breadth < config.fast_late_exhaustion_max_market_breadth
+        && directional_market_return_1h < 0.0
+        && directional_flow.is_some_and(|value| value < config.fast_late_exhaustion_max_flow)
+}
+
 impl StrategyNode for FastTrendActivationNode {
     fn id(&self) -> &str {
         &self.id
@@ -304,6 +323,18 @@ impl StrategyNode for FastTrendActivationNode {
                     }
                 });
             confirmation_hits += u64::from(ignition && confirmation.is_some());
+            let entry_pattern = confirmation
+                .map(|(_, pattern)| pattern)
+                .unwrap_or("awaiting_confirmation");
+            let late_exhaustion = is_late_exhaustion(
+                entry_pattern,
+                directional_extension,
+                directional_return_4h,
+                directional_market_breadth,
+                directional_market_return_1h,
+                directional_flow,
+                &self.config,
+            );
 
             let oi_values: Vec<_> = instrument
                 .open_interest
@@ -334,6 +365,16 @@ impl StrategyNode for FastTrendActivationNode {
                     "altcoin market strongly opposes the signal: directional 1h median {:.2}% / breadth {:.0}%",
                     directional_market_return_1h * 100.0,
                     directional_market_breadth * 100.0
+                ));
+            }
+            if late_exhaustion {
+                blockers.push(format!(
+                    "late shallow reclaim lacks broad confirmation: extension {:.2}%, 4h {:.2}%, directional breadth {:.0}%, market 1h {:.2}%, taker pressure {:.0}%",
+                    directional_extension * 100.0,
+                    directional_return_4h * 100.0,
+                    directional_market_breadth * 100.0,
+                    directional_market_return_1h * 100.0,
+                    directional_flow.unwrap_or_default() * 100.0,
                 ));
             }
             if !breakout {
@@ -423,9 +464,6 @@ impl StrategyNode for FastTrendActivationNode {
             };
             let stop_pct =
                 (1.25 * atr(&closed, index, 20) / reference_price.max(f64::EPSILON)).max(0.0035);
-            let entry_pattern = confirmation
-                .map(|(_, pattern)| pattern)
-                .unwrap_or("awaiting_confirmation");
             let score = directional_body_return.max(0.0)
                 * volume_ratio
                 * (1.0 + directional_flow.unwrap_or_default().max(0.0))
@@ -456,6 +494,10 @@ impl StrategyNode for FastTrendActivationNode {
                 (
                     "direct_reacceleration_ready".into(),
                     direct_reacceleration_ready.to_string(),
+                ),
+                (
+                    "late_exhaustion_veto_triggered".into(),
+                    late_exhaustion.to_string(),
                 ),
                 (
                     "ignition_pattern".into(),
@@ -714,5 +756,49 @@ mod tests {
             ignition_pattern(true, 0.0092, 2.1, Some(0.20), 1.033, 0.029, 0.052, &config,),
             Some("compression_breakout")
         );
+    }
+
+    #[test]
+    fn late_exhaustion_veto_matches_rays_without_becoming_a_global_gate() {
+        let config = LaneConfig::default();
+        assert!(is_late_exhaustion(
+            "shallow_reclaim",
+            0.0166,
+            0.0402,
+            0.361,
+            -0.00113,
+            Some(0.202),
+            &config,
+        ));
+
+        // An early idiosyncratic leader is still admitted even without broad
+        // participation, preserving the fast lane's intended frequency.
+        assert!(!is_late_exhaustion(
+            "shallow_reclaim",
+            0.010,
+            0.020,
+            0.35,
+            -0.002,
+            Some(0.20),
+            &config,
+        ));
+        assert!(!is_late_exhaustion(
+            "shallow_reclaim",
+            0.020,
+            0.040,
+            0.35,
+            -0.002,
+            Some(0.35),
+            &config,
+        ));
+        assert!(!is_late_exhaustion(
+            "direct_continuation",
+            0.020,
+            0.040,
+            0.35,
+            -0.002,
+            Some(0.20),
+            &config,
+        ));
     }
 }

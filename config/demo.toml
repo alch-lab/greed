@@ -92,6 +92,15 @@ fast_reacceleration_direct_min_market_breadth = 0.60
 fast_reacceleration_direct_min_market_return_1h = 0.002
 fast_reacceleration_direct_max_extension = 0.025
 fast_reacceleration_direct_early_extension = 0.015
+
+# Do not restore the old global breadth gate. Only veto a shallow-reclaim
+# entry when a mature single-name move is fighting the broader market and its
+# own taker flow is no longer strong enough to justify the late chase.
+fast_late_exhaustion_veto_enabled = true
+fast_late_exhaustion_min_extension = 0.015
+fast_late_exhaustion_min_return_4h = 0.03
+fast_late_exhaustion_max_market_breadth = 0.45
+fast_late_exhaustion_max_flow = 0.25
 # Stay early without demanding a perfectly flat pre-break hour. 4USDT on
 # 2026-09-05 began its persistent leg with +2.9% pre-break, +5.2% over 4h and
 # +2.3% OI over 15m, then supplied the required 1m reclaim.

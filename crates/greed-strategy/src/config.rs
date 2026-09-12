@@ -78,6 +78,15 @@ pub struct LaneConfig {
     pub fast_reacceleration_direct_min_market_return_1h: f64,
     pub fast_reacceleration_direct_max_extension: f64,
     pub fast_reacceleration_direct_early_extension: f64,
+    /// Reject only a narrow late-exhaustion shape: a shallow reclaim after a
+    /// mature single-name move that is opposed by the broader tape and lacks
+    /// strong taker-flow confirmation. This is deliberately not a global
+    /// market-breadth gate.
+    pub fast_late_exhaustion_veto_enabled: bool,
+    pub fast_late_exhaustion_min_extension: f64,
+    pub fast_late_exhaustion_min_return_4h: f64,
+    pub fast_late_exhaustion_max_market_breadth: f64,
+    pub fast_late_exhaustion_max_flow: f64,
     pub fast_max_prebreak_return_1h: f64,
     pub fast_max_return_4h: f64,
     pub fast_max_oi_change_15m: f64,
@@ -172,6 +181,11 @@ impl Default for LaneConfig {
             fast_reacceleration_direct_min_market_return_1h: 0.002,
             fast_reacceleration_direct_max_extension: 0.025,
             fast_reacceleration_direct_early_extension: 0.015,
+            fast_late_exhaustion_veto_enabled: true,
+            fast_late_exhaustion_min_extension: 0.015,
+            fast_late_exhaustion_min_return_4h: 0.03,
+            fast_late_exhaustion_max_market_breadth: 0.45,
+            fast_late_exhaustion_max_flow: 0.25,
             fast_max_prebreak_return_1h: 0.03,
             fast_max_return_4h: 0.06,
             fast_max_oi_change_15m: 0.03,
@@ -348,6 +362,12 @@ impl StrategyConfig {
             || !(lanes.fast_reacceleration_min_body_return_5m
                 ..=lanes.fast_reacceleration_direct_max_extension)
                 .contains(&lanes.fast_reacceleration_direct_early_extension)
+            || !(lanes.fast_min_body_return_5m..=lanes.fast_max_prebreak_return_1h)
+                .contains(&lanes.fast_late_exhaustion_min_extension)
+            || !(0.01..=lanes.fast_max_return_4h)
+                .contains(&lanes.fast_late_exhaustion_min_return_4h)
+            || !(0.20..=0.49).contains(&lanes.fast_late_exhaustion_max_market_breadth)
+            || !(lanes.fast_min_flow_5m..=0.50).contains(&lanes.fast_late_exhaustion_max_flow)
             || !(0.0..=0.05).contains(&lanes.fast_max_prebreak_return_1h)
             || !(0.01..=0.10).contains(&lanes.fast_max_return_4h)
             || !(0.001..=0.05).contains(&lanes.fast_max_oi_change_15m)
