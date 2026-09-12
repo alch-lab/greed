@@ -28,8 +28,14 @@ const STREAM_IDLE_TIMEOUT_SECS: u64 = 5 * 60;
 // the universe instead of simultaneously removing every executable book.
 const MARKET_STREAM_SHARDS: usize = 2;
 const TRADE_STREAM_SHARDS: usize = 2;
-const PUBLIC_STREAM_SHARDS: usize = 2;
+// Depth is an execution-safety dependency. Subscribe every symbol on two
+// independent sockets so a transient peer reset cannot make half of the
+// universe untradeable while that socket reconnects. Four shards keep the
+// per-socket traffic close to the old two-shard/non-redundant layout.
+const PUBLIC_STREAM_SHARDS: usize = 4;
+const PUBLIC_STREAM_REPLICAS: usize = 2;
 const SYMBOL_WARMUP_MS: i64 = 10_000;
+const CLIENT_HEARTBEAT_SECS: u64 = 30;
 
 #[derive(Debug, Clone)]
 struct BookFlowObservation {
@@ -112,6 +118,11 @@ struct StreamState {
     candles: BTreeMap<(String, String), VecDeque<Candle>>,
     candle_update_ms: BTreeMap<(String, String), i64>,
     books: BTreeMap<String, BookState>,
+    // Partial depth snapshots carry a final update id. With redundant depth
+    // subscriptions both sockets deliver the same update; retain the id so
+    // the duplicate refreshes freshness without manufacturing a second OFI
+    // observation.
+    book_update_ids: BTreeMap<String, u64>,
     book_flow: BTreeMap<String, VecDeque<BookFlowObservation>>,
     trades: BTreeMap<String, VecDeque<(i64, bool, f64)>>,
     /// Binance liquidation stream snapshots. Binance publishes at most the
@@ -162,6 +173,7 @@ impl MarketStreamHub {
                 .retain(|symbol, _| normalized.binary_search(symbol).is_ok());
             state.telemetry.subscribed_symbols = normalized.len();
             state.desired_symbols = normalized.iter().cloned().collect();
+            refresh_public_connection_health(&mut state);
             drop(state);
             let _ = self.symbols.send(normalized);
         }
@@ -554,6 +566,8 @@ async fn run_dynamic_connection(
                     let idle_deadline =
                         tokio::time::sleep(Duration::from_secs(STREAM_IDLE_TIMEOUT_SECS));
                     tokio::pin!(idle_deadline);
+                    let heartbeat = tokio::time::sleep(Duration::from_secs(CLIENT_HEARTBEAT_SECS));
+                    tokio::pin!(heartbeat);
                     let disconnect_reason = loop {
                         tokio::select! {
                             changed = symbols.changed() => {
@@ -620,6 +634,15 @@ async fn run_dynamic_connection(
                             _ = &mut idle_deadline => {
                                 break "websocket receive idle timeout".to_string();
                             }
+                            _ = &mut heartbeat => {
+                                if writer.send(Message::Ping(Vec::new().into())).await.is_err() {
+                                    break "heartbeat write failed".to_string();
+                                }
+                                heartbeat.as_mut().reset(
+                                    tokio::time::Instant::now()
+                                        + Duration::from_secs(CLIENT_HEARTBEAT_SECS),
+                                );
+                            }
                         }
                     };
                     stable_connection = connected_at.elapsed() >= Duration::from_secs(60);
@@ -646,23 +669,17 @@ fn mark_route_recovering(
     state: &Arc<RwLock<StreamState>>,
     route: StreamRoute,
     symbols: &[String],
-    now_ms: i64,
+    _now_ms: i64,
 ) {
     let mut state = state.write().expect("stream state poisoned");
     match route {
-        StreamRoute::Public(shard) => {
-            for symbol in symbols {
-                if symbol_shard(
-                    &format!("{}@depth20@500ms", symbol.to_lowercase()),
-                    PUBLIC_STREAM_SHARDS,
-                ) == shard
-                {
-                    state
-                        .symbol_admitted_ms
-                        .insert(symbol.to_uppercase(), now_ms);
-                    state.book_flow.remove(&symbol.to_uppercase());
-                }
-            }
+        StreamRoute::Public(_) => {
+            // Depth is replicated. The surviving route continues refreshing
+            // both the executable book and OFI window, so reconnecting one
+            // replica must not push healthy symbols back into warm-up or
+            // erase their shared flow history. Stale-gap protection lives in
+            // `update_depth` and still prevents joining observations across
+            // a genuine all-replicas outage.
         }
         StreamRoute::Trade(shard) => {
             for symbol in symbols {
@@ -836,8 +853,17 @@ fn public_streams(symbols: &[String]) -> BTreeSet<String> {
 fn public_streams_shard(symbols: &[String], shard: usize) -> BTreeSet<String> {
     public_streams(symbols)
         .into_iter()
-        .filter(|stream| symbol_shard(stream, PUBLIC_STREAM_SHARDS) == shard)
+        .filter(|stream| public_stream_shards(stream).contains(&shard))
         .collect()
+}
+
+fn public_stream_shards(stream: &str) -> [usize; PUBLIC_STREAM_REPLICAS] {
+    debug_assert_eq!(PUBLIC_STREAM_REPLICAS, 2);
+    let primary = symbol_shard(stream, PUBLIC_STREAM_SHARDS);
+    // Offset by half the ring. The two copies never share a socket and a
+    // single failed shard always leaves every symbol covered.
+    let secondary = (primary + PUBLIC_STREAM_SHARDS / 2) % PUBLIC_STREAM_SHARDS;
+    [primary, secondary]
 }
 
 fn handle_payload(
@@ -1075,6 +1101,7 @@ fn update_depth(state: &Arc<RwLock<StreamState>>, value: &Value, received_ms: i6
         .get("E")
         .and_then(Value::as_i64)
         .unwrap_or(received_ms);
+    let update_id = value.get("u").and_then(Value::as_u64);
     let book = BookState {
         meta: ObservationMeta {
             event_ms,
@@ -1105,15 +1132,36 @@ fn update_depth(state: &Arc<RwLock<StreamState>>, value: &Value, received_ms: i6
             .collect(),
     };
     let mut state = state.write().expect("stream state poisoned");
+    if let Some(update_id) = update_id {
+        match state.book_update_ids.get(&symbol).copied() {
+            Some(previous_id) if update_id < previous_id => return Ok(()),
+            Some(previous_id) if update_id == previous_id => {
+                // The redundant route delivered the same exchange snapshot.
+                // Refresh receipt time, but do not count it as order flow.
+                state.books.insert(symbol, book);
+                return Ok(());
+            }
+            _ => {
+                state.book_update_ids.insert(symbol.clone(), update_id);
+            }
+        }
+    }
     if let Some(previous) = state.books.get(&symbol) {
-        if let Some(observation) = book_flow_observation(previous, &book) {
-            let values = state.book_flow.entry(symbol.clone()).or_default();
-            values.push_back(observation);
-            while values
-                .front()
-                .is_some_and(|value| value.received_ms < received_ms - BOOK_FLOW_HISTORY_MS)
-            {
-                values.pop_front();
+        let contiguous = book
+            .meta
+            .received_ms
+            .saturating_sub(previous.meta.received_ms)
+            <= STREAM_TTL_MS;
+        if contiguous {
+            if let Some(observation) = book_flow_observation(previous, &book) {
+                let values = state.book_flow.entry(symbol.clone()).or_default();
+                values.push_back(observation);
+                while values
+                    .front()
+                    .is_some_and(|value| value.received_ms < received_ms - BOOK_FLOW_HISTORY_MS)
+                {
+                    values.pop_front();
+                }
             }
         }
     }
@@ -1395,8 +1443,7 @@ fn set_connected(
                 .iter()
                 .filter(|value| **value)
                 .count();
-            state.telemetry.public_connected =
-                state.telemetry.public_shards_connected == PUBLIC_STREAM_SHARDS;
+            refresh_public_connection_health(&mut state);
         }
     }
     if let Some(error) = error {
@@ -1411,6 +1458,15 @@ fn set_connected(
     {
         state.telemetry.last_error = None;
     }
+}
+
+fn refresh_public_connection_health(state: &mut StreamState) {
+    state.telemetry.public_connected = state.desired_symbols.iter().all(|symbol| {
+        let stream = format!("{}@depth20@500ms", symbol.to_lowercase());
+        public_stream_shards(&stream)
+            .into_iter()
+            .any(|shard| state.public_connections[shard])
+    });
 }
 
 fn record_message(state: &Arc<RwLock<StreamState>>, route: StreamRoute, now_ms: i64) {
@@ -1668,7 +1724,7 @@ mod tests {
     }
 
     #[test]
-    fn public_stream_shards_are_disjoint_and_complete() {
+    fn public_stream_shards_are_redundant_and_complete() {
         let symbols = vec![
             "BTCUSDT".to_string(),
             "ETHUSDT".to_string(),
@@ -1679,10 +1735,15 @@ mod tests {
         let mut combined = BTreeSet::new();
         for shard in 0..PUBLIC_STREAM_SHARDS {
             let streams = public_streams_shard(&symbols, shard);
-            assert!(combined.is_disjoint(&streams));
             combined.extend(streams);
         }
         assert_eq!(combined, expected);
+        for stream in expected {
+            let owning_shards = (0..PUBLIC_STREAM_SHARDS)
+                .filter(|shard| public_streams_shard(&symbols, *shard).contains(&stream))
+                .count();
+            assert_eq!(owning_shards, PUBLIC_STREAM_REPLICAS);
+        }
     }
 
     #[test]
@@ -1788,14 +1849,14 @@ mod tests {
     }
 
     #[test]
-    fn public_reconnect_rewarms_only_symbols_on_the_affected_depth_shard() {
+    fn public_reconnect_preserves_flow_served_by_the_redundant_route() {
         let symbols = vec![
             "BTCUSDT".to_string(),
             "ETHUSDT".to_string(),
             "SOLUSDT".to_string(),
             "XRPUSDT".to_string(),
         ];
-        let shard = symbol_shard("btcusdt@depth20@500ms", PUBLIC_STREAM_SHARDS);
+        let shard = public_stream_shards("btcusdt@depth20@500ms")[0];
         let state = Arc::new(RwLock::new(StreamState::default()));
         {
             let mut inner = state.write().unwrap();
@@ -1817,16 +1878,64 @@ mod tests {
 
         let inner = state.read().unwrap();
         for symbol in &symbols {
-            let affected = symbol_shard(
-                &format!("{}@depth20@500ms", symbol.to_lowercase()),
-                PUBLIC_STREAM_SHARDS,
-            ) == shard;
-            assert_eq!(
-                inner.symbol_admitted_ms[symbol],
-                if affected { 2_000 } else { 1_000 }
-            );
-            assert_eq!(inner.book_flow.contains_key(symbol), !affected);
+            assert_eq!(inner.symbol_admitted_ms[symbol], 1_000);
+            assert!(inner.book_flow.contains_key(symbol));
         }
+    }
+
+    #[test]
+    fn one_public_shard_failure_keeps_every_symbol_covered() {
+        let symbols = [
+            "BTCUSDT".to_string(),
+            "ETHUSDT".to_string(),
+            "SOLUSDT".to_string(),
+            "XRPUSDT".to_string(),
+        ];
+        let mut state = StreamState {
+            desired_symbols: symbols.iter().cloned().collect(),
+            ..StreamState::default()
+        };
+        state.public_connections.fill(true);
+        for failed in 0..PUBLIC_STREAM_SHARDS {
+            state.public_connections[failed] = false;
+            refresh_public_connection_health(&mut state);
+            assert!(state.telemetry.public_connected);
+            state.public_connections[failed] = true;
+        }
+    }
+
+    #[test]
+    fn redundant_depth_updates_do_not_double_count_book_flow() {
+        let state = Arc::new(RwLock::new(StreamState::default()));
+        let depth = |update_id: u64, bid_qty: &str, ask_qty: &str| {
+            serde_json::json!({
+                "s":"YBUSDT", "E":1_000 + update_id as i64, "u":update_id,
+                "b":[["1.0",bid_qty]], "a":[["1.1",ask_qty]]
+            })
+        };
+        update_depth(&state, &depth(10, "100", "100"), 1_000).unwrap();
+        update_depth(&state, &depth(11, "110", "90"), 1_500).unwrap();
+        update_depth(&state, &depth(11, "110", "90"), 1_501).unwrap();
+        assert_eq!(state.read().unwrap().book_flow["YBUSDT"].len(), 1);
+    }
+
+    #[test]
+    fn depth_flow_does_not_bridge_a_stale_reconnect_gap() {
+        let state = Arc::new(RwLock::new(StreamState::default()));
+        let depth = |update_id: u64, event_ms: i64| {
+            serde_json::json!({
+                "s":"YBUSDT", "E":event_ms, "u":update_id,
+                "b":[["1.0","100"]], "a":[["1.1","100"]]
+            })
+        };
+        update_depth(&state, &depth(10, 1_000), 1_000).unwrap();
+        update_depth(&state, &depth(20, 31_000), 31_000).unwrap();
+        assert!(state
+            .read()
+            .unwrap()
+            .book_flow
+            .get("YBUSDT")
+            .is_none_or(VecDeque::is_empty));
     }
 
     #[test]
