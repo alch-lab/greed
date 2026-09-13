@@ -315,6 +315,11 @@ impl StrategyNode for PositionPlannerNode {
                 .clamp(0.1, 1.0);
             let mut profit_shield_activation_r = tag_f64(c, "profit_shield_activation_r")
                 .unwrap_or(self.config.profit_shield_activation_r);
+            let profit_memory_activation_pct = tag_f64(c, "profit_memory_activation_pct")
+                .filter(|value| (0.0005..=0.01).contains(value));
+            let profit_memory_floor_net_pct = tag_f64(c, "profit_memory_floor_net_pct")
+                .unwrap_or_default()
+                .clamp(-0.002, 0.002);
             let mut break_even_buffer_pct = tag_f64(c, "break_even_buffer_pct")
                 .unwrap_or(self.config.break_even_buffer_pct)
                 .clamp(0.0, 0.01);
@@ -582,6 +587,11 @@ impl StrategyNode for PositionPlannerNode {
                     && !c.tags.contains_key("unprotected_runner_fraction")
                     && profit_shield_activation_r > 0.0)
                     .then_some(stop_pct * profit_shield_activation_r),
+                profit_memory_activation_pct: (!fixed_time_exit
+                    && !c.tags.contains_key("unprotected_runner_fraction"))
+                .then_some(profit_memory_activation_pct)
+                .flatten(),
+                profit_memory_floor_net_pct,
                 // Start locking profit before TP1. Waiting until TP1 meant a
                 // position could reach roughly +1R, miss the 2R partial, and
                 // surrender almost all open profit back to the cost shield.
@@ -1064,6 +1074,8 @@ mod tests {
             ("target_account_profit_pct".into(), "0.003".into()),
             ("cost_aware_full_take_profit".into(), "true".into()),
             ("profit_shield_activation_r".into(), "1.0".into()),
+            ("profit_memory_activation_pct".into(), "0.001".into()),
+            ("profit_memory_floor_net_pct".into(), "-0.0002".into()),
             ("pre_tp_trailing_activation_r".into(), "1.0".into()),
             ("trailing_distance_pct".into(), "0.001".into()),
         ]));
@@ -1100,6 +1112,8 @@ mod tests {
         assert!((plan.take_profit_prices[0].0 - 100.39).abs() < 1e-9);
         assert_eq!(plan.take_profit_prices[0].1, 1.0);
         assert!((plan.profit_shield_activation_pct.unwrap() - 0.0028).abs() < 1e-12);
+        assert_eq!(plan.profit_memory_activation_pct, Some(0.001));
+        assert_eq!(plan.profit_memory_floor_net_pct, -0.0002);
         assert!((plan.trailing_activation_pct.unwrap() - 0.0028).abs() < 1e-12);
         assert!((plan.trailing_distance_pct.unwrap() - 0.0009).abs() < 1e-12);
     }

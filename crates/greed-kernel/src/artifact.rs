@@ -107,6 +107,16 @@ pub struct PositionPlan {
     pub break_even_buffer_pct: f64,
     #[serde(default)]
     pub profit_shield_activation_pct: Option<f64>,
+    /// Arms a lightweight executable-value floor after the trade has merely
+    /// paid for its round trip. Unlike the main profit shield, this does not
+    /// tighten the hosted stop or cap a continuing winner.
+    #[serde(default)]
+    pub profit_memory_activation_pct: Option<f64>,
+    /// Floor on the executable net-return basis. A small negative value lets
+    /// normal spread noise breathe while preventing a paid-for trade from
+    /// returning all the way to the catastrophe stop.
+    #[serde(default)]
+    pub profit_memory_floor_net_pct: f64,
     pub trailing_activation_pct: Option<f64>,
     pub trailing_distance_pct: Option<f64>,
     #[serde(default)]

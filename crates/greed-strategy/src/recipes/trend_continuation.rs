@@ -515,6 +515,11 @@ impl StrategyNode for TrendContinuationNode {
                         "profit_shield_activation_r".into(),
                         self.config.trend_profit_shield_activation_r.to_string(),
                     );
+                    // Trend trades need more breathing room than the Fast and
+                    // liquidation lanes, but a genuine 20 bps executable
+                    // excursion should not be forgotten entirely.
+                    tags.insert("profit_memory_activation_pct".into(), "0.0020".into());
+                    tags.insert("profit_memory_floor_net_pct".into(), "-0.0005".into());
                     tags.insert(
                         "break_even_buffer_pct".into(),
                         self.config.trend_profit_shield_buffer_pct.to_string(),

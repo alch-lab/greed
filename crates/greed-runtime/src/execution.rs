@@ -150,6 +150,10 @@ struct ExecutionMeta {
     #[serde(default)]
     profit_shield_activation_pct: Option<f64>,
     #[serde(default)]
+    profit_memory_activation_pct: Option<f64>,
+    #[serde(default)]
+    profit_memory_floor_net_pct: f64,
+    #[serde(default)]
     break_even_armed: bool,
     #[serde(default)]
     extreme_price: f64,
@@ -405,6 +409,8 @@ pub struct DemoPositionSnapshot {
     pub fixed_time_exit: bool,
     pub break_even_armed: bool,
     pub profit_shield_activation_pct: Option<f64>,
+    pub profit_memory_activation_pct: Option<f64>,
+    pub profit_memory_floor_net_pct: f64,
     pub executable_profit: Option<crate::profit_guard::ProfitGuard>,
     pub executable_profit_guard_enabled: bool,
     pub profit_reversal_count: u8,
@@ -1280,9 +1286,10 @@ impl BinanceDemoExecution {
                     let partial_shield_hit = meta
                         .break_even_after_fraction
                         .is_some_and(|threshold| closed_fraction + 1e-6 >= threshold);
+                    let profit_memory = effective_profit_memory(meta);
                     let executable_mode = self.config.executable_profit_guard
                         && !meta.fixed_time_exit
-                        && meta.profit_shield_activation_pct.is_some();
+                        && (meta.profit_shield_activation_pct.is_some() || profit_memory.is_some());
                     let fresh_quote = executable_quotes.get(symbol).filter(|q| {
                         chrono::Utc::now().timestamp_millis() + self.clock_offset_ms - q.exchange_ms
                             <= crate::profit_guard::MAX_QUOTE_AGE_MS
@@ -1299,6 +1306,10 @@ impl BinanceDemoExecution {
                                 crate::profit_guard::Protection {
                                     activation: meta.profit_shield_activation_pct,
                                     floor: meta.break_even_buffer_pct,
+                                    memory_activation: profit_memory.map(|value| value.0),
+                                    memory_floor_net: profit_memory
+                                        .map(|value| value.1)
+                                        .unwrap_or_default(),
                                     trailing_activation,
                                     trailing_distance: meta.trailing_distance_pct,
                                     partial_activated: partial_shield_hit,
@@ -1318,7 +1329,23 @@ impl BinanceDemoExecution {
                                 },
                             })});
                             if exit {
-                                executable_exits.push((symbol.clone(), position.clone()));
+                                let main_shield_activated = partial_shield_hit
+                                    || meta.profit_shield_activation_pct.is_some_and(
+                                        |activation| {
+                                            meta.executable_profit.as_ref().is_some_and(|guard| {
+                                                guard.peak_net_return
+                                                    >= (activation
+                                                        - crate::profit_guard::COST_RESERVE)
+                                                        .max(0.0)
+                                            })
+                                        },
+                                    );
+                                let reason = if main_shield_activated {
+                                    "executable_profit_protection"
+                                } else {
+                                    "executable_profit_memory"
+                                };
+                                executable_exits.push((symbol.clone(), position.clone(), reason));
                                 continue;
                             }
                         }
@@ -1412,7 +1439,7 @@ impl BinanceDemoExecution {
                 if self.config.executable_profit_guard {
                     self.save()?;
                 }
-                for (symbol, position) in executable_exits {
+                for (symbol, position, exit_reason) in executable_exits {
                     let decision_ms = chrono::Utc::now().timestamp_millis();
                     let trigger_quote = self
                         .state
@@ -1425,11 +1452,11 @@ impl BinanceDemoExecution {
                             let flat_confirmed_ms = chrono::Utc::now().timestamp_millis();
                             if let Some(meta) = self.state.positions.get_mut(&symbol) {
                                 meta.exit_requested = true;
-                                meta.pending_exit_reason = Some("executable_profit_protection".into());
+                                meta.pending_exit_reason = Some(exit_reason.into());
                             }
                             self.save()?;
                             events.push(ExchangeEvent {kind:"exchange_exit_requested".into(),payload:serde_json::json!({
-                                "ts_ms":flat_confirmed_ms,"symbol":symbol,"reason":"executable_profit_protection",
+                                "ts_ms":flat_confirmed_ms,"symbol":symbol,"reason":exit_reason,
                                 "latency":{
                                     "trigger_exchange_ms":trigger_quote.map(|value|value.0),
                                     "trigger_observed_ms":trigger_quote.map(|value|value.1),
@@ -2884,12 +2911,20 @@ impl BinanceDemoExecution {
                         break_even_armed: meta.map(|value| value.break_even_armed).unwrap_or(false),
                         profit_shield_activation_pct: meta
                             .and_then(|value| value.profit_shield_activation_pct),
+                        profit_memory_activation_pct: meta
+                            .and_then(effective_profit_memory)
+                            .map(|value| value.0),
+                        profit_memory_floor_net_pct: meta
+                            .and_then(effective_profit_memory)
+                            .map(|value| value.1)
+                            .unwrap_or_default(),
                         executable_profit: meta.and_then(|value| value.executable_profit.clone()),
                         executable_profit_guard_enabled: self.config.executable_profit_guard
                             && meta.is_some_and(|value| {
                                 !value.fixed_time_exit
                                     && !value.runner_active
-                                    && value.profit_shield_activation_pct.is_some()
+                                    && (value.profit_shield_activation_pct.is_some()
+                                        || effective_profit_memory(value).is_some())
                             }),
                         profit_reversal_count: meta
                             .map(|value| value.profit_reversal_count)
@@ -3350,6 +3385,8 @@ impl BinanceDemoExecution {
                             ),
                             break_even_buffer_pct: plan.break_even_buffer_pct,
                             profit_shield_activation_pct: actual_protection.activation_pct,
+                            profit_memory_activation_pct: plan.profit_memory_activation_pct,
+                            profit_memory_floor_net_pct: plan.profit_memory_floor_net_pct,
                             break_even_armed: false,
                             extreme_price: fill.entry_price,
                             adverse_price: fill.entry_price,
@@ -4773,6 +4810,8 @@ impl BinanceDemoExecution {
                 }),
                 break_even_buffer_pct: plan.break_even_buffer_pct,
                 profit_shield_activation_pct: actual_protection.activation_pct,
+                profit_memory_activation_pct: plan.profit_memory_activation_pct,
+                profit_memory_floor_net_pct: plan.profit_memory_floor_net_pct,
                 break_even_armed: false,
                 extreme_price: entry_price,
                 adverse_price: entry_price,
@@ -6521,6 +6560,33 @@ fn effective_trailing_activation(meta: &ExecutionMeta) -> Option<f64> {
     })
 }
 
+/// Persisted values win, while funded strategies created before this upgrade
+/// inherit the new protection on restart. This preserves the current epoch
+/// and protects already-open positions without rewriting their journal.
+fn effective_profit_memory(meta: &ExecutionMeta) -> Option<(f64, f64)> {
+    if let Some(activation) = meta.profit_memory_activation_pct {
+        return Some((activation, meta.profit_memory_floor_net_pct));
+    }
+    match meta.recipe.as_str() {
+        "fast_trend_activation" => Some((0.0010, -0.0002)),
+        "liquidation_exhaustion_reversal" | LIQUIDATION_REENTRY_RECIPE => Some((0.0012, -0.0002)),
+        "trend_continuation" | TREND_REENTRY_RECIPE | TREND_PROFIT_REVERSAL_RECIPE => {
+            Some((0.0020, -0.0005))
+        }
+        _ => None,
+    }
+}
+
+fn main_executable_profit_protection_armed(meta: &ExecutionMeta) -> bool {
+    meta.profit_shield_activation_pct.is_some_and(|activation| {
+        meta.executable_profit.as_ref().is_some_and(|guard| {
+            guard.floor_net_return.is_some()
+                && guard.peak_net_return
+                    >= (activation - crate::profit_guard::COST_RESERVE).max(0.0)
+        })
+    })
+}
+
 fn should_arm_same_side_trend_reentry(
     enabled: bool,
     recipe: &str,
@@ -6822,12 +6888,7 @@ fn max_hold_review(
     if meta.recipe != "fast_trend_activation" || meta.entry_price <= f64::EPSILON {
         return MaxHoldReview::Exit;
     }
-    if meta.break_even_armed
-        || meta
-            .executable_profit
-            .as_ref()
-            .is_some_and(|guard| guard.floor_net_return.is_some())
-    {
+    if meta.break_even_armed || main_executable_profit_protection_armed(meta) {
         return MaxHoldReview::ReleaseToProtection;
     }
     if meta.pending_exit_reason.as_deref() == Some("max_hold")
@@ -7751,6 +7812,8 @@ mod tests {
             break_even_after_fraction: Some(0.4),
             break_even_buffer_pct: 0.0018,
             profit_shield_activation_pct: Some(0.00625),
+            profit_memory_activation_pct: Some(0.0020),
+            profit_memory_floor_net_pct: -0.0005,
             trailing_activation_pct: Some(0.01),
             trailing_distance_pct: Some(0.005),
             early_failure_after_ms: 180_000,
@@ -8210,6 +8273,30 @@ mod tests {
     }
 
     #[test]
+    fn fast_profit_memory_does_not_disable_the_deadline() {
+        let meta: ExecutionMeta = serde_json::from_value(serde_json::json!({
+            "candidate_id":"fast:memory","recipe":"fast_trend_activation","side":"buy",
+            "entry_ms":1_000,"first_fill_ms":1_000,"entry_price":100.0,
+            "initial_quantity":10.0,"last_observed_quantity":10.0,
+            "initial_risk_usd":20.0,"stop_price":98.0,"extreme_price":100.12,
+            "profit_shield_activation_pct":0.0028,
+            "profit_memory_activation_pct":0.001,
+            "profit_memory_floor_net_pct":-0.0002,
+            "max_hold_ms":600_000,
+            "executable_profit":{
+                "quantity":10.0,"peak_net_return":0.0002,"current_net_return":0.0001,
+                "floor_net_return":-0.0002,"observed_ms":600_000,"exchange_ms":600_000,
+                "exit_vwap":100.11
+            }
+        }))
+        .unwrap();
+        assert!(!matches!(
+            max_hold_review(&meta, 601_000, 100.11, None),
+            MaxHoldReview::ReleaseToProtection
+        ));
+    }
+
+    #[test]
     fn fast_trend_deadline_grants_one_short_grace_for_profitable_high_exit_impact() {
         let mut meta: ExecutionMeta = serde_json::from_value(serde_json::json!({
             "candidate_id":"fast:progress","recipe":"fast_trend_activation","side":"buy",
@@ -8419,6 +8506,23 @@ mod tests {
             max_hold_review(&meta, 601_000, 0.6859, Some(reference)),
             MaxHoldReview::Exit
         );
+    }
+
+    #[test]
+    fn legacy_open_positions_inherit_recipe_profit_memory_without_state_rewrite() {
+        let fast: ExecutionMeta = serde_json::from_value(serde_json::json!({
+            "candidate_id":"fast:legacy","recipe":"fast_trend_activation","side":"sell",
+            "entry_ms":1_000,"entry_price":100.0,"stop_price":101.0,"max_hold_ms":600_000
+        }))
+        .unwrap();
+        assert_eq!(effective_profit_memory(&fast), Some((0.0010, -0.0002)));
+
+        let unrelated: ExecutionMeta = serde_json::from_value(serde_json::json!({
+            "candidate_id":"other:legacy","recipe":"other","side":"buy",
+            "entry_ms":1_000,"entry_price":100.0,"stop_price":99.0,"max_hold_ms":0
+        }))
+        .unwrap();
+        assert_eq!(effective_profit_memory(&unrelated), None);
     }
 
     #[test]

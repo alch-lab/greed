@@ -94,6 +94,8 @@ pub fn quote(
 pub struct Protection {
     pub activation: Option<f64>,
     pub floor: f64,
+    pub memory_activation: Option<f64>,
+    pub memory_floor_net: f64,
     pub trailing_activation: Option<f64>,
     pub trailing_distance: Option<f64>,
     pub partial_activated: bool,
@@ -144,6 +146,13 @@ pub fn observe(
         || protection
             .activation
             .is_some_and(|a| s.peak_net_return >= (a - COST_RESERVE).max(0.0));
+    let memory_activated = protection
+        .memory_activation
+        .is_some_and(|activation| s.peak_net_return >= (activation - COST_RESERVE).max(0.0));
+    if memory_activated {
+        let floor = protection.memory_floor_net.clamp(-COST_RESERVE, 0.0);
+        s.floor_net_return = Some(s.floor_net_return.map_or(floor, |old| old.max(floor)));
+    }
     if activated {
         // Arm only above the floor. Never liquidate a legacy position just
         // because an inherited TP already happened before its first quote.
@@ -185,6 +194,8 @@ mod tests {
         Protection {
             activation: Some(0.0025),
             floor: 0.0015,
+            memory_activation: None,
+            memory_floor_net: 0.0,
             trailing_activation: Some(0.005),
             trailing_distance: Some(0.003),
             partial_activated: false,
@@ -234,10 +245,55 @@ mod tests {
     }
 
     #[test]
+    fn cost_coverage_memory_arms_without_capping_a_winner() {
+        let protection = Protection {
+            activation: Some(0.0028),
+            floor: 0.0018,
+            memory_activation: Some(0.0010),
+            memory_floor_net: -0.0002,
+            trailing_activation: Some(0.0028),
+            trailing_distance: Some(0.0009),
+            partial_activated: false,
+        };
+        let mut state = None;
+        // Twelve gross bps covers the conservative ten-bps reserve and arms
+        // only a scratch floor. The position remains open while it advances.
+        assert!(!observe(
+            &mut state,
+            q(100.12),
+            Side::Buy,
+            100.0,
+            1.0,
+            protection,
+        ));
+        assert_eq!(state.as_ref().unwrap().floor_net_return, Some(-0.0002));
+        assert!(!observe(
+            &mut state,
+            q(100.30),
+            Side::Buy,
+            100.0,
+            1.0,
+            protection,
+        ));
+        // A full giveback to seven gross bps is below the remembered
+        // minus-two-net-bps floor and requests an executable close.
+        assert!(observe(
+            &mut state,
+            q(100.07),
+            Side::Buy,
+            100.0,
+            1.0,
+            protection,
+        ));
+    }
+
+    #[test]
     fn trend_lifecycle_ratchets_after_the_trailing_handoff() {
         let lifecycle = Protection {
             activation: Some(0.008),
             floor: 0.0015,
+            memory_activation: None,
+            memory_floor_net: 0.0,
             trailing_activation: Some(0.010),
             trailing_distance: Some(0.005),
             partial_activated: false,

@@ -616,6 +616,12 @@ impl StrategyNode for FastTrendActivationNode {
                 // The planner replaces these placeholders with thresholds
                 // derived from the final liquidity-sized dollar target.
                 ("profit_shield_activation_r".into(), "1.0".into()),
+                // Once executable value has paid the conservative 10 bps
+                // round-trip reserve, remember it. A two-bps net giveback
+                // floor prevents a small winner from becoming a full-risk
+                // loss without forcing an early take-profit.
+                ("profit_memory_activation_pct".into(), "0.0010".into()),
+                ("profit_memory_floor_net_pct".into(), "-0.0002".into()),
                 ("pre_tp_trailing_activation_r".into(), "1.0".into()),
                 ("trailing_distance_pct".into(), "0.001".into()),
                 ("cost_aware_profit_shield".into(), "true".into()),
