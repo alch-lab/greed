@@ -25,6 +25,49 @@ fn is_major(symbol: &str) -> bool {
     ["BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT"].contains(&symbol)
 }
 
+#[derive(Debug, Clone, Copy, Default)]
+struct LiveImpulse {
+    opposing_body_pct: Option<f64>,
+    opposing_flow: Option<f64>,
+    vetoed: bool,
+}
+
+fn live_impulse(
+    instrument: &greed_kernel::InstrumentFrame,
+    side: Side,
+    now_ms: i64,
+    config: &LaneConfig,
+) -> LiveImpulse {
+    let Some(series) = instrument
+        .micro_perpetual
+        .as_ref()
+        .filter(|series| series.meta.usable_at(now_ms))
+    else {
+        return LiveImpulse::default();
+    };
+    let Some(candle) =
+        series.values.iter().rev().find(|candle| {
+            candle.open_ms <= now_ms && now_ms <= candle.close_ms.saturating_add(1_000)
+        })
+    else {
+        return LiveImpulse::default();
+    };
+    if candle.open <= f64::EPSILON || candle.quote_volume <= f64::EPSILON {
+        return LiveImpulse::default();
+    }
+    let opposing_body_pct = -side.sign() * (instrument.price / candle.open - 1.0);
+    let opposing_flow = candle
+        .taker_buy_quote
+        .map(|buy| -side.sign() * (2.0 * buy / candle.quote_volume - 1.0));
+    LiveImpulse {
+        opposing_body_pct: Some(opposing_body_pct),
+        opposing_flow,
+        vetoed: config.liquidation_impulse_veto_enabled
+            && opposing_body_pct >= config.liquidation_impulse_veto_min_body_pct
+            && opposing_flow.is_some_and(|flow| flow >= config.liquidation_impulse_veto_min_flow),
+    }
+}
+
 impl StrategyNode for LiquidationExhaustionReversalNode {
     fn id(&self) -> &str {
         &self.id
@@ -70,6 +113,7 @@ impl StrategyNode for LiquidationExhaustionReversalNode {
             // bought. Forced short liquidation is aggressive buying, so the
             // reversal trade is sold.
             let side = if long_dominant { Side::Buy } else { Side::Sell };
+            let impulse = live_impulse(instrument, side, ctx.frame.as_of_ms, &self.config);
             let min_age_ms = i64::from(self.config.liquidation_min_entry_delay_seconds) * 1_000;
             let max_age_ms = i64::from(self.config.liquidation_max_signal_age_seconds) * 1_000;
             let fresh = age_ms >= min_age_ms && age_ms <= max_age_ms;
@@ -143,6 +187,13 @@ impl StrategyNode for LiquidationExhaustionReversalNode {
                 }
                 None => blockers.push("post-liquidation recovery path is incomplete".into()),
                 _ => {}
+            }
+            if impulse.vetoed {
+                blockers.push(format!(
+                    "live 1m impulse still opposes the fade: body {:.2}% · taker flow {:.0}%",
+                    impulse.opposing_body_pct.unwrap_or_default() * 100.0,
+                    impulse.opposing_flow.unwrap_or_default() * 100.0
+                ));
             }
 
             let verdict = if blockers.is_empty() {
@@ -224,6 +275,21 @@ impl StrategyNode for LiquidationExhaustionReversalNode {
                         "liquidation_reversal_bps".into(),
                         reversal_bps.unwrap_or_default().to_string(),
                     ),
+                    (
+                        "live_1m_opposing_body_pct".into(),
+                        impulse
+                            .opposing_body_pct
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "missing".into()),
+                    ),
+                    (
+                        "live_1m_opposing_flow".into(),
+                        impulse
+                            .opposing_flow
+                            .map(|value| value.to_string())
+                            .unwrap_or_else(|| "missing".into()),
+                    ),
+                    ("live_1m_impulse_veto".into(), impulse.vetoed.to_string()),
                     (
                         "stop_pct".into(),
                         self.config.liquidation_stop_pct.to_string(),
@@ -369,7 +435,7 @@ impl StrategyNode for LiquidationExhaustionReversalNode {
 mod tests {
     use super::*;
     use greed_kernel::{
-        AccountFrame, BookState, CandleSeries, InstrumentFrame, MarketFrame, MarketKind,
+        AccountFrame, BookState, Candle, CandleSeries, InstrumentFrame, MarketFrame, MarketKind,
         MicrostructureState, ObservationMeta,
     };
 
@@ -500,6 +566,87 @@ mod tests {
             .unwrap();
         assert_eq!(candidate.side, Side::Sell);
         assert_eq!(candidate.reference_price, 99.89);
+    }
+
+    #[test]
+    fn live_one_minute_v_rebound_blocks_a_premature_fade() {
+        let mut market = frame(1_000.0, 9_000.0);
+        let instrument = market.instruments.get_mut("ALTUSDT").unwrap();
+        instrument.price = 101.5;
+        instrument.micro_perpetual = Some(CandleSeries {
+            venue: "test".into(),
+            market: MarketKind::Perpetual,
+            interval_ms: 60_000,
+            meta: observation(20_000),
+            values: vec![Candle {
+                open_ms: 0,
+                close_ms: 59_999,
+                open: 100.0,
+                high: 101.6,
+                low: 99.9,
+                close: 101.5,
+                quote_volume: 1_000_000.0,
+                taker_buy_quote: Some(550_000.0),
+                closed: false,
+            }],
+        });
+        let mut node =
+            LiquidationExhaustionReversalNode::new(&["ALTUSDT".into()], LaneConfig::default());
+        let records = node
+            .evaluate(&NodeContext {
+                frame: &market,
+                artifacts: &BTreeMap::new(),
+            })
+            .unwrap();
+        let candidate = records
+            .iter()
+            .find_map(|record| record.artifact.candidate())
+            .unwrap();
+        assert_eq!(candidate.side, Side::Sell);
+        assert_eq!(candidate.verdict, Verdict::Block);
+        assert_eq!(candidate.tags["live_1m_impulse_veto"], "true");
+        assert!(candidate
+            .blockers
+            .iter()
+            .any(|reason| reason.contains("live 1m impulse still opposes")));
+    }
+
+    #[test]
+    fn weak_or_unconfirmed_minute_move_does_not_remove_a_valid_reversal() {
+        let mut market = frame(1_000.0, 9_000.0);
+        let instrument = market.instruments.get_mut("ALTUSDT").unwrap();
+        instrument.price = 100.7;
+        instrument.micro_perpetual = Some(CandleSeries {
+            venue: "test".into(),
+            market: MarketKind::Perpetual,
+            interval_ms: 60_000,
+            meta: observation(20_000),
+            values: vec![Candle {
+                open_ms: 0,
+                close_ms: 59_999,
+                open: 100.0,
+                high: 100.8,
+                low: 99.9,
+                close: 100.7,
+                quote_volume: 1_000_000.0,
+                taker_buy_quote: Some(510_000.0),
+                closed: false,
+            }],
+        });
+        let mut node =
+            LiquidationExhaustionReversalNode::new(&["ALTUSDT".into()], LaneConfig::default());
+        let records = node
+            .evaluate(&NodeContext {
+                frame: &market,
+                artifacts: &BTreeMap::new(),
+            })
+            .unwrap();
+        let candidate = records
+            .iter()
+            .find_map(|record| record.artifact.candidate())
+            .unwrap();
+        assert_eq!(candidate.verdict, Verdict::Pass);
+        assert_eq!(candidate.tags["live_1m_impulse_veto"], "false");
     }
 
     #[test]

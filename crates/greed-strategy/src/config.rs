@@ -127,6 +127,12 @@ pub struct LaneConfig {
     /// an execution-safety boundary for Demo, whose altcoin books can diverge
     /// materially from mainnet market data.
     pub liquidation_max_execution_divergence_bps: f64,
+    /// Refuse a fade while the live one-minute candle is still accelerating
+    /// in the direction of the liquidation rebound. This is deliberately a
+    /// narrow continuation veto, not a general candle-trend filter.
+    pub liquidation_impulse_veto_enabled: bool,
+    pub liquidation_impulse_veto_min_body_pct: f64,
+    pub liquidation_impulse_veto_min_flow: f64,
     /// After a profitable executable-profit shield closes an exhaustion
     /// reversal, allow one same-direction continuation attempt when a fresh
     /// one-minute candle breaks the favorable extreme with directional flow.
@@ -230,6 +236,9 @@ impl Default for LaneConfig {
             liquidation_trailing_distance_bps: 30.0,
             liquidation_risk_per_trade_pct: 0.0025,
             liquidation_max_execution_divergence_bps: 15.0,
+            liquidation_impulse_veto_enabled: true,
+            liquidation_impulse_veto_min_body_pct: 0.005,
+            liquidation_impulse_veto_min_flow: 0.05,
             liquidation_reentry_enabled: true,
             liquidation_reentry_window_minutes: 6,
             liquidation_reentry_min_body_pct: 0.0015,
@@ -421,6 +430,8 @@ impl StrategyConfig {
             || lanes.liquidation_trailing_distance_bps >= lanes.liquidation_trailing_activation_bps
             || !(0.001..=0.01).contains(&lanes.liquidation_risk_per_trade_pct)
             || !(1.0..=50.0).contains(&lanes.liquidation_max_execution_divergence_bps)
+            || !(0.001..=0.03).contains(&lanes.liquidation_impulse_veto_min_body_pct)
+            || !(0.0..=0.50).contains(&lanes.liquidation_impulse_veto_min_flow)
             || !(1..=15).contains(&lanes.liquidation_reentry_window_minutes)
             || !(0.0005..=0.01).contains(&lanes.liquidation_reentry_min_body_pct)
             || !(0.0..=0.50).contains(&lanes.liquidation_reentry_min_flow)

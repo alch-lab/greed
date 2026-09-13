@@ -6747,11 +6747,13 @@ const FAST_TREND_STRUCTURE_MIN_RETURN_5M: f64 = 0.001;
 const FAST_TREND_STRUCTURE_MIN_FLOW_5M: f64 = 0.02;
 const MAX_STORED_EXECUTABLE_QUOTE_AGE_MS: i64 = 5_000;
 const FAST_TREND_HIGH_EXIT_IMPACT_BPS: f64 = 10.0;
+const FAST_TREND_MAX_EXIT_VENUE_DIVERGENCE_BPS: f64 = 15.0;
 
 #[derive(Debug, Clone, Copy)]
 struct FastTrendHoldContext {
     directional_return_5m: f64,
     directional_flow_5m: f64,
+    reference_price: f64,
 }
 
 fn fast_trend_hold_context(
@@ -6798,6 +6800,7 @@ fn fast_trend_hold_context_from_candles(
     Some(FastTrendHoldContext {
         directional_return_5m: side.sign() * (last.close / first.open - 1.0),
         directional_flow_5m: side.sign() * (2.0 * taker_buy_quote / quote_volume - 1.0),
+        reference_price: last.close,
     })
 }
 
@@ -6924,6 +6927,45 @@ fn max_hold_review(
             directional_flow_5m: trend.map(|value| value.directional_flow_5m),
             reason: "meaningful_progress_with_bounded_adverse_move",
         };
+    }
+
+    // Binance Demo occasionally prints an executable book tens of basis
+    // points away from the mainnet market data that generated the signal.
+    // A max-hold close is discretionary, unlike a catastrophe stop, so give
+    // one short grace when the fresh reference market says the trade is still
+    // flat/favorable but the Demo exit quote alone is materially adverse.
+    // Genuine continuation/progress takes precedence above; the exchange stop
+    // remains armed throughout and the next review exits.
+    if meta.max_hold_reviews == 0 {
+        if let (Some(executable_price), Some(trend)) = (executable_price, trend) {
+            let reference_pct = meta.side.sign() * (trend.reference_price / meta.entry_price - 1.0);
+            let reference_r = reference_pct / stop_risk_pct;
+            let divergence_bps =
+                absolute_price_divergence_bps(executable_price, trend.reference_price);
+            if divergence_bps >= FAST_TREND_MAX_EXIT_VENUE_DIVERGENCE_BPS
+                && reference_r >= -0.05
+                && current_r < reference_r
+            {
+                let executable_net_pnl_usd = guard
+                    .map(|value| {
+                        value.current_net_return
+                            * meta.entry_price
+                            * meta.last_observed_quantity.max(0.0)
+                    })
+                    .unwrap_or_default();
+                return MaxHoldReview::Extend {
+                    extension_ms: FAST_TREND_EXECUTABLE_GRACE_MS,
+                    progress_r,
+                    current_r,
+                    executable_net_pnl_usd,
+                    initial_risk_usd,
+                    exit_impact_bps: divergence_bps,
+                    directional_return_5m: Some(trend.directional_return_5m),
+                    directional_flow_5m: Some(trend.directional_flow_5m),
+                    reason: "execution_venue_diverged_from_fresh_reference",
+                };
+            }
+        }
     }
 
     let Some(guard) = guard else {
@@ -8291,6 +8333,7 @@ mod tests {
         let live_short_tape = FastTrendHoldContext {
             directional_return_5m: 0.0027,
             directional_flow_5m: 0.05,
+            reference_price: 1.5460,
         };
         assert!(matches!(
             max_hold_review(&meta, 601_000, 1.5496, Some(live_short_tape)),
@@ -8307,6 +8350,7 @@ mod tests {
                 Some(FastTrendHoldContext {
                     directional_return_5m: -0.001,
                     directional_flow_5m: -0.10,
+                    reference_price: 1.5496,
                 }),
             ),
             MaxHoldReview::Exit
@@ -8327,6 +8371,7 @@ mod tests {
         let context = fast_trend_hold_context_from_candles(&candles, Side::Sell, now_ms).unwrap();
         assert!(context.directional_return_5m > FAST_TREND_STRUCTURE_MIN_RETURN_5M);
         assert!(context.directional_flow_5m > FAST_TREND_STRUCTURE_MIN_FLOW_5M);
+        assert_eq!(context.reference_price, 1.5460);
 
         candles[2].open_ms += 1;
         candles[2].close_ms += 1;
@@ -8336,6 +8381,44 @@ mod tests {
         candles[2].close_ms -= 1;
         candles[4].closed = false;
         assert!(fast_trend_hold_context_from_candles(&candles, Side::Sell, now_ms).is_none());
+    }
+
+    #[test]
+    fn fast_deadline_defers_one_demo_quote_divergence_then_exits() {
+        // ETHFI 2026-09-13: the mainnet candle remained near the short entry,
+        // while Binance Demo's executable buy quote was about 55 bps higher.
+        // The deadline is allowed one grace; the catastrophe stop is not.
+        let mut meta: ExecutionMeta = serde_json::from_value(serde_json::json!({
+            "candidate_id":"fast:ethfi","recipe":"fast_trend_activation","side":"sell",
+            "entry_ms":1_000,"first_fill_ms":1_000,"entry_price":0.68230053,
+            "initial_quantity":13_098.4,"last_observed_quantity":13_098.4,
+            "initial_risk_usd":53.62,"stop_price":0.686239765,
+            "extreme_price":0.68189,"max_hold_ms":600_000,
+            "executable_profit":{
+                "quantity":13098.4,"peak_net_return":0.0006,
+                "current_net_return":-0.0055,"floor_net_return":null,
+                "observed_ms":600_000,"exchange_ms":600_000,"exit_vwap":0.685997873
+            }
+        }))
+        .unwrap();
+        let reference = FastTrendHoldContext {
+            directional_return_5m: 0.0,
+            directional_flow_5m: 0.0,
+            reference_price: 0.6821,
+        };
+        assert!(matches!(
+            max_hold_review(&meta, 601_000, 0.6859, Some(reference)),
+            MaxHoldReview::Extend {
+                extension_ms: FAST_TREND_EXECUTABLE_GRACE_MS,
+                reason: "execution_venue_diverged_from_fresh_reference",
+                ..
+            }
+        ));
+        meta.max_hold_reviews = 1;
+        assert_eq!(
+            max_hold_review(&meta, 601_000, 0.6859, Some(reference)),
+            MaxHoldReview::Exit
+        );
     }
 
     #[test]

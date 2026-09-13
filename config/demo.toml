@@ -151,6 +151,13 @@ liquidation_risk_per_trade_pct = 0.0025
 # trade when the Demo top-of-book differs by more than 15 bps, and use an IOC
 # limit so an accepted order cannot slip through that boundary.
 liquidation_max_execution_divergence_bps = 15.0
+# A three-second bounce is not exhaustion when the live 1m candle is still
+# expanding against the proposed fade with aggressive-flow confirmation.
+# The conjunction keeps ordinary reversals tradable while rejecting V-shaped
+# continuation such as LSK on 2026-09-13.
+liquidation_impulse_veto_enabled = true
+liquidation_impulse_veto_min_body_pct = 0.005
+liquidation_impulse_veto_min_flow = 0.05
 # A profitable shield exit can be a brief bounce rather than the end of the
 # liquidation move. Rejoin once, in the same direction, only after a fresh
 # completed 1m candle breaks the prior favorable extreme with aligned taker
