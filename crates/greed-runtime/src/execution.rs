@@ -89,6 +89,7 @@ enum ProtectionReplacement {
     Replaced(i64),
     ExistingProtection,
     PositionAlreadyFlat,
+    ImmediateTrigger,
 }
 
 const PROTECTION_VISIBILITY_GRACE_MS: i64 = 5_000;
@@ -1528,6 +1529,38 @@ impl BinanceDemoExecution {
                                     "ts_ms":chrono::Utc::now().timestamp_millis(),
                                     "symbol":symbol,
                                     "reason":"position_flat_after_unknown_stop_cancel",
+                                    "venue":"binance_demo","paper_only":true
+                                }),
+                            });
+                        }
+                        Ok(ProtectionReplacement::ImmediateTrigger) => {
+                            // The tighter stop is already through Binance's
+                            // MARK_PRICE trigger. Closing now is the intended
+                            // profit/risk protection action, not an execution
+                            // failure. Preserve the strategy reason so PnL and
+                            // performance attribution remain truthful.
+                            self.close_market(&position).await.with_context(|| {
+                                format!(
+                                    "{reason} became immediately executable and the market close failed"
+                                )
+                            })?;
+                            let exit_reason = normalized_protective_exit_reason(reason);
+                            if let Some(meta) = self.state.positions.get_mut(&symbol) {
+                                meta.exit_requested = true;
+                                meta.pending_exit_reason = Some(exit_reason.into());
+                                meta.stop_price = desired;
+                                meta.break_even_armed = true;
+                                meta.stop_reason = Some(reason.into());
+                                protection_state_changed = true;
+                            }
+                            events.push(ExchangeEvent {
+                                kind: "exchange_exit_requested".into(),
+                                payload: serde_json::json!({
+                                    "ts_ms":chrono::Utc::now().timestamp_millis(),
+                                    "symbol":symbol,
+                                    "reason":exit_reason,
+                                    "trigger":"replacement_stop_would_immediately_trigger",
+                                    "desired_stop_price":desired,
                                     "venue":"binance_demo","paper_only":true
                                 }),
                             });
@@ -5789,6 +5822,17 @@ impl BinanceDemoExecution {
             Err(error) if is_existing_close_position_protection_error(&error) => {
                 Ok(ProtectionReplacement::ExistingProtection)
             }
+            Err(error) if is_immediate_trigger_error(&error) => {
+                let latest = self.signed_read("/fapi/v2/account", vec![]).await?;
+                let positions = parse_account(&latest)?.positions;
+                match positions.get(symbol) {
+                    None => Ok(ProtectionReplacement::PositionAlreadyFlat),
+                    Some(current) if current.side != position.side => Err(anyhow!(
+                        "{symbol} reversed while its protective stop became immediately executable"
+                    )),
+                    Some(_) => Ok(ProtectionReplacement::ImmediateTrigger),
+                }
+            }
             Err(error) => Err(error).context("submit replacement protective stop"),
         }
     }
@@ -6163,13 +6207,19 @@ fn summarize_trades(rows: &[Value], position_side: Side) -> TradeSummary {
 
 fn protective_exit_reason(meta: &ExecutionMeta) -> &str {
     match meta.stop_reason.as_deref() {
-        Some("pre_tp_profit_shield") => "profit_shield_stop",
-        Some("trailing_protection") => "trailing_protection",
-        Some("risk_shield") => "risk_shield_stop",
-        Some("initial_stop") => "initial_stop",
-        Some(reason) => reason,
+        Some(reason) => normalized_protective_exit_reason(reason),
         None if meta.break_even_armed => "trailing_or_protected_stop",
         None => "initial_stop",
+    }
+}
+
+fn normalized_protective_exit_reason(reason: &str) -> &str {
+    match reason {
+        "pre_tp_profit_shield" => "profit_shield_stop",
+        "trailing_protection" => "trailing_protection",
+        "risk_shield" => "risk_shield_stop",
+        "initial_stop" => "initial_stop",
+        reason => reason,
     }
 }
 
@@ -6595,7 +6645,12 @@ fn exit_matches_stop(side: Side, stop_price: f64, exit_price: f64) -> bool {
     if stop_price <= 0.0 || exit_price <= 0.0 {
         return false;
     }
-    const STOP_MARKET_TOLERANCE_PCT: f64 = 0.0025;
+    // Binance conditional stops are triggered by MARK_PRICE while the fill is
+    // reported at the contract trade price. Fast altcoin dislocations can put
+    // those two prices more than 25 bps apart even when the hosted stop is the
+    // indisputable exit source (GRIFFAIN was 31.2 bps). Keep this bounded so a
+    // genuinely distant manual close is not relabelled as a strategy stop.
+    const STOP_MARKET_TOLERANCE_PCT: f64 = 0.005;
     match side {
         Side::Buy => exit_price <= stop_price * (1.0 + STOP_MARKET_TOLERANCE_PCT),
         Side::Sell => exit_price >= stop_price * (1.0 - STOP_MARKET_TOLERANCE_PCT),
@@ -6897,6 +6952,10 @@ fn is_invalid_symbol_error(error: &anyhow::Error) -> bool {
 fn is_unknown_order_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
     message.contains("\"code\":-2011") || message.contains("Unknown order sent")
+}
+fn is_immediate_trigger_error(error: &anyhow::Error) -> bool {
+    let message = format!("{error:#}");
+    message.contains("\"code\":-2021") || message.contains("Order would immediately trigger")
 }
 fn is_existing_close_position_protection_error(error: &anyhow::Error) -> bool {
     let message = format!("{error:#}");
@@ -7506,10 +7565,14 @@ mod tests {
     fn stop_fill_matching_allows_slippage_but_not_favorable_distance() {
         assert!(exit_matches_stop(Side::Buy, 100.0, 99.8));
         assert!(exit_matches_stop(Side::Buy, 100.0, 100.2));
-        assert!(!exit_matches_stop(Side::Buy, 100.0, 100.3));
+        assert!(exit_matches_stop(Side::Buy, 100.0, 100.4));
+        assert!(!exit_matches_stop(Side::Buy, 100.0, 100.6));
         assert!(exit_matches_stop(Side::Sell, 100.0, 100.2));
         assert!(exit_matches_stop(Side::Sell, 100.0, 99.8));
-        assert!(!exit_matches_stop(Side::Sell, 100.0, 99.7));
+        // GRIFFAIN's MARK_PRICE-triggered stop filled 31.2 bps through the
+        // planned stop on the favorable side and must remain attributable.
+        assert!(exit_matches_stop(Side::Sell, 0.0161805, 0.01613));
+        assert!(!exit_matches_stop(Side::Sell, 100.0, 99.4));
     }
 
     #[test]
@@ -7630,6 +7693,24 @@ mod tests {
         .context("cancel current protective stop");
         assert!(is_unknown_order_error(&error));
         assert!(!is_unknown_order_error(&anyhow!("ordinary timeout")));
+    }
+
+    #[test]
+    fn recognizes_immediately_executable_protection_as_a_normal_exit_trigger() {
+        let error = anyhow!(
+            "{}",
+            "Binance demo /fapi/v1/algoOrder returned 400 Bad Request: {\"code\":-2021,\"msg\":\"Order would immediately trigger.\"}"
+        )
+        .context("submit replacement protective stop");
+        assert!(is_immediate_trigger_error(&error));
+        assert_eq!(
+            normalized_protective_exit_reason("pre_tp_profit_shield"),
+            "profit_shield_stop"
+        );
+        assert_eq!(
+            normalized_protective_exit_reason("trailing_protection"),
+            "trailing_protection"
+        );
     }
 
     #[test]
