@@ -811,10 +811,16 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                 let mut evaluation = graph.evaluate(&frame)?;
                 let (reentry_artifacts, reentry_events) =
                     execution.lock().await.trend_reentry_artifacts(&frame);
+                let (liquidation_reentry_artifacts, liquidation_reentry_events) =
+                    execution.lock().await.liquidation_reentry_artifacts(&frame);
                 let has_reentry_candidate = reentry_artifacts
                     .iter()
+                    .chain(liquidation_reentry_artifacts.iter())
                     .any(|record| matches!(&record.artifact, Artifact::Candidate(_)));
-                for record in reentry_artifacts {
+                for record in reentry_artifacts
+                    .into_iter()
+                    .chain(liquidation_reentry_artifacts)
+                {
                     evaluation.artifacts.insert(record.key.clone(), record);
                 }
                 if !evaluation
@@ -831,9 +837,26 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                         .node_order
                         .insert(planner_index, "lane.trend_continuation_reentry".into());
                 }
+                if !evaluation
+                    .node_order
+                    .iter()
+                    .any(|node| node == "lane.liquidation_exhaustion_reentry")
+                {
+                    let planner_index = evaluation
+                        .node_order
+                        .iter()
+                        .position(|node| node == "portfolio.position_planner")
+                        .unwrap_or(evaluation.node_order.len());
+                    evaluation
+                        .node_order
+                        .insert(planner_index, "lane.liquidation_exhaustion_reentry".into());
+                }
                 if has_reentry_candidate {
                     let mut planner = PositionPlannerNode::new(
-                        vec!["lane.trend_continuation_reentry".into()],
+                        vec![
+                            "lane.trend_continuation_reentry".into(),
+                            "lane.liquidation_exhaustion_reentry".into(),
+                        ],
                         active_strategy.risk.clone(),
                     );
                     let records = planner
@@ -848,6 +871,11 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                 }
                 journal.append("graph_evaluation", serde_json::to_value(&evaluation)?)?;
                 for event in reentry_events {
+                    let payload = with_run_id(event.payload, &identity);
+                    history.append(&event.kind, payload.clone())?;
+                    journal.append(&event.kind, payload)?;
+                }
+                for event in liquidation_reentry_events {
                     let payload = with_run_id(event.payload, &identity);
                     history.append(&event.kind, payload.clone())?;
                     journal.append(&event.kind, payload)?;

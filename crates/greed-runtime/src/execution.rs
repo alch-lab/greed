@@ -34,6 +34,7 @@ const TREND_REENTRY_RECIPE: &str = "trend_continuation_reentry";
 const TREND_PROFIT_REVERSAL_RECIPE: &str = "trend_profit_reversal";
 const MAX_PROFIT_REVERSALS_PER_CHAIN: u8 = 2;
 const LIQUIDATION_REVERSAL_RECIPE: &str = "liquidation_exhaustion_reversal";
+const LIQUIDATION_REENTRY_RECIPE: &str = "liquidation_exhaustion_reentry";
 const LIQUIDATION_EXECUTION_BASIS_VERSION: u32 = 1;
 
 fn recipe_slot_full(
@@ -244,6 +245,20 @@ struct TrendReentryCampaign {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+struct LiquidationReentryCampaign {
+    source_candidate_id: String,
+    symbol: String,
+    side: Side,
+    armed_ms: i64,
+    expires_ms: i64,
+    favorable_extreme: f64,
+    #[serde(default)]
+    last_evaluated_bar_ms: i64,
+    #[serde(default)]
+    signal: Option<TrendReentrySignal>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 struct PendingEntryState {
     plan: greed_kernel::PositionPlan,
     recipe: String,
@@ -308,6 +323,7 @@ struct DemoState {
     recipe_outcomes: BTreeMap<String, Vec<ExecutionOutcome>>,
     symbol_outcomes: BTreeMap<String, Vec<ExecutionOutcome>>,
     trend_reentries: BTreeMap<String, TrendReentryCampaign>,
+    liquidation_reentries: BTreeMap<String, LiquidationReentryCampaign>,
     performance_epoch: u32,
     performance_basis_version: u32,
     /// Version the adaptive gate independently when a lane's execution
@@ -576,6 +592,7 @@ impl BinanceDemoExecution {
             value.state.recipe_outcomes.clear();
             value.state.symbol_outcomes.clear();
             value.state.trend_reentries.clear();
+            value.state.liquidation_reentries.clear();
             value.state.accounted_attempt_ids.clear();
             value.state.entry_attempt_ids.clear();
             value.state.filled_entry_attempt_ids.clear();
@@ -1882,6 +1899,39 @@ impl BinanceDemoExecution {
                                 }),
                             });
                         }
+                        if should_arm_liquidation_reentry(
+                            self.lanes.liquidation_reentry_enabled,
+                            &meta.recipe,
+                            &exit_reason,
+                            summary.as_ref().map(|value| value.net_pnl_usd),
+                            meta.extreme_price,
+                        ) {
+                            let campaign = LiquidationReentryCampaign {
+                                source_candidate_id: meta.candidate_id.clone(),
+                                symbol: symbol.clone(),
+                                side: meta.side,
+                                armed_ms: now_ms,
+                                expires_ms: now_ms
+                                    + i64::from(self.lanes.liquidation_reentry_window_minutes)
+                                        * 60_000,
+                                favorable_extreme: meta.extreme_price,
+                                last_evaluated_bar_ms: now_ms,
+                                signal: None,
+                            };
+                            self.state
+                                .liquidation_reentries
+                                .insert(symbol.clone(), campaign.clone());
+                            events.push(liquidation_reentry_state_event(
+                                now_ms,
+                                &campaign,
+                                "waiting_for_resume",
+                                serde_json::json!({
+                                    "favorable_extreme":campaign.favorable_extreme,
+                                    "min_body_pct":self.lanes.liquidation_reentry_min_body_pct,
+                                    "min_directional_flow":self.lanes.liquidation_reentry_min_flow,
+                                }),
+                            ));
+                        }
                         events.push(ExchangeEvent {
                             kind: "exchange_exit".into(),
                             payload: serde_json::json!({
@@ -2446,11 +2496,196 @@ impl BinanceDemoExecution {
         (artifacts, events)
     }
 
+    /// Rejoin a profitable liquidation fade once, but only after the market
+    /// proves that the shield exit was a transient bounce. This deliberately
+    /// uses completed one-minute structure and never arms after a stop-out.
+    pub fn liquidation_reentry_artifacts(
+        &mut self,
+        frame: &MarketFrame,
+    ) -> (Vec<ArtifactRecord>, Vec<ExchangeEvent>) {
+        let mut events = Vec::new();
+        let mut artifacts = Vec::new();
+        let mut changed = false;
+        let symbols: Vec<_> = self.state.liquidation_reentries.keys().cloned().collect();
+
+        for symbol in symbols {
+            let Some(mut campaign) = self.state.liquidation_reentries.remove(&symbol) else {
+                continue;
+            };
+            if frame.as_of_ms > campaign.expires_ms {
+                changed = true;
+                events.push(liquidation_reentry_state_event(
+                    frame.as_of_ms,
+                    &campaign,
+                    "expired",
+                    serde_json::json!({"reason":"one_minute_resume_not_confirmed"}),
+                ));
+                continue;
+            }
+            let Some(instrument) = frame.instrument(&symbol) else {
+                self.state.liquidation_reentries.insert(symbol, campaign);
+                continue;
+            };
+            if campaign.signal.is_none() {
+                if let Some(series) = instrument.micro_perpetual.as_ref() {
+                    for bar in series.values.iter().filter(|bar| bar.closed) {
+                        if bar.close_ms <= campaign.armed_ms
+                            || bar.close_ms <= campaign.last_evaluated_bar_ms
+                        {
+                            continue;
+                        }
+                        campaign.last_evaluated_bar_ms = bar.close_ms;
+                        changed = true;
+                        if let Some(signal) = liquidation_resume_confirmation(
+                            campaign.side,
+                            campaign.favorable_extreme,
+                            instrument.price,
+                            bar,
+                            self.lanes.liquidation_reentry_min_body_pct,
+                            self.lanes.liquidation_reentry_min_flow,
+                            self.lanes.liquidation_stop_pct,
+                        ) {
+                            campaign.signal = Some(signal.clone());
+                            events.push(liquidation_reentry_state_event(
+                                frame.as_of_ms,
+                                &campaign,
+                                "confirmed",
+                                serde_json::json!({
+                                    "signal_ms":signal.signal_ms,
+                                    "body_pct":signal.body_pct,
+                                    "directional_flow":signal.directional_flow,
+                                    "reference_price":signal.reference_price,
+                                }),
+                            ));
+                            break;
+                        }
+                    }
+                }
+            }
+
+            if let Some(signal) = campaign.signal.as_ref() {
+                let candidate_expires_ms = (signal.signal_ms + 60_000).min(campaign.expires_ms);
+                if frame.as_of_ms <= candidate_expires_ms {
+                    if let Some(book) = instrument
+                        .book
+                        .as_ref()
+                        .filter(|book| book.meta.usable_at(frame.as_of_ms))
+                    {
+                        let reference_price = match campaign.side {
+                            Side::Buy => book.ask,
+                            Side::Sell => book.bid,
+                        };
+                        let candidate = TradeCandidate {
+                            id: format!(
+                                "{LIQUIDATION_REENTRY_RECIPE}:{}:{}",
+                                campaign.symbol, signal.signal_ms
+                            ),
+                            recipe: LIQUIDATION_REENTRY_RECIPE.into(),
+                            symbol: campaign.symbol.clone(),
+                            side: campaign.side,
+                            signal_ms: signal.signal_ms,
+                            expires_ms: candidate_expires_ms,
+                            reference_price,
+                            score: signal.body_pct * signal.directional_flow.max(0.0),
+                            confidence: 0.80,
+                            verdict: Verdict::Pass,
+                            blockers: vec![],
+                            evidence: vec![
+                                format!("{}.confirmed_profit_shield_exit", campaign.symbol),
+                                format!("{}.binance_ws_1m_resume", campaign.symbol),
+                                format!("{}.book", campaign.symbol),
+                            ],
+                            tags: BTreeMap::from([
+                                ("lane".into(), LIQUIDATION_REENTRY_RECIPE.into()),
+                                // A genuinely fresh three-second liquidation
+                                // event (priority 2.0) supersedes this older
+                                // continuation thesis on the same symbol.
+                                ("priority".into(), "1.9".into()),
+                                (
+                                    "parent_candidate_id".into(),
+                                    campaign.source_candidate_id.clone(),
+                                ),
+                                ("liquidation_reentry".into(), "true".into()),
+                                (
+                                    "risk_per_trade_pct".into(),
+                                    self.lanes.liquidation_risk_per_trade_pct.to_string(),
+                                ),
+                                (
+                                    "stop_pct".into(),
+                                    self.lanes.liquidation_stop_pct.to_string(),
+                                ),
+                                ("max_notional_multiple".into(), "1.0".into()),
+                                ("managed_exit_only".into(), "true".into()),
+                                ("disable_take_profit".into(), "false".into()),
+                                ("take_profit_fraction".into(), "1.0".into()),
+                                ("fixed_time_exit".into(), "false".into()),
+                                (
+                                    "profit_shield_activation_r".into(),
+                                    (self.lanes.liquidation_profit_shield_activation_bps
+                                        / 10_000.0
+                                        / self.lanes.liquidation_stop_pct)
+                                        .to_string(),
+                                ),
+                                (
+                                    "break_even_buffer_pct".into(),
+                                    (self.lanes.liquidation_profit_shield_floor_bps / 10_000.0)
+                                        .to_string(),
+                                ),
+                                (
+                                    "pre_tp_trailing_activation_r".into(),
+                                    (self.lanes.liquidation_trailing_activation_bps
+                                        / 10_000.0
+                                        / self.lanes.liquidation_stop_pct)
+                                        .to_string(),
+                                ),
+                                (
+                                    "trailing_distance_pct".into(),
+                                    (self.lanes.liquidation_trailing_distance_bps / 10_000.0)
+                                        .to_string(),
+                                ),
+                                (
+                                    "max_hold_ms".into(),
+                                    (i64::from(self.lanes.liquidation_hold_minutes) * 60_000)
+                                        .to_string(),
+                                ),
+                                ("entry_timeout_ms".into(), "0".into()),
+                                (
+                                    "max_entry_adverse_bps".into(),
+                                    self.lanes
+                                        .liquidation_max_execution_divergence_bps
+                                        .to_string(),
+                                ),
+                                ("bounded_taker_ioc".into(), "true".into()),
+                                ("min_fill_ratio".into(), "1.0".into()),
+                                ("min_managed_fill_ratio".into(), "0.0".into()),
+                            ]),
+                        };
+                        artifacts.push(ArtifactRecord {
+                            key: format!("candidate.{}", candidate.id),
+                            producer: "lane.liquidation_exhaustion_reentry".into(),
+                            artifact: Artifact::Candidate(candidate),
+                        });
+                    }
+                } else {
+                    campaign.signal = None;
+                    changed = true;
+                }
+            }
+            self.state.liquidation_reentries.insert(symbol, campaign);
+        }
+
+        if changed {
+            self.save().ok();
+        }
+        (artifacts, events)
+    }
+
     pub fn pinned_symbols(&self) -> BTreeSet<String> {
         self.position_symbols()
             .cloned()
             .chain(self.state.pending_entries.keys().cloned())
             .chain(self.state.trend_reentries.keys().cloned())
+            .chain(self.state.liquidation_reentries.keys().cloned())
             .collect()
     }
 
@@ -2910,6 +3145,14 @@ impl BinanceDemoExecution {
                         serde_json::json!({"candidate_id":plan.candidate_id}),
                     ));
                 }
+                if let Some(campaign) = self.state.liquidation_reentries.remove(&plan.symbol) {
+                    events.push(liquidation_reentry_state_event(
+                        frame.as_of_ms,
+                        &campaign,
+                        "superseded_by_fresh_liquidation_event",
+                        serde_json::json!({"candidate_id":plan.candidate_id}),
+                    ));
+                }
             }
             // A profitable first leg hands this symbol to the persisted re-entry
             // campaign until it confirms, expires, or makes its single attempt.
@@ -2963,7 +3206,9 @@ impl BinanceDemoExecution {
             }
             if !matches!(
                 recipe.as_str(),
-                LIQUIDATION_REVERSAL_RECIPE | TREND_PROFIT_REVERSAL_RECIPE
+                LIQUIDATION_REVERSAL_RECIPE
+                    | LIQUIDATION_REENTRY_RECIPE
+                    | TREND_PROFIT_REVERSAL_RECIPE
             ) && self
                 .symbol_loss_cooldown_until(&plan.symbol)
                 .is_some_and(|until_ms| frame.as_of_ms < until_ms)
@@ -2989,6 +3234,16 @@ impl BinanceDemoExecution {
             ) {
                 if let Some(campaign) = self.state.trend_reentries.remove(&plan.symbol) {
                     events.push(reentry_state_event(
+                        frame.as_of_ms,
+                        &campaign,
+                        "entry_attempted",
+                        serde_json::json!({"candidate_id":plan.candidate_id}),
+                    ));
+                }
+            }
+            if recipe == LIQUIDATION_REENTRY_RECIPE {
+                if let Some(campaign) = self.state.liquidation_reentries.remove(&plan.symbol) {
+                    events.push(liquidation_reentry_state_event(
                         frame.as_of_ms,
                         &campaign,
                         "entry_attempted",
@@ -6283,6 +6538,79 @@ fn should_arm_same_side_trend_reentry(
         && favorable_extreme > f64::EPSILON
 }
 
+fn should_arm_liquidation_reentry(
+    enabled: bool,
+    recipe: &str,
+    exit_reason: &str,
+    net_pnl_usd: Option<f64>,
+    favorable_extreme: f64,
+) -> bool {
+    enabled
+        && recipe == LIQUIDATION_REVERSAL_RECIPE
+        && exit_reason == "executable_profit_protection"
+        && net_pnl_usd.is_some_and(|value| value > 0.0)
+        && favorable_extreme > f64::EPSILON
+}
+
+fn liquidation_reentry_state_event(
+    ts_ms: i64,
+    campaign: &LiquidationReentryCampaign,
+    stage: &str,
+    detail: Value,
+) -> ExchangeEvent {
+    ExchangeEvent {
+        kind: "liquidation_reentry_state".into(),
+        payload: serde_json::json!({
+            "ts_ms":ts_ms,
+            "recipe":LIQUIDATION_REENTRY_RECIPE,
+            "source_candidate_id":campaign.source_candidate_id,
+            "symbol":campaign.symbol,
+            "side":campaign.side,
+            "stage":stage,
+            "armed_ms":campaign.armed_ms,
+            "expires_ms":campaign.expires_ms,
+            "favorable_extreme":campaign.favorable_extreme,
+            "detail":detail,
+            "venue":"binance_demo",
+            "paper_only":true,
+        }),
+    }
+}
+
+fn liquidation_resume_confirmation(
+    side: Side,
+    favorable_extreme: f64,
+    reference_price: f64,
+    bar: &Candle,
+    min_body_pct: f64,
+    min_directional_flow: f64,
+    stop_pct: f64,
+) -> Option<TrendReentrySignal> {
+    if favorable_extreme <= f64::EPSILON
+        || reference_price <= f64::EPSILON
+        || bar.quote_volume <= f64::EPSILON
+    {
+        return None;
+    }
+    let sign = side.sign();
+    let body_pct = sign * (bar.close / bar.open.max(f64::EPSILON) - 1.0);
+    let directional_flow =
+        sign * (2.0 * bar.taker_buy_quote? / bar.quote_volume.max(f64::EPSILON) - 1.0);
+    let resumed = match side {
+        Side::Buy => bar.close > favorable_extreme,
+        Side::Sell => bar.close < favorable_extreme,
+    };
+    (resumed && body_pct >= min_body_pct && directional_flow >= min_directional_flow).then_some(
+        TrendReentrySignal {
+            signal_ms: bar.close_ms,
+            reference_price,
+            stop_pct,
+            body_pct,
+            directional_flow,
+        },
+    )
+}
+
 fn reentry_state_event(
     ts_ms: i64,
     campaign: &TrendReentryCampaign,
@@ -8150,6 +8478,76 @@ mod tests {
             });
             assert!(!active_close_all_stop(&order, "LSKUSDT", 42));
         }
+    }
+
+    #[test]
+    fn liquidation_reentry_only_arms_after_a_profitable_shield_exit() {
+        assert!(should_arm_liquidation_reentry(
+            true,
+            LIQUIDATION_REVERSAL_RECIPE,
+            "executable_profit_protection",
+            Some(0.34),
+            0.23625,
+        ));
+        assert!(!should_arm_liquidation_reentry(
+            true,
+            LIQUIDATION_REVERSAL_RECIPE,
+            "initial_stop",
+            Some(-7.24),
+            0.0869,
+        ));
+        assert!(!should_arm_liquidation_reentry(
+            true,
+            LIQUIDATION_REENTRY_RECIPE,
+            "executable_profit_protection",
+            Some(1.0),
+            0.23,
+        ));
+    }
+
+    #[test]
+    fn liquidation_reentry_requires_extreme_break_body_and_flow() {
+        let bar = Candle {
+            open_ms: 60_000,
+            close_ms: 119_999,
+            open: 0.2360,
+            high: 0.2361,
+            low: 0.2348,
+            close: 0.2350,
+            quote_volume: 100_000.0,
+            taker_buy_quote: Some(40_000.0),
+            closed: true,
+        };
+        let signal =
+            liquidation_resume_confirmation(Side::Sell, 0.2355, 0.2350, &bar, 0.0015, 0.10, 0.02)
+                .expect("a fresh directional break should confirm");
+        assert!(signal.body_pct > 0.004);
+        assert!((signal.directional_flow - 0.20).abs() < 1e-9);
+
+        let weak_flow = Candle {
+            taker_buy_quote: Some(49_000.0),
+            ..bar.clone()
+        };
+        assert!(liquidation_resume_confirmation(
+            Side::Sell,
+            0.2355,
+            0.2350,
+            &weak_flow,
+            0.0015,
+            0.10,
+            0.02,
+        )
+        .is_none());
+        assert!(liquidation_resume_confirmation(
+            Side::Sell,
+            0.2340,
+            0.2350,
+            &bar,
+            0.0015,
+            0.10,
+            0.02,
+        )
+        .is_none());
     }
 
     #[test]

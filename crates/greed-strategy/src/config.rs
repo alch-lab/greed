@@ -127,6 +127,13 @@ pub struct LaneConfig {
     /// an execution-safety boundary for Demo, whose altcoin books can diverge
     /// materially from mainnet market data.
     pub liquidation_max_execution_divergence_bps: f64,
+    /// After a profitable executable-profit shield closes an exhaustion
+    /// reversal, allow one same-direction continuation attempt when a fresh
+    /// one-minute candle breaks the favorable extreme with directional flow.
+    pub liquidation_reentry_enabled: bool,
+    pub liquidation_reentry_window_minutes: u32,
+    pub liquidation_reentry_min_body_pct: f64,
+    pub liquidation_reentry_min_flow: f64,
     pub trend_min_return_4h: f64,
     pub trend_min_efficiency: f64,
     pub trend_min_hour_volume_ratio: f64,
@@ -223,6 +230,10 @@ impl Default for LaneConfig {
             liquidation_trailing_distance_bps: 30.0,
             liquidation_risk_per_trade_pct: 0.0025,
             liquidation_max_execution_divergence_bps: 15.0,
+            liquidation_reentry_enabled: true,
+            liquidation_reentry_window_minutes: 6,
+            liquidation_reentry_min_body_pct: 0.0015,
+            liquidation_reentry_min_flow: 0.10,
             trend_min_return_4h: 0.025,
             trend_min_efficiency: 0.45,
             trend_min_hour_volume_ratio: 0.65,
@@ -410,6 +421,9 @@ impl StrategyConfig {
             || lanes.liquidation_trailing_distance_bps >= lanes.liquidation_trailing_activation_bps
             || !(0.001..=0.01).contains(&lanes.liquidation_risk_per_trade_pct)
             || !(1.0..=50.0).contains(&lanes.liquidation_max_execution_divergence_bps)
+            || !(1..=15).contains(&lanes.liquidation_reentry_window_minutes)
+            || !(0.0005..=0.01).contains(&lanes.liquidation_reentry_min_body_pct)
+            || !(0.0..=0.50).contains(&lanes.liquidation_reentry_min_flow)
             || !(0.02..=0.20).contains(&lanes.trend_min_return_4h)
             || !(0.10..=0.90).contains(&lanes.trend_min_efficiency)
             || lanes.trend_min_hour_volume_ratio <= 0.0

@@ -624,6 +624,10 @@ fn recipe_from_id(id: &str) -> &'static str {
         "trend_continuation"
     } else if id.contains("fast_trend_activation") {
         "fast_trend_activation"
+    } else if id.contains("liquidation_exhaustion_reentry") {
+        "liquidation_exhaustion_reentry"
+    } else if id.contains("liquidation_exhaustion_reversal") {
+        "liquidation_exhaustion_reversal"
     } else if id.contains("intraday_sweep_reversal") {
         "intraday_sweep_reversal"
     } else if id.contains("early_ignition") {
@@ -642,6 +646,9 @@ fn lane_for_recipe(recipe: &str) -> &'static str {
             "trend_continuation"
         }
         "fast_trend_activation" => "fast_trend_activation",
+        "liquidation_exhaustion_reversal" | "liquidation_exhaustion_reentry" => {
+            "liquidation_exhaustion_reversal"
+        }
         "intraday_sweep_reversal" => "intraday_sweep_reversal",
         "early_ignition" => "early_ignition",
         _ => "unknown",
@@ -890,6 +897,14 @@ mod tests {
         assert_eq!(
             lane_for_recipe("trend_profit_reversal"),
             "trend_continuation"
+        );
+        assert_eq!(
+            recipe_from_id("liquidation_exhaustion_reentry:USELESSUSDT:1"),
+            "liquidation_exhaustion_reentry"
+        );
+        assert_eq!(
+            lane_for_recipe("liquidation_exhaustion_reentry"),
+            "liquidation_exhaustion_reversal"
         );
     }
 

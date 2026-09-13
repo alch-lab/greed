@@ -151,6 +151,14 @@ liquidation_risk_per_trade_pct = 0.0025
 # trade when the Demo top-of-book differs by more than 15 bps, and use an IOC
 # limit so an accepted order cannot slip through that boundary.
 liquidation_max_execution_divergence_bps = 15.0
+# A profitable shield exit can be a brief bounce rather than the end of the
+# liquidation move. Rejoin once, in the same direction, only after a fresh
+# completed 1m candle breaks the prior favorable extreme with aligned taker
+# flow. Stop-outs never arm this path.
+liquidation_reentry_enabled = true
+liquidation_reentry_window_minutes = 6
+liquidation_reentry_min_body_pct = 0.0015
+liquidation_reentry_min_flow = 0.10
 trend_min_return_4h = 0.025
 trend_min_efficiency = 0.45
 trend_min_hour_volume_ratio = 0.65
