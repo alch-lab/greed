@@ -176,6 +176,39 @@ fn is_late_exhaustion(
         && directional_flow.is_some_and(|value| value < config.fast_late_exhaustion_max_flow)
 }
 
+#[derive(Debug, Clone, Copy)]
+struct ShockAbsorption {
+    range_pct: f64,
+    opposing_wick_share: f64,
+    directional_close_location: f64,
+}
+
+fn shock_absorption(bar: &Candle, side: Side) -> ShockAbsorption {
+    let range = (bar.high - bar.low).max(0.0);
+    let opposing_wick = match side {
+        Side::Buy => bar.high - bar.open.max(bar.close),
+        Side::Sell => bar.open.min(bar.close) - bar.low,
+    }
+    .max(0.0);
+    let directional_close_location = match side {
+        Side::Buy => (bar.close - bar.low) / range.max(f64::EPSILON),
+        Side::Sell => (bar.high - bar.close) / range.max(f64::EPSILON),
+    };
+    ShockAbsorption {
+        range_pct: range / bar.open.max(f64::EPSILON),
+        opposing_wick_share: opposing_wick / range.max(f64::EPSILON),
+        directional_close_location,
+    }
+}
+
+fn is_shock_absorption(metrics: ShockAbsorption, config: &LaneConfig) -> bool {
+    config.fast_shock_absorption_veto_enabled
+        && metrics.range_pct >= config.fast_shock_absorption_min_range
+        && metrics.opposing_wick_share >= config.fast_shock_absorption_min_opposing_wick_share
+        && metrics.directional_close_location
+            <= config.fast_shock_absorption_max_directional_close_location
+}
+
 impl StrategyNode for FastTrendActivationNode {
     fn id(&self) -> &str {
         &self.id
@@ -212,6 +245,7 @@ impl StrategyNode for FastTrendActivationNode {
         let mut inspected = 0_u64;
         let mut ignition_hits = 0_u64;
         let mut confirmation_hits = 0_u64;
+        let mut shock_absorption_vetoes = 0_u64;
         let mut oi_ready = 0_u64;
 
         for symbol in self.symbols.iter().filter(|symbol| !is_major(symbol)) {
@@ -304,6 +338,9 @@ impl StrategyNode for FastTrendActivationNode {
             );
             let ignition = ignition_pattern.is_some();
             ignition_hits += u64::from(ignition);
+            let absorption = shock_absorption(bar, side);
+            let shock_absorption_veto = ignition && is_shock_absorption(absorption, &self.config);
+            shock_absorption_vetoes += u64::from(shock_absorption_veto);
 
             let directional_extension = directional_prebreak_return_1h + directional_body_return;
             let direct_reacceleration_ready = direct_confirmation_allowed(
@@ -387,6 +424,14 @@ impl StrategyNode for FastTrendActivationNode {
                     directional_market_breadth * 100.0,
                     directional_market_return_1h * 100.0,
                     directional_flow.unwrap_or_default() * 100.0,
+                ));
+            }
+            if shock_absorption_veto {
+                blockers.push(format!(
+                    "ignition extreme was absorbed: 5m range {:.2}%, opposing wick {:.0}% of range, directional close location {:.0}%",
+                    absorption.range_pct * 100.0,
+                    absorption.opposing_wick_share * 100.0,
+                    absorption.directional_close_location * 100.0,
                 ));
             }
             if !breakout {
@@ -533,6 +578,22 @@ impl StrategyNode for FastTrendActivationNode {
                     late_exhaustion.to_string(),
                 ),
                 (
+                    "shock_absorption_veto_triggered".into(),
+                    shock_absorption_veto.to_string(),
+                ),
+                (
+                    "ignition_range_pct".into(),
+                    absorption.range_pct.to_string(),
+                ),
+                (
+                    "ignition_opposing_wick_share".into(),
+                    absorption.opposing_wick_share.to_string(),
+                ),
+                (
+                    "ignition_directional_close_location".into(),
+                    absorption.directional_close_location.to_string(),
+                ),
+                (
                     "ignition_pattern".into(),
                     ignition_pattern.unwrap_or("none").into(),
                 ),
@@ -669,6 +730,10 @@ impl StrategyNode for FastTrendActivationNode {
                     ("market_breadth_1h".into(), market_breadth),
                     ("ignition_hits".into(), ignition_hits as f64),
                     ("confirmation_hits".into(), confirmation_hits as f64),
+                    (
+                        "shock_absorption_vetoes".into(),
+                        shock_absorption_vetoes as f64,
+                    ),
                     ("oi_ready_symbols".into(), oi_ready as f64),
                     ("pass_candidates".into(), passed.len() as f64),
                 ]),
@@ -716,6 +781,45 @@ mod tests {
         let values = [(0, 100.0), (300_000, 101.0), (900_000, 102.0)];
         let change = oi_change(&values, 900_000, 900_000).unwrap();
         assert!((change - 0.02).abs() < 1e-9);
+    }
+
+    fn candle(open: f64, high: f64, low: f64, close: f64) -> Candle {
+        Candle {
+            open_ms: 0,
+            close_ms: 299_999,
+            open,
+            high,
+            low,
+            close,
+            quote_volume: 1_000_000.0,
+            taker_buy_quote: Some(500_000.0),
+            closed: true,
+        }
+    }
+
+    #[test]
+    fn absorbed_breakdown_blocks_the_ilv_short_shape() {
+        let config = LaneConfig::default();
+        let metrics = shock_absorption(&candle(3.547, 3.549, 3.452, 3.520), Side::Sell);
+        assert!(is_shock_absorption(metrics, &config));
+        assert!(metrics.opposing_wick_share > 0.70);
+        assert!(metrics.directional_close_location < 0.30);
+    }
+
+    #[test]
+    fn clean_impulses_remain_eligible_on_both_sides() {
+        let config = LaneConfig::default();
+        let clean_short = shock_absorption(&candle(100.0, 100.2, 97.8, 98.0), Side::Sell);
+        let clean_long = shock_absorption(&candle(100.0, 102.2, 99.8, 102.0), Side::Buy);
+        assert!(!is_shock_absorption(clean_short, &config));
+        assert!(!is_shock_absorption(clean_long, &config));
+    }
+
+    #[test]
+    fn upper_wick_absorption_symmetrically_blocks_a_long() {
+        let config = LaneConfig::default();
+        let metrics = shock_absorption(&candle(100.0, 103.0, 99.9, 100.8), Side::Buy);
+        assert!(is_shock_absorption(metrics, &config));
     }
 
     #[test]

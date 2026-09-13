@@ -87,6 +87,14 @@ pub struct LaneConfig {
     pub fast_late_exhaustion_min_return_4h: f64,
     pub fast_late_exhaustion_max_market_breadth: f64,
     pub fast_late_exhaustion_max_flow: f64,
+    /// Reject an immediate continuation entry when the ignition candle's
+    /// extreme is strongly absorbed before that candle closes.  This is
+    /// symmetric: lower-wick absorption blocks shorts and upper-wick
+    /// absorption blocks longs.
+    pub fast_shock_absorption_veto_enabled: bool,
+    pub fast_shock_absorption_min_range: f64,
+    pub fast_shock_absorption_min_opposing_wick_share: f64,
+    pub fast_shock_absorption_max_directional_close_location: f64,
     pub fast_max_prebreak_return_1h: f64,
     pub fast_max_return_4h: f64,
     pub fast_max_oi_change_15m: f64,
@@ -186,6 +194,10 @@ impl Default for LaneConfig {
             fast_late_exhaustion_min_return_4h: 0.03,
             fast_late_exhaustion_max_market_breadth: 0.45,
             fast_late_exhaustion_max_flow: 0.25,
+            fast_shock_absorption_veto_enabled: true,
+            fast_shock_absorption_min_range: 0.015,
+            fast_shock_absorption_min_opposing_wick_share: 0.50,
+            fast_shock_absorption_max_directional_close_location: 0.40,
             fast_max_prebreak_return_1h: 0.03,
             fast_max_return_4h: 0.06,
             fast_max_oi_change_15m: 0.03,
@@ -368,6 +380,9 @@ impl StrategyConfig {
                 .contains(&lanes.fast_late_exhaustion_min_return_4h)
             || !(0.20..=0.49).contains(&lanes.fast_late_exhaustion_max_market_breadth)
             || !(lanes.fast_min_flow_5m..=0.50).contains(&lanes.fast_late_exhaustion_max_flow)
+            || !(0.005..=0.05).contains(&lanes.fast_shock_absorption_min_range)
+            || !(0.30..=0.80).contains(&lanes.fast_shock_absorption_min_opposing_wick_share)
+            || !(0.10..=0.49).contains(&lanes.fast_shock_absorption_max_directional_close_location)
             || !(0.0..=0.05).contains(&lanes.fast_max_prebreak_return_1h)
             || !(0.01..=0.10).contains(&lanes.fast_max_return_4h)
             || !(0.001..=0.05).contains(&lanes.fast_max_oi_change_15m)
