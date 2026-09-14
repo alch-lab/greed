@@ -409,6 +409,13 @@ impl StrategyNode for FastTrendActivationNode {
             oi_ready += u64::from(oi_15m.is_some() && oi_60m.is_some());
 
             let mut blockers = Vec::new();
+            if side == Side::Sell {
+                // Paper-canary experiment exp_gate_fast_sell (hyp_fast_sell_negative_edge):
+                // fast-lane sell entries carried negative edge (rolling PF 0.264).
+                // Block them for execution while keeping them observable as
+                // counterfactual observations for later evaluation.
+                blockers.push("sell-side entries disabled by exp_gate_fast_sell".into());
+            }
             if !market_ready {
                 blockers.push(format!(
                     "altcoin market strongly opposes the signal: directional 1h median {:.2}% / breadth {:.0}%",
