@@ -7,8 +7,6 @@ active checkout. Generated code is rejected before compilation when it adds
 host/process/network/file-system primitives.
 """
 
-from __future__ import annotations
-
 import hashlib
 import json
 import os
@@ -44,13 +42,17 @@ MAX_REPLACEMENTS = 8
 MAX_REPLACEMENT_BYTES = 24_000
 
 
-def run(*args: str, cwd: Path = PROJECT, capture: bool = True) -> str:
+def run(*args, **options):
+    cwd = options.pop("cwd", PROJECT)
+    capture = options.pop("capture", True)
+    if options:
+        raise TypeError("unexpected run options: " + ", ".join(options))
     try:
         completed = subprocess.run(
             args,
             cwd=cwd,
             check=True,
-            text=True,
+            universal_newlines=True,
             stdout=subprocess.PIPE if capture else None,
             stderr=subprocess.STDOUT if capture else None,
         )
@@ -61,14 +63,14 @@ def run(*args: str, cwd: Path = PROJECT, capture: bool = True) -> str:
     return completed.stdout.strip() if capture else ""
 
 
-def atomic_json(path: Path, value: dict) -> None:
+def atomic_json(path, value):
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     temporary.replace(path)
 
 
-def fail_manifest(review_ms: int | None, stage: str, detail: str) -> None:
+def fail_manifest(review_ms, stage, detail):
     atomic_json(MANIFEST, {
         "schema_version": 1,
         "candidate_id": f"failed-{int(time.time() * 1000)}",
@@ -81,7 +83,7 @@ def fail_manifest(review_ms: int | None, stage: str, detail: str) -> None:
     })
 
 
-def source_bundle() -> list[dict]:
+def source_bundle():
     result = []
     for relative in sorted(ALLOWED_FILES):
         text = (PROJECT / relative).read_text(encoding="utf-8")
@@ -93,7 +95,7 @@ def source_bundle() -> list[dict]:
     return result
 
 
-def call_model(review: dict, sources: list[dict]) -> dict:
+def call_model(review, sources):
     key = os.environ.get("ZHIPU_API_KEY")
     if not key:
         raise ValueError("ZHIPU_API_KEY is missing")
@@ -137,7 +139,7 @@ def call_model(review: dict, sources: list[dict]) -> dict:
     return json.loads(content)
 
 
-def validate_proposal(proposal: dict, sources: list[dict]) -> list[dict]:
+def validate_proposal(proposal, sources):
     if proposal.get("decision") == "no_candidate":
         return []
     if proposal.get("decision") != "candidate":
@@ -165,7 +167,7 @@ def validate_proposal(proposal: dict, sources: list[dict]) -> list[dict]:
     return changes
 
 
-def main() -> int:
+def main():
     if not REVIEW.is_file():
         atomic_json(MANIFEST, {
             "schema_version": 1, "candidate_id": f"waiting-{int(time.time() * 1000)}",

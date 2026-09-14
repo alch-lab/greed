@@ -1,8 +1,6 @@
 #!/usr/bin/env python3
 """Promote exactly one approved and validated candidate, with rollback."""
 
-from __future__ import annotations
-
 import json
 import os
 import subprocess
@@ -18,21 +16,25 @@ MANIFEST = OUTPUT / "latest-candidate.json"
 RESULT = OUTPUT / "latest-promotion.json"
 
 
-def run(*args: str, cwd: Path = PROJECT, env: dict | None = None) -> str:
+def run(*args, **options):
+    cwd = options.pop("cwd", PROJECT)
+    env = options.pop("env", None)
+    if options:
+        raise TypeError("unexpected run options: " + ", ".join(options))
     completed = subprocess.run(
-        args, cwd=cwd, env=env, check=True, text=True,
+        args, cwd=cwd, env=env, check=True, universal_newlines=True,
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
     )
     return completed.stdout.strip()
 
 
-def atomic(path: Path, value: dict) -> None:
+def atomic(path, value):
     temporary = path.with_suffix(path.suffix + ".tmp")
     temporary.write_text(json.dumps(value, indent=2) + "\n", encoding="utf-8")
     temporary.replace(path)
 
 
-def finish(candidate: dict, status: str, detail: str) -> None:
+def finish(candidate, status, detail):
     now = int(time.time() * 1000)
     result = {
         "schema_version": 1,
@@ -49,7 +51,7 @@ def finish(candidate: dict, status: str, detail: str) -> None:
     atomic(MANIFEST, candidate)
 
 
-def main() -> int:
+def main():
     request = json.loads(REQUEST.read_text(encoding="utf-8"))
     candidate = json.loads(MANIFEST.read_text(encoding="utf-8"))
     if request.get("status") != "requested" or candidate.get("status") != "ready":
