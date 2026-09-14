@@ -434,6 +434,16 @@ impl StrategyNode for FastTrendActivationNode {
                     absorption.directional_close_location * 100.0,
                 ));
             }
+            // Canary experiment exp_fast_sell_gate_1 (H1_fast_sell_negative_edge):
+            // fast-lane sells carry persistent negative net expectancy (rolling
+            // PF 0.34, -$210.94 over 20 completed trades). Require directional
+            // market breadth >= 55% for sell entries only; buys are unchanged.
+            if side == Side::Sell && directional_market_breadth < 0.55 {
+                blockers.push(format!(
+                    "sell entry requires directional breadth >= 55% (current {:.0}%)",
+                    directional_market_breadth * 100.0
+                ));
+            }
             if !breakout {
                 blockers.push("waiting for a completed 5m range breakout".into());
             }
