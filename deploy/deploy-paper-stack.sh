@@ -11,6 +11,7 @@ set -Eeuo pipefail
 #   DEPLOY_BRANCH=main
 #   RUN_TESTS=1
 #   DEPLOY_FRONTEND=1
+#   PRUNE_BUILD_CACHE=1 (remove non-runtime build debris after a healthy deploy)
 #   EXPECTED_EPOCH=19 (optional assertion; deployment refuses an epoch change)
 
 readonly BACKEND_DIR="${BACKEND_DIR:-/opt/greed}"
@@ -20,6 +21,7 @@ readonly CADDY_SERVICE="${CADDY_SERVICE:-caddy}"
 readonly DEPLOY_BRANCH="${DEPLOY_BRANCH:-main}"
 readonly RUN_TESTS="${RUN_TESTS:-1}"
 readonly DEPLOY_FRONTEND="${DEPLOY_FRONTEND:-1}"
+readonly PRUNE_BUILD_CACHE="${PRUNE_BUILD_CACHE:-1}"
 readonly LOCK_FILE="/tmp/greed-paper-deploy.lock"
 
 BACKEND_BACKUP=""
@@ -102,6 +104,30 @@ rollback_backend() {
     install -m 0755 "${BACKEND_BACKUP}" "${BACKEND_DIR}/target/release/greed"
     systemctl restart "${BACKEND_SERVICE}"
   fi
+}
+
+prune_non_runtime_artifacts() {
+  local artifact
+
+  [[ "${PRUNE_BUILD_CACHE}" == "1" ]] || return 0
+
+  # The running release binary is self-contained. Debug outputs are not used by
+  # systemd, and release incremental state is disabled for production builds.
+  # Keep target/release/deps so the next bounded release build stays fast.
+  rm -rf -- \
+    "${BACKEND_DIR}/target/debug" \
+    "${BACKEND_DIR}/target/release/incremental" \
+    "${FRONTEND_DIR}/dist.next"
+
+  # Remove obsolete, manually named binaries such as greed-v2 and hashed CLI
+  # copies. Libraries in deps remain cached; the next deployment only relinks
+  # the small CLI binary. The active target/release/greed is never matched.
+  for artifact in \
+    "${BACKEND_DIR}"/target/release/greed-* \
+    "${BACKEND_DIR}"/target/release/deps/greed-*; do
+    [[ -e "${artifact}" || -L "${artifact}" ]] || continue
+    rm -f -- "${artifact}"
+  done
 }
 
 trap 'printf "\nFailed at line %s. Runtime data was not deleted.\n" "$LINENO" >&2' ERR
@@ -211,6 +237,7 @@ fi
 
 rm -f -- "${BACKEND_BACKUP}"
 rm -rf -- "${FRONTEND_BACKUP}"
+prune_non_runtime_artifacts
 
 step "Deployment complete"
 printf 'backend_commit=%s\n' "$(git -C "${BACKEND_DIR}" rev-parse --short HEAD)"
