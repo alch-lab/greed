@@ -121,7 +121,7 @@ enum Command {
         output_dir: String,
         #[arg(long)]
         model: Option<String>,
-        /// Build and persist the sanitized input without calling Kimi.
+        /// Build and persist the sanitized input without calling Zhipu.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },

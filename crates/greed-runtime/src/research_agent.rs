@@ -182,7 +182,7 @@ pub async fn run(
     let model = requested_model
         .map(str::to_owned)
         .or_else(|| std::env::var("GREED_RESEARCH_MODEL").ok())
-        .unwrap_or_else(|| "kimi-k3".to_owned());
+        .unwrap_or_else(|| "glm-5.2".to_owned());
     let snapshot = json!({
         "schema_version": 1,
         "generated_ms": generated_ms,
@@ -210,10 +210,10 @@ pub async fn run(
         }));
     }
 
-    let api_key = std::env::var("MOONSHOT_API_KEY")
-        .context("MOONSHOT_API_KEY is required for the research agent")?;
+    let api_key = std::env::var("ZHIPU_API_KEY")
+        .context("ZHIPU_API_KEY is required for the research agent")?;
     let api_base = std::env::var("GREED_RESEARCH_API_BASE")
-        .unwrap_or_else(|_| "https://api.moonshot.cn/v1".to_owned());
+        .unwrap_or_else(|_| "https://open.bigmodel.cn/api/paas/v4".to_owned());
     let endpoint = format!("{}/chat/completions", api_base.trim_end_matches('/'));
     let request = json!({
         "model": model,
@@ -237,27 +237,27 @@ pub async fn run(
         .json(&request)
         .send()
         .await
-        .context("call Kimi Chat Completions API")?;
+        .context("call Zhipu Chat Completions API")?;
     let status_code = response.status();
     let body = response.text().await?;
     if !status_code.is_success() {
         let diagnostic = body.chars().take(2_000).collect::<String>();
         bail!(
-            "Kimi Chat Completions API returned {status_code}: {}",
+            "Zhipu Chat Completions API returned {status_code}: {}",
             diagnostic
         );
     }
     let envelope: Value =
-        serde_json::from_str(&body).context("parse Kimi Chat Completions envelope")?;
+        serde_json::from_str(&body).context("parse Zhipu Chat Completions envelope")?;
     let output_text = extract_output_text(&envelope)
-        .context("Kimi Chat Completions returned no assistant content")?;
+        .context("Zhipu Chat Completions returned no assistant content")?;
     let review: Value =
         serde_json::from_str(output_text).context("parse structured research review")?;
     validate_review(&review)?;
     let artifact = json!({
         "schema_version":1,
         "generated_ms":generated_ms,
-        "provider":"moonshot_kimi",
+        "provider":"zhipu_bigmodel",
         "model":model,
         "response_id":envelope.get("id"),
         "review":review

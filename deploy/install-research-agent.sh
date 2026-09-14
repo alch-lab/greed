@@ -10,11 +10,11 @@ readonly ENV_FILE="${ENV_FILE:-/etc/greed-research.env}"
   exit 1
 }
 [[ -f "${ENV_FILE}" ]] || {
-  printf 'create %s with MOONSHOT_API_KEY and optional GREED_RESEARCH_MODEL first\n' "${ENV_FILE}" >&2
+  printf 'create %s with ZHIPU_API_KEY and optional GREED_RESEARCH_MODEL first\n' "${ENV_FILE}" >&2
   exit 1
 }
-grep -q '^MOONSHOT_API_KEY=' "${ENV_FILE}" || {
-  printf '%s does not define MOONSHOT_API_KEY\n' "${ENV_FILE}" >&2
+grep -q '^ZHIPU_API_KEY=' "${ENV_FILE}" || {
+  printf '%s does not define ZHIPU_API_KEY\n' "${ENV_FILE}" >&2
   exit 1
 }
 
