@@ -5,6 +5,7 @@ mod market_stream;
 mod monitor;
 mod profit_guard;
 mod report;
+mod research_agent;
 mod source;
 
 use anyhow::{Context, Result};
@@ -107,6 +108,22 @@ enum Command {
     Report {
         #[arg(long, default_value = "data/runtime/alpha-events.jsonl")]
         journal: String,
+    },
+    /// Produce a structured strategy review. This command never trades or deploys.
+    Research {
+        #[arg(long, default_value = "config/demo.toml")]
+        config: String,
+        #[arg(long, default_value = "data/runtime/alpha-events.jsonl")]
+        journal: String,
+        #[arg(long, default_value = "data/runtime/alpha-status.json")]
+        status: String,
+        #[arg(long, default_value = "data/research/agent")]
+        output_dir: String,
+        #[arg(long)]
+        model: Option<String>,
+        /// Build and persist the sanitized input without calling OpenAI.
+        #[arg(long, default_value_t = false)]
+        dry_run: bool,
     },
 }
 
@@ -416,6 +433,31 @@ async fn main() -> Result<()> {
             println!(
                 "{}",
                 serde_json::to_string_pretty(&report::build(&journal)?)?
+            );
+            Ok(())
+        }
+        Command::Research {
+            config,
+            journal,
+            status,
+            output_dir,
+            model,
+            dry_run,
+        } => {
+            let config = load(&config)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(
+                    &research_agent::run(
+                        &config,
+                        &journal,
+                        &status,
+                        &output_dir,
+                        model.as_deref(),
+                        dry_run,
+                    )
+                    .await?,
+                )?
             );
             Ok(())
         }

@@ -1,0 +1,17 @@
+[Unit]
+Description=greed structured paper-strategy research review
+After=network-online.target greed-paper.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=/opt/greed
+ExecStart=/opt/greed/target/release/greed research --config config/demo.toml
+EnvironmentFile=/etc/greed-research.env
+NoNewPrivileges=true
+ProtectSystem=full
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/opt/greed/data/research/agent
+User=greed
+Group=greed

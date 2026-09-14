@@ -102,6 +102,7 @@ if [[ "${configured_research_path}" = /* ]]; then
 else
   research_path="${APP_DIR}/${configured_research_path}"
 fi
+research_agent_dir="$(dirname "${research_path}")/agent"
 
 printf 'kind\tsource\tarchive_state\tsource_bytes\tarchived_bytes\tfirst_recorded_ms\tlast_recorded_ms\n' \
   > "${SOURCE_MANIFEST}"
@@ -135,6 +136,9 @@ for source in "${research_sources[@]}"; do
   copy_jsonl_tail "${source}" "${destination}"
   record_source research "${source}" "${destination}"
 done
+copy_if_present \
+  "${research_agent_dir}/latest-review.json" \
+  "${WORK_DIR}/research/agent-latest-review.json"
 
 if [[ -x "target/release/greed" && -f "${RUNTIME_DIR}/alpha-events.jsonl" ]]; then
   timeout 90 target/release/greed report \
@@ -162,6 +166,7 @@ curl -sS --max-time 10 http://127.0.0.1:8088/api/status \
   printf 'config_file=%s\n' "${CONFIG_FILE}"
   printf 'research_configured_path=%s\n' "${configured_research_path}"
   printf 'research_resolved_path=%s\n' "${research_path}"
+  printf 'research_agent_dir=%s\n' "${research_agent_dir}"
   printf 'event_source_bytes=%s\n' "$(wc -c < "${RUNTIME_DIR}/alpha-events.jsonl" 2>/dev/null || printf 0)"
   printf 'history_source_bytes=%s\n' "$(wc -c < "${RUNTIME_DIR}/alpha-history.jsonl" 2>/dev/null || printf 0)"
   printf 'research_source_bytes=%s\n' "$(wc -c < "${research_path}" 2>/dev/null || printf 0)"
