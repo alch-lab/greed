@@ -66,7 +66,9 @@ and the candidate builder never reuses an older review for that run.
 
 When a review returns `run_experiments` with usable data, systemd starts a
 separate candidate builder. It makes one additional Zhipu request and permits
-exact replacements only in the three strategy recipe files. Execution,
+exact replacements in one review-selected recipe at a time, from an allowlist
+of three strategy recipe files. Disabling deep reasoning for this mechanical
+step keeps the response budget available for the actual patch. Execution,
 accounting, portfolio risk, configuration, epoch, deployment code and secrets
 are not editable. Added host, process, file-system, network, environment, FFI,
 include-macro and unsafe capabilities are rejected before compilation.

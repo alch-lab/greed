@@ -46,6 +46,10 @@ class CandidateDeferred(Exception):
     pass
 
 
+class CandidateOutputError(ValueError):
+    pass
+
+
 def run(*args, **options):
     cwd = options.pop("cwd", PROJECT)
     capture = options.pop("capture", True)
@@ -87,9 +91,38 @@ def fail_manifest(review_ms, stage, detail):
     })
 
 
-def source_bundle():
+def select_recipe(review):
+    recipes = [
+        (
+            "crates/greed-strategy/src/recipes/liquidation_exhaustion_reversal.rs",
+            ("liquidation_exhaustion_reversal", "liquidation exhaustion", "liquidation reversal"),
+        ),
+        (
+            "crates/greed-strategy/src/recipes/fast_trend_activation.rs",
+            ("fast_trend_activation", "fast trend activation", "fast activation"),
+        ),
+        (
+            "crates/greed-strategy/src/recipes/trend_continuation.rs",
+            ("trend_continuation", "trend continuation"),
+        ),
+    ]
+    for experiment in review.get("experiments") or []:
+        text = json.dumps(experiment, ensure_ascii=False).lower()
+        for path, aliases in recipes:
+            if any(alias in text for alias in aliases):
+                return path
+    text = json.dumps(review, ensure_ascii=False).lower()
+    scored = []
+    for path, aliases in recipes:
+        score = sum(text.count(alias) for alias in aliases)
+        if score:
+            scored.append((score, path))
+    return max(scored)[1] if scored else None
+
+
+def source_bundle(paths):
     result = []
-    for relative in sorted(ALLOWED_FILES):
+    for relative in sorted(paths):
         text = (PROJECT / relative).read_text(encoding="utf-8")
         result.append({
             "path": relative,
@@ -97,6 +130,29 @@ def source_bundle():
             "content": text,
         })
     return result
+
+
+def decode_candidate_envelope(envelope):
+    try:
+        choice = envelope["choices"][0]
+        message = choice["message"]
+        content = message.get("content")
+    except (KeyError, IndexError, TypeError) as error:
+        raise CandidateOutputError("candidate response has no assistant message") from error
+    if not isinstance(content, str) or not content.strip():
+        reasoning = message.get("reasoning_content") or ""
+        usage = envelope.get("usage") or {}
+        raise CandidateOutputError(
+            "candidate response content is empty; finish_reason={}; reasoning_bytes={}; completion_tokens={}".format(
+                choice.get("finish_reason"), len(reasoning.encode()), usage.get("completion_tokens")
+            )
+        )
+    try:
+        return json.loads(content)
+    except ValueError as error:
+        raise CandidateOutputError(
+            "candidate response is not JSON: {}; content_bytes={}".format(error, len(content.encode()))
+        )
 
 
 def call_model(review, sources, correction=None):
@@ -114,8 +170,8 @@ def call_model(review, sources, correction=None):
         "Return JSON only. Never change execution, accounting, portfolio risk, credentials, deployment, "
         "epoch, dependencies, or public APIs. Do not add file/process/network/environment access, unsafe, "
         "FFI, include macros, or tests that perform side effects. Prefer no_candidate when evidence is weak. "
-        "Every search string must occur exactly once in the supplied file. Keep the patch small and change "
-        "only the strategy recipe directly supported by the review. Use no more than {} exact replacements. "
+        "Every search string must occur exactly once in the supplied file. Only the single supplied recipe "
+        "may be changed. Keep the patch small and use no more than {} exact replacements. "
         "The JSON shape is: ".format(MAX_REPLACEMENTS) + json.dumps(schema)
     )
     if correction:
@@ -135,7 +191,8 @@ def call_model(review, sources, correction=None):
                 {"role": "user", "content": payload},
             ],
             "response_format": {"type": "json_object"},
-            "max_tokens": 6144,
+            "thinking": {"type": "disabled"},
+            "max_tokens": 12288,
             "temperature": 0.2,
             "stream": False,
         }).encode(),
@@ -154,8 +211,7 @@ def call_model(review, sources, correction=None):
         if provider_code == "1308":
             raise CandidateDeferred("Zhipu Coding Plan quota is temporarily exhausted")
         raise RuntimeError(f"Zhipu candidate request returned {error.code}: {detail}") from error
-    content = envelope["choices"][0]["message"]["content"]
-    return json.loads(content)
+    return decode_candidate_envelope(envelope)
 
 
 def validate_proposal(proposal, sources):
@@ -177,7 +233,7 @@ def validate_proposal(proposal, sources):
         path = change.get("path")
         search = change.get("search")
         replacement = change.get("replace")
-        if path not in ALLOWED_FILES or not isinstance(search, str) or not isinstance(replacement, str):
+        if path not in originals or not isinstance(search, str) or not isinstance(replacement, str):
             raise ValueError("candidate contains an invalid path or replacement")
         if not search or search == replacement or originals[path].count(search) != 1:
             raise ValueError(f"replacement search is not unique in {path}")
@@ -230,7 +286,18 @@ def main():
 
     run("git", "fetch", "origin", "main")
     base_commit = run("git", "rev-parse", "origin/main")
-    sources = source_bundle()
+    selected_recipe = select_recipe(review)
+    if selected_recipe is None:
+        atomic_json(MANIFEST, {
+            "schema_version": 1, "candidate_id": "blocked-{}".format(review_ms),
+            "review_ms": review_ms, "status": "blocked", "stage": "recipe_selection",
+            "summary": "The review did not identify one strategy recipe precisely enough to edit safely.",
+            "updated_ms": int(time.time() * 1000),
+            "gates": [{"name": "Single recipe identified", "passed": False}],
+        })
+        return 0
+    sources = source_bundle([selected_recipe])
+    retry_used = False
     try:
         proposal = call_model(review, sources)
     except CandidateDeferred as error:
@@ -242,9 +309,44 @@ def main():
             "gates": [{"name": "Provider quota available", "passed": False}],
         })
         return 0
+    except CandidateOutputError as first_error:
+        retry_used = True
+        try:
+            proposal = call_model(review, sources, str(first_error))
+        except CandidateDeferred as error:
+            atomic_json(MANIFEST, {
+                "schema_version": 1, "candidate_id": "blocked-{}".format(review_ms),
+                "review_ms": review_ms, "status": "blocked", "stage": "provider_quota",
+                "summary": "Candidate regeneration is waiting for the next Coding Plan quota window.",
+                "detail": str(error), "updated_ms": int(time.time() * 1000),
+                "gates": [{"name": "Provider quota available", "passed": False}],
+            })
+            return 0
+        except CandidateOutputError as second_error:
+            atomic_json(MANIFEST, {
+                "schema_version": 1, "candidate_id": "blocked-{}".format(review_ms),
+                "review_ms": review_ms, "status": "blocked", "stage": "provider_output",
+                "summary": "Zhipu returned no usable candidate JSON after one compact retry.",
+                "detail": str(second_error)[:2000], "updated_ms": int(time.time() * 1000),
+                "gates": [{"name": "Complete candidate response", "passed": False}],
+            })
+            return 0
     try:
         changes = validate_proposal(proposal, sources)
     except ValueError as first_error:
+        if retry_used:
+            atomic_json(MANIFEST, {
+                "schema_version": 1,
+                "candidate_id": "blocked-{}".format(review_ms),
+                "review_ms": review_ms,
+                "status": "blocked",
+                "stage": "proposal_validation",
+                "summary": "The regenerated candidate was not mechanically applicable.",
+                "detail": str(first_error)[:2000],
+                "updated_ms": int(time.time() * 1000),
+                "gates": [{"name": "Candidate patch shape", "passed": False}],
+            })
+            return 0
         try:
             proposal = call_model(review, sources, str(first_error))
         except CandidateDeferred as error:
@@ -254,6 +356,15 @@ def main():
                 "summary": "Candidate correction is waiting for the next Coding Plan quota window.",
                 "detail": str(error), "updated_ms": int(time.time() * 1000),
                 "gates": [{"name": "Provider quota available", "passed": False}],
+            })
+            return 0
+        except CandidateOutputError as error:
+            atomic_json(MANIFEST, {
+                "schema_version": 1, "candidate_id": "blocked-{}".format(review_ms),
+                "review_ms": review_ms, "status": "blocked", "stage": "provider_output",
+                "summary": "Zhipu returned no usable candidate JSON after one compact retry.",
+                "detail": str(error)[:2000], "updated_ms": int(time.time() * 1000),
+                "gates": [{"name": "Complete candidate response", "passed": False}],
             })
             return 0
         try:
