@@ -25,7 +25,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 const UNIVERSE_MISS_THRESHOLD: u8 = 4;
@@ -445,20 +445,19 @@ async fn main() -> Result<()> {
             dry_run,
         } => {
             let config = load(&config)?;
-            println!(
-                "{}",
-                serde_json::to_string_pretty(
-                    &research_agent::run(
-                        &config,
-                        &journal,
-                        &status,
-                        &output_dir,
-                        model.as_deref(),
-                        dry_run,
-                    )
-                    .await?,
-                )?
-            );
+            let result = research_agent::run(
+                &config,
+                &journal,
+                &status,
+                &output_dir,
+                model.as_deref(),
+                dry_run,
+            )
+            .await;
+            if let Err(failure) = &result {
+                error!(error=%format!("{failure:#}"), "structured strategy research failed");
+            }
+            println!("{}", serde_json::to_string_pretty(&result?)?);
             Ok(())
         }
     }

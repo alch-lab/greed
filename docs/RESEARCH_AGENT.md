@@ -46,6 +46,10 @@ sudo PROJECT_DIR=/opt/greed /opt/greed/deploy/install-research-agent.sh
 The timer runs at 00:05, 06:05, 12:05, and 18:05 Asia/Shanghai. Results are
 written atomically as timestamped files and as
 `data/research/agent/latest-review.json`.
+API, response-parsing, and schema-validation failures are written to
+`data/research/agent/latest-error.json` and emitted to journald with their full
+error chain. Requests use Zhipu JSON mode and results are also validated
+locally.
 
 ## Bounded storage
 

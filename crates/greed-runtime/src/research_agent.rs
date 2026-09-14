@@ -169,6 +169,19 @@ fn atomic_json(path: &Path, value: &Value) -> Result<()> {
     Ok(())
 }
 
+fn record_failure(output_dir: &str, generated_ms: i64, model: &str, stage: &str, detail: &str) {
+    let artifact = json!({
+        "schema_version":1,
+        "generated_ms":generated_ms,
+        "provider":"zhipu_bigmodel",
+        "model":model,
+        "status":"failed",
+        "stage":stage,
+        "detail":detail.chars().take(2_000).collect::<String>(),
+    });
+    let _ = atomic_json(&Path::new(output_dir).join("latest-error.json"), &artifact);
+}
+
 pub async fn run(
     config: &AppConfig,
     journal: &str,
@@ -224,36 +237,95 @@ pub async fn run(
             )},
             {"role":"user", "content":serde_json::to_string(&snapshot)?}
         ],
-        "temperature": 0.1,
+        "response_format":{"type":"json_object"},
+        "max_tokens":8192,
+        "temperature":1.0,
         "stream": false
     });
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
         .build()?;
-    let response = client
+    let response = match client
         .post(&endpoint)
         .header(AUTHORIZATION, format!("Bearer {api_key}"))
         .header(CONTENT_TYPE, "application/json")
         .json(&request)
         .send()
         .await
-        .context("call Zhipu Chat Completions API")?;
+    {
+        Ok(response) => response,
+        Err(error) => {
+            record_failure(
+                output_dir,
+                generated_ms,
+                &model,
+                "request",
+                &error.to_string(),
+            );
+            return Err(error).context("call Zhipu Chat Completions API");
+        }
+    };
     let status_code = response.status();
     let body = response.text().await?;
     if !status_code.is_success() {
         let diagnostic = body.chars().take(2_000).collect::<String>();
+        record_failure(
+            output_dir,
+            generated_ms,
+            &model,
+            "http_response",
+            &format!("{status_code}: {diagnostic}"),
+        );
         bail!(
             "Zhipu Chat Completions API returned {status_code}: {}",
             diagnostic
         );
     }
-    let envelope: Value =
-        serde_json::from_str(&body).context("parse Zhipu Chat Completions envelope")?;
-    let output_text = extract_output_text(&envelope)
-        .context("Zhipu Chat Completions returned no assistant content")?;
-    let review: Value =
-        serde_json::from_str(output_text).context("parse structured research review")?;
-    validate_review(&review)?;
+    let envelope: Value = serde_json::from_str(&body)
+        .map_err(|error| {
+            record_failure(
+                output_dir,
+                generated_ms,
+                &model,
+                "response_envelope",
+                &error.to_string(),
+            );
+            error
+        })
+        .context("parse Zhipu Chat Completions envelope")?;
+    let output_text = extract_output_text(&envelope).ok_or_else(|| {
+        let detail = "Zhipu Chat Completions returned no assistant content";
+        record_failure(
+            output_dir,
+            generated_ms,
+            &model,
+            "assistant_content",
+            detail,
+        );
+        anyhow::anyhow!(detail)
+    })?;
+    let review: Value = serde_json::from_str(output_text)
+        .map_err(|error| {
+            record_failure(
+                output_dir,
+                generated_ms,
+                &model,
+                "review_json",
+                &format!("{error}; output={output_text}"),
+            );
+            error
+        })
+        .context("parse structured research review")?;
+    if let Err(error) = validate_review(&review) {
+        record_failure(
+            output_dir,
+            generated_ms,
+            &model,
+            "review_validation",
+            &error.to_string(),
+        );
+        return Err(error);
+    }
     let artifact = json!({
         "schema_version":1,
         "generated_ms":generated_ms,
