@@ -121,6 +121,22 @@ fn extract_output_text(response: &Value) -> Option<&str> {
         .as_str()
 }
 
+fn provider_error(body: &str) -> (Option<String>, Option<String>) {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return (None, None);
+    };
+    (
+        value
+            .pointer("/error/code")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+        value
+            .pointer("/error/message")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
+    )
+}
+
 fn validate_review(review: &Value) -> Result<()> {
     let object = review
         .as_object()
@@ -271,6 +287,7 @@ pub async fn run(
     let body = response.text().await?;
     if !status_code.is_success() {
         let diagnostic = body.chars().take(2_000).collect::<String>();
+        let (provider_code, provider_message) = provider_error(&body);
         record_failure(
             output_dir,
             generated_ms,
@@ -278,7 +295,17 @@ pub async fn run(
             "http_response",
             &format!("{status_code}: {diagnostic}"),
         );
-        if diagnostic.contains("\"code\":\"1113\"") && !api_base.contains("/api/coding/") {
+        if provider_code.as_deref() == Some("1308") {
+            return Ok(json!({
+                "status":"deferred",
+                "generated_ms":generated_ms,
+                "model":model,
+                "reason":"zhipu_coding_plan_five_hour_limit",
+                "provider_message":provider_message,
+                "next_action":"the systemd timer will retry at its next scheduled run"
+            }));
+        }
+        if provider_code.as_deref() == Some("1113") && !api_base.contains("/api/coding/") {
             bail!(
                 "Zhipu Coding Plan quota is unavailable through {api_base}; set \
                  GREED_RESEARCH_API_BASE={ZHIPU_CODING_API_BASE}. Provider response: {diagnostic}"
@@ -362,6 +389,18 @@ mod tests {
         assert_eq!(
             extract_output_text(&response),
             Some("{\"decision\":\"no_change\"}")
+        );
+    }
+
+    #[test]
+    fn extracts_zhipu_quota_error() {
+        let body = r#"{"error":{"code":"1308","message":"limit; reset later"}}"#;
+        assert_eq!(
+            provider_error(body),
+            (
+                Some("1308".to_owned()),
+                Some("limit; reset later".to_owned())
+            )
         );
     }
 

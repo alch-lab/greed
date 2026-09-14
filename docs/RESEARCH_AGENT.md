@@ -56,6 +56,11 @@ API, response-parsing, and schema-validation failures are written to
 error chain. Requests use Zhipu JSON mode and results are also validated
 locally.
 
+When Zhipu reports Coding Plan error `1308`, the run exits successfully with a
+`deferred` result instead of leaving the oneshot service failed. The timer does
+not retry in a tight loop; it waits for its next six-hourly run, by which time
+the five-hour rolling allowance has normally recovered.
+
 ## Bounded storage
 
 The live decision journal and raw research journal are each bounded to four
