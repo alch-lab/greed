@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
-use greed_kernel::{BookState, Candle, CandleSeries, DataQuality, MarketFrame, MarketKind};
+#[cfg(test)]
+use greed_kernel::MarketKind;
+use greed_kernel::{BookState, Candle, CandleSeries, DataQuality, MarketFrame};
 use serde::Serialize;
 use serde_json::Value;
 use std::{
@@ -10,76 +12,10 @@ use std::{
     sync::Mutex,
 };
 
-const SNAPSHOT_INTERVAL_MS: i64 = 60_000;
 const JOURNAL_MAX_BYTES: u64 = 256 * 1024 * 1024;
 const JOURNAL_ROTATIONS: usize = 4;
 const FORWARD_HORIZONS_MS: [i64; 6] = [10_000, 30_000, 60_000, 180_000, 300_000, 900_000];
 const RESEARCH_LABEL_VERSION: u32 = 2;
-
-#[derive(Default)]
-pub struct SampleRecorder {
-    seen_candles: BTreeSet<String>,
-    last_snapshot_ms: BTreeMap<String, i64>,
-}
-
-impl SampleRecorder {
-    pub fn record(&mut self, journal: &Journal, frame: &MarketFrame) -> Result<()> {
-        for instrument in frame.instruments.values() {
-            for series in std::iter::once(&instrument.perpetual)
-                .chain(instrument.fast_perpetual.iter())
-                .chain(instrument.micro_perpetual.iter())
-            {
-                // The REST bootstrap can contain 1,200 bars per interval. Those
-                // bars are inputs, not observations made by this run. Persist
-                // only the newest closed bar and then append each newly closed
-                // bar once as the websocket advances.
-                if let Some(bar) = series.values.iter().rev().find(|bar| bar.closed) {
-                    let market = match series.market {
-                        MarketKind::Perpetual => "perpetual",
-                    };
-                    let key = format!(
-                        "{}:{market}:{}:{}",
-                        instrument.symbol, series.interval_ms, bar.close_ms
-                    );
-                    if self.seen_candles.insert(key) {
-                        journal.append(
-                            "market_candle",
-                            serde_json::json!({"symbol":instrument.symbol,"venue":series.venue,"market":series.market,"interval_ms":series.interval_ms,"bar":bar,"meta":series.meta}),
-                        )?;
-                    }
-                }
-            }
-            let last_snapshot = self
-                .last_snapshot_ms
-                .get(&instrument.symbol)
-                .copied()
-                .unwrap_or_default();
-            if frame.as_of_ms - last_snapshot >= SNAPSHOT_INTERVAL_MS {
-                journal.append(
-                    "market_snapshot",
-                    serde_json::json!({
-                        "as_of_ms":frame.as_of_ms,
-                        "symbol":instrument.symbol,
-                        "price":instrument.price,
-                        "last_5m":instrument.fast_perpetual.as_ref().and_then(|series|series.values.last()),
-                        "last_1m":instrument.micro_perpetual.as_ref().and_then(|series|series.values.last()),
-                        "open_interest":instrument.open_interest.as_ref().and_then(|series|series.values.last().map(|latest|serde_json::json!({
-                                "timestamp_ms":latest.timestamp_ms,
-                                "quantity":latest.quantity,
-                                "value_usd":latest.value_usd,
-                                "quality":series.meta.quality,
-                            }))),
-                        "book":instrument.book,
-                        "microstructure":instrument.microstructure
-                    }),
-                )?;
-                self.last_snapshot_ms
-                    .insert(instrument.symbol.clone(), frame.as_of_ms);
-            }
-        }
-        Ok(())
-    }
-}
 
 #[derive(Debug)]
 struct PendingResearchSample {

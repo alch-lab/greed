@@ -16,7 +16,7 @@ use greed_kernel::{
     AccountFrame, Artifact, ArtifactRecord, GraphEvaluation, NodeContext, StrategyNode, Verdict,
 };
 use greed_strategy::{build_graph, risk::PositionPlannerNode, StrategyConfig};
-use journal::{Journal, ResearchRecorder, SampleRecorder, StatusWriter};
+use journal::{Journal, ResearchRecorder, StatusWriter};
 use source::BinanceMarketSource;
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -25,7 +25,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{mpsc, Mutex};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 const UNIVERSE_MISS_THRESHOLD: u8 = 4;
@@ -121,7 +121,7 @@ enum Command {
         output_dir: String,
         #[arg(long)]
         model: Option<String>,
-        /// Build and persist the sanitized input without calling OpenAI.
+        /// Build and persist the sanitized input without calling Kimi.
         #[arg(long, default_value_t = false)]
         dry_run: bool,
     },
@@ -506,7 +506,11 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
             "latency":{"state":"initializing"},
         }));
     }
-    let journal = Journal::new(&config.runtime.journal_path)?;
+    let journal = Journal::bounded(
+        &config.runtime.journal_path,
+        config.runtime.journal_file_max_mb * 1024 * 1024,
+        config.runtime.journal_rotations,
+    )?;
     let history = Journal::new(&config.runtime.history_path)?;
     let research_capacity_bytes = config
         .runtime
@@ -572,8 +576,13 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
         "symbols": active_strategy.symbols.clone(),
         "dynamic": active_strategy.universe.dynamic_enabled,
     });
-    let mut samples = SampleRecorder::default();
     let mut completed = 0u64;
+    let diagnostic_snapshot_ms = config.runtime.diagnostic_snapshot_seconds as i64 * 1_000;
+    let mut last_diagnostic_snapshot_ms = 0i64;
+    let mut last_equity_snapshot_ms = 0i64;
+    let mut last_frame_log_ms = 0i64;
+    let mut last_sync_error_log_ms = 0i64;
+    let mut last_frame_error_log_ms = 0i64;
     let (sync_tx, mut sync_rx) = mpsc::unbounded_channel();
     let sync_execution = Arc::clone(&execution);
     let reconciliation_healthy = Arc::new(AtomicBool::new(true));
@@ -613,7 +622,7 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                         },
                     }));
                 }
-                if completed_ms - last_latency_event_ms >= 10_000 {
+                if completed_ms - last_latency_event_ms >= 60_000 {
                     if let Ok(events) = result.as_mut() {
                         events.push(execution::ExchangeEvent {
                             kind: "execution_latency".into(),
@@ -643,16 +652,23 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                 Ok(events) => {
                     for event in events {
                         let payload = with_run_id(event.payload, &identity);
-                        history.append(&event.kind, payload.clone())?;
+                        if event.kind != "execution_latency"
+                            && event.kind != "executable_profit_observation"
+                        {
+                            history.append(&event.kind, payload.clone())?;
+                        }
                         journal.append(&event.kind, payload)?;
                     }
                 }
                 Err(error) => {
-                    warn!(error=%error, "Binance demo account sync failed; blocking new orders until reconciliation recovers");
-                    journal.append(
-                        "exchange_sync_error",
-                        serde_json::json!({"ts_ms":now_ms,"error":error,"venue":"binance_demo"}),
-                    )?;
+                    if now_ms - last_sync_error_log_ms >= 30_000 {
+                        warn!(error=%error, "Binance demo account sync failed; blocking new orders until reconciliation recovers");
+                        journal.append(
+                            "exchange_sync_error",
+                            serde_json::json!({"ts_ms":now_ms,"error":error,"venue":"binance_demo"}),
+                        )?;
+                        last_sync_error_log_ms = now_ms;
+                    }
                 }
             }
         }
@@ -822,8 +838,11 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                         // first evaluation; retained symbols remain live.
                         tokio::time::sleep(Duration::from_secs(2)).await;
                     }
-                    universe_status = serde_json::to_value(&discovery)?;
-                    journal.append("universe_refresh", universe_status.clone())?;
+                    let next_universe_status = serde_json::to_value(&discovery)?;
+                    if next_universe_status["symbols"] != universe_status["symbols"] {
+                        journal.append("universe_refresh", next_universe_status.clone())?;
+                    }
+                    universe_status = next_universe_status;
                 }
                 Err(error) => journal.append(
                     "universe_refresh_error",
@@ -838,9 +857,12 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
         let account = execution.lock().await.account_frame()?;
         match source.fetch_frame(&active_strategy, account).await {
             Ok(mut frame) => {
-                samples.record(&journal, &frame)?;
                 let data_health = source.health();
-                journal.append("data_health", data_health.clone())?;
+                let diagnostic_due =
+                    frame.as_of_ms - last_diagnostic_snapshot_ms >= diagnostic_snapshot_ms;
+                if diagnostic_due {
+                    journal.append("data_health", data_health.clone())?;
+                }
                 if let Some(research_journal) = &research_journal {
                     research_samples.record(research_journal, &frame)?;
                     research_samples.record_health(
@@ -911,10 +933,17 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                         evaluation.artifacts.insert(record.key.clone(), record);
                     }
                 }
-                journal.append("graph_evaluation", serde_json::to_value(&evaluation)?)?;
+                if diagnostic_due {
+                    journal.append("graph_evaluation", serde_json::to_value(&evaluation)?)?;
+                    last_diagnostic_snapshot_ms = frame.as_of_ms;
+                }
                 for event in reentry_events {
                     let payload = with_run_id(event.payload, &identity);
-                    history.append(&event.kind, payload.clone())?;
+                    if event.kind != "execution_latency"
+                        && event.kind != "executable_profit_observation"
+                    {
+                        history.append(&event.kind, payload.clone())?;
+                    }
                     journal.append(&event.kind, payload)?;
                 }
                 for event in liquidation_reentry_events {
@@ -966,8 +995,12 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                     "execution":execution_health,
                     "runtime":identity,
                 });
-                history.append("exchange_equity", observation.clone())?;
-                journal.append("exchange_equity", observation)?;
+                let equity_due = frame.as_of_ms - last_equity_snapshot_ms >= diagnostic_snapshot_ms;
+                if equity_due || !order_events.is_empty() {
+                    history.append("exchange_equity", observation.clone())?;
+                    journal.append("exchange_equity", observation)?;
+                    last_equity_snapshot_ms = frame.as_of_ms;
+                }
                 status.write(&serde_json::json!({
                     "as_of_ms":frame.as_of_ms,
                     "paper_only":true,
@@ -986,18 +1019,29 @@ async fn run_binance_demo(config: AppConfig, iterations: u64) -> Result<()> {
                     "runtime":identity,
                 }))?;
                 completed += 1;
-                info!(
+                debug!(
                     iteration = completed,
                     equity = account.equity_usd,
                     "Binance demo frame complete"
                 );
+                if frame.as_of_ms - last_frame_log_ms >= 300_000 {
+                    info!(
+                        iteration = completed,
+                        equity = account.equity_usd,
+                        "Binance demo runtime healthy"
+                    );
+                    last_frame_log_ms = frame.as_of_ms;
+                }
             }
             Err(error) => {
-                warn!(error=%error,"market frame failed; no Binance demo orders submitted");
-                journal.append(
-                    "frame_error",
-                    serde_json::json!({"error":error.to_string()}),
-                )?;
+                if now_ms - last_frame_error_log_ms >= 30_000 {
+                    warn!(error=%error,"market frame failed; no Binance demo orders submitted");
+                    journal.append(
+                        "frame_error",
+                        serde_json::json!({"error":error.to_string()}),
+                    )?;
+                    last_frame_error_log_ms = now_ms;
+                }
             }
         }
         if iterations > 0 && completed >= iterations {

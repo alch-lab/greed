@@ -12,9 +12,14 @@ request_timeout_seconds = 8
 candle_limit = 1200
 journal_path = "data/runtime/alpha-events.jsonl"
 history_path = "data/runtime/alpha-history.jsonl"
+diagnostic_snapshot_seconds = 30
+# Verbose causal diagnostics are bounded to 4 x 64 MiB. Trade/PnL history and
+# execution recovery state are separate files and are never pruned by this cap.
+journal_file_max_mb = 64
+journal_rotations = 3
 # Compact research samples live outside the verbose strategy journal so market
-# history survives long enough for walk-forward alpha research. Nine bounded
-# 256 MiB files cap disk use at roughly 2.25 GiB without touching trade/PnL data.
+# history survives long enough for walk-forward alpha research. Four bounded
+# 64 MiB files cap this raw dataset at 256 MiB without touching trade/PnL data.
 research_enabled = true
 research_path = "data/research/market-research.jsonl"
 research_snapshot_seconds = 15
@@ -24,8 +29,8 @@ research_backfill_1m_bars = 360
 research_backfill_5m_bars = 576
 research_backfill_15m_bars = 1200
 research_backfill_1h_bars = 720
-research_file_max_mb = 256
-research_rotations = 8
+research_file_max_mb = 64
+research_rotations = 3
 status_path = "data/runtime/alpha-status.json"
 execution_state_path = "data/runtime/binance-alpha-state.json"
 http_listen = "127.0.0.1:8088"

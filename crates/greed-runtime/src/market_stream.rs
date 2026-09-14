@@ -434,7 +434,11 @@ async fn run_connection(route: StreamRoute, url: String, state: Arc<RwLock<Strea
                     false,
                     Some("websocket connect timed out after 10 seconds".into()),
                 );
-                warn!(url=%url, "Binance market websocket connection timed out");
+                if backoff == 1 {
+                    warn!(url=%url, "Binance market websocket connection timed out");
+                } else {
+                    debug!(url=%url, backoff_seconds=backoff, "Binance market websocket still reconnecting");
+                }
             }
             Ok(Ok((stream, _))) => {
                 set_connected(&state, route, true, None);
@@ -485,7 +489,11 @@ async fn run_connection(route: StreamRoute, url: String, state: Arc<RwLock<Strea
             }
             Ok(Err(error)) => {
                 set_connected(&state, route, false, Some(error.to_string()));
-                warn!(error=%error, "Binance market websocket connection failed");
+                if backoff == 1 {
+                    warn!(error=%error, "Binance market websocket connection failed");
+                } else {
+                    debug!(error=%error, backoff_seconds=backoff, "Binance market websocket still reconnecting");
+                }
             }
         }
         record_reconnect(&state, route);
@@ -526,11 +534,19 @@ async fn run_dynamic_connection(
                     false,
                     Some("websocket connect timed out after 10 seconds".into()),
                 );
-                warn!(url=%url, "Binance dynamic websocket connection timed out");
+                if backoff == 1 {
+                    warn!(url=%url, "Binance dynamic websocket connection timed out");
+                } else {
+                    debug!(url=%url, backoff_seconds=backoff, "Binance dynamic websocket still reconnecting");
+                }
             }
             Ok(Err(error)) => {
                 set_connected(&state, route, false, Some(error.to_string()));
-                warn!(error=%error, url=%url, "Binance dynamic websocket connection failed");
+                if backoff == 1 {
+                    warn!(error=%error, url=%url, "Binance dynamic websocket connection failed");
+                } else {
+                    debug!(error=%error, url=%url, backoff_seconds=backoff, "Binance dynamic websocket still reconnecting");
+                }
             }
             Ok(Ok((stream, _))) => {
                 set_connected(&state, route, true, None);
@@ -713,20 +729,22 @@ fn log_disconnect(route: StreamRoute, connected_for: Duration, detail: &str, dyn
             connected_seconds=seconds,
             "Binance websocket peer reset; reconnecting"
         );
-    } else if dynamic {
+    } else if seconds < 15 && dynamic {
         warn!(
             route=?route,
             connected_seconds=seconds,
             reason=%detail,
             "Binance dynamic websocket disconnected"
         );
-    } else {
+    } else if seconds < 15 {
         warn!(
             route=?route,
             connected_seconds=seconds,
             reason=%detail,
             "Binance websocket disconnected"
         );
+    } else {
+        debug!(route=?route, connected_seconds=seconds, reason=%detail, "Binance websocket reconnecting after a stable session");
     }
 }
 

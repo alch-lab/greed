@@ -59,6 +59,9 @@ pub struct RuntimeConfig {
     pub candle_limit: usize,
     pub journal_path: String,
     pub history_path: String,
+    pub diagnostic_snapshot_seconds: u64,
+    pub journal_file_max_mb: u64,
+    pub journal_rotations: usize,
     pub research_enabled: bool,
     pub research_path: String,
     pub research_snapshot_seconds: u64,
@@ -91,6 +94,9 @@ impl Default for RuntimeConfig {
             candle_limit: 160,
             journal_path: "data/runtime/alpha-events.jsonl".into(),
             history_path: "data/runtime/alpha-history.jsonl".into(),
+            diagnostic_snapshot_seconds: 30,
+            journal_file_max_mb: 64,
+            journal_rotations: 3,
             research_enabled: true,
             research_path: "data/research/market-research.jsonl".into(),
             research_snapshot_seconds: 15,
@@ -143,6 +149,15 @@ impl AppConfig {
         }
         if !(5..=60).contains(&self.runtime.research_snapshot_seconds) {
             return Err("research_snapshot_seconds must be 5..=60".into());
+        }
+        if !(10..=300).contains(&self.runtime.diagnostic_snapshot_seconds) {
+            return Err("diagnostic_snapshot_seconds must be 10..=300".into());
+        }
+        if !(16..=256).contains(&self.runtime.journal_file_max_mb) {
+            return Err("journal_file_max_mb must be 16..=256".into());
+        }
+        if !(1..=8).contains(&self.runtime.journal_rotations) {
+            return Err("journal_rotations must be 1..=8".into());
         }
         if !(30..=300).contains(&self.runtime.research_level_map_seconds) {
             return Err("research_level_map_seconds must be 30..=300".into());

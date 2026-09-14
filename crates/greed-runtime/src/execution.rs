@@ -144,6 +144,8 @@ struct ExecutionMeta {
     #[serde(default)]
     executable_profit: Option<crate::profit_guard::ProfitGuard>,
     #[serde(default)]
+    last_profit_observation_log_ms: i64,
+    #[serde(default)]
     break_even_after_fraction: Option<f64>,
     #[serde(default)]
     break_even_buffer_pct: f64,
@@ -1315,19 +1317,22 @@ impl BinanceDemoExecution {
                                     partial_activated: partial_shield_hit,
                                 },
                             );
-                            events.push(ExchangeEvent {kind:"executable_profit_observation".into(),payload:serde_json::json!({
-                                "ts_ms":now_ms,"symbol":symbol,"candidate_id":meta.candidate_id,
-                                "recipe":meta.recipe,"mark_price":position.mark_price,"entry_price":meta.entry_price,
-                                "remaining_quantity":position.quantity.abs(),"guard":meta.executable_profit,
-                                "cost_reserve_bps":crate::profit_guard::COST_RESERVE*10000.0,
-                                "quote_source":"execution_venue_depth","exit_requested":exit,
-                                "latency":{
-                                    "exchange_quote_ms":quote.exchange_ms,
-                                    "quote_observed_ms":quote.observed_ms,
-                                    "decision_ms":chrono::Utc::now().timestamp_millis(),
-                                    "quote_age_ms":chrono::Utc::now().timestamp_millis()+self.clock_offset_ms-quote.exchange_ms,
-                                },
-                            })});
+                            if exit || now_ms - meta.last_profit_observation_log_ms >= 5_000 {
+                                events.push(ExchangeEvent {kind:"executable_profit_observation".into(),payload:serde_json::json!({
+                                    "ts_ms":now_ms,"symbol":symbol,"candidate_id":meta.candidate_id,
+                                    "recipe":meta.recipe,"mark_price":position.mark_price,"entry_price":meta.entry_price,
+                                    "remaining_quantity":position.quantity.abs(),"guard":meta.executable_profit,
+                                    "cost_reserve_bps":crate::profit_guard::COST_RESERVE*10000.0,
+                                    "quote_source":"execution_venue_depth","exit_requested":exit,
+                                    "latency":{
+                                        "exchange_quote_ms":quote.exchange_ms,
+                                        "quote_observed_ms":quote.observed_ms,
+                                        "decision_ms":chrono::Utc::now().timestamp_millis(),
+                                        "quote_age_ms":chrono::Utc::now().timestamp_millis()+self.clock_offset_ms-quote.exchange_ms,
+                                    },
+                                })});
+                                meta.last_profit_observation_log_ms = now_ms;
+                            }
                             if exit {
                                 let main_shield_activated = partial_shield_hit
                                     || meta.profit_shield_activation_pct.is_some_and(
@@ -3370,6 +3375,7 @@ impl BinanceDemoExecution {
                             unprotected_runner_fraction: plan.unprotected_runner_fraction,
                             runner_active: false,
                             executable_profit: None,
+                            last_profit_observation_log_ms: 0,
                             break_even_after_fraction: plan.break_even_after_fraction.map(
                                 |fraction| {
                                     self.rules
@@ -4804,6 +4810,7 @@ impl BinanceDemoExecution {
                 unprotected_runner_fraction: plan.unprotected_runner_fraction,
                 runner_active: false,
                 executable_profit: None,
+                last_profit_observation_log_ms: 0,
                 break_even_after_fraction: plan.break_even_after_fraction.map(|fraction| {
                     floor_step(executed * fraction, rules.quantity_step)
                         / executed.max(f64::EPSILON)

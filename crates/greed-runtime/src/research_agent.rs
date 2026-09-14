@@ -111,18 +111,54 @@ fn journal_reports(journal: &str, rotations: usize) -> Vec<Value> {
 
 fn extract_output_text(response: &Value) -> Option<&str> {
     response
-        .get("output")?
+        .get("choices")?
         .as_array()?
-        .iter()
-        .flat_map(|item| {
-            item.get("content")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-        })
-        .find(|content| content.get("type").and_then(Value::as_str) == Some("output_text"))
-        .and_then(|content| content.get("text"))
-        .and_then(Value::as_str)
+        .first()?
+        .get("message")?
+        .get("content")?
+        .as_str()
+}
+
+fn validate_review(review: &Value) -> Result<()> {
+    let object = review
+        .as_object()
+        .context("research review must be a JSON object")?;
+    for required in [
+        "decision",
+        "summary",
+        "data_quality",
+        "observations",
+        "hypotheses",
+        "experiments",
+        "do_not_change",
+    ] {
+        if !object.contains_key(required) {
+            bail!("research review is missing required field {required}");
+        }
+    }
+    if !matches!(
+        review["decision"].as_str(),
+        Some("no_change" | "run_experiments")
+    ) {
+        bail!("research review decision is invalid");
+    }
+    for experiment in review["experiments"]
+        .as_array()
+        .context("research review experiments must be an array")?
+    {
+        if experiment["minimum_closed_trades"]
+            .as_u64()
+            .unwrap_or_default()
+            < 20
+            || experiment["walk_forward_windows"]
+                .as_u64()
+                .unwrap_or_default()
+                < 3
+        {
+            bail!("research experiment violates minimum validation requirements");
+        }
+    }
+    Ok(())
 }
 
 fn atomic_json(path: &Path, value: &Value) -> Result<()> {
@@ -146,14 +182,14 @@ pub async fn run(
     let model = requested_model
         .map(str::to_owned)
         .or_else(|| std::env::var("GREED_RESEARCH_MODEL").ok())
-        .unwrap_or_else(|| "gpt-6-astra".to_owned());
+        .unwrap_or_else(|| "kimi-k3".to_owned());
     let snapshot = json!({
         "schema_version": 1,
         "generated_ms": generated_ms,
         "paper_only": true,
         "strategy": config.strategy,
         "portfolio": config.portfolio,
-        "journal_reports": journal_reports(journal, config.runtime.research_rotations),
+        "journal_reports": journal_reports(journal, config.runtime.journal_rotations),
         "live_status": compact_status(status),
         "constraints": {
             "strategy_behavior_baseline": "da3344b",
@@ -174,50 +210,54 @@ pub async fn run(
         }));
     }
 
-    let api_key = std::env::var("OPENAI_API_KEY")
-        .context("OPENAI_API_KEY is required for the research agent")?;
+    let api_key = std::env::var("MOONSHOT_API_KEY")
+        .context("MOONSHOT_API_KEY is required for the research agent")?;
+    let api_base = std::env::var("GREED_RESEARCH_API_BASE")
+        .unwrap_or_else(|_| "https://api.moonshot.cn/v1".to_owned());
+    let endpoint = format!("{}/chat/completions", api_base.trim_end_matches('/'));
     let request = json!({
         "model": model,
-        "store": false,
-        "instructions": RESEARCH_INSTRUCTIONS,
-        "input": serde_json::to_string(&snapshot)?,
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "greed_strategy_review",
-                "strict": true,
-                "schema": review_schema()
-            }
-        }
+        "messages": [
+            {"role":"system", "content":format!(
+                "{RESEARCH_INSTRUCTIONS}\nReturn only valid JSON matching this schema: {}",
+                serde_json::to_string(&review_schema()).expect("schema serializes")
+            )},
+            {"role":"user", "content":serde_json::to_string(&snapshot)?}
+        ],
+        "temperature": 0.1,
+        "stream": false
     });
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(600))
         .build()?;
     let response = client
-        .post("https://api.openai.com/v1/responses")
+        .post(&endpoint)
         .header(AUTHORIZATION, format!("Bearer {api_key}"))
         .header(CONTENT_TYPE, "application/json")
         .json(&request)
         .send()
         .await
-        .context("call OpenAI Responses API")?;
+        .context("call Kimi Chat Completions API")?;
     let status_code = response.status();
     let body = response.text().await?;
     if !status_code.is_success() {
         let diagnostic = body.chars().take(2_000).collect::<String>();
         bail!(
-            "OpenAI Responses API returned {status_code}: {}",
+            "Kimi Chat Completions API returned {status_code}: {}",
             diagnostic
         );
     }
-    let envelope: Value = serde_json::from_str(&body).context("parse Responses API envelope")?;
-    let output_text =
-        extract_output_text(&envelope).context("Responses API returned no output_text")?;
+    let envelope: Value =
+        serde_json::from_str(&body).context("parse Kimi Chat Completions envelope")?;
+    let output_text = extract_output_text(&envelope)
+        .context("Kimi Chat Completions returned no assistant content")?;
     let review: Value =
         serde_json::from_str(output_text).context("parse structured research review")?;
+    validate_review(&review)?;
     let artifact = json!({
         "schema_version":1,
         "generated_ms":generated_ms,
+        "provider":"moonshot_kimi",
         "model":model,
         "response_id":envelope.get("id"),
         "review":review
@@ -239,10 +279,9 @@ mod tests {
 
     #[test]
     fn extracts_structured_output_text() {
-        let response = json!({"output":[{"content":[
-            {"type":"reasoning","text":"hidden"},
-            {"type":"output_text","text":"{\"decision\":\"no_change\"}"}
-        ]}]});
+        let response = json!({"choices":[{"message":{
+            "role":"assistant", "content":"{\"decision\":\"no_change\"}"
+        }}]});
         assert_eq!(
             extract_output_text(&response),
             Some("{\"decision\":\"no_change\"}")
@@ -258,5 +297,16 @@ mod tests {
                 ["minimum"],
             20
         );
+    }
+
+    #[test]
+    fn rejects_reviews_that_weaken_validation_minimums() {
+        let review = json!({
+            "decision":"run_experiments", "summary":"x",
+            "data_quality":{"usable":true,"issues":[]},
+            "observations":[], "hypotheses":[], "do_not_change":[],
+            "experiments":[{"minimum_closed_trades":5,"walk_forward_windows":1}]
+        });
+        assert!(validate_review(&review).is_err());
     }
 }

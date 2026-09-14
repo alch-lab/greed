@@ -10,7 +10,7 @@ active strategy, and never deploys code.
 - `greed paper` remains the only process that owns exchange execution.
 - `greed research` reads paper artifacts and writes under
   `data/research/agent/`.
-- The OpenAI request uses `store: false` and contains no exchange credential.
+- The Kimi request contains no exchange credential or trading authority.
 - Proposed changes must pass deterministic replay, at least three walk-forward
   windows, and a paper canary before a later promotion workflow may use them.
 - A review may explicitly return `no_change`; running the timer does not imply a
@@ -32,8 +32,9 @@ This writes the exact sanitized model input to
 Create `/etc/greed-research.env` with mode `0600`:
 
 ```text
-OPENAI_API_KEY=replace_me
-GREED_RESEARCH_MODEL=gpt-6-astra
+MOONSHOT_API_KEY=replace_me
+GREED_RESEARCH_API_BASE=https://api.moonshot.cn/v1
+GREED_RESEARCH_MODEL=kimi-k3
 ```
 
 Then build greed and install the timer:
@@ -45,3 +46,18 @@ sudo PROJECT_DIR=/opt/greed /opt/greed/deploy/install-research-agent.sh
 The timer runs at 00:05, 06:05, 12:05, and 18:05 Asia/Shanghai. Results are
 written atomically as timestamped files and as
 `data/research/agent/latest-review.json`.
+
+## Bounded storage
+
+The live decision journal and raw research journal are each bounded to four
+64 MiB files by `config/demo.toml`. Durable trade/PnL history and execution
+recovery state are separate and are not removed by those limits. High-volume
+diagnostics are sampled: complete graph/data-health snapshots every 30 seconds,
+profit-guard observations every five seconds, and execution latency every
+minute. Trade, exit, rejection, protection, operator and accounting events are
+still recorded immediately.
+
+Use `deploy/prune-paper-data.sh` without arguments to preview reclaimable files.
+Pass `--apply` only after reviewing the exact list. The script never removes the
+current journal, trade history, status, execution state, or research-agent
+reviews.

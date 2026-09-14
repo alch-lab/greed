@@ -796,7 +796,7 @@ impl BinanceMarketSource {
                         // need one journal line per retry.
                         tracing::debug!(symbol = %key.0, interval = %key.1, error = %error, "kline history bootstrap retry timed out");
                     } else {
-                        tracing::warn!(symbol = %key.0, interval = %key.1, error = %error, "kline history bootstrap failed");
+                        tracing::debug!(symbol = %key.0, interval = %key.1, error = %error, "kline history bootstrap failed; symbol remains blocked until recovery");
                     }
                     self.candle_bootstrap_retry_after
                         .insert(key.clone(), now + KLINE_BOOTSTRAP_RETRY_DELAY_MS);
