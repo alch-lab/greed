@@ -62,6 +62,16 @@ the agent regenerates one compact response from the original input. A second
 malformed response is recorded as deferred instead of failing the systemd job,
 and the candidate builder never reuses an older review for that run.
 
+The model contracts are versioned in generated artifacts. The research prompt
+is `research-v2-compact`: analyze only supplied causal records, propose
+falsifiable experiments, reject hindsight and single-trade tuning, and require
+executable-price costs plus rolling out-of-sample replay before claiming an
+improvement. The candidate prompt is `candidate-v3-single-recipe`: return JSON
+only, edit one supplied recipe with at most 16 exact replacements, leave the
+runtime, execution, accounting, risk, deployment and APIs unchanged, and return
+`no_candidate` when the evidence cannot support a valid minimal patch. API keys
+and exchange credentials are never included in either model payload.
+
 ## Candidate and promotion loop
 
 When a review returns `run_experiments` with usable data, systemd starts a
@@ -78,16 +88,23 @@ systemd job or touching the active strategy.
 
 The builder uses a detached worktree at the current `origin/main`, then runs
 Rust formatting, all workspace tests, a release build and configuration
-validation. A passing candidate is committed and pushed as
+validation. An engineering-valid candidate is committed and pushed as
 `research/auto-<review timestamp>`. The temporary worktree and build artifacts
 are removed afterwards to keep disk use bounded. A public, patch-free summary
 is written to `data/research/agent/latest-candidate.json`.
 
+Engineering checks do not prove an improvement in PnL. A review's requested
+minimum trade count and walk-forward window count are experiment design, not
+results, and are never displayed as passing performance gates. Until a fixed,
+deterministic replay runner writes a matching `performance_validation` result,
+the candidate remains `blocked` and cannot be promoted.
+
 The dashboard shows the candidate and all gates. Guests can only inspect it.
 An authenticated Operator can request promotion only after new entries are
 paused and the account has no open positions. The root-owned promotion path
-unit rechecks the candidate ID, commit, base commit, remote branch and every
-gate. It deploys the candidate without changing epoch or runtime data, waits
+unit rechecks the candidate ID, commit, base commit, remote branch, every gate,
+and the deterministic performance-validation result. It deploys the candidate
+without changing epoch or runtime data, waits
 for backend health, and only then fast-forwards `main`. A failed deployment
 keeps or restores the previous binary and records the failure in
 `data/research/agent/latest-promotion.json`.

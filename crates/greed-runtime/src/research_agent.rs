@@ -199,6 +199,7 @@ fn atomic_json(path: &Path, value: &Value) -> Result<()> {
 fn record_failure(output_dir: &str, generated_ms: i64, model: &str, stage: &str, detail: &str) {
     let artifact = json!({
         "schema_version":1,
+        "prompt_version":"research-v2-compact",
         "generated_ms":generated_ms,
         "provider":"zhipu_bigmodel",
         "model":model,
@@ -246,6 +247,7 @@ pub async fn run(
             "status":"dry_run",
             "generated_ms":generated_ms,
             "model":model,
+            "prompt_version":"research-v2-compact",
             "input_path":Path::new(output_dir).join("latest-input.json")
         }));
     }
@@ -481,6 +483,7 @@ pub async fn run(
     }
     let artifact = json!({
         "schema_version":1,
+        "prompt_version":"research-v2-compact",
         "generated_ms":generated_ms,
         "provider":"zhipu_bigmodel",
         "model":model,

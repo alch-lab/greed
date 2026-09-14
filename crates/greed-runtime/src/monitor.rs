@@ -333,6 +333,15 @@ async fn reset_risk_guard(State(state): State<ApiState>, headers: HeaderMap) -> 
 async fn research_candidate(State(state): State<ApiState>) -> Response {
     match read_json(&state.research_candidate_path) {
         Ok(mut value) => {
+            if value["status"] == "ready" && !performance_validation_passed(&value) {
+                value["status"] = json!("blocked");
+                value["detail"] = json!(
+                    "Engineering checks passed, but no deterministic historical performance replay has passed."
+                );
+                if let Some(gates) = value["gates"].as_array_mut() {
+                    gates.push(json!({"name":"Historical performance replay","passed":false}));
+                }
+            }
             if let Ok(request) = read_json(&state.promotion_request_path) {
                 let same_candidate = request["candidate_id"] == value["candidate_id"];
                 if same_candidate && request["status"] == "requested" {
@@ -385,6 +394,12 @@ async fn promote_candidate(
         || candidate["status"].as_str() != Some("ready")
     {
         return api_error(StatusCode::CONFLICT, "candidate is not ready for promotion");
+    }
+    if !performance_validation_passed(&candidate) {
+        return api_error(
+            StatusCode::CONFLICT,
+            "candidate has no passing deterministic historical performance replay",
+        );
     }
     let gates_pass = candidate["gates"]
         .as_array()
@@ -540,6 +555,11 @@ fn valid_candidate_id(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+}
+
+fn performance_validation_passed(candidate: &Value) -> bool {
+    candidate["performance_validation"]["passed"] == true
+        && candidate["performance_validation"]["status"] == "passed"
 }
 
 fn atomic_write_json(path: &Path, value: &Value) -> Result<()> {
@@ -996,6 +1016,10 @@ mod tests {
         assert!(valid_candidate_id("auto-1780000000000"));
         assert!(!valid_candidate_id("research/auto-1"));
         assert!(!valid_candidate_id("../../main"));
+        assert!(!performance_validation_passed(&json!({"status":"ready"})));
+        assert!(performance_validation_passed(&json!({
+            "performance_validation":{"status":"passed","passed":true}
+        })));
     }
 
     #[test]

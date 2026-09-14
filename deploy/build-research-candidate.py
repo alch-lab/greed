@@ -425,25 +425,31 @@ def main():
             "commit", "-m", str(proposal.get("title") or "automated strategy candidate"), cwd=worktree)
         candidate_commit = run("git", "rev-parse", "HEAD", cwd=worktree)
         run("git", "push", "--force-with-lease", "origin", f"HEAD:refs/heads/{branch}", cwd=worktree)
-        experiments = review.get("experiments") or []
-        minimum_trades = min((int(row.get("minimum_closed_trades", 0)) for row in experiments), default=0)
-        windows = min((int(row.get("walk_forward_windows", 0)) for row in experiments), default=0)
         gates = [
             {"name": "Research data usable", "passed": True},
-            {"name": f"Validation design · ≥{minimum_trades} trades", "passed": minimum_trades >= 20},
-            {"name": f"Walk-forward design · {windows} windows", "passed": windows >= 3},
             {"name": "Strategy-only source boundary", "passed": True},
             {"name": "Forbidden capability scan", "passed": True},
             {"name": "Rust formatting", "passed": True},
             {"name": "Workspace tests", "passed": True},
             {"name": "Release build and config validation", "passed": True},
+            {"name": "Historical performance replay", "passed": False},
         ]
+        performance_validation = {
+            "status": "not_run",
+            "passed": False,
+            "reason": (
+                "The review defines a proposed experiment, not a deterministic replay result. "
+                "An arbitrary Rust patch cannot be promoted on engineering checks alone."
+            ),
+        }
         atomic_json(MANIFEST, {
             "schema_version": 1, "candidate_id": candidate_id, "review_ms": review_ms,
-            "status": "ready" if all(row["passed"] for row in gates) else "blocked",
+            "prompt_version": "candidate-v3-single-recipe",
+            "status": "blocked",
             "title": proposal.get("title"), "summary": proposal.get("summary"),
             "base_commit": base_commit, "branch": branch, "candidate_commit": candidate_commit,
             "changed_files": sorted(changed), "gates": gates,
+            "performance_validation": performance_validation,
             "created_ms": int(time.time() * 1000), "updated_ms": int(time.time() * 1000),
         })
         return 0

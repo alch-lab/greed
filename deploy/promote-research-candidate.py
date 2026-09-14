@@ -61,6 +61,9 @@ def main():
             raise ValueError(f"approval does not match candidate {field}")
     if not candidate.get("gates") or not all(row.get("passed") is True for row in candidate["gates"]):
         raise ValueError("candidate gates are incomplete")
+    performance = candidate.get("performance_validation") or {}
+    if performance.get("status") != "passed" or performance.get("passed") is not True:
+        raise ValueError("candidate has no passing deterministic historical performance replay")
 
     run("git", "fetch", "origin")
     origin_main = run("git", "rev-parse", "origin/main")
