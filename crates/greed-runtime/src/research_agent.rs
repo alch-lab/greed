@@ -20,6 +20,8 @@ the sample is insufficient. Candidate changes are paper-only and must not weaken
 hard account risk limits.
 "#;
 
+const ZHIPU_CODING_API_BASE: &str = "https://open.bigmodel.cn/api/coding/paas/v4";
+
 fn review_schema() -> Value {
     json!({
         "type": "object",
@@ -226,7 +228,7 @@ pub async fn run(
     let api_key = std::env::var("ZHIPU_API_KEY")
         .context("ZHIPU_API_KEY is required for the research agent")?;
     let api_base = std::env::var("GREED_RESEARCH_API_BASE")
-        .unwrap_or_else(|_| "https://open.bigmodel.cn/api/paas/v4".to_owned());
+        .unwrap_or_else(|_| ZHIPU_CODING_API_BASE.to_owned());
     let endpoint = format!("{}/chat/completions", api_base.trim_end_matches('/'));
     let request = json!({
         "model": model,
@@ -276,10 +278,13 @@ pub async fn run(
             "http_response",
             &format!("{status_code}: {diagnostic}"),
         );
-        bail!(
-            "Zhipu Chat Completions API returned {status_code}: {}",
-            diagnostic
-        );
+        if diagnostic.contains("\"code\":\"1113\"") && !api_base.contains("/api/coding/") {
+            bail!(
+                "Zhipu Coding Plan quota is unavailable through {api_base}; set \
+                 GREED_RESEARCH_API_BASE={ZHIPU_CODING_API_BASE}. Provider response: {diagnostic}"
+            );
+        }
+        bail!("Zhipu Chat Completions API returned {status_code}: {diagnostic}");
     }
     let envelope: Value = serde_json::from_str(&body)
         .map_err(|error| {
@@ -380,5 +385,13 @@ mod tests {
             "experiments":[{"minimum_closed_trades":5,"walk_forward_windows":1}]
         });
         assert!(validate_review(&review).is_err());
+    }
+
+    #[test]
+    fn coding_plan_uses_the_dedicated_api_base() {
+        assert_eq!(
+            ZHIPU_CODING_API_BASE,
+            "https://open.bigmodel.cn/api/coding/paas/v4"
+        );
     }
 }

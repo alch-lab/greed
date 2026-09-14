@@ -33,9 +33,14 @@ Create `/etc/greed-research.env` with mode `0600`:
 
 ```text
 ZHIPU_API_KEY=replace_me
-GREED_RESEARCH_API_BASE=https://open.bigmodel.cn/api/paas/v4
+GREED_RESEARCH_API_BASE=https://open.bigmodel.cn/api/coding/paas/v4
 GREED_RESEARCH_MODEL=glm-5.2
 ```
+
+The Coding Plan quota is separate from BigModel's general pay-as-you-go balance.
+Its key must use the dedicated `/api/coding/paas/v4` base URL; the general
+`/api/paas/v4` endpoint can authenticate the same key but returns provider error
+`1113` when no general-billing balance is available.
 
 Then build greed and install the timer:
 

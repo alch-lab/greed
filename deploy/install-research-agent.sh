@@ -18,6 +18,12 @@ grep -q '^ZHIPU_API_KEY=' "${ENV_FILE}" || {
   exit 1
 }
 
+if grep -qx 'GREED_RESEARCH_API_BASE=https://open.bigmodel.cn/api/paas/v4/*' "${ENV_FILE}"; then
+  printf '%s uses the general-billing endpoint; Coding Plan requires %s\n' \
+    "${ENV_FILE}" 'https://open.bigmodel.cn/api/coding/paas/v4' >&2
+  exit 1
+fi
+
 install -d -o greed -g greed -m 0750 "${PROJECT_DIR}/data/research/agent"
 install -m 0644 "${PROJECT_DIR}/deploy/greed-research.service" /etc/systemd/system/greed-research.service
 install -m 0644 "${PROJECT_DIR}/deploy/greed-research.timer" /etc/systemd/system/greed-research.timer
