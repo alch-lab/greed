@@ -5,8 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+PermissionsStartOnly=true
 WorkingDirectory=/opt/greed
 ExecStart=/opt/greed/target/release/greed research --config config/demo.toml
+ExecStartPost=/usr/bin/systemctl start --no-block greed-candidate.service
 EnvironmentFile=/etc/greed-research.env
 StandardOutput=journal
 StandardError=journal

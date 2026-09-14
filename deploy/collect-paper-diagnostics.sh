@@ -139,6 +139,15 @@ done
 copy_if_present \
   "${research_agent_dir}/latest-review.json" \
   "${WORK_DIR}/research/agent-latest-review.json"
+copy_if_present \
+  "${research_agent_dir}/latest-candidate.json" \
+  "${WORK_DIR}/research/agent-latest-candidate.json"
+copy_if_present \
+  "${research_agent_dir}/latest-promotion.json" \
+  "${WORK_DIR}/research/agent-latest-promotion.json"
+copy_if_present \
+  "${research_agent_dir}/latest-run.json" \
+  "${WORK_DIR}/research/agent-latest-run.json"
 
 if [[ -x "target/release/greed" && -f "${RUNTIME_DIR}/alpha-events.jsonl" ]]; then
   timeout 90 target/release/greed report \

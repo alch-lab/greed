@@ -10,6 +10,7 @@ set -Eeuo pipefail
 #   CADDY_SERVICE=caddy
 #   DEPLOY_BRANCH=main
 #   RUN_TESTS=1
+#   DEPLOY_FRONTEND=1
 #   EXPECTED_EPOCH=19 (optional assertion; deployment refuses an epoch change)
 
 readonly BACKEND_DIR="${BACKEND_DIR:-/opt/greed}"
@@ -18,6 +19,7 @@ readonly BACKEND_SERVICE="${BACKEND_SERVICE:-greed-paper}"
 readonly CADDY_SERVICE="${CADDY_SERVICE:-caddy}"
 readonly DEPLOY_BRANCH="${DEPLOY_BRANCH:-main}"
 readonly RUN_TESTS="${RUN_TESTS:-1}"
+readonly DEPLOY_FRONTEND="${DEPLOY_FRONTEND:-1}"
 readonly LOCK_FILE="/tmp/greed-paper-deploy.lock"
 
 BACKEND_BACKUP=""
@@ -106,21 +108,28 @@ trap 'printf "\nFailed at line %s. Runtime data was not deleted.\n" "$LINENO" >&
 
 [[ "${EUID}" -eq 0 ]] || fail "run this script with sudo"
 activate_build_toolchains
-for command in git cargo node npm curl systemctl flock install grep seq cp mv rm sed sleep; do
+for command in git cargo curl systemctl flock install grep seq cp mv rm sed sleep; do
   require_command "${command}"
 done
-node_major="$(node --version | sed -E 's/^v([0-9]+).*/\1/')"
-npm_major="$(npm --version | sed -E 's/^([0-9]+).*/\1/')"
-[[ "${node_major}" -ge 18 ]] || fail "Node.js >= 18 is required (found $(node --version))"
-[[ "${npm_major}" -ge 7 ]] || fail "npm >= 7 is required for package-lock v3 (found $(npm --version))"
 [[ -d "${BACKEND_DIR}/.git" ]] || fail "backend checkout not found: ${BACKEND_DIR}"
-[[ -d "${FRONTEND_DIR}/.git" ]] || fail "frontend checkout not found: ${FRONTEND_DIR}"
+if [[ "${DEPLOY_FRONTEND}" == "1" ]]; then
+  for command in node npm; do
+    require_command "${command}"
+  done
+  node_major="$(node --version | sed -E 's/^v([0-9]+).*/\1/')"
+  npm_major="$(npm --version | sed -E 's/^([0-9]+).*/\1/')"
+  [[ "${node_major}" -ge 18 ]] || fail "Node.js >= 18 is required (found $(node --version))"
+  [[ "${npm_major}" -ge 7 ]] || fail "npm >= 7 is required for package-lock v3 (found $(npm --version))"
+  [[ -d "${FRONTEND_DIR}/.git" ]] || fail "frontend checkout not found: ${FRONTEND_DIR}"
+fi
 
 exec 9>"${LOCK_FILE}"
 flock -n 9 || fail "another greed deployment is already running"
 
 require_clean_checkout "${BACKEND_DIR}"
-require_clean_checkout "${FRONTEND_DIR}"
+if [[ "${DEPLOY_FRONTEND}" == "1" ]]; then
+  require_clean_checkout "${FRONTEND_DIR}"
+fi
 
 # Refuse unintended accounting resets before building/restarting. Capture this
 # before pull; callers updating this script first can pass EXPECTED_EPOCH.
@@ -157,26 +166,28 @@ if ! wait_for_health; then
   fail "${BACKEND_SERVICE} did not become healthy"
 fi
 
-step "Update frontend"
-git -C "${FRONTEND_DIR}" fetch origin
-git -C "${FRONTEND_DIR}" checkout "${DEPLOY_BRANCH}"
-git -C "${FRONTEND_DIR}" pull --ff-only origin "${DEPLOY_BRANCH}"
+if [[ "${DEPLOY_FRONTEND}" == "1" ]]; then
+  step "Update frontend"
+  git -C "${FRONTEND_DIR}" fetch origin
+  git -C "${FRONTEND_DIR}" checkout "${DEPLOY_BRANCH}"
+  git -C "${FRONTEND_DIR}" pull --ff-only origin "${DEPLOY_BRANCH}"
 
-step "Build frontend in a staging directory"
-(cd "${FRONTEND_DIR}" && npm ci --include=dev)
-rm -rf -- "${FRONTEND_DIR}/dist.next"
-(cd "${FRONTEND_DIR}" && \
-  ./node_modules/.bin/tsc -b && \
-  ./node_modules/.bin/vite build --outDir dist.next --emptyOutDir)
-[[ -f "${FRONTEND_DIR}/dist.next/index.html" ]] \
-  || fail "frontend staging build did not produce index.html"
+  step "Build frontend in a staging directory"
+  (cd "${FRONTEND_DIR}" && npm ci --include=dev)
+  rm -rf -- "${FRONTEND_DIR}/dist.next"
+  (cd "${FRONTEND_DIR}" && \
+    ./node_modules/.bin/tsc -b && \
+    ./node_modules/.bin/vite build --outDir dist.next --emptyOutDir)
+  [[ -f "${FRONTEND_DIR}/dist.next/index.html" ]] \
+    || fail "frontend staging build did not produce index.html"
 
-if [[ -d "${FRONTEND_DIR}/dist" ]]; then
-  FRONTEND_BACKUP="${FRONTEND_DIR}/dist.deploy-backup"
-  rm -rf -- "${FRONTEND_BACKUP}"
-  mv "${FRONTEND_DIR}/dist" "${FRONTEND_BACKUP}"
+  if [[ -d "${FRONTEND_DIR}/dist" ]]; then
+    FRONTEND_BACKUP="${FRONTEND_DIR}/dist.deploy-backup"
+    rm -rf -- "${FRONTEND_BACKUP}"
+    mv "${FRONTEND_DIR}/dist" "${FRONTEND_BACKUP}"
+  fi
+  mv "${FRONTEND_DIR}/dist.next" "${FRONTEND_DIR}/dist"
 fi
-mv "${FRONTEND_DIR}/dist.next" "${FRONTEND_DIR}/dist"
 
 step "Validate Caddy and confirm the static server is running"
 if command -v caddy >/dev/null 2>&1; then
@@ -189,7 +200,7 @@ fi
 systemctl is-active --quiet "${CADDY_SERVICE}" \
   || fail "${CADDY_SERVICE} is not running"
 
-if ! curl -fsS --max-time 5 http://127.0.0.1:9527/paper \
+if [[ "${DEPLOY_FRONTEND}" == "1" ]] && ! curl -fsS --max-time 5 http://127.0.0.1:9527/paper \
   | grep -q '/assets/'; then
   if [[ -n "${FRONTEND_BACKUP}" && -d "${FRONTEND_BACKUP}" ]]; then
     rm -rf -- "${FRONTEND_DIR}/dist"
@@ -203,6 +214,10 @@ rm -rf -- "${FRONTEND_BACKUP}"
 
 step "Deployment complete"
 printf 'backend_commit=%s\n' "$(git -C "${BACKEND_DIR}" rev-parse --short HEAD)"
-printf 'frontend_commit=%s\n' "$(git -C "${FRONTEND_DIR}" rev-parse --short HEAD)"
+if [[ "${DEPLOY_FRONTEND}" == "1" ]]; then
+  printf 'frontend_commit=%s\n' "$(git -C "${FRONTEND_DIR}" rev-parse --short HEAD)"
+else
+  printf 'frontend_commit=unchanged\n'
+fi
 systemctl --no-pager --full status "${BACKEND_SERVICE}" | sed -n '1,12p'
 printf 'dashboard=http://127.0.0.1:9527/paper\n'

@@ -25,11 +25,16 @@ if grep -qx 'GREED_RESEARCH_API_BASE=https://open.bigmodel.cn/api/paas/v4/*' "${
 fi
 
 install -d -o greed -g greed -m 0750 "${PROJECT_DIR}/data/research/agent"
+install -d -o root -g root -m 0750 /opt/greed-candidates
 install -m 0644 "${PROJECT_DIR}/deploy/greed-research.service" /etc/systemd/system/greed-research.service
 install -m 0644 "${PROJECT_DIR}/deploy/greed-research.timer" /etc/systemd/system/greed-research.timer
+install -m 0644 "${PROJECT_DIR}/deploy/greed-candidate.service" /etc/systemd/system/greed-candidate.service
+install -m 0644 "${PROJECT_DIR}/deploy/greed-promotion.service" /etc/systemd/system/greed-promotion.service
+install -m 0644 "${PROJECT_DIR}/deploy/greed-promotion.path" /etc/systemd/system/greed-promotion.path
 chmod 0600 "${ENV_FILE}"
 systemctl daemon-reload
 systemctl enable --now greed-research.timer
+systemctl enable --now greed-promotion.path
 systemctl start greed-research.service
 systemctl --no-pager --full status greed-research.service
 systemctl list-timers greed-research.timer --no-pager

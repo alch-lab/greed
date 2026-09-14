@@ -56,6 +56,35 @@ API, response-parsing, and schema-validation failures are written to
 error chain. Requests use Zhipu JSON mode and results are also validated
 locally.
 
+## Candidate and promotion loop
+
+When a review returns `run_experiments` with usable data, systemd starts a
+separate candidate builder. It makes one additional Zhipu request and permits
+exact replacements only in the three strategy recipe files. Execution,
+accounting, portfolio risk, configuration, epoch, deployment code and secrets
+are not editable. Added host, process, file-system, network, environment, FFI,
+include-macro and unsafe capabilities are rejected before compilation.
+
+The builder uses a detached worktree at the current `origin/main`, then runs
+Rust formatting, all workspace tests, a release build and configuration
+validation. A passing candidate is committed and pushed as
+`research/auto-<review timestamp>`. The temporary worktree and build artifacts
+are removed afterwards to keep disk use bounded. A public, patch-free summary
+is written to `data/research/agent/latest-candidate.json`.
+
+The dashboard shows the candidate and all gates. Guests can only inspect it.
+An authenticated Operator can request promotion only after new entries are
+paused and the account has no open positions. The root-owned promotion path
+unit rechecks the candidate ID, commit, base commit, remote branch and every
+gate. It deploys the candidate without changing epoch or runtime data, waits
+for backend health, and only then fast-forwards `main`. A failed deployment
+keeps or restores the previous binary and records the failure in
+`data/research/agent/latest-promotion.json`.
+
+The model never receives exchange credentials and cannot call the promotion
+unit directly. Human approval is the only bridge from a pushed candidate
+branch to the running paper strategy.
+
 When Zhipu reports Coding Plan error `1308`, the run exits successfully with a
 `deferred` result instead of leaving the oneshot service failed. The timer does
 not retry in a tight loop; it waits for its next six-hourly run, by which time
