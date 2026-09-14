@@ -38,8 +38,12 @@ FORBIDDEN_ADDITIONS = (
     "tokio::net", "TcpStream", "UdpSocket", "include_str!", "include_bytes!",
     "env!", "option_env!", "extern \"C\"", "#[link",
 )
-MAX_REPLACEMENTS = 8
+MAX_REPLACEMENTS = 16
 MAX_REPLACEMENT_BYTES = 24_000
+
+
+class CandidateDeferred(Exception):
+    pass
 
 
 def run(*args, **options):
@@ -95,7 +99,7 @@ def source_bundle():
     return result
 
 
-def call_model(review, sources):
+def call_model(review, sources, correction=None):
     key = os.environ.get("ZHIPU_API_KEY")
     if not key:
         raise ValueError("ZHIPU_API_KEY is missing")
@@ -111,8 +115,16 @@ def call_model(review, sources):
         "epoch, dependencies, or public APIs. Do not add file/process/network/environment access, unsafe, "
         "FFI, include macros, or tests that perform side effects. Prefer no_candidate when evidence is weak. "
         "Every search string must occur exactly once in the supplied file. Keep the patch small and change "
-        "only the strategy recipe directly supported by the review. The JSON shape is: " + json.dumps(schema)
+        "only the strategy recipe directly supported by the review. Use no more than {} exact replacements. "
+        "The JSON shape is: ".format(MAX_REPLACEMENTS) + json.dumps(schema)
     )
+    if correction:
+        instructions += (
+            " Your previous answer was rejected by the local validator: "
+            + correction[:600]
+            + ". Regenerate the complete JSON object and obey the shape exactly. "
+              "Use decision=no_candidate when no valid exact replacement is available."
+        )
     payload = json.dumps({"review": review, "editable_sources": sources}, ensure_ascii=False)
     request = urllib.request.Request(
         API_BASE + "/chat/completions",
@@ -134,7 +146,14 @@ def call_model(review, sources):
         with urllib.request.urlopen(request, timeout=600) as response:
             envelope = json.load(response)
     except urllib.error.HTTPError as error:
-        raise RuntimeError(f"Zhipu candidate request returned {error.code}: {error.read().decode()[:2000]}") from error
+        detail = error.read().decode()[:2000]
+        try:
+            provider_code = str(json.loads(detail).get("error", {}).get("code", ""))
+        except (TypeError, ValueError):
+            provider_code = ""
+        if provider_code == "1308":
+            raise CandidateDeferred("Zhipu Coding Plan quota is temporarily exhausted")
+        raise RuntimeError(f"Zhipu candidate request returned {error.code}: {detail}") from error
     content = envelope["choices"][0]["message"]["content"]
     return json.loads(content)
 
@@ -146,7 +165,12 @@ def validate_proposal(proposal, sources):
         raise ValueError("candidate decision must be candidate or no_candidate")
     changes = proposal.get("changes")
     if not isinstance(changes, list) or not 1 <= len(changes) <= MAX_REPLACEMENTS:
-        raise ValueError("candidate must contain 1..8 replacements")
+        count = len(changes) if isinstance(changes, list) else "not_a_list"
+        raise ValueError(
+            "candidate must contain 1..{} replacements; received {}".format(
+                MAX_REPLACEMENTS, count
+            )
+        )
     originals = {row["path"]: row["content"] for row in sources}
     total = 0
     for change in changes:
@@ -207,8 +231,46 @@ def main():
     run("git", "fetch", "origin", "main")
     base_commit = run("git", "rev-parse", "origin/main")
     sources = source_bundle()
-    proposal = call_model(review, sources)
-    changes = validate_proposal(proposal, sources)
+    try:
+        proposal = call_model(review, sources)
+    except CandidateDeferred as error:
+        atomic_json(MANIFEST, {
+            "schema_version": 1, "candidate_id": "blocked-{}".format(review_ms),
+            "review_ms": review_ms, "status": "blocked", "stage": "provider_quota",
+            "summary": "Candidate generation is waiting for the next Coding Plan quota window.",
+            "detail": str(error), "updated_ms": int(time.time() * 1000),
+            "gates": [{"name": "Provider quota available", "passed": False}],
+        })
+        return 0
+    try:
+        changes = validate_proposal(proposal, sources)
+    except ValueError as first_error:
+        try:
+            proposal = call_model(review, sources, str(first_error))
+        except CandidateDeferred as error:
+            atomic_json(MANIFEST, {
+                "schema_version": 1, "candidate_id": "blocked-{}".format(review_ms),
+                "review_ms": review_ms, "status": "blocked", "stage": "provider_quota",
+                "summary": "Candidate correction is waiting for the next Coding Plan quota window.",
+                "detail": str(error), "updated_ms": int(time.time() * 1000),
+                "gates": [{"name": "Provider quota available", "passed": False}],
+            })
+            return 0
+        try:
+            changes = validate_proposal(proposal, sources)
+        except ValueError as second_error:
+            atomic_json(MANIFEST, {
+                "schema_version": 1,
+                "candidate_id": "blocked-{}".format(review_ms),
+                "review_ms": review_ms,
+                "status": "blocked",
+                "stage": "proposal_validation",
+                "summary": "The model did not produce a safe, mechanically applicable patch.",
+                "detail": str(second_error)[:2000],
+                "updated_ms": int(time.time() * 1000),
+                "gates": [{"name": "Candidate patch shape", "passed": False}],
+            })
+            return 0
     if not changes:
         atomic_json(MANIFEST, {
             "schema_version": 1, "candidate_id": f"review-{review_ms}", "review_ms": review_ms,

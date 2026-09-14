@@ -70,6 +70,9 @@ exact replacements only in the three strategy recipe files. Execution,
 accounting, portfolio risk, configuration, epoch, deployment code and secrets
 are not editable. Added host, process, file-system, network, environment, FFI,
 include-macro and unsafe capabilities are rejected before compilation.
+Malformed candidate patches are regenerated once. If the second response still
+cannot be applied mechanically, it is exposed as `blocked` without failing the
+systemd job or touching the active strategy.
 
 The builder uses a detached worktree at the current `origin/main`, then runs
 Rust formatting, all workspace tests, a release build and configuration
