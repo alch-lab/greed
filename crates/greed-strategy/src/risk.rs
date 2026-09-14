@@ -1078,9 +1078,6 @@ mod tests {
             ("profit_memory_floor_net_pct".into(), "-0.0002".into()),
             ("pre_tp_trailing_activation_r".into(), "1.0".into()),
             ("trailing_distance_pct".into(), "0.001".into()),
-            ("early_failure_after_ms".into(), "180000".into()),
-            ("early_failure_adverse_r".into(), "0.6".into()),
-            ("early_failure_max_mfe_r".into(), "0.2".into()),
         ]));
         let artifacts = BTreeMap::from([(record.key.clone(), record)]);
         let frame = MarketFrame {
@@ -1119,9 +1116,6 @@ mod tests {
         assert_eq!(plan.profit_memory_floor_net_pct, -0.0002);
         assert!((plan.trailing_activation_pct.unwrap() - 0.0028).abs() < 1e-12);
         assert!((plan.trailing_distance_pct.unwrap() - 0.0009).abs() < 1e-12);
-        assert_eq!(plan.early_failure_after_ms, 180_000);
-        assert!((plan.early_failure_adverse_pct - 0.003).abs() < 1e-12);
-        assert!((plan.early_failure_max_favorable_pct - 0.001).abs() < 1e-12);
     }
 
     #[test]

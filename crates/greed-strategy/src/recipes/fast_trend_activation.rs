@@ -10,19 +10,6 @@ use std::collections::BTreeMap;
 // planner converts this account-level objective into a price target after the
 // actual liquidity-sized notional and estimated round-trip cost are known.
 const FAST_TARGET_ACCOUNT_PROFIT_PCT: f64 = 0.003;
-// A direct continuation is only real when the one-minute confirmation retains
-// a meaningful share of the ignition candle's aggressive flow.  Weak local
-// follow-through is still allowed when the broader tape confirms the side.
-const FAST_MIN_CONFIRMATION_FLOW_RETENTION: f64 = 0.85;
-const FAST_WEAK_CONFIRMATION_MIN_BREADTH: f64 = 0.55;
-// This lane detects early acceleration, not a full four-hour trend reversal.
-// A separate reversal recipe must own moves that fight an entrenched tape.
-const FAST_MAX_OPPOSING_RETURN_4H: f64 = 0.04;
-// Give a fast setup three minutes to prove itself. If it never managed ten
-// favorable bps and is already thirty adverse bps, its premise has failed.
-const FAST_EARLY_FAILURE_AFTER_MS: i64 = 180_000;
-const FAST_EARLY_FAILURE_ADVERSE_PCT: f64 = 0.003;
-const FAST_EARLY_FAILURE_MAX_FAVORABLE_PCT: f64 = 0.001;
 
 pub struct FastTrendActivationNode {
     id: String,
@@ -222,21 +209,6 @@ fn is_shock_absorption(metrics: ShockAbsorption, config: &LaneConfig) -> bool {
             <= config.fast_shock_absorption_max_directional_close_location
 }
 
-fn weak_direct_confirmation(
-    entry_pattern: &str,
-    directional_confirmation_flow: Option<f64>,
-    directional_ignition_flow: Option<f64>,
-    directional_market_breadth: f64,
-) -> bool {
-    entry_pattern == "direct_continuation"
-        && directional_market_breadth < FAST_WEAK_CONFIRMATION_MIN_BREADTH
-        && directional_confirmation_flow
-            .zip(directional_ignition_flow)
-            .is_some_and(|(confirmation, ignition)| {
-                confirmation < ignition * FAST_MIN_CONFIRMATION_FLOW_RETENTION
-            })
-}
-
 impl StrategyNode for FastTrendActivationNode {
     fn id(&self) -> &str {
         &self.id
@@ -403,19 +375,6 @@ impl StrategyNode for FastTrendActivationNode {
             let entry_pattern = confirmation
                 .map(|(_, pattern, _)| pattern)
                 .unwrap_or("awaiting_confirmation");
-            let directional_confirmation_flow =
-                confirmation.map(|(_, _, minute_flow)| sign * minute_flow);
-            let confirmation_flow_retention = directional_confirmation_flow
-                .zip(directional_flow)
-                .filter(|(_, ignition)| *ignition > f64::EPSILON)
-                .map(|(confirmation, ignition)| confirmation / ignition);
-            let weak_confirmation = weak_direct_confirmation(
-                entry_pattern,
-                directional_confirmation_flow,
-                directional_flow,
-                directional_market_breadth,
-            );
-            let opposing_four_hour_trend = directional_return_4h < -FAST_MAX_OPPOSING_RETURN_4H;
             let late_exhaustion = is_late_exhaustion(
                 entry_pattern,
                 directional_extension,
@@ -473,19 +432,6 @@ impl StrategyNode for FastTrendActivationNode {
                     absorption.range_pct * 100.0,
                     absorption.opposing_wick_share * 100.0,
                     absorption.directional_close_location * 100.0,
-                ));
-            }
-            if weak_confirmation {
-                blockers.push(format!(
-                    "direct confirmation lost ignition flow without broad support: retention {:.0}% / directional breadth {:.0}%",
-                    confirmation_flow_retention.unwrap_or_default() * 100.0,
-                    directional_market_breadth * 100.0,
-                ));
-            }
-            if opposing_four_hour_trend {
-                blockers.push(format!(
-                    "fast activation opposes an entrenched 4h move: directional return {:.2}%",
-                    directional_return_4h * 100.0,
                 ));
             }
             if !breakout {
@@ -590,20 +536,6 @@ impl StrategyNode for FastTrendActivationNode {
                     confirmation
                         .map(|(_, _, flow)| flow.to_string())
                         .unwrap_or_else(|| "missing".into()),
-                ),
-                (
-                    "confirmation_flow_retention".into(),
-                    confirmation_flow_retention
-                        .map(|value| value.to_string())
-                        .unwrap_or_else(|| "missing".into()),
-                ),
-                (
-                    "weak_confirmation_veto_triggered".into(),
-                    weak_confirmation.to_string(),
-                ),
-                (
-                    "opposing_4h_trend_veto_triggered".into(),
-                    opposing_four_hour_trend.to_string(),
                 ),
                 (
                     "confirmation_close_ms".into(),
@@ -714,18 +646,6 @@ impl StrategyNode for FastTrendActivationNode {
                 ("max_entry_adverse_bps".into(), "6".into()),
                 ("taker_fallback".into(), "false".into()),
                 ("max_hold_ms".into(), (10 * 60_000).to_string()),
-                (
-                    "early_failure_after_ms".into(),
-                    FAST_EARLY_FAILURE_AFTER_MS.to_string(),
-                ),
-                (
-                    "early_failure_adverse_r".into(),
-                    (FAST_EARLY_FAILURE_ADVERSE_PCT / stop_pct).to_string(),
-                ),
-                (
-                    "early_failure_max_mfe_r".into(),
-                    (FAST_EARLY_FAILURE_MAX_FAVORABLE_PCT / stop_pct).to_string(),
-                ),
             ]);
             if verdict == Verdict::Pass {
                 if let Some(book) = instrument.book.as_ref() {
@@ -1042,34 +962,6 @@ mod tests {
             -0.002,
             Some(0.20),
             &config,
-        ));
-    }
-
-    #[test]
-    fn weak_direct_follow_through_needs_broad_support() {
-        assert!(weak_direct_confirmation(
-            "direct_continuation",
-            Some(0.19),
-            Some(0.30),
-            0.43,
-        ));
-        assert!(!weak_direct_confirmation(
-            "direct_continuation",
-            Some(0.19),
-            Some(0.30),
-            0.64,
-        ));
-        assert!(!weak_direct_confirmation(
-            "direct_continuation",
-            Some(0.26),
-            Some(0.30),
-            0.43,
-        ));
-        assert!(!weak_direct_confirmation(
-            "shallow_reclaim",
-            Some(0.10),
-            Some(0.30),
-            0.30,
         ));
     }
 }

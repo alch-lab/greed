@@ -104,7 +104,9 @@ fast_late_exhaustion_max_flow = 0.25
 # A large impulse that rejects most of its own extreme is absorption, not a
 # clean continuation. Block the immediate chase on either side and wait for a
 # later independent setup; never auto-reverse from this candle alone.
-fast_shock_absorption_veto_enabled = true
+# Strategy behavior baseline restored from da3344b (2026-09-13 profitable
+# window). Later execution, accounting, reconnect, and cost protections remain.
+fast_shock_absorption_veto_enabled = false
 fast_shock_absorption_min_range = 0.015
 fast_shock_absorption_min_opposing_wick_share = 0.50
 fast_shock_absorption_max_directional_close_location = 0.40
@@ -155,14 +157,14 @@ liquidation_max_execution_divergence_bps = 15.0
 # expanding against the proposed fade with aggressive-flow confirmation.
 # The conjunction keeps ordinary reversals tradable while rejecting V-shaped
 # continuation such as LSK on 2026-09-13.
-liquidation_impulse_veto_enabled = true
+liquidation_impulse_veto_enabled = false
 liquidation_impulse_veto_min_body_pct = 0.005
 liquidation_impulse_veto_min_flow = 0.05
 # A profitable shield exit can be a brief bounce rather than the end of the
 # liquidation move. Rejoin once, in the same direction, only after a fresh
 # completed 1m candle breaks the prior favorable extreme with aligned taker
 # flow. Stop-outs never arm this path.
-liquidation_reentry_enabled = true
+liquidation_reentry_enabled = false
 liquidation_reentry_window_minutes = 6
 liquidation_reentry_min_body_pct = 0.0015
 liquidation_reentry_min_flow = 0.10
