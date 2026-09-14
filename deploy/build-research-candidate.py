@@ -166,8 +166,27 @@ def validate_proposal(proposal: dict, sources: list[dict]) -> list[dict]:
 
 
 def main() -> int:
+    if not REVIEW.is_file():
+        atomic_json(MANIFEST, {
+            "schema_version": 1, "candidate_id": f"waiting-{int(time.time() * 1000)}",
+            "review_ms": None, "status": "no_candidate",
+            "summary": "The latest research run did not produce a complete review. It will retry on schedule.",
+            "updated_ms": int(time.time() * 1000), "gates": [],
+        })
+        return 0
     review_artifact = json.loads(REVIEW.read_text(encoding="utf-8"))
     review_ms = int(review_artifact.get("generated_ms") or 0)
+    latest_input = OUTPUT / "latest-input.json"
+    if latest_input.is_file():
+        input_ms = int(json.loads(latest_input.read_text(encoding="utf-8")).get("generated_ms") or 0)
+        if input_ms != review_ms:
+            atomic_json(MANIFEST, {
+                "schema_version": 1, "candidate_id": f"waiting-{input_ms}",
+                "review_ms": input_ms, "status": "no_candidate",
+                "summary": "The latest research response was incomplete. The previous review was not reused.",
+                "updated_ms": int(time.time() * 1000), "gates": [],
+            })
+            return 0
     review = review_artifact.get("review") or {}
     if review.get("decision") != "run_experiments" or not review.get("data_quality", {}).get("usable"):
         atomic_json(MANIFEST, {

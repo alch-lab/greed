@@ -28,51 +28,51 @@ fn review_schema() -> Value {
         "additionalProperties": false,
         "properties": {
             "decision": {"type":"string", "enum":["no_change","run_experiments"]},
-            "summary": {"type":"string"},
+            "summary": {"type":"string","maxLength":600},
             "data_quality": {
                 "type":"object", "additionalProperties":false,
                 "properties": {
                     "usable": {"type":"boolean"},
-                    "issues": {"type":"array", "items":{"type":"string"}}
+                    "issues": {"type":"array","maxItems":6,"items":{"type":"string","maxLength":240}}
                 },
                 "required":["usable","issues"]
             },
-            "observations": {"type":"array", "items":{"type":"string"}},
+            "observations": {"type":"array","maxItems":8,"items":{"type":"string","maxLength":240}},
             "hypotheses": {
-                "type":"array",
+                "type":"array","maxItems":3,
                 "items": {
                     "type":"object", "additionalProperties":false,
                     "properties": {
-                        "id":{"type":"string"},
-                        "claim":{"type":"string"},
-                        "evidence":{"type":"array","items":{"type":"string"}},
-                        "falsification":{"type":"string"}
+                        "id":{"type":"string","maxLength":80},
+                        "claim":{"type":"string","maxLength":300},
+                        "evidence":{"type":"array","maxItems":5,"items":{"type":"string","maxLength":240}},
+                        "falsification":{"type":"string","maxLength":300}
                     },
                     "required":["id","claim","evidence","falsification"]
                 }
             },
             "experiments": {
-                "type":"array",
+                "type":"array","maxItems":3,
                 "items": {
                     "type":"object", "additionalProperties":false,
                     "properties": {
-                        "id":{"type":"string"},
-                        "hypothesis_id":{"type":"string"},
-                        "scope":{"type":"string"},
-                        "change":{"type":"string"},
-                        "control":{"type":"string"},
+                        "id":{"type":"string","maxLength":80},
+                        "hypothesis_id":{"type":"string","maxLength":80},
+                        "scope":{"type":"string","maxLength":180},
+                        "change":{"type":"string","maxLength":400},
+                        "control":{"type":"string","maxLength":300},
                         "minimum_closed_trades":{"type":"integer","minimum":20},
                         "walk_forward_windows":{"type":"integer","minimum":3},
-                        "acceptance":{"type":"array","items":{"type":"string"}},
-                        "rejection":{"type":"array","items":{"type":"string"}},
-                        "risks":{"type":"array","items":{"type":"string"}}
+                        "acceptance":{"type":"array","maxItems":5,"items":{"type":"string","maxLength":240}},
+                        "rejection":{"type":"array","maxItems":5,"items":{"type":"string","maxLength":240}},
+                        "risks":{"type":"array","maxItems":5,"items":{"type":"string","maxLength":240}}
                     },
                     "required":["id","hypothesis_id","scope","change","control",
                         "minimum_closed_trades","walk_forward_windows","acceptance",
                         "rejection","risks"]
                 }
             },
-            "do_not_change": {"type":"array", "items":{"type":"string"}}
+            "do_not_change": {"type":"array","maxItems":8,"items":{"type":"string","maxLength":180}}
         },
         "required":["decision","summary","data_quality","observations","hypotheses",
             "experiments","do_not_change"]
@@ -118,6 +118,15 @@ fn extract_output_text(response: &Value) -> Option<&str> {
         .first()?
         .get("message")?
         .get("content")?
+        .as_str()
+}
+
+fn finish_reason(response: &Value) -> Option<&str> {
+    response
+        .get("choices")?
+        .as_array()?
+        .first()?
+        .get("finish_reason")?
         .as_str()
 }
 
@@ -250,14 +259,14 @@ pub async fn run(
         "model": model,
         "messages": [
             {"role":"system", "content":format!(
-                "{RESEARCH_INSTRUCTIONS}\nReturn only valid JSON matching this schema: {}",
+                "{RESEARCH_INSTRUCTIONS}\nBe compact: at most 8 observations, 3 hypotheses and 3 experiments; keep every string concise. Return only one complete valid JSON object matching this schema: {}",
                 serde_json::to_string(&review_schema()).expect("schema serializes")
             )},
             {"role":"user", "content":serde_json::to_string(&snapshot)?}
         ],
         "response_format":{"type":"json_object"},
         "max_tokens":8192,
-        "temperature":1.0,
+        "temperature":0.2,
         "stream": false
     });
     let client = reqwest::Client::builder()
@@ -325,29 +334,141 @@ pub async fn run(
             error
         })
         .context("parse Zhipu Chat Completions envelope")?;
-    let output_text = extract_output_text(&envelope).ok_or_else(|| {
-        let detail = "Zhipu Chat Completions returned no assistant content";
-        record_failure(
-            output_dir,
-            generated_ms,
-            &model,
-            "assistant_content",
-            detail,
-        );
-        anyhow::anyhow!(detail)
-    })?;
-    let review: Value = serde_json::from_str(output_text)
-        .map_err(|error| {
+    let mut output_text = extract_output_text(&envelope)
+        .ok_or_else(|| {
+            let detail = "Zhipu Chat Completions returned no assistant content";
             record_failure(
                 output_dir,
                 generated_ms,
                 &model,
-                "review_json",
-                &format!("{error}; output={output_text}"),
+                "assistant_content",
+                detail,
             );
-            error
-        })
-        .context("parse structured research review")?;
+            anyhow::anyhow!(detail)
+        })?
+        .to_owned();
+    let mut response_id = envelope.get("id").cloned();
+    let review: Value = match serde_json::from_str(&output_text) {
+        Ok(review) => review,
+        Err(first_error) => {
+            record_failure(
+                output_dir,
+                generated_ms,
+                &model,
+                "review_json_retry",
+                &format!(
+                    "{first_error}; finish_reason={:?}; output_bytes={}",
+                    finish_reason(&envelope),
+                    output_text.len()
+                ),
+            );
+            let repair_request = json!({
+                "model": model,
+                "messages": [
+                    {"role":"system", "content":format!(
+                        "Return one complete compact JSON object only. The previous response was truncated or malformed. Use at most 4 observations, 2 hypotheses and 2 experiments. Do not add commentary. Schema: {}",
+                        serde_json::to_string(&review_schema()).expect("schema serializes")
+                    )},
+                    {"role":"user", "content":format!(
+                        "Recreate the review from scratch using this input. Do not continue the broken JSON. Input: {}",
+                        serde_json::to_string(&snapshot)?
+                    )}
+                ],
+                "response_format":{"type":"json_object"},
+                "max_tokens":8192,
+                "temperature":0.0,
+                "stream":false
+            });
+            let repaired_response = match client
+                .post(&endpoint)
+                .header(AUTHORIZATION, format!("Bearer {api_key}"))
+                .header(CONTENT_TYPE, "application/json")
+                .json(&repair_request)
+                .send()
+                .await
+            {
+                Ok(response) => response,
+                Err(error) => {
+                    record_failure(
+                        output_dir,
+                        generated_ms,
+                        &model,
+                        "review_retry_request",
+                        &error.to_string(),
+                    );
+                    return Ok(json!({
+                        "status":"deferred","generated_ms":generated_ms,"model":model,
+                        "reason":"malformed_provider_response","next_action":"the systemd timer will retry"
+                    }));
+                }
+            };
+            let repaired_status = repaired_response.status();
+            let repaired_body = repaired_response.text().await?;
+            if !repaired_status.is_success() {
+                record_failure(
+                    output_dir,
+                    generated_ms,
+                    &model,
+                    "review_retry_http",
+                    &format!(
+                        "{repaired_status}: {}",
+                        repaired_body.chars().take(2_000).collect::<String>()
+                    ),
+                );
+                return Ok(json!({
+                    "status":"deferred","generated_ms":generated_ms,"model":model,
+                    "reason":"malformed_provider_response","next_action":"the systemd timer will retry"
+                }));
+            }
+            let repaired_envelope: Value = match serde_json::from_str(&repaired_body) {
+                Ok(value) => value,
+                Err(error) => {
+                    record_failure(
+                        output_dir,
+                        generated_ms,
+                        &model,
+                        "review_retry_envelope",
+                        &error.to_string(),
+                    );
+                    return Ok(json!({
+                        "status":"deferred","generated_ms":generated_ms,"model":model,
+                        "reason":"malformed_provider_response","next_action":"the systemd timer will retry"
+                    }));
+                }
+            };
+            let Some(repaired_text) = extract_output_text(&repaired_envelope) else {
+                record_failure(
+                    output_dir,
+                    generated_ms,
+                    &model,
+                    "review_retry_content",
+                    "retry returned no assistant content",
+                );
+                return Ok(json!({
+                    "status":"deferred","generated_ms":generated_ms,"model":model,
+                    "reason":"malformed_provider_response","next_action":"the systemd timer will retry"
+                }));
+            };
+            output_text = repaired_text.to_owned();
+            response_id = repaired_envelope.get("id").cloned();
+            match serde_json::from_str(&output_text) {
+                Ok(review) => review,
+                Err(error) => {
+                    record_failure(
+                        output_dir,
+                        generated_ms,
+                        &model,
+                        "review_retry_json",
+                        &format!("{error}; output_bytes={}", output_text.len()),
+                    );
+                    return Ok(json!({
+                        "status":"deferred","generated_ms":generated_ms,"model":model,
+                        "reason":"malformed_provider_response","next_action":"the systemd timer will retry"
+                    }));
+                }
+            }
+        }
+    };
     if let Err(error) = validate_review(&review) {
         record_failure(
             output_dir,
@@ -363,7 +484,7 @@ pub async fn run(
         "generated_ms":generated_ms,
         "provider":"zhipu_bigmodel",
         "model":model,
-        "response_id":envelope.get("id"),
+        "response_id":response_id,
         "review":review
     });
     let timestamped = Path::new(output_dir).join(format!("review-{generated_ms}.json"));

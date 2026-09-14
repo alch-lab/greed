@@ -56,6 +56,12 @@ API, response-parsing, and schema-validation failures are written to
 error chain. Requests use Zhipu JSON mode and results are also validated
 locally.
 
+Research output is bounded to a small number of concise observations,
+hypotheses and experiments. If Zhipu still returns truncated or malformed JSON,
+the agent regenerates one compact response from the original input. A second
+malformed response is recorded as deferred instead of failing the systemd job,
+and the candidate builder never reuses an older review for that run.
+
 ## Candidate and promotion loop
 
 When a review returns `run_experiments` with usable data, systemd starts a
