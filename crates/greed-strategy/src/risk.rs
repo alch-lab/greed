@@ -23,6 +23,8 @@ const ESTIMATED_MAKER_TAKER_FEE_BPS: f64 = 7.0;
 // planner expresses activation on gross price while the guard tracks net
 // executable return after this reserve.
 const EXECUTABLE_PROFIT_COST_RESERVE_PCT: f64 = 0.001;
+const FAST_SHIELD_TARGET_FRACTION: f64 = 0.25;
+const FAST_TRAILING_TARGET_FRACTION: f64 = 0.125;
 
 fn cost_aware_profit_shield_buffer(
     configured_buffer_pct: f64,
@@ -436,16 +438,17 @@ impl StrategyNode for PositionPlannerNode {
                 let desired_net_usd = a.equity_usd * target_account_profit_pct;
                 let gross_target_pct = desired_net_usd / notional.max(1.0) + cost_bps / 10_000.0;
                 target_r = gross_target_pct / stop_pct.max(f64::EPSILON);
-                // Arm at roughly 60% of the desired *net* dollar objective and
-                // allow a 30%-of-target retracement. Expressing both against
-                // the liquidity-sized notional keeps the dollar behavior
-                // stable when the book forces a smaller position.
+                // Fast positions retain the full target, but protection starts
+                // after one quarter of that objective and may give back only
+                // one eighth. Together with the zero-net profit memory this
+                // removes the unprotected interval without forcing every
+                // small favorable move to take profit immediately.
                 let desired_net_return = desired_net_usd / notional.max(1.0);
-                let shield_activation_pct =
-                    EXECUTABLE_PROFIT_COST_RESERVE_PCT + desired_net_return * 0.60;
+                let shield_activation_pct = EXECUTABLE_PROFIT_COST_RESERVE_PCT
+                    + desired_net_return * FAST_SHIELD_TARGET_FRACTION;
                 profit_shield_activation_r = shield_activation_pct / stop_pct.max(f64::EPSILON);
                 trailing_activation_r = profit_shield_activation_r;
-                trailing_distance_pct = desired_net_return * 0.30;
+                trailing_distance_pct = desired_net_return * FAST_TRAILING_TARGET_FRACTION;
                 effective_full_take_profit_pct = Some(gross_target_pct);
                 estimated_target_cost_bps = Some(cost_bps);
             }
@@ -1060,22 +1063,22 @@ mod tests {
     }
 
     #[test]
-    fn fast_sprint_targets_three_tenths_of_equity_after_estimated_cost() {
+    fn fast_sprint_targets_four_tenths_with_continuous_profit_protection() {
         let mut record = candidate("fast:sprint", FAST_TREND_RECIPE, "ALTUSDT", 1);
         let Artifact::Candidate(value) = &mut record.artifact else {
             panic!("candidate fixture must contain a candidate");
         };
         value.tags.extend(BTreeMap::from([
             ("stop_pct".into(), "0.005".into()),
-            ("risk_per_trade_pct".into(), "0.005".into()),
+            ("risk_per_trade_pct".into(), "0.002".into()),
             ("max_notional_multiple".into(), "1.0".into()),
             ("target_r".into(), "1.0".into()),
             ("take_profit_fraction".into(), "1.0".into()),
-            ("target_account_profit_pct".into(), "0.003".into()),
+            ("target_account_profit_pct".into(), "0.004".into()),
             ("cost_aware_full_take_profit".into(), "true".into()),
             ("profit_shield_activation_r".into(), "1.0".into()),
             ("profit_memory_activation_pct".into(), "0.001".into()),
-            ("profit_memory_floor_net_pct".into(), "-0.0002".into()),
+            ("profit_memory_floor_net_pct".into(), "0.0".into()),
             ("pre_tp_trailing_activation_r".into(), "1.0".into()),
             ("trailing_distance_pct".into(), "0.001".into()),
         ]));
@@ -1107,15 +1110,18 @@ mod tests {
                 _ => None,
             })
             .expect("fast sprint plan");
-        assert!((plan.notional_usd - 10_000.0).abs() < 1e-9);
-        // 30 USD desired net + 9 bps estimated round-trip cost: 39 bps gross.
-        assert!((plan.take_profit_prices[0].0 - 100.39).abs() < 1e-9);
+        assert!((plan.notional_usd - 4_000.0).abs() < 1e-9);
+        // 40 USD desired net on $4,000 notional + 9 bps estimated round-trip
+        // cost: 109 bps gross. Initial planned risk remains $20.
+        assert!((plan.take_profit_prices[0].0 - 101.09).abs() < 1e-9);
         assert_eq!(plan.take_profit_prices[0].1, 1.0);
-        assert!((plan.profit_shield_activation_pct.unwrap() - 0.0028).abs() < 1e-12);
+        // The executable guard subtracts its 10 bps reserve, so the 35 bps
+        // gross activation corresponds to $10 net on $4,000 notional.
+        assert!((plan.profit_shield_activation_pct.unwrap() - 0.0035).abs() < 1e-12);
         assert_eq!(plan.profit_memory_activation_pct, Some(0.001));
-        assert_eq!(plan.profit_memory_floor_net_pct, -0.0002);
-        assert!((plan.trailing_activation_pct.unwrap() - 0.0028).abs() < 1e-12);
-        assert!((plan.trailing_distance_pct.unwrap() - 0.0009).abs() < 1e-12);
+        assert_eq!(plan.profit_memory_floor_net_pct, 0.0);
+        assert!((plan.trailing_activation_pct.unwrap() - 0.0035).abs() < 1e-12);
+        assert!((plan.trailing_distance_pct.unwrap() - 0.00125).abs() < 1e-12);
     }
 
     #[test]

@@ -5,7 +5,6 @@ mod market_stream;
 mod monitor;
 mod profit_guard;
 mod report;
-mod research_agent;
 mod source;
 
 use anyhow::{Context, Result};
@@ -25,7 +24,7 @@ use std::{
     time::Duration,
 };
 use tokio::sync::{mpsc, Mutex};
-use tracing::{debug, error, info, warn};
+use tracing::{debug, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 const UNIVERSE_MISS_THRESHOLD: u8 = 4;
@@ -108,22 +107,6 @@ enum Command {
     Report {
         #[arg(long, default_value = "data/runtime/alpha-events.jsonl")]
         journal: String,
-    },
-    /// Produce a structured strategy review. This command never trades or deploys.
-    Research {
-        #[arg(long, default_value = "config/demo.toml")]
-        config: String,
-        #[arg(long, default_value = "data/runtime/alpha-events.jsonl")]
-        journal: String,
-        #[arg(long, default_value = "data/runtime/alpha-status.json")]
-        status: String,
-        #[arg(long, default_value = "data/research/agent")]
-        output_dir: String,
-        #[arg(long)]
-        model: Option<String>,
-        /// Build and persist the sanitized input without calling Zhipu.
-        #[arg(long, default_value_t = false)]
-        dry_run: bool,
     },
 }
 
@@ -434,30 +417,6 @@ async fn main() -> Result<()> {
                 "{}",
                 serde_json::to_string_pretty(&report::build(&journal)?)?
             );
-            Ok(())
-        }
-        Command::Research {
-            config,
-            journal,
-            status,
-            output_dir,
-            model,
-            dry_run,
-        } => {
-            let config = load(&config)?;
-            let result = research_agent::run(
-                &config,
-                &journal,
-                &status,
-                &output_dir,
-                model.as_deref(),
-                dry_run,
-            )
-            .await;
-            if let Err(failure) = &result {
-                error!(error=%format!("{failure:#}"), "structured strategy research failed");
-            }
-            println!("{}", serde_json::to_string_pretty(&result?)?);
             Ok(())
         }
     }

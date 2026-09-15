@@ -288,6 +288,50 @@ mod tests {
     }
 
     #[test]
+    fn fast_lifecycle_has_no_gap_between_break_even_and_dynamic_profit_lock() {
+        let protection = Protection {
+            activation: Some(0.0035),
+            floor: 0.0018,
+            memory_activation: Some(0.0010),
+            memory_floor_net: 0.0,
+            trailing_activation: Some(0.0035),
+            trailing_distance: Some(0.00125),
+            partial_activated: false,
+        };
+        let mut state = None;
+        // Covering the ten-bps reserve arms a zero-net floor, but does not
+        // force the trade out while executable value continues to improve.
+        assert!(!observe(
+            &mut state,
+            q(100.11),
+            Side::Buy,
+            100.0,
+            1.0,
+            protection,
+        ));
+        assert_eq!(state.as_ref().unwrap().floor_net_return, Some(0.0));
+        // The dynamic stage starts at 25% of the full objective and locks half
+        // of that first tranche (peak minus one-eighth of the objective).
+        assert!(!observe(
+            &mut state,
+            q(100.36),
+            Side::Buy,
+            100.0,
+            1.0,
+            protection,
+        ));
+        assert!((state.as_ref().unwrap().floor_net_return.unwrap() - 0.00135).abs() < 1e-12);
+        assert!(observe(
+            &mut state,
+            q(100.23),
+            Side::Buy,
+            100.0,
+            1.0,
+            protection,
+        ));
+    }
+
+    #[test]
     fn trend_lifecycle_ratchets_after_the_trailing_handoff() {
         let lifecycle = Protection {
             activation: Some(0.008),

@@ -1,9 +1,0 @@
-[Unit]
-Description=watch for authenticated greed strategy promotion requests
-
-[Path]
-PathChanged=/opt/greed/data/research/agent/promote-request.json
-Unit=greed-promotion.service
-
-[Install]
-WantedBy=multi-user.target

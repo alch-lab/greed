@@ -109,19 +109,24 @@ fast_late_exhaustion_max_flow = 0.25
 # A large impulse that rejects most of its own extreme is absorption, not a
 # clean continuation. Block the immediate chase on either side and wait for a
 # later independent setup; never auto-reverse from this candle alone.
-# Strategy behavior baseline restored from da3344b (2026-09-13 profitable
-# window). Later execution, accounting, reconnect, and cost protections remain.
-fast_shock_absorption_veto_enabled = false
+# Keep this veto narrow: it rejected two losing Epoch-19 entries while leaving
+# 47 of 49 observed Fast fills eligible. The 45% close-location boundary also
+# covers the RAYSOL rejection without becoming a general volatility filter.
+fast_shock_absorption_veto_enabled = true
 fast_shock_absorption_min_range = 0.015
 fast_shock_absorption_min_opposing_wick_share = 0.50
-fast_shock_absorption_max_directional_close_location = 0.40
+fast_shock_absorption_max_directional_close_location = 0.45
 # Stay early without demanding a perfectly flat pre-break hour. 4USDT on
 # 2026-09-05 began its persistent leg with +2.9% pre-break, +5.2% over 4h and
 # +2.3% OI over 15m, then supplied the required 1m reclaim.
 fast_max_prebreak_return_1h = 0.03
 fast_max_return_4h = 0.06
 fast_max_oi_change_15m = 0.03
-fast_risk_per_trade_pct = 0.005
+# Keep the Fast sleeve's initial risk near $20 per $10,000 of equity while the
+# full net objective is $40. Executable break-even memory and an early dynamic
+# ratchet may realize smaller wins; position notional still adapts to stop
+# distance and depth.
+fast_risk_per_trade_pct = 0.002
 fast_entry_timeout_seconds = 20
 fast_min_fill_ratio = 0.80
 fast_min_managed_fill_ratio = 0.50
@@ -162,7 +167,7 @@ liquidation_max_execution_divergence_bps = 15.0
 # expanding against the proposed fade with aggressive-flow confirmation.
 # The conjunction keeps ordinary reversals tradable while rejecting V-shaped
 # continuation such as LSK on 2026-09-13.
-liquidation_impulse_veto_enabled = false
+liquidation_impulse_veto_enabled = true
 liquidation_impulse_veto_min_body_pct = 0.005
 liquidation_impulse_veto_min_flow = 0.05
 # A profitable shield exit can be a brief bounce rather than the end of the

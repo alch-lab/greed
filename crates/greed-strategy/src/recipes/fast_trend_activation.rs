@@ -6,10 +6,10 @@ use greed_kernel::{
 use std::collections::BTreeMap;
 
 // Paper-only sprint experiment: close the entire position once its executable
-// profit can contribute roughly 0.30% of the current sleeve equity. The
+// profit can contribute roughly 0.40% of the current sleeve equity. The
 // planner converts this account-level objective into a price target after the
 // actual liquidity-sized notional and estimated round-trip cost are known.
-const FAST_TARGET_ACCOUNT_PROFIT_PCT: f64 = 0.003;
+const FAST_TARGET_ACCOUNT_PROFIT_PCT: f64 = 0.004;
 
 pub struct FastTrendActivationNode {
     id: String,
@@ -617,11 +617,12 @@ impl StrategyNode for FastTrendActivationNode {
                 // derived from the final liquidity-sized dollar target.
                 ("profit_shield_activation_r".into(), "1.0".into()),
                 // Once executable value has paid the conservative 10 bps
-                // round-trip reserve, remember it. A two-bps net giveback
-                // floor prevents a small winner from becoming a full-risk
-                // loss without forcing an early take-profit.
+                // round-trip reserve, remember it at a non-negative net
+                // floor. The dynamic shield then starts at one quarter of the
+                // account-level objective and ratchets continuously, leaving
+                // no unprotected gap before the full target.
                 ("profit_memory_activation_pct".into(), "0.0010".into()),
-                ("profit_memory_floor_net_pct".into(), "-0.0002".into()),
+                ("profit_memory_floor_net_pct".into(), "0.0".into()),
                 ("pre_tp_trailing_activation_r".into(), "1.0".into()),
                 ("trailing_distance_pct".into(), "0.001".into()),
                 ("cost_aware_profit_shield".into(), "true".into()),
@@ -963,5 +964,10 @@ mod tests {
             Some(0.20),
             &config,
         ));
+    }
+
+    #[test]
+    fn fast_sprint_targets_forty_dollars_per_ten_thousand_equity() {
+        assert_eq!(FAST_TARGET_ACCOUNT_PROFIT_PCT, 0.004);
     }
 }

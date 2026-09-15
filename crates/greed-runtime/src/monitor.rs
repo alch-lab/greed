@@ -84,8 +84,6 @@ struct ApiState {
     operator_password: Option<Arc<str>>,
     operator_token: Option<Arc<str>>,
     live_portfolio: LivePortfolio,
-    research_candidate_path: PathBuf,
-    promotion_request_path: PathBuf,
 }
 
 #[derive(Deserialize)]
@@ -96,11 +94,6 @@ struct LoginRequest {
 #[derive(Deserialize, Default)]
 struct ManualCloseRequest {
     note: Option<String>,
-}
-
-#[derive(Deserialize)]
-struct PromoteCandidateRequest {
-    candidate_id: String,
 }
 
 #[derive(Deserialize)]
@@ -165,14 +158,6 @@ pub async fn start(config: &RuntimeConfig, live_portfolio: LivePortfolio) -> Res
         operator_password,
         operator_token,
         live_portfolio,
-        research_candidate_path: Path::new(&config.research_path)
-            .parent()
-            .unwrap_or_else(|| Path::new("data/research"))
-            .join("agent/latest-candidate.json"),
-        promotion_request_path: Path::new(&config.research_path)
-            .parent()
-            .unwrap_or_else(|| Path::new("data/research"))
-            .join("agent/promote-request.json"),
     };
     let router = Router::new()
         .route("/api/health", get(health))
@@ -187,8 +172,6 @@ pub async fn start(config: &RuntimeConfig, live_portfolio: LivePortfolio) -> Res
         .route("/api/control/pause", post(pause))
         .route("/api/control/resume", post(resume))
         .route("/api/control/risk/reset", post(reset_risk_guard))
-        .route("/api/research/candidate", get(research_candidate))
-        .route("/api/research/candidate/promote", post(promote_candidate))
         .route("/api/positions/{symbol}/close", post(manual_close))
         .with_state(state);
     let task = tokio::spawn(async move {
@@ -330,110 +313,6 @@ async fn reset_risk_guard(State(state): State<ApiState>, headers: HeaderMap) -> 
     }
 }
 
-async fn research_candidate(State(state): State<ApiState>) -> Response {
-    match read_json(&state.research_candidate_path) {
-        Ok(mut value) => {
-            if value["status"] == "ready" && !performance_validation_passed(&value) {
-                value["status"] = json!("blocked");
-                value["detail"] = json!(
-                    "Engineering checks passed, but no deterministic historical performance replay has passed."
-                );
-                if let Some(gates) = value["gates"].as_array_mut() {
-                    gates.push(json!({"name":"Historical performance replay","passed":false}));
-                }
-            }
-            if let Ok(request) = read_json(&state.promotion_request_path) {
-                let same_candidate = request["candidate_id"] == value["candidate_id"];
-                if same_candidate && request["status"] == "requested" {
-                    value["status"] = json!("promotion_requested");
-                }
-            }
-            Json(value).into_response()
-        }
-        Err(error)
-            if error
-                .downcast_ref::<std::io::Error>()
-                .is_some_and(|value| value.kind() == std::io::ErrorKind::NotFound) =>
-        {
-            Json(json!({"status":"none"})).into_response()
-        }
-        Err(error) => api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string()),
-    }
-}
-
-async fn promote_candidate(
-    State(state): State<ApiState>,
-    headers: HeaderMap,
-    Json(input): Json<PromoteCandidateRequest>,
-) -> Response {
-    let Some(actor) = operator_actor(&state, &headers) else {
-        return api_error(StatusCode::UNAUTHORIZED, "operator login required");
-    };
-    if !state.paused.load(Ordering::SeqCst) {
-        return api_error(
-            StatusCode::CONFLICT,
-            "pause new entries before promoting a strategy candidate",
-        );
-    }
-    let Some(live) = state.live_portfolio.snapshot() else {
-        return api_error(StatusCode::SERVICE_UNAVAILABLE, "live portfolio is warming");
-    };
-    if live["account"]["open_positions"].as_u64().unwrap_or(0) != 0 {
-        return api_error(
-            StatusCode::CONFLICT,
-            "candidate promotion requires zero open positions",
-        );
-    }
-    let candidate = match read_json(&state.research_candidate_path) {
-        Ok(value) => value,
-        Err(error) => return api_error(StatusCode::NOT_FOUND, &error.to_string()),
-    };
-    let candidate_id = input.candidate_id.trim();
-    if !valid_candidate_id(candidate_id)
-        || candidate["candidate_id"].as_str() != Some(candidate_id)
-        || candidate["status"].as_str() != Some("ready")
-    {
-        return api_error(StatusCode::CONFLICT, "candidate is not ready for promotion");
-    }
-    if !performance_validation_passed(&candidate) {
-        return api_error(
-            StatusCode::CONFLICT,
-            "candidate has no passing deterministic historical performance replay",
-        );
-    }
-    let gates_pass = candidate["gates"]
-        .as_array()
-        .is_some_and(|gates| !gates.is_empty() && gates.iter().all(|gate| gate["passed"] == true));
-    if !gates_pass {
-        return api_error(
-            StatusCode::CONFLICT,
-            "candidate validation gates have not all passed",
-        );
-    }
-    if let Ok(existing) = read_json(&state.promotion_request_path) {
-        if existing["status"] == "requested" {
-            return api_error(
-                StatusCode::CONFLICT,
-                "a candidate promotion is already running",
-            );
-        }
-    }
-    let request = json!({
-        "schema_version":1,
-        "candidate_id":candidate_id,
-        "candidate_commit":candidate["candidate_commit"],
-        "base_commit":candidate["base_commit"],
-        "branch":candidate["branch"],
-        "actor":actor,
-        "requested_ms":chrono::Utc::now().timestamp_millis(),
-        "status":"requested",
-    });
-    if let Err(error) = atomic_write_json(&state.promotion_request_path, &request) {
-        return api_error(StatusCode::INTERNAL_SERVER_ERROR, &error.to_string());
-    }
-    (StatusCode::ACCEPTED, Json(request)).into_response()
-}
-
 async fn set_paused(state: ApiState, headers: HeaderMap, paused: bool) -> Response {
     let Some(actor) = operator_actor(&state, &headers) else {
         return api_error(StatusCode::UNAUTHORIZED, "operator login required");
@@ -548,29 +427,6 @@ fn valid_symbol(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit())
-}
-
-fn valid_candidate_id(value: &str) -> bool {
-    (5..=64).contains(&value.len())
-        && value
-            .bytes()
-            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
-}
-
-fn performance_validation_passed(candidate: &Value) -> bool {
-    candidate["performance_validation"]["passed"] == true
-        && candidate["performance_validation"]["status"] == "passed"
-}
-
-fn atomic_write_json(path: &Path, value: &Value) -> Result<()> {
-    let parent = path
-        .parent()
-        .context("promotion request has no parent directory")?;
-    std::fs::create_dir_all(parent)?;
-    let temporary = path.with_extension("json.tmp");
-    std::fs::write(&temporary, serde_json::to_vec_pretty(value)?)?;
-    std::fs::rename(temporary, path)?;
-    Ok(())
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -1013,13 +869,6 @@ mod tests {
         assert!(!valid_symbol("promusdt"));
         assert!(!valid_symbol("BTCUSDC"));
         assert!(!valid_symbol("BTC/USDT"));
-        assert!(valid_candidate_id("auto-1780000000000"));
-        assert!(!valid_candidate_id("research/auto-1"));
-        assert!(!valid_candidate_id("../../main"));
-        assert!(!performance_validation_passed(&json!({"status":"ready"})));
-        assert!(performance_validation_passed(&json!({
-            "performance_validation":{"status":"passed","passed":true}
-        })));
     }
 
     #[test]

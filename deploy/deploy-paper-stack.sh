@@ -130,6 +130,27 @@ prune_non_runtime_artifacts() {
   done
 }
 
+remove_retired_ai_research_services() {
+  local unit
+
+  # These units belonged to the retired external-AI code-generation path.
+  # Market/research capture remains part of greed-paper and is not touched.
+  for unit in \
+    greed-research.timer \
+    greed-research.service \
+    greed-candidate.service \
+    greed-promotion.path \
+    greed-promotion.service; do
+    systemctl disable --now "${unit}" >/dev/null 2>&1 || true
+    rm -f -- "/etc/systemd/system/${unit}"
+  done
+  rm -f -- /etc/greed-research.env
+  rm -rf -- "${BACKEND_DIR}/data/research/agent" /opt/greed-candidates
+  git -C "${BACKEND_DIR}" worktree prune >/dev/null 2>&1 || true
+  systemctl daemon-reload
+  systemctl reset-failed >/dev/null 2>&1 || true
+}
+
 trap 'printf "\nFailed at line %s. Runtime data was not deleted.\n" "$LINENO" >&2' ERR
 
 [[ "${EUID}" -eq 0 ]] || fail "run this script with sudo"
@@ -186,6 +207,7 @@ fi
   ./target/release/greed validate --config config/demo.toml)
 
 step "Restart backend without touching data/"
+remove_retired_ai_research_services
 systemctl restart "${BACKEND_SERVICE}"
 if ! wait_for_health; then
   rollback_backend

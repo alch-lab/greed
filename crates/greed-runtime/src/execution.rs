@@ -6575,7 +6575,7 @@ fn effective_profit_memory(meta: &ExecutionMeta) -> Option<(f64, f64)> {
         return Some((activation, meta.profit_memory_floor_net_pct));
     }
     match meta.recipe.as_str() {
-        "fast_trend_activation" => Some((0.0010, -0.0002)),
+        "fast_trend_activation" => Some((0.0010, 0.0)),
         "liquidation_exhaustion_reversal" | LIQUIDATION_REENTRY_RECIPE => Some((0.0012, -0.0002)),
         "trend_continuation" | TREND_REENTRY_RECIPE | TREND_PROFIT_REVERSAL_RECIPE => {
             Some((0.0020, -0.0005))
@@ -8522,7 +8522,7 @@ mod tests {
             "entry_ms":1_000,"entry_price":100.0,"stop_price":101.0,"max_hold_ms":600_000
         }))
         .unwrap();
-        assert_eq!(effective_profit_memory(&fast), Some((0.0010, -0.0002)));
+        assert_eq!(effective_profit_memory(&fast), Some((0.0010, 0.0)));
 
         let unrelated: ExecutionMeta = serde_json::from_value(serde_json::json!({
             "candidate_id":"other:legacy","recipe":"other","side":"buy",

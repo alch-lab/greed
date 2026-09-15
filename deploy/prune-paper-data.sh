@@ -22,17 +22,13 @@ while IFS= read -r path; do
   [[ -n "${path}" ]] && targets+=("${path}")
 done < <(find data -maxdepth 1 -type d -name 'runtime-incident-*' -mtime +7 -print 2>/dev/null | sort)
 
-while IFS= read -r path; do
-  [[ -n "${path}" ]] && targets+=("${path}")
-done < <(find data/research/agent -maxdepth 1 -type f -name 'review-*.json' -mtime +30 -print 2>/dev/null | sort)
-
 printf 'Preserved:\n'
 printf '  %s\n' \
   data/runtime/alpha-events.jsonl \
   data/runtime/alpha-history.jsonl \
   data/runtime/alpha-status.json \
   data/runtime/binance-alpha-state.json \
-  data/research/agent
+  data/research/market-research.jsonl
 
 if (( ${#targets[@]} == 0 )); then
   printf 'No files are eligible for pruning.\n'
