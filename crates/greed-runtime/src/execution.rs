@@ -6579,24 +6579,22 @@ fn effective_trailing_activation(meta: &ExecutionMeta) -> Option<f64> {
 /// inherit the new protection on restart. This preserves the current epoch
 /// and protects already-open positions without rewriting their journal.
 fn effective_profit_memory(meta: &ExecutionMeta) -> Option<(f64, f64)> {
-    // Apply the positive executable floor to positions opened immediately
-    // before a rolling deployment as well as newly planned positions. This
-    // changes only Fast exit protection; entry selection remains untouched.
-    if meta.recipe == "fast_trend_activation" {
+    // A negative floor contradicts the event name and lets several small
+    // winners be erased by a "profit" exit. Apply one positive executable
+    // floor to every funded lane, including positions restored across a
+    // rolling deployment. Entry selection remains untouched.
+    if let Some(activation) = meta.profit_memory_activation_pct {
         return Some((
-            meta.profit_memory_activation_pct
-                .unwrap_or(0.0020)
-                .max(0.0020),
+            activation.max(0.0020),
             meta.profit_memory_floor_net_pct.max(0.0007),
         ));
     }
-    if let Some(activation) = meta.profit_memory_activation_pct {
-        return Some((activation, meta.profit_memory_floor_net_pct));
-    }
     match meta.recipe.as_str() {
-        "liquidation_exhaustion_reversal" | LIQUIDATION_REENTRY_RECIPE => Some((0.0012, -0.0002)),
+        "fast_trend_activation"
+        | "liquidation_exhaustion_reversal"
+        | LIQUIDATION_REENTRY_RECIPE => Some((0.0020, 0.0007)),
         "trend_continuation" | TREND_REENTRY_RECIPE | TREND_PROFIT_REVERSAL_RECIPE => {
-            Some((0.0020, -0.0005))
+            Some((0.0020, 0.0007))
         }
         _ => None,
     }
@@ -8558,6 +8556,17 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(effective_profit_memory(&fast), Some((0.0020, 0.0007)));
+
+        let liquidation: ExecutionMeta = serde_json::from_value(serde_json::json!({
+            "candidate_id":"liq:legacy","recipe":"liquidation_exhaustion_reversal","side":"sell",
+            "entry_ms":1_000,"entry_price":100.0,"stop_price":102.0,"max_hold_ms":900_000,
+            "profit_memory_activation_pct":0.0012,"profit_memory_floor_net_pct":-0.0002
+        }))
+        .unwrap();
+        assert_eq!(
+            effective_profit_memory(&liquidation),
+            Some((0.0020, 0.0007))
+        );
 
         let unrelated: ExecutionMeta = serde_json::from_value(serde_json::json!({
             "candidate_id":"other:legacy","recipe":"other","side":"buy",

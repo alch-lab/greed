@@ -322,8 +322,12 @@ impl StrategyNode for LiquidationExhaustionReversalNode {
                             / self.config.liquidation_stop_pct)
                             .to_string(),
                     ),
-                    ("profit_memory_activation_pct".into(), "0.0012".into()),
-                    ("profit_memory_floor_net_pct".into(), "-0.0002".into()),
+                    // Profit memory is named as such only when it can protect
+                    // a positive executable value after the cost reserve.
+                    // The shared runtime enforces the same floor for legacy
+                    // and already-open positions during a rolling deploy.
+                    ("profit_memory_activation_pct".into(), "0.0020".into()),
+                    ("profit_memory_floor_net_pct".into(), "0.0007".into()),
                     (
                         "break_even_buffer_pct".into(),
                         (self.config.liquidation_profit_shield_floor_bps / 10_000.0).to_string(),
