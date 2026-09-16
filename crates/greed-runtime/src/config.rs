@@ -36,7 +36,7 @@ impl Default for ExecutionConfig {
             api_secret_env: "BINANCE_DEMO_API_SECRET".into(),
             recv_window_ms: 5_000,
             leverage: 5,
-            executable_profit_guard: false,
+            executable_profit_guard: true,
         }
     }
 }
@@ -215,6 +215,9 @@ impl AppConfig {
         if !(1..=5).contains(&self.execution.leverage) {
             return Err("demo leverage must be 1..=5".into());
         }
+        if !self.execution.executable_profit_guard {
+            return Err("executable_profit_guard must remain enabled for funded strategies".into());
+        }
         Ok(())
     }
 }
@@ -228,6 +231,14 @@ mod tests {
         let mut config: AppConfig =
             toml::from_str(include_str!("../../../config/demo.toml")).expect("paper config parses");
         config.execution.base_url = "https://fapi.binance.com".into();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn funded_demo_rejects_disabled_executable_profit_guard() {
+        let mut config: AppConfig =
+            toml::from_str(include_str!("../../../config/demo.toml")).expect("paper config parses");
+        config.execution.executable_profit_guard = false;
         assert!(config.validate().is_err());
     }
 }

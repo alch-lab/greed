@@ -23,6 +23,11 @@ const ESTIMATED_MAKER_TAKER_FEE_BPS: f64 = 7.0;
 // planner expresses activation on gross price while the guard tracks net
 // executable return after this reserve.
 const EXECUTABLE_PROFIT_COST_RESERVE_PCT: f64 = 0.001;
+/// Unified executable-profit memory contract for every funded lane. Recipes
+/// may request stricter values, but the planner never emits a weaker or
+/// negative memory floor.
+pub const PROFIT_MEMORY_MIN_ACTIVATION_PCT: f64 = 0.0020;
+pub const PROFIT_MEMORY_MIN_NET_FLOOR_PCT: f64 = 0.0007;
 const FAST_SHIELD_TARGET_FRACTION: f64 = 0.25;
 const FAST_TRAILING_TARGET_FRACTION: f64 = 0.125;
 
@@ -347,10 +352,11 @@ impl StrategyNode for PositionPlannerNode {
             let mut profit_shield_activation_r = tag_f64(c, "profit_shield_activation_r")
                 .unwrap_or(self.config.profit_shield_activation_r);
             let profit_memory_activation_pct = tag_f64(c, "profit_memory_activation_pct")
-                .filter(|value| (0.0005..=0.01).contains(value));
+                .filter(|value| (0.0005..=0.01).contains(value))
+                .map(|value| value.max(PROFIT_MEMORY_MIN_ACTIVATION_PCT));
             let profit_memory_floor_net_pct = tag_f64(c, "profit_memory_floor_net_pct")
                 .unwrap_or_default()
-                .clamp(-0.002, 0.002);
+                .clamp(PROFIT_MEMORY_MIN_NET_FLOOR_PCT, 0.002);
             let mut break_even_buffer_pct = tag_f64(c, "break_even_buffer_pct")
                 .unwrap_or(self.config.break_even_buffer_pct)
                 .clamp(0.0, 0.01);
@@ -563,6 +569,16 @@ impl StrategyNode for PositionPlannerNode {
                 .into(),
             );
             signal_context.insert("entry_strength_score".into(), assessment.score.to_string());
+            if let Some(activation) = profit_memory_activation_pct {
+                signal_context.insert(
+                    "profit_memory_activation_pct".into(),
+                    activation.to_string(),
+                );
+                signal_context.insert(
+                    "profit_memory_floor_net_pct".into(),
+                    profit_memory_floor_net_pct.to_string(),
+                );
+            }
             if let Some(lsr) = assessment.lsr {
                 signal_context.insert("long_short_ratio_5m".into(), lsr.to_string());
             }
@@ -1188,8 +1204,22 @@ mod tests {
         // The executable guard subtracts its 10 bps reserve, so the 35 bps
         // gross activation corresponds to $10 net on $4,000 notional.
         assert!((plan.profit_shield_activation_pct.unwrap() - 0.0035).abs() < 1e-12);
-        assert_eq!(plan.profit_memory_activation_pct, Some(0.001));
-        assert_eq!(plan.profit_memory_floor_net_pct, 0.0);
+        assert_eq!(
+            plan.profit_memory_activation_pct,
+            Some(PROFIT_MEMORY_MIN_ACTIVATION_PCT)
+        );
+        assert_eq!(
+            plan.profit_memory_floor_net_pct,
+            PROFIT_MEMORY_MIN_NET_FLOOR_PCT
+        );
+        assert_eq!(
+            plan.signal_context["profit_memory_activation_pct"],
+            PROFIT_MEMORY_MIN_ACTIVATION_PCT.to_string()
+        );
+        assert_eq!(
+            plan.signal_context["profit_memory_floor_net_pct"],
+            PROFIT_MEMORY_MIN_NET_FLOOR_PCT.to_string()
+        );
         assert!((plan.trailing_activation_pct.unwrap() - 0.0035).abs() < 1e-12);
         assert!((plan.trailing_distance_pct.unwrap() - 0.00125).abs() < 1e-12);
     }

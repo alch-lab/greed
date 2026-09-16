@@ -150,15 +150,16 @@ pub fn observe(
         .memory_activation
         .is_some_and(|activation| s.peak_net_return >= (activation - COST_RESERVE).max(0.0));
     if memory_activated {
-        // A remembered-profit floor may be positive. Cap it at the observed
-        // executable peak and arm only while the current quote is above it,
-        // preventing a bad configuration from requesting an immediate close.
+        // A remembered-profit floor may be positive and is capped at the
+        // observed executable peak. "Profit memory" may never remember a
+        // loss. Clamp malformed or
+        // legacy negative configuration to net break-even, and ratchet an
+        // already-restored negative floor immediately once its historical
+        // executable peak proves activation.
         let floor = protection
             .memory_floor_net
-            .clamp(-COST_RESERVE, s.peak_net_return.max(-COST_RESERVE));
-        if s.current_net_return > floor {
-            s.floor_net_return = Some(s.floor_net_return.map_or(floor, |old| old.max(floor)));
-        }
+            .clamp(0.0, s.peak_net_return.max(0.0));
+        s.floor_net_return = Some(s.floor_net_return.map_or(floor, |old| old.max(floor)));
     }
     if activated {
         // Arm only above the floor. Never liquidate a legacy position just
@@ -252,7 +253,7 @@ mod tests {
     }
 
     #[test]
-    fn cost_coverage_memory_arms_without_capping_a_winner() {
+    fn malformed_negative_memory_floor_is_clamped_to_net_break_even() {
         let protection = Protection {
             activation: Some(0.0028),
             floor: 0.0018,
@@ -263,8 +264,8 @@ mod tests {
             partial_activated: false,
         };
         let mut state = None;
-        // Twelve gross bps covers the conservative ten-bps reserve and arms
-        // only a scratch floor. The position remains open while it advances.
+        // Twelve gross bps covers the conservative ten-bps reserve. A legacy
+        // negative floor is not allowed to turn "profit memory" into a loss.
         assert!(!observe(
             &mut state,
             q(100.12),
@@ -273,7 +274,7 @@ mod tests {
             1.0,
             protection,
         ));
-        assert_eq!(state.as_ref().unwrap().floor_net_return, Some(-0.0002));
+        assert_eq!(state.as_ref().unwrap().floor_net_return, Some(0.0));
         assert!(!observe(
             &mut state,
             q(100.30),
@@ -282,8 +283,8 @@ mod tests {
             1.0,
             protection,
         ));
-        // A full giveback to seven gross bps is below the remembered
-        // minus-two-net-bps floor and requests an executable close.
+        // A full giveback to seven gross bps is below net break-even and
+        // requests an executable close.
         assert!(observe(
             &mut state,
             q(100.07),
@@ -327,6 +328,37 @@ mod tests {
             1.0,
             protection,
         ));
+    }
+
+    #[test]
+    fn restored_negative_floor_is_upgraded_and_exited_without_another_peak() {
+        let protection = Protection {
+            activation: None,
+            floor: 0.0,
+            memory_activation: Some(0.0020),
+            memory_floor_net: 0.0007,
+            trailing_activation: None,
+            trailing_distance: None,
+            partial_activated: false,
+        };
+        let mut state = Some(ProfitGuard {
+            quantity: 1.0,
+            peak_net_return: 0.0011,
+            current_net_return: -0.0002,
+            floor_net_return: Some(-0.0002),
+            observed_ms: 900,
+            exchange_ms: 900,
+            exit_vwap: 100.08,
+        });
+        assert!(observe(
+            &mut state,
+            q(100.15),
+            Side::Buy,
+            100.0,
+            1.0,
+            protection,
+        ));
+        assert_eq!(state.unwrap().floor_net_return, Some(0.0007));
     }
 
     #[test]

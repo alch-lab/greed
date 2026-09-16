@@ -1,4 +1,8 @@
-use crate::{primitives::meta, LaneConfig};
+use crate::{
+    primitives::meta,
+    risk::{PROFIT_MEMORY_MIN_ACTIVATION_PCT, PROFIT_MEMORY_MIN_NET_FLOOR_PCT},
+    LaneConfig,
+};
 use greed_kernel::{
     Artifact, ArtifactRecord, Candle, DataQuality, NodeContext, Side, StateArtifact, StrategyNode,
     TradeCandidate, Verdict,
@@ -518,8 +522,14 @@ impl StrategyNode for TrendContinuationNode {
                     // Trend trades need more breathing room than the Fast and
                     // liquidation lanes, but a genuine 20 bps executable
                     // excursion should not be forgotten entirely.
-                    tags.insert("profit_memory_activation_pct".into(), "0.0020".into());
-                    tags.insert("profit_memory_floor_net_pct".into(), "-0.0005".into());
+                    tags.insert(
+                        "profit_memory_activation_pct".into(),
+                        PROFIT_MEMORY_MIN_ACTIVATION_PCT.to_string(),
+                    );
+                    tags.insert(
+                        "profit_memory_floor_net_pct".into(),
+                        PROFIT_MEMORY_MIN_NET_FLOOR_PCT.to_string(),
+                    );
                     tags.insert(
                         "break_even_buffer_pct".into(),
                         self.config.trend_profit_shield_buffer_pct.to_string(),

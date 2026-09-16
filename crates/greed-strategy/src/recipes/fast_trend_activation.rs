@@ -1,4 +1,8 @@
-use crate::{primitives::meta, LaneConfig};
+use crate::{
+    primitives::meta,
+    risk::{PROFIT_MEMORY_MIN_ACTIVATION_PCT, PROFIT_MEMORY_MIN_NET_FLOOR_PCT},
+    LaneConfig,
+};
 use greed_kernel::{
     Artifact, ArtifactRecord, Candle, DataQuality, NodeContext, Side, StateArtifact, StrategyNode,
     TradeCandidate, Verdict,
@@ -621,8 +625,14 @@ impl StrategyNode for FastTrendActivationNode {
                 // net bps on a giveback so a normal quote-to-fill delay or one
                 // price tick does not turn remembered profit into a fee loss.
                 // The dynamic shield still takes over as profit expands.
-                ("profit_memory_activation_pct".into(), "0.0020".into()),
-                ("profit_memory_floor_net_pct".into(), "0.0007".into()),
+                (
+                    "profit_memory_activation_pct".into(),
+                    PROFIT_MEMORY_MIN_ACTIVATION_PCT.to_string(),
+                ),
+                (
+                    "profit_memory_floor_net_pct".into(),
+                    PROFIT_MEMORY_MIN_NET_FLOOR_PCT.to_string(),
+                ),
                 ("pre_tp_trailing_activation_r".into(), "1.0".into()),
                 ("trailing_distance_pct".into(), "0.001".into()),
                 ("cost_aware_profit_shield".into(), "true".into()),

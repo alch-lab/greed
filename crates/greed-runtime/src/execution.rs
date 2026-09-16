@@ -7,7 +7,10 @@ use greed_kernel::{
     AccountFrame, Artifact, ArtifactMeta, ArtifactRecord, Candle, DataQuality, GraphEvaluation,
     MarketFrame, Side, StateArtifact, TradeCandidate, Verdict,
 };
-use greed_strategy::{LaneConfig, RiskConfig};
+use greed_strategy::{
+    risk::{PROFIT_MEMORY_MIN_ACTIVATION_PCT, PROFIT_MEMORY_MIN_NET_FLOOR_PCT},
+    LaneConfig, RiskConfig,
+};
 use hmac::{Hmac, Mac};
 use reqwest::{Client, Method};
 use serde::{Deserialize, Serialize};
@@ -1209,7 +1212,8 @@ impl BinanceDemoExecution {
                         if meta.exit_requested
                             || meta.runner_active
                             || meta.fixed_time_exit
-                            || meta.profit_shield_activation_pct.is_none()
+                            || (meta.profit_shield_activation_pct.is_none()
+                                && effective_profit_memory(meta).is_none())
                         {
                             continue;
                         }
@@ -1402,18 +1406,35 @@ impl BinanceDemoExecution {
                     let profit_shield_hit = meta
                         .profit_shield_activation_pct
                         .is_some_and(|activation| favorable >= activation);
-                    let shield_hit = partial_shield_hit || profit_shield_hit;
-                    let mut desired_stop = None;
-                    let mut reason = if profit_shield_hit && !partial_shield_hit {
+                    let memory_armed = profit_memory.is_some_and(|(activation, _)| {
+                        meta.executable_profit.as_ref().is_some_and(|guard| {
+                            guard.floor_net_return.is_some()
+                                && guard.peak_net_return
+                                    >= (activation - crate::profit_guard::COST_RESERVE).max(0.0)
+                        })
+                    });
+                    let executable_floor_stop = executable_floor_stop_price(meta);
+                    let shield_hit =
+                        partial_shield_hit || profit_shield_hit || executable_floor_stop.is_some();
+                    // Mirror the local executable-value floor onto Binance's
+                    // hosted stop. Local market-close detection remains the
+                    // second line of defence, not the only one.
+                    let mut desired_stop = executable_floor_stop;
+                    let mut reason = if memory_armed && !profit_shield_hit && !partial_shield_hit {
+                        "profit_memory_protection"
+                    } else if profit_shield_hit && !partial_shield_hit {
                         "pre_tp_profit_shield"
                     } else {
                         "risk_shield"
                     };
                     if shield_hit && !meta.break_even_armed && meta.entry_price > 0.0 {
-                        desired_stop = Some(
-                            meta.entry_price
-                                * (1.0 + meta.side.sign() * meta.break_even_buffer_pct),
-                        );
+                        let break_even_stop = meta.entry_price
+                            * (1.0 + meta.side.sign() * meta.break_even_buffer_pct);
+                        desired_stop = Some(match (meta.side, desired_stop) {
+                            (Side::Buy, Some(current)) => current.max(break_even_stop),
+                            (Side::Sell, Some(current)) => current.min(break_even_stop),
+                            (_, None) => break_even_stop,
+                        });
                     }
                     if shield_hit
                         && effective_trailing_activation(meta)
@@ -2371,6 +2392,14 @@ impl BinanceDemoExecution {
                             "break_even_buffer_pct".into(),
                             self.lanes.trend_profit_shield_buffer_pct.to_string(),
                         ),
+                        (
+                            "profit_memory_activation_pct".into(),
+                            PROFIT_MEMORY_MIN_ACTIVATION_PCT.to_string(),
+                        ),
+                        (
+                            "profit_memory_floor_net_pct".into(),
+                            PROFIT_MEMORY_MIN_NET_FLOOR_PCT.to_string(),
+                        ),
                         ("cost_aware_profit_shield".into(), "true".into()),
                         (
                             "pre_tp_trailing_activation_r".into(),
@@ -2670,6 +2699,14 @@ impl BinanceDemoExecution {
                                     "break_even_buffer_pct".into(),
                                     (self.lanes.liquidation_profit_shield_floor_bps / 10_000.0)
                                         .to_string(),
+                                ),
+                                (
+                                    "profit_memory_activation_pct".into(),
+                                    PROFIT_MEMORY_MIN_ACTIVATION_PCT.to_string(),
+                                ),
+                                (
+                                    "profit_memory_floor_net_pct".into(),
+                                    PROFIT_MEMORY_MIN_NET_FLOOR_PCT.to_string(),
                                 ),
                                 (
                                     "pre_tp_trailing_activation_r".into(),
@@ -5891,7 +5928,10 @@ impl BinanceDemoExecution {
                     ("type".into(), kind.into()),
                     (
                         "triggerPrice".into(),
-                        decimal(round_step(trigger, rules.price_tick), rules.price_tick),
+                        decimal(
+                            protective_trigger_price(side, trigger, rules.price_tick),
+                            rules.price_tick,
+                        ),
                     ),
                     ("closePosition".into(), "true".into()),
                     ("workingType".into(), "MARK_PRICE".into()),
@@ -6525,6 +6565,7 @@ fn protective_exit_reason(meta: &ExecutionMeta) -> &str {
 fn normalized_protective_exit_reason(reason: &str) -> &str {
     match reason {
         "pre_tp_profit_shield" => "profit_shield_stop",
+        "profit_memory_protection" => "executable_profit_memory",
         "trailing_protection" => "trailing_protection",
         "risk_shield" => "risk_shield_stop",
         "initial_stop" => "initial_stop",
@@ -6585,19 +6626,38 @@ fn effective_profit_memory(meta: &ExecutionMeta) -> Option<(f64, f64)> {
     // rolling deployment. Entry selection remains untouched.
     if let Some(activation) = meta.profit_memory_activation_pct {
         return Some((
-            activation.max(0.0020),
-            meta.profit_memory_floor_net_pct.max(0.0007),
+            activation.max(PROFIT_MEMORY_MIN_ACTIVATION_PCT),
+            meta.profit_memory_floor_net_pct
+                .max(PROFIT_MEMORY_MIN_NET_FLOOR_PCT),
         ));
     }
     match meta.recipe.as_str() {
         "fast_trend_activation"
         | "liquidation_exhaustion_reversal"
-        | LIQUIDATION_REENTRY_RECIPE => Some((0.0020, 0.0007)),
-        "trend_continuation" | TREND_REENTRY_RECIPE | TREND_PROFIT_REVERSAL_RECIPE => {
-            Some((0.0020, 0.0007))
-        }
+        | LIQUIDATION_REENTRY_RECIPE => Some((
+            PROFIT_MEMORY_MIN_ACTIVATION_PCT,
+            PROFIT_MEMORY_MIN_NET_FLOOR_PCT,
+        )),
+        "trend_continuation" | TREND_REENTRY_RECIPE | TREND_PROFIT_REVERSAL_RECIPE => Some((
+            PROFIT_MEMORY_MIN_ACTIVATION_PCT,
+            PROFIT_MEMORY_MIN_NET_FLOOR_PCT,
+        )),
         _ => None,
     }
+}
+
+/// Convert the executable net-return floor back into the gross trigger price
+/// understood by the exchange-hosted stop. The cost reserve is re-added
+/// because the guard stores floors after estimated round-trip costs.
+fn executable_floor_stop_price(meta: &ExecutionMeta) -> Option<f64> {
+    meta.executable_profit
+        .as_ref()
+        .and_then(|guard| guard.floor_net_return)
+        .filter(|floor| floor.is_finite() && *floor >= 0.0 && meta.entry_price > 0.0)
+        .map(|floor| {
+            meta.entry_price
+                * (1.0 + meta.side.sign() * (floor + crate::profit_guard::COST_RESERVE))
+        })
 }
 
 fn main_executable_profit_protection_armed(meta: &ExecutionMeta) -> bool {
@@ -7350,9 +7410,18 @@ fn ceil_step(value: f64, step: f64) -> f64 {
         (value / step).ceil() * step
     }
 }
-fn round_step(value: f64, step: f64) -> f64 {
-    (value / step).round() * step
+
+/// Quantize a stop toward the protected position, never away from it. A sell
+/// stop protects a long and therefore rounds up; a buy stop protects a short
+/// and rounds down. Nearest-tick rounding could silently give back part (or
+/// all) of a small positive profit-memory floor.
+fn protective_trigger_price(exit_side: Side, value: f64, step: f64) -> f64 {
+    match exit_side {
+        Side::Sell => ceil_step(value, step),
+        Side::Buy => floor_step(value, step),
+    }
 }
+
 fn decimal(value: f64, step: f64) -> String {
     let precision = (-step.log10().floor()).max(0.0) as usize;
     format!("{value:.precision$}")
@@ -7853,7 +7922,7 @@ mod tests {
             break_even_buffer_pct: 0.0018,
             profit_shield_activation_pct: Some(0.00625),
             profit_memory_activation_pct: Some(0.0020),
-            profit_memory_floor_net_pct: -0.0005,
+            profit_memory_floor_net_pct: 0.0007,
             trailing_activation_pct: Some(0.01),
             trailing_distance_pct: Some(0.005),
             early_failure_after_ms: 180_000,
@@ -7869,6 +7938,8 @@ mod tests {
         assert_eq!(floor_step(1.239, 0.01), 1.23);
         assert_eq!(decimal(1.23, 0.01), "1.23");
         assert_eq!(ceil_step(1.231, 0.01), 1.24);
+        assert!((protective_trigger_price(Side::Sell, 100.11, 0.1) - 100.2).abs() < 1e-9);
+        assert!((protective_trigger_price(Side::Buy, 99.89, 0.1) - 99.8).abs() < 1e-9);
     }
 
     #[test]
@@ -8574,6 +8645,25 @@ mod tests {
         }))
         .unwrap();
         assert_eq!(effective_profit_memory(&unrelated), None);
+    }
+
+    #[test]
+    fn executable_memory_floor_maps_to_symmetric_hosted_stop_prices() {
+        let buy: ExecutionMeta = serde_json::from_value(serde_json::json!({
+            "candidate_id":"fast:buy","recipe":"fast_trend_activation","side":"buy",
+            "entry_ms":1_000,"entry_price":100.0,"stop_price":99.0,"max_hold_ms":600_000,
+            "executable_profit":{
+                "quantity":1.0,"peak_net_return":0.0011,"current_net_return":0.0008,
+                "floor_net_return":0.0007,"observed_ms":2_000,"exchange_ms":1_999,
+                "exit_vwap":100.18
+            }
+        }))
+        .unwrap();
+        assert!((executable_floor_stop_price(&buy).unwrap() - 100.17).abs() < 1e-9);
+
+        let mut sell = buy;
+        sell.side = Side::Sell;
+        assert!((executable_floor_stop_price(&sell).unwrap() - 99.83).abs() < 1e-9);
     }
 
     #[test]

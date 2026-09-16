@@ -1,4 +1,8 @@
-use crate::{primitives::meta, LaneConfig};
+use crate::{
+    primitives::meta,
+    risk::{PROFIT_MEMORY_MIN_ACTIVATION_PCT, PROFIT_MEMORY_MIN_NET_FLOOR_PCT},
+    LaneConfig,
+};
 use greed_kernel::{
     Artifact, ArtifactRecord, DataQuality, NodeContext, Side, StateArtifact, StrategyNode,
     TradeCandidate, Verdict,
@@ -326,8 +330,14 @@ impl StrategyNode for LiquidationExhaustionReversalNode {
                     // a positive executable value after the cost reserve.
                     // The shared runtime enforces the same floor for legacy
                     // and already-open positions during a rolling deploy.
-                    ("profit_memory_activation_pct".into(), "0.0020".into()),
-                    ("profit_memory_floor_net_pct".into(), "0.0007".into()),
+                    (
+                        "profit_memory_activation_pct".into(),
+                        PROFIT_MEMORY_MIN_ACTIVATION_PCT.to_string(),
+                    ),
+                    (
+                        "profit_memory_floor_net_pct".into(),
+                        PROFIT_MEMORY_MIN_NET_FLOOR_PCT.to_string(),
+                    ),
                     (
                         "break_even_buffer_pct".into(),
                         (self.config.liquidation_profit_shield_floor_bps / 10_000.0).to_string(),
