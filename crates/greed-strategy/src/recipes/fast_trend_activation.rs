@@ -616,13 +616,13 @@ impl StrategyNode for FastTrendActivationNode {
                 // The planner replaces these placeholders with thresholds
                 // derived from the final liquidity-sized dollar target.
                 ("profit_shield_activation_r".into(), "1.0".into()),
-                // Once executable value has paid the conservative 10 bps
-                // round-trip reserve, remember it at a non-negative net
-                // floor. The dynamic shield then starts at one quarter of the
-                // account-level objective and ratchets continuously, leaving
-                // no unprotected gap before the full target.
-                ("profit_memory_activation_pct".into(), "0.0010".into()),
-                ("profit_memory_floor_net_pct".into(), "0.0".into()),
+                // Arm only after executable value has cleared the conservative
+                // 10 bps round-trip reserve by another 10 bps. Preserve seven
+                // net bps on a giveback so a normal quote-to-fill delay or one
+                // price tick does not turn remembered profit into a fee loss.
+                // The dynamic shield still takes over as profit expands.
+                ("profit_memory_activation_pct".into(), "0.0020".into()),
+                ("profit_memory_floor_net_pct".into(), "0.0007".into()),
                 ("pre_tp_trailing_activation_r".into(), "1.0".into()),
                 ("trailing_distance_pct".into(), "0.001".into()),
                 ("cost_aware_profit_shield".into(), "true".into()),

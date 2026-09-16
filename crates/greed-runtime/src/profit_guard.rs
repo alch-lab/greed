@@ -150,8 +150,15 @@ pub fn observe(
         .memory_activation
         .is_some_and(|activation| s.peak_net_return >= (activation - COST_RESERVE).max(0.0));
     if memory_activated {
-        let floor = protection.memory_floor_net.clamp(-COST_RESERVE, 0.0);
-        s.floor_net_return = Some(s.floor_net_return.map_or(floor, |old| old.max(floor)));
+        // A remembered-profit floor may be positive. Cap it at the observed
+        // executable peak and arm only while the current quote is above it,
+        // preventing a bad configuration from requesting an immediate close.
+        let floor = protection
+            .memory_floor_net
+            .clamp(-COST_RESERVE, s.peak_net_return.max(-COST_RESERVE));
+        if s.current_net_return > floor {
+            s.floor_net_return = Some(s.floor_net_return.map_or(floor, |old| old.max(floor)));
+        }
     }
     if activated {
         // Arm only above the floor. Never liquidate a legacy position just
@@ -280,6 +287,41 @@ mod tests {
         assert!(observe(
             &mut state,
             q(100.07),
+            Side::Buy,
+            100.0,
+            1.0,
+            protection,
+        ));
+    }
+
+    #[test]
+    fn positive_memory_floor_locks_executable_profit_before_break_even() {
+        let protection = Protection {
+            activation: None,
+            floor: 0.0,
+            memory_activation: Some(0.0020),
+            memory_floor_net: 0.0007,
+            trailing_activation: None,
+            trailing_distance: None,
+            partial_activated: false,
+        };
+        let mut state = None;
+        // Twenty-one gross bps leaves eleven net bps after the reserve. The
+        // seven-net-bps floor arms without closing the advancing position.
+        assert!(!observe(
+            &mut state,
+            q(100.21),
+            Side::Buy,
+            100.0,
+            1.0,
+            protection,
+        ));
+        assert_eq!(state.as_ref().unwrap().floor_net_return, Some(0.0007));
+        // A retrace to sixteen gross bps leaves six net bps and exits before
+        // the executable value reaches the fee-only break-even boundary.
+        assert!(observe(
+            &mut state,
+            q(100.16),
             Side::Buy,
             100.0,
             1.0,

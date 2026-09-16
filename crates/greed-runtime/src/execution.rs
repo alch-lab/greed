@@ -6571,11 +6571,21 @@ fn effective_trailing_activation(meta: &ExecutionMeta) -> Option<f64> {
 /// inherit the new protection on restart. This preserves the current epoch
 /// and protects already-open positions without rewriting their journal.
 fn effective_profit_memory(meta: &ExecutionMeta) -> Option<(f64, f64)> {
+    // Apply the positive executable floor to positions opened immediately
+    // before a rolling deployment as well as newly planned positions. This
+    // changes only Fast exit protection; entry selection remains untouched.
+    if meta.recipe == "fast_trend_activation" {
+        return Some((
+            meta.profit_memory_activation_pct
+                .unwrap_or(0.0020)
+                .max(0.0020),
+            meta.profit_memory_floor_net_pct.max(0.0007),
+        ));
+    }
     if let Some(activation) = meta.profit_memory_activation_pct {
         return Some((activation, meta.profit_memory_floor_net_pct));
     }
     match meta.recipe.as_str() {
-        "fast_trend_activation" => Some((0.0010, 0.0)),
         "liquidation_exhaustion_reversal" | LIQUIDATION_REENTRY_RECIPE => Some((0.0012, -0.0002)),
         "trend_continuation" | TREND_REENTRY_RECIPE | TREND_PROFIT_REVERSAL_RECIPE => {
             Some((0.0020, -0.0005))
@@ -8522,7 +8532,7 @@ mod tests {
             "entry_ms":1_000,"entry_price":100.0,"stop_price":101.0,"max_hold_ms":600_000
         }))
         .unwrap();
-        assert_eq!(effective_profit_memory(&fast), Some((0.0010, 0.0)));
+        assert_eq!(effective_profit_memory(&fast), Some((0.0020, 0.0007)));
 
         let unrelated: ExecutionMeta = serde_json::from_value(serde_json::json!({
             "candidate_id":"other:legacy","recipe":"other","side":"buy",
