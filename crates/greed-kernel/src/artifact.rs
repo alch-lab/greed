@@ -10,6 +10,18 @@ pub enum Verdict {
     Unknown,
 }
 
+/// Signal-time conviction used by the shared portfolio policy.  Recipes still
+/// describe *what* was observed; this enum describes how much account risk the
+/// portfolio is allowed to put behind that observation.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryStrength {
+    Probe,
+    #[default]
+    Confirmed,
+    Conviction,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ArtifactMeta {
     pub as_of_ms: i64,
@@ -58,6 +70,10 @@ pub struct TradeCandidate {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PositionPlan {
     pub candidate_id: String,
+    #[serde(default)]
+    pub entry_strength: EntryStrength,
+    #[serde(default)]
+    pub entry_score: f64,
     /// Immutable signal-time measurements copied from the candidate. These
     /// are journaled with the eventual entry so later research can separate
     /// market regimes without reconstructing a historical live frame.

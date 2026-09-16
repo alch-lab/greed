@@ -3,8 +3,9 @@ use crate::market_stream::{MarketStreamHub, StreamTicker};
 use anyhow::{anyhow, Result};
 use futures_util::{stream, StreamExt};
 use greed_kernel::{
-    AccountFrame, BookState, Candle, CandleSeries, DataQuality, InstrumentFrame, MarketFrame,
-    MarketKind, ObservationMeta, OpenInterestPoint, OpenInterestSeries, PriceLevel,
+    AccountFrame, BookState, Candle, CandleSeries, DataQuality, InstrumentFrame,
+    LongShortRatioPoint, LongShortRatioSeries, MarketFrame, MarketKind, ObservationMeta,
+    OpenInterestPoint, OpenInterestSeries, PriceLevel,
 };
 use greed_strategy::StrategyConfig;
 use reqwest::{Client, StatusCode};
@@ -61,6 +62,8 @@ pub struct BinanceMarketSource {
     candle_bootstrap_last_error: Option<String>,
     open_interest_cache: BTreeMap<String, OpenInterestSeries>,
     open_interest_retry_after: BTreeMap<String, i64>,
+    long_short_ratio_cache: BTreeMap<String, LongShortRatioSeries>,
+    long_short_ratio_retry_after: BTreeMap<String, i64>,
     depth_fallbacks_last_frame: usize,
     depth_fallbacks_total: u64,
 }
@@ -116,6 +119,8 @@ const KLINE_TERMINAL_REPAIR_RETRY_MS: i64 = 15_000;
 const MAX_KLINE_TERMINAL_REPAIRS_PER_FRAME: usize = 8;
 const OI_REFRESH_MS: i64 = 5 * 60_000;
 const MAX_OI_REQUESTS_PER_FRAME: usize = 4;
+const LSR_REFRESH_MS: i64 = 5 * 60_000;
+const MAX_LSR_REQUESTS_PER_FRAME: usize = 6;
 const DEPTH_FALLBACK_CONCURRENCY: usize = 8;
 const DEPTH_FALLBACK_TIMEOUT: Duration = Duration::from_secs(2);
 
@@ -185,6 +190,8 @@ impl BinanceMarketSource {
             candle_bootstrap_last_error: None,
             open_interest_cache: BTreeMap::new(),
             open_interest_retry_after: BTreeMap::new(),
+            long_short_ratio_cache: BTreeMap::new(),
+            long_short_ratio_retry_after: BTreeMap::new(),
             depth_fallbacks_last_frame: 0,
             depth_fallbacks_total: 0,
         })
@@ -1067,6 +1074,96 @@ impl BinanceMarketSource {
         }
     }
 
+    async fn long_short_ratio_history(
+        &self,
+        symbol: &str,
+        now: i64,
+    ) -> Result<LongShortRatioSeries> {
+        let suffix =
+            format!("/futures/data/globalLongShortAccountRatio?symbol={symbol}&period=5m&limit=24");
+        let values = self.get_from_bases(&self.futures_bases(), &suffix).await?;
+        let rows = values
+            .as_array()
+            .ok_or_else(|| anyhow!("long-short-ratio response is not an array"))?;
+        let mut points = Vec::with_capacity(rows.len());
+        for row in rows {
+            let parse = |key: &str| -> Result<f64> {
+                row.get(key)
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| anyhow!("long-short-ratio {key} is missing"))?
+                    .parse()
+                    .map_err(Into::into)
+            };
+            points.push(LongShortRatioPoint {
+                timestamp_ms: row
+                    .get("timestamp")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| anyhow!("long-short-ratio timestamp is missing"))?,
+                ratio: parse("longShortRatio")?,
+                long_account: parse("longAccount")?,
+                short_account: parse("shortAccount")?,
+            });
+        }
+        Ok(LongShortRatioSeries {
+            interval_ms: 300_000,
+            meta: Self::meta(
+                now,
+                LSR_REFRESH_MS + 90_000,
+                "binance_global_long_short_account_ratio",
+                DataQuality::Complete,
+            ),
+            values: points,
+        })
+    }
+
+    async fn refresh_long_short_ratios(&mut self, strategy: &StrategyConfig, now: i64) {
+        let symbols: Vec<_> = strategy
+            .symbols
+            .iter()
+            .filter(|symbol| {
+                let stale = self
+                    .long_short_ratio_cache
+                    .get(*symbol)
+                    .is_none_or(|series| now - series.meta.received_ms >= LSR_REFRESH_MS);
+                let retry_ready = self
+                    .long_short_ratio_retry_after
+                    .get(*symbol)
+                    .is_none_or(|retry_after| now >= *retry_after);
+                stale && retry_ready
+            })
+            .take(MAX_LSR_REQUESTS_PER_FRAME)
+            .cloned()
+            .collect();
+        let source = &*self;
+        let results = stream::iter(symbols)
+            .map(|symbol| async move {
+                let result = tokio::time::timeout(
+                    KLINE_BOOTSTRAP_TIMEOUT,
+                    source.long_short_ratio_history(&symbol, now),
+                )
+                .await
+                .map_err(|_| anyhow!("long-short-ratio request timed out"))
+                .and_then(|value| value);
+                (symbol, result)
+            })
+            .buffer_unordered(MAX_LSR_REQUESTS_PER_FRAME)
+            .collect::<Vec<_>>()
+            .await;
+        for (symbol, result) in results {
+            match result {
+                Ok(series) => {
+                    self.long_short_ratio_cache.insert(symbol.clone(), series);
+                    self.long_short_ratio_retry_after.remove(&symbol);
+                }
+                Err(error) => {
+                    tracing::debug!(symbol = %symbol, error = %error, "long-short ratio is warming");
+                    self.long_short_ratio_retry_after
+                        .insert(symbol, now + KLINE_BOOTSTRAP_RETRY_DELAY_MS);
+                }
+            }
+        }
+    }
+
     fn stream_observation_klines(
         &self,
         symbol: &str,
@@ -1152,6 +1249,7 @@ impl BinanceMarketSource {
         if !urgent_liquidation {
             self.bootstrap_missing_klines(strategy, now).await;
             self.refresh_open_interest(strategy, now).await;
+            self.refresh_long_short_ratios(strategy, now).await;
         }
         self.repair_elapsed_candle_terminals(chrono::Utc::now().timestamp_millis())
             .await;
@@ -1320,6 +1418,7 @@ impl BinanceMarketSource {
                     fast_perpetual,
                     micro_perpetual,
                     open_interest: self.open_interest_cache.get(symbol).cloned(),
+                    long_short_ratio: self.long_short_ratio_cache.get(symbol).cloned(),
                     book,
                     microstructure,
                 },

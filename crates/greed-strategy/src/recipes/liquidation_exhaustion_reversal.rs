@@ -472,6 +472,7 @@ mod tests {
                     fast_perpetual: None,
                     micro_perpetual: None,
                     open_interest: None,
+                    long_short_ratio: None,
                     book: Some(BookState {
                         meta: meta.clone(),
                         bid: 99.89,

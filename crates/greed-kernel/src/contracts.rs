@@ -175,6 +175,11 @@ pub struct InstrumentFrame {
     /// existing journals and cold-start frames remain backward compatible.
     #[serde(default)]
     pub open_interest: Option<OpenInterestSeries>,
+    /// Binance global account long/short ratio.  This is context, never a
+    /// standalone direction signal: extreme same-side crowding reduces entry
+    /// strength while opposite crowding may support a squeeze setup.
+    #[serde(default)]
+    pub long_short_ratio: Option<LongShortRatioSeries>,
     pub book: Option<BookState>,
     pub microstructure: Option<MicrostructureState>,
 }
@@ -196,6 +201,21 @@ pub struct OpenInterestSeries {
     pub interval_ms: i64,
     pub meta: ObservationMeta,
     pub values: Vec<OpenInterestPoint>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LongShortRatioPoint {
+    pub timestamp_ms: i64,
+    pub ratio: f64,
+    pub long_account: f64,
+    pub short_account: f64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LongShortRatioSeries {
+    pub interval_ms: i64,
+    pub meta: ObservationMeta,
+    pub values: Vec<LongShortRatioPoint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

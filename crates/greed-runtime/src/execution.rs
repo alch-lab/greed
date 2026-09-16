@@ -37,6 +37,14 @@ const LIQUIDATION_REVERSAL_RECIPE: &str = "liquidation_exhaustion_reversal";
 const LIQUIDATION_REENTRY_RECIPE: &str = "liquidation_exhaustion_reentry";
 const LIQUIDATION_EXECUTION_BASIS_VERSION: u32 = 1;
 
+/// Trading-day boundary used by the dashboard and daily risk controls.  The
+/// deployment is operated in Asia/Shanghai, so UTC dates made "Today" roll at
+/// 08:00 local time and disagreed with the user's ledger.
+fn portfolio_day(now: chrono::DateTime<chrono::Utc>) -> String {
+    let offset = chrono::FixedOffset::east_opt(8 * 60 * 60).expect("valid UTC+8 offset");
+    now.with_timezone(&offset).format("%Y-%m-%d").to_string()
+}
+
 fn recipe_slot_full(
     recipe: &str,
     fast_active: usize,
@@ -618,7 +626,7 @@ impl BinanceDemoExecution {
                 .ok_or_else(|| anyhow!("demo account not synchronized"))?;
             value.state.baseline_wallet_usd = Some(wallet);
             value.state.peak_equity_usd = Some(value.portfolio.initial_equity_usd);
-            value.state.risk_day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+            value.state.risk_day = portfolio_day(chrono::Utc::now());
             value.state.risk_day_start_equity_usd = Some(value.portfolio.initial_equity_usd);
             value.state.seen.clear();
             value.save()?;
@@ -2028,7 +2036,7 @@ impl BinanceDemoExecution {
             .unwrap_or(account.wallet_balance);
         let realized = account.wallet_balance - baseline;
         let equity = self.portfolio.initial_equity_usd + account.margin_balance - baseline;
-        let day = chrono::Utc::now().format("%Y-%m-%d").to_string();
+        let day = portfolio_day(chrono::Utc::now());
         if self.state.risk_day != day {
             self.state.risk_day = day;
             self.state.risk_day_start_equity_usd = Some(equity);
@@ -2085,7 +2093,7 @@ impl BinanceDemoExecution {
         let (previous_day_start, previous_peak) = reset_portfolio_risk_baselines(
             &mut self.state,
             equity,
-            chrono::Utc::now().format("%Y-%m-%d").to_string(),
+            portfolio_day(chrono::Utc::now()),
         );
         self.save()?;
         Ok(ExchangeEvent {
@@ -7751,6 +7759,21 @@ mod tests {
     use super::*;
 
     #[test]
+    fn portfolio_day_rolls_at_shanghai_midnight() {
+        use chrono::TimeZone;
+        let before = chrono::Utc
+            .with_ymd_and_hms(2026, 9, 15, 15, 59, 59)
+            .single()
+            .unwrap();
+        let after = chrono::Utc
+            .with_ymd_and_hms(2026, 9, 15, 16, 0, 0)
+            .single()
+            .unwrap();
+        assert_eq!(portfolio_day(before), "2026-09-15");
+        assert_eq!(portfolio_day(after), "2026-09-16");
+    }
+
+    #[test]
     fn operator_risk_reset_changes_only_the_loss_baselines() {
         let mut state = DemoState {
             risk_day: "2026-09-08".into(),
@@ -7807,6 +7830,8 @@ mod tests {
     fn guarded_plan(side: Side) -> greed_kernel::PositionPlan {
         greed_kernel::PositionPlan {
             candidate_id: "trend_continuation:TESTUSDT:1".into(),
+            entry_strength: greed_kernel::EntryStrength::Confirmed,
+            entry_score: 0.75,
             signal_context: BTreeMap::new(),
             symbol: "TESTUSDT".into(),
             side,

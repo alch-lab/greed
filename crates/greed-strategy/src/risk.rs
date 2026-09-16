@@ -1,7 +1,7 @@
-use crate::{primitives::meta, RiskConfig};
+use crate::{entry_strength, primitives::meta, RiskConfig};
 use greed_kernel::{
-    Artifact, ArtifactRecord, BookState, DataQuality, NodeContext, PositionPlan, PriceLevel, Side,
-    StateArtifact, StrategyNode, Verdict,
+    Artifact, ArtifactRecord, BookState, DataQuality, EntryStrength, NodeContext, PositionPlan,
+    PriceLevel, Side, StateArtifact, StrategyNode, Verdict,
 };
 use std::collections::BTreeMap;
 
@@ -300,18 +300,47 @@ impl StrategyNode for PositionPlannerNode {
                 planned_symbols.remove(&c.symbol);
                 continue;
             }
+            let assessment = entry_strength::assess(c, i, ctx.frame.as_of_ms);
+            // Recipe-local percentages used to let a weak Fast signal risk as
+            // much as a high-quality setup.  The shared classifier is now the
+            // sole account-risk authority; recipe tags remain in the journal
+            // for backward-compatible research only.
             let default_risk_pct = if c.confidence >= self.config.high_confidence_threshold {
                 self.config.high_confidence_risk_per_trade_pct
             } else {
                 self.config.risk_per_trade_pct
             };
-            let risk_pct = tag_f64(c, "risk_per_trade_pct")
-                .unwrap_or(default_risk_pct)
-                .clamp(0.001, 0.02);
-            let stop_pct = tag_f64(c, "stop_pct")
-                .unwrap_or(self.config.initial_stop_pct)
-                .clamp(0.003, 0.10);
-            let mut target_r = tag_f64(c, "target_r").unwrap_or(self.config.first_take_profit_r);
+            let risk_pct = if assessment.evidence_count > 0 {
+                assessment.risk_pct()
+            } else {
+                tag_f64(c, "risk_per_trade_pct")
+                    .unwrap_or(default_risk_pct)
+                    .clamp(0.001, 0.02)
+            };
+            let strength_stop_multiplier = match assessment.strength {
+                EntryStrength::Probe => 0.75,
+                EntryStrength::Confirmed => 1.0,
+                EntryStrength::Conviction => 1.20,
+            };
+            let strength_stop_multiplier = if assessment.evidence_count > 0 {
+                strength_stop_multiplier
+            } else {
+                1.0
+            };
+            let stop_pct = (tag_f64(c, "stop_pct").unwrap_or(self.config.initial_stop_pct)
+                * strength_stop_multiplier)
+                .clamp(0.0025, 0.10);
+            let strength_target_multiplier = if assessment.evidence_count == 0 {
+                1.0
+            } else {
+                match assessment.strength {
+                    EntryStrength::Probe => 0.75,
+                    EntryStrength::Confirmed => 1.0,
+                    EntryStrength::Conviction => 1.20,
+                }
+            };
+            let mut target_r = tag_f64(c, "target_r").unwrap_or(self.config.first_take_profit_r)
+                * strength_target_multiplier;
             let take_fraction = tag_f64(c, "take_profit_fraction")
                 .unwrap_or(self.config.first_take_profit_fraction)
                 .clamp(0.1, 1.0);
@@ -332,7 +361,17 @@ impl StrategyNode for PositionPlannerNode {
             let explicit_profit_protection = c.tags.contains_key("profit_shield_activation_r")
                 || c.tags.contains_key("pre_tp_trailing_activation_r")
                 || c.tags.contains_key("trailing_distance_pct");
-            let early_failure_after_ms = tag_i64(c, "early_failure_after_ms").unwrap_or_default();
+            let lifecycle_multiplier = if assessment.evidence_count == 0 {
+                5
+            } else {
+                match assessment.strength {
+                    EntryStrength::Probe => 3,
+                    EntryStrength::Confirmed => 5,
+                    EntryStrength::Conviction => 6,
+                }
+            };
+            let early_failure_after_ms =
+                tag_i64(c, "early_failure_after_ms").unwrap_or_default() * lifecycle_multiplier / 5;
             let early_failure_adverse_r = tag_f64(c, "early_failure_adverse_r").unwrap_or_default();
             let early_failure_max_mfe_r = tag_f64(c, "early_failure_max_mfe_r").unwrap_or_default();
             let desired_notional = (a.equity_usd * risk_pct / stop_pct).min(
@@ -420,9 +459,14 @@ impl StrategyNode for PositionPlannerNode {
             let mut effective_full_take_profit_pct = None;
             let mut estimated_target_cost_bps = None;
             if tag_bool(c, "cost_aware_full_take_profit") {
-                let target_account_profit_pct = tag_f64(c, "target_account_profit_pct")
-                    .unwrap_or_default()
-                    .clamp(0.0001, 0.02);
+                let target_account_profit_pct =
+                    if c.recipe == FAST_TREND_RECIPE && assessment.evidence_count > 0 {
+                        assessment.fast_target_account_pct()
+                    } else {
+                        tag_f64(c, "target_account_profit_pct")
+                            .unwrap_or_default()
+                            .clamp(0.0001, 0.02)
+                    };
                 let mid = (book.bid + book.ask) * 0.5;
                 let spread_bps = if mid > f64::EPSILON {
                     (book.ask - book.bid) / mid * 10_000.0
@@ -510,6 +554,23 @@ impl StrategyNode for PositionPlannerNode {
                 .then_some(first_exit_fraction);
             let mut signal_context = c.tags.clone();
             signal_context.insert(
+                "entry_strength".into(),
+                match assessment.strength {
+                    EntryStrength::Probe => "probe",
+                    EntryStrength::Confirmed => "confirmed",
+                    EntryStrength::Conviction => "conviction",
+                }
+                .into(),
+            );
+            signal_context.insert("entry_strength_score".into(), assessment.score.to_string());
+            if let Some(lsr) = assessment.lsr {
+                signal_context.insert("long_short_ratio_5m".into(), lsr.to_string());
+            }
+            if let Some(vsr) = assessment.vsr {
+                signal_context.insert("volatility_state_ratio".into(), vsr.to_string());
+            }
+            signal_context.insert("effective_risk_pct".into(), risk_pct.to_string());
+            signal_context.insert(
                 "effective_profit_shield_buffer_pct".into(),
                 break_even_buffer_pct.to_string(),
             );
@@ -527,9 +588,13 @@ impl StrategyNode for PositionPlannerNode {
                 signal_context.insert(
                     "target_account_profit_usd".into(),
                     (a.equity_usd
-                        * tag_f64(c, "target_account_profit_pct")
-                            .unwrap_or_default()
-                            .clamp(0.0001, 0.02))
+                        * if c.recipe == FAST_TREND_RECIPE && assessment.evidence_count > 0 {
+                            assessment.fast_target_account_pct()
+                        } else {
+                            tag_f64(c, "target_account_profit_pct")
+                                .unwrap_or_default()
+                                .clamp(0.0001, 0.02)
+                        })
                     .to_string(),
                 );
             }
@@ -548,6 +613,8 @@ impl StrategyNode for PositionPlannerNode {
             }
             let plan = PositionPlan {
                 candidate_id: c.id.clone(),
+                entry_strength: assessment.strength,
+                entry_score: assessment.score,
                 signal_context,
                 symbol: c.symbol.clone(),
                 side: c.side,
@@ -624,7 +691,9 @@ impl StrategyNode for PositionPlannerNode {
                     stop_pct * early_failure_max_mfe_r
                 },
                 max_hold_ms: tag_i64(c, "max_hold_ms")
-                    .unwrap_or_else(|| i64::from(self.config.max_hold_minutes) * 60_000),
+                    .unwrap_or_else(|| i64::from(self.config.max_hold_minutes) * 60_000)
+                    * lifecycle_multiplier
+                    / 5,
                 fixed_time_exit,
             };
             out.push(ArtifactRecord {
@@ -687,6 +756,7 @@ mod tests {
             fast_perpetual: None,
             micro_perpetual: None,
             open_interest: None,
+            long_short_ratio: None,
             book: Some(BookState {
                 meta: meta(),
                 bid: 99.99,

@@ -355,6 +355,21 @@ impl ResearchRecorder {
                     "quality":series.meta.quality,
                 }))
             });
+            let long_short_ratio = instrument.long_short_ratio.as_ref().and_then(|series| {
+                let latest = series.values.last()?;
+                Some(serde_json::json!({
+                    "interval_ms":series.interval_ms,
+                    "timestamp_ms":latest.timestamp_ms,
+                    "ratio":latest.ratio,
+                    "long_account":latest.long_account,
+                    "short_account":latest.short_account,
+                    "event_age_ms":frame.as_of_ms-series.meta.event_ms,
+                    "usable":series.meta.usable_at(frame.as_of_ms),
+                    "quality":series.meta.quality,
+                }))
+            });
+            let volatility_state_ratio =
+                greed_strategy::entry_strength::volatility_state_ratio(instrument, frame.as_of_ms);
             records.push((
                 "research_snapshot".to_string(),
                 serde_json::json!({
@@ -365,6 +380,8 @@ impl ResearchRecorder {
                     "book":book,
                     "flow":flow,
                     "open_interest":open_interest,
+                    "long_short_ratio":long_short_ratio,
+                    "volatility_state_ratio":volatility_state_ratio,
                 }),
             ));
             queue.push_back(PendingResearchSample {
