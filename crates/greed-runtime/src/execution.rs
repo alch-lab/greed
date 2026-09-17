@@ -39,6 +39,13 @@ const MAX_PROFIT_REVERSALS_PER_CHAIN: u8 = 2;
 const LIQUIDATION_REVERSAL_RECIPE: &str = "liquidation_exhaustion_reversal";
 const LIQUIDATION_REENTRY_RECIPE: &str = "liquidation_exhaustion_reentry";
 const LIQUIDATION_EXECUTION_BASIS_VERSION: u32 = 1;
+// Leave room for fees, mark-price movement and Binance's own maintenance
+// margin calculation. A fresh account snapshot is read immediately before
+// every entry, so strategy equity can never authorize more margin than the
+// execution account can actually provide.
+const ENTRY_MARGIN_CAPACITY_FRACTION: f64 = 0.90;
+const INSUFFICIENT_MARGIN_RETRY_FRACTION: f64 = 0.50;
+const INSUFFICIENT_MARGIN_RETRY_CAPACITY_FRACTION: f64 = 0.80;
 
 /// Trading-day boundary used by the dashboard and daily risk controls.  The
 /// deployment is operated in Asia/Shanghai, so UTC dates made "Today" roll at
@@ -460,6 +467,19 @@ struct RemoteAccount {
     positions: BTreeMap<String, RemotePosition>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct EntrySizing {
+    planned_notional_usd: f64,
+    planned_quantity: f64,
+    submitted_notional_usd: f64,
+    submitted_quantity: f64,
+    available_balance_usd: f64,
+    estimated_initial_margin_usd: f64,
+    margin_capacity_notional_usd: f64,
+    size_multiplier: f64,
+    margin_capped: bool,
+}
+
 #[derive(Debug)]
 struct EntryExecution {
     order: Value,
@@ -470,6 +490,8 @@ struct EntryExecution {
     maker_reprices: u8,
     final_maker_limit: Option<f64>,
     size_multiplier: f64,
+    sizing: EntrySizing,
+    margin_retry: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -506,6 +528,8 @@ struct BracketExecution {
     maker_reprices: u8,
     final_maker_limit: Option<f64>,
     size_multiplier: f64,
+    sizing: EntrySizing,
+    margin_retry: bool,
     order_submitted_ms: i64,
     first_fill_ms: i64,
     entry_completed_ms: i64,
@@ -3439,20 +3463,32 @@ impl BinanceDemoExecution {
                     .await
                 {
                     Ok(event) => events.push(event),
-                    Err(error) => events.push(ExchangeEvent {
-                        kind: "exchange_order_rejected".into(),
-                        payload: serde_json::json!({
-                            "ts_ms":chrono::Utc::now().timestamp_millis(),
-                            "candidate_id":plan.candidate_id,
-                            "recipe":recipe,
-                            "symbol":plan.symbol,
-                            "side":plan.side,
-                            "reason":error.to_string(),
-                            "stage":"entry_submission",
-                            "venue":"binance_demo",
-                            "paper_only":true,
-                        }),
-                    }),
+                    Err(error) => {
+                        let available_balance_usd = self
+                            .account
+                            .as_ref()
+                            .map(|account| account.available_balance);
+                        events.push(ExchangeEvent {
+                            kind: "exchange_order_rejected".into(),
+                            payload: serde_json::json!({
+                                "ts_ms":chrono::Utc::now().timestamp_millis(),
+                                "candidate_id":plan.candidate_id,
+                                "recipe":recipe,
+                                "symbol":plan.symbol,
+                                "side":plan.side,
+                                "reference_price":plan.reference_price,
+                                "planned_notional_usd":plan.notional_usd * size_multiplier,
+                                "planned_quantity":plan.notional_usd * size_multiplier / plan.reference_price.max(f64::EPSILON),
+                                "available_balance_usd":available_balance_usd,
+                                "estimated_initial_margin_usd":plan.notional_usd * size_multiplier / f64::from(self.config.leverage),
+                                "leverage":self.config.leverage,
+                                "reason":format!("{error:#}"),
+                                "stage":"entry_submission",
+                                "venue":"binance_demo",
+                                "paper_only":true,
+                            }),
+                        });
+                    }
                 }
                 continue;
             }
@@ -3549,9 +3585,26 @@ impl BinanceDemoExecution {
                     let signal_to_order_ms = candidate
                         .map(|value| frame.as_of_ms.saturating_sub(value.signal_ms))
                         .unwrap_or_default();
+                    let mut entry_payload = serde_json::json!({"ts_ms":fill.first_fill_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"signal_context":plan.signal_context,"entry_mode":fill.entry_mode,"entry_price_source":fill.entry_price_source,"maker_attempted":fill.maker_attempted,"maker_wait_ms":fill.maker_wait_ms,"maker_reprices":fill.maker_reprices,"requested_limit":plan.entry_limit,"final_maker_limit":fill.final_maker_limit,"entry_price":fill.entry_price,"quantity":fill.quantity,"notional_usd":actual_notional_usd,"actual_notional_usd":actual_notional_usd,"planned_notional_usd":planned_notional_usd,"fill_ratio":fill_ratio,"partial_fill":fill_ratio < 0.999,"actual_protection":{"initial_risk_usd":actual_initial_risk_usd,"activation_pct":actual_protection.activation_pct,"trailing_distance_pct":actual_protection.trailing_distance_pct},"probe_size_multiplier":size_multiplier,"entry_size_multiplier":fill.size_multiplier,"margin_type":"isolated","unprotected_runner_fraction":plan.unprotected_runner_fraction,"entry_timing":{"signal_ms":candidate.map(|value|value.signal_ms),"order_submitted_ms":fill.order_submitted_ms,"first_fill_ms":fill.first_fill_ms,"entry_completed_ms":fill.entry_completed_ms,"source":fill.entry_time_source},"entry_guard":{"invalidation_bps":plan.entry_invalidation_bps,"max_opposing_flow":plan.entry_guard_max_opposing_flow,"max_opposing_return_bps":plan.entry_guard_max_opposing_return_bps},"early_failure":{"after_ms":plan.early_failure_after_ms,"adverse_pct":plan.early_failure_adverse_pct,"max_favorable_pct":plan.early_failure_max_favorable_pct},"spread_bps":cost.spread_bps,"expected_exit_slippage_bps":cost.expected_exit_slippage_bps,"estimated_round_trip_cost_bps":cost.estimated_round_trip_cost_bps,"gross_target_bps":cost.gross_target_bps,"target_to_cost_ratio":cost.target_to_cost_ratio,"order_id":fill.order_id,"stop_algo_id":fill.stop_algo_id,"take_profit_order_ids":fill.take_profit_order_ids,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true});
+                    if let Some(payload) = entry_payload.as_object_mut() {
+                        payload.insert(
+                            "margin_sizing".into(),
+                            serde_json::json!({
+                                "original_planned_notional_usd":fill.sizing.planned_notional_usd,
+                                "planned_quantity":fill.sizing.planned_quantity,
+                                "submitted_quantity":fill.sizing.submitted_quantity,
+                                "available_balance_usd":fill.sizing.available_balance_usd,
+                                "estimated_initial_margin_usd":fill.sizing.estimated_initial_margin_usd,
+                                "margin_capacity_notional_usd":fill.sizing.margin_capacity_notional_usd,
+                                "leverage":self.config.leverage,
+                                "margin_capped":fill.sizing.margin_capped,
+                                "margin_retry":fill.margin_retry
+                            }),
+                        );
+                    }
                     events.push(ExchangeEvent {
                         kind: "exchange_entry".into(),
-                        payload: serde_json::json!({"ts_ms":fill.first_fill_ms,"candidate_id":plan.candidate_id,"recipe":recipe,"lane":recipe,"symbol":plan.symbol,"side":plan.side,"signal_context":plan.signal_context,"entry_mode":fill.entry_mode,"entry_price_source":fill.entry_price_source,"maker_attempted":fill.maker_attempted,"maker_wait_ms":fill.maker_wait_ms,"maker_reprices":fill.maker_reprices,"requested_limit":plan.entry_limit,"final_maker_limit":fill.final_maker_limit,"entry_price":fill.entry_price,"quantity":fill.quantity,"notional_usd":actual_notional_usd,"actual_notional_usd":actual_notional_usd,"planned_notional_usd":planned_notional_usd,"fill_ratio":fill_ratio,"partial_fill":fill_ratio < 0.999,"actual_protection":{"initial_risk_usd":actual_initial_risk_usd,"activation_pct":actual_protection.activation_pct,"trailing_distance_pct":actual_protection.trailing_distance_pct},"probe_size_multiplier":size_multiplier,"entry_size_multiplier":fill.size_multiplier,"margin_type":"isolated","unprotected_runner_fraction":plan.unprotected_runner_fraction,"entry_timing":{"signal_ms":candidate.map(|value|value.signal_ms),"order_submitted_ms":fill.order_submitted_ms,"first_fill_ms":fill.first_fill_ms,"entry_completed_ms":fill.entry_completed_ms,"source":fill.entry_time_source},"entry_guard":{"invalidation_bps":plan.entry_invalidation_bps,"max_opposing_flow":plan.entry_guard_max_opposing_flow,"max_opposing_return_bps":plan.entry_guard_max_opposing_return_bps},"early_failure":{"after_ms":plan.early_failure_after_ms,"adverse_pct":plan.early_failure_adverse_pct,"max_favorable_pct":plan.early_failure_max_favorable_pct},"spread_bps":cost.spread_bps,"expected_exit_slippage_bps":cost.expected_exit_slippage_bps,"estimated_round_trip_cost_bps":cost.estimated_round_trip_cost_bps,"gross_target_bps":cost.gross_target_bps,"target_to_cost_ratio":cost.target_to_cost_ratio,"order_id":fill.order_id,"stop_algo_id":fill.stop_algo_id,"take_profit_order_ids":fill.take_profit_order_ids,"signal_to_order_ms":signal_to_order_ms,"discovery_latency_ms":discovery_latency_ms,"venue":"binance_demo","paper_only":true}),
+                        payload: entry_payload,
                     });
                 }
                 Err(error) => {
@@ -3606,7 +3659,7 @@ impl BinanceDemoExecution {
                         );
                         self.save().ok();
                     }
-                    let failure = error.to_string();
+                    let failure = format!("{error:#}");
                     let filled_round_trip = attempt.as_ref().is_some_and(|value| {
                         value.entry_quantity > f64::EPSILON && value.exit_quantity > f64::EPSILON
                     });
@@ -3654,6 +3707,11 @@ impl BinanceDemoExecution {
                             "symbol":plan.symbol,
                             "side":plan.side,
                             "reference_price":plan.reference_price,
+                            "planned_notional_usd":plan.notional_usd * size_multiplier,
+                            "planned_quantity":plan.notional_usd * size_multiplier / plan.reference_price.max(f64::EPSILON),
+                            "available_balance_usd":self.account.as_ref().map(|account| account.available_balance),
+                            "estimated_initial_margin_usd":plan.notional_usd * size_multiplier / f64::from(self.config.leverage),
+                            "leverage":self.config.leverage,
                             "requested_limit":plan.entry_limit,
                             "max_entry_adverse_bps":plan.max_entry_adverse_bps,
                             "taker_fallback":plan.taker_fallback,
@@ -3848,6 +3906,55 @@ impl BinanceDemoExecution {
         events
     }
 
+    async fn refreshed_entry_sizing(
+        &mut self,
+        plan: &greed_kernel::PositionPlan,
+        size_multiplier: f64,
+        exchange_max_quantity: f64,
+        quantity_step: f64,
+    ) -> Result<EntrySizing> {
+        let value = self
+            .signed_read("/fapi/v2/account", vec![])
+            .await
+            .context("refresh account before sizing a new entry")?;
+        let account = parse_account(&value)?;
+        let sizing = margin_aware_entry_sizing(
+            plan.notional_usd * size_multiplier,
+            plan.reference_price,
+            account.available_balance,
+            self.config.leverage,
+            exchange_max_quantity,
+            quantity_step,
+            ENTRY_MARGIN_CAPACITY_FRACTION,
+        )?;
+        self.account = Some(account);
+        Ok(sizing)
+    }
+
+    async fn refreshed_margin_retry_sizing(
+        &mut self,
+        initial: EntrySizing,
+        reference_price: f64,
+        exchange_max_quantity: f64,
+        quantity_step: f64,
+    ) -> Result<EntrySizing> {
+        let value = self
+            .signed_read("/fapi/v2/account", vec![])
+            .await
+            .context("refresh account before insufficient-margin retry")?;
+        let account = parse_account(&value)?;
+        let sizing = margin_retry_sizing(
+            initial,
+            reference_price,
+            account.available_balance,
+            self.config.leverage,
+            exchange_max_quantity,
+            quantity_step,
+        )?;
+        self.account = Some(account);
+        Ok(sizing)
+    }
+
     async fn start_pending_entry(
         &mut self,
         plan: &greed_kernel::PositionPlan,
@@ -3861,15 +3968,15 @@ impl BinanceDemoExecution {
             .get(&plan.symbol)
             .cloned()
             .ok_or_else(|| anyhow!("missing exchange rules for {}", plan.symbol))?;
-        let desired_quantity = floor_step(
-            plan.notional_usd * size_multiplier / plan.reference_price,
-            rules.quantity_step,
-        );
-        let quantity = cap_entry_quantity(
-            desired_quantity,
-            rules.max_limit_quantity,
-            rules.quantity_step,
-        )?;
+        let mut sizing = self
+            .refreshed_entry_sizing(
+                plan,
+                size_multiplier,
+                rules.max_limit_quantity,
+                rules.quantity_step,
+            )
+            .await?;
+        let mut quantity = sizing.submitted_quantity;
         validate_entry_quantity_and_exits(plan, quantity, plan.reference_price, &rules)?;
         match self.pending_entry_guard(plan, chrono::Utc::now().timestamp_millis()) {
             EntryGuardState::Healthy => {}
@@ -3916,13 +4023,14 @@ impl BinanceDemoExecution {
             )
         };
         let mut reprice_attempt = 0u8;
+        let mut margin_retried = false;
         let order_submitted_ms = chrono::Utc::now().timestamp_millis();
         let mut pending = PendingEntryState {
             plan: plan.clone(),
             recipe: recipe.clone(),
             signal_ms,
             discovery_latency_ms,
-            size_multiplier,
+            size_multiplier: size_multiplier * sizing.size_multiplier,
             requested_quantity: quantity,
             active_client_id: active_client_id.clone(),
             passive_price,
@@ -3949,6 +4057,8 @@ impl BinanceDemoExecution {
             pending.active_client_id.clone_from(&active_client_id);
             pending.passive_price = passive_price;
             pending.reprice_attempt = reprice_attempt;
+            pending.requested_quantity = quantity;
+            pending.size_multiplier = size_multiplier * sizing.size_multiplier;
             self.state
                 .pending_entries
                 .insert(plan.symbol.clone(), pending.clone());
@@ -3971,6 +4081,56 @@ impl BinanceDemoExecution {
                 .await
             {
                 Ok(order) => break order,
+                Err(error) if is_insufficient_margin_error(&error) && !margin_retried => {
+                    let initial_sizing = sizing;
+                    sizing = match self
+                        .refreshed_margin_retry_sizing(
+                            initial_sizing,
+                            plan.reference_price,
+                            rules.max_limit_quantity,
+                            rules.quantity_step,
+                        )
+                        .await
+                    {
+                        Ok(value) => value,
+                        Err(retry_error) => {
+                            self.state.pending_entries.remove(&plan.symbol);
+                            self.save().ok();
+                            return Err(retry_error).with_context(|| {
+                                format!(
+                                    "insufficient-margin retry sizing failed after {}; original error: {error:#}",
+                                    entry_sizing_context(
+                                        initial_sizing,
+                                        self.config.leverage,
+                                        false
+                                    )
+                                )
+                            });
+                        }
+                    };
+                    quantity = sizing.submitted_quantity;
+                    if let Err(validation_error) = validate_entry_quantity_and_exits(
+                        plan,
+                        quantity,
+                        plan.reference_price,
+                        &rules,
+                    ) {
+                        self.state.pending_entries.remove(&plan.symbol);
+                        self.save().ok();
+                        return Err(validation_error)
+                            .context("insufficient-margin retry was too small to protect safely");
+                    }
+                    active_client_id = client_order_id("marginretry", &plan.candidate_id);
+                    margin_retried = true;
+                    tracing::warn!(
+                        symbol = %plan.symbol,
+                        initial_quantity = initial_sizing.submitted_quantity,
+                        retry_quantity = quantity,
+                        available_balance_usd = sizing.available_balance_usd,
+                        leverage = self.config.leverage,
+                        "entry rejected for insufficient margin; retrying once at a smaller size"
+                    );
+                }
                 Err(error) if is_post_only_rejection(&error) => {
                     reprice_attempt += 1;
                     if reprice_attempt > 3 {
@@ -4011,7 +4171,12 @@ impl BinanceDemoExecution {
                 Err(error) => {
                     self.state.pending_entries.remove(&plan.symbol);
                     self.save().ok();
-                    return Err(error);
+                    return Err(error).with_context(|| {
+                        format!(
+                            "entry submission failed after {}",
+                            entry_sizing_context(sizing, self.config.leverage, margin_retried)
+                        )
+                    });
                 }
             }
         };
@@ -4174,6 +4339,15 @@ impl BinanceDemoExecution {
                 "symbol":plan.symbol,
                 "side":plan.side,
                 "requested_quantity":quantity,
+                "planned_quantity":sizing.planned_quantity,
+                "planned_notional_usd":sizing.planned_notional_usd,
+                "submitted_notional_usd":quantity * passive_price,
+                "available_balance_usd":sizing.available_balance_usd,
+                "estimated_initial_margin_usd":quantity * passive_price / f64::from(self.config.leverage),
+                "margin_capacity_notional_usd":sizing.margin_capacity_notional_usd,
+                "leverage":self.config.leverage,
+                "margin_capped":sizing.margin_capped,
+                "margin_retry":margin_retried,
                 "limit_price":passive_price,
                 "order_id":order["orderId"],
                 "client_order_id":active_client_id,
@@ -5281,31 +5455,33 @@ impl BinanceDemoExecution {
     }
 
     async fn place_bracket(
-        &self,
+        &mut self,
         plan: &greed_kernel::PositionPlan,
         size_multiplier: f64,
     ) -> Result<BracketExecution> {
         let rules = self
             .rules
             .get(&plan.symbol)
+            .cloned()
             .ok_or_else(|| anyhow!("missing exchange rules for {}", plan.symbol))?;
         let bounded_taker_ioc = plan
             .signal_context
             .get("bounded_taker_ioc")
             .is_some_and(|value| value == "true");
-        let desired_quantity = floor_step(
-            plan.notional_usd * size_multiplier / plan.reference_price,
-            rules.quantity_step,
-        );
-        let quantity = cap_entry_quantity(
-            desired_quantity,
-            if bounded_taker_ioc {
-                rules.max_limit_quantity
-            } else {
-                rules.max_market_quantity
-            },
-            rules.quantity_step,
-        )?;
+        let exchange_max_quantity = if bounded_taker_ioc {
+            rules.max_limit_quantity
+        } else {
+            rules.max_market_quantity
+        };
+        let mut sizing = self
+            .refreshed_entry_sizing(
+                plan,
+                size_multiplier,
+                exchange_max_quantity,
+                rules.quantity_step,
+            )
+            .await?;
+        let mut quantity = sizing.submitted_quantity;
         if quantity < rules.min_quantity || quantity * plan.reference_price < rules.min_notional {
             return Err(anyhow!(
                 "order is below Binance quantity or notional minimum"
@@ -5416,28 +5592,90 @@ impl BinanceDemoExecution {
         } else {
             None
         };
-        let client_id = client_order_id("entry", &plan.candidate_id);
         let order_submitted_ms = chrono::Utc::now().timestamp_millis();
-        let mut entry_parameters = vec![
-            ("symbol".into(), plan.symbol.clone()),
-            ("side".into(), side_name(plan.side).into()),
-            ("quantity".into(), decimal(quantity, rules.quantity_step)),
-            ("newClientOrderId".into(), client_id.clone()),
-            ("newOrderRespType".into(), "RESULT".into()),
-        ];
-        if let Some(limit) = execution_limit {
-            entry_parameters.extend([
-                ("type".into(), "LIMIT".into()),
-                ("timeInForce".into(), "IOC".into()),
-                ("price".into(), decimal(limit, rules.price_tick)),
-            ]);
-        } else {
-            entry_parameters.push(("type".into(), "MARKET".into()));
-        }
+        let entry_parameters = |quantity: f64, client_id: &str| {
+            let mut parameters = vec![
+                ("symbol".into(), plan.symbol.clone()),
+                ("side".into(), side_name(plan.side).into()),
+                ("quantity".into(), decimal(quantity, rules.quantity_step)),
+                ("newClientOrderId".into(), client_id.to_string()),
+                ("newOrderRespType".into(), "RESULT".into()),
+            ];
+            if let Some(limit) = execution_limit {
+                parameters.extend([
+                    ("type".into(), "LIMIT".into()),
+                    ("timeInForce".into(), "IOC".into()),
+                    ("price".into(), decimal(limit, rules.price_tick)),
+                ]);
+            } else {
+                parameters.push(("type".into(), "MARKET".into()));
+            }
+            parameters
+        };
+        let client_id = client_order_id("entry", &plan.candidate_id);
+        let initial_order = self
+            .submit_or_lookup(
+                &plan.symbol,
+                &client_id,
+                entry_parameters(quantity, &client_id),
+            )
+            .await;
+        let (order, margin_retry) = match initial_order {
+            Ok(order) => (order, false),
+            Err(error) if is_insufficient_margin_error(&error) => {
+                let initial_sizing = sizing;
+                sizing = self
+                    .refreshed_margin_retry_sizing(
+                        initial_sizing,
+                        plan.reference_price,
+                        exchange_max_quantity,
+                        rules.quantity_step,
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "insufficient-margin retry sizing failed after {}; original error: {error:#}",
+                            entry_sizing_context(initial_sizing, self.config.leverage, false)
+                        )
+                    })?;
+                quantity = sizing.submitted_quantity;
+                validate_entry_quantity_and_exits(plan, quantity, plan.reference_price, &rules)
+                    .context("insufficient-margin retry was too small to protect safely")?;
+                let retry_client_id = client_order_id("marginretry", &plan.candidate_id);
+                tracing::warn!(
+                    symbol = %plan.symbol,
+                    initial_quantity = initial_sizing.submitted_quantity,
+                    retry_quantity = quantity,
+                    available_balance_usd = sizing.available_balance_usd,
+                    leverage = self.config.leverage,
+                    "entry rejected for insufficient margin; retrying once at a smaller size"
+                );
+                let order = self
+                    .submit_or_lookup(
+                        &plan.symbol,
+                        &retry_client_id,
+                        entry_parameters(quantity, &retry_client_id),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "entry submission failed after {}",
+                            entry_sizing_context(sizing, self.config.leverage, true)
+                        )
+                    })?;
+                (order, true)
+            }
+            Err(error) => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "entry submission failed after {}",
+                        entry_sizing_context(sizing, self.config.leverage, false)
+                    )
+                });
+            }
+        };
         let entry = EntryExecution {
-            order: self
-                .submit_or_lookup(&plan.symbol, &client_id, entry_parameters)
-                .await?,
+            order,
             requested_quantity: quantity,
             mode: if bounded_taker_ioc {
                 "bounded_taker_ioc"
@@ -5448,7 +5686,9 @@ impl BinanceDemoExecution {
             maker_wait_ms: 0,
             maker_reprices: 0,
             final_maker_limit: execution_limit,
-            size_multiplier: 1.0,
+            size_multiplier: sizing.size_multiplier,
+            sizing,
+            margin_retry,
         };
         let mut executed =
             parse_f64(&entry.order, "executedQty").unwrap_or(entry.requested_quantity);
@@ -5461,7 +5701,7 @@ impl BinanceDemoExecution {
             entry.requested_quantity,
             entry_price_hint(&entry.order, plan.reference_price),
             plan.min_managed_fill_ratio,
-            rules,
+            &rules,
             &plan.take_profit_prices,
         );
         if plan.min_fill_ratio > 0.0
@@ -5527,7 +5767,7 @@ impl BinanceDemoExecution {
                     &plan.symbol,
                     plan.side,
                     executed,
-                    rules,
+                    &rules,
                     &close_id,
                 )
                 .await
@@ -5567,7 +5807,7 @@ impl BinanceDemoExecution {
                     plan.side.opposite(),
                     "STOP_MARKET",
                     stop_price,
-                    rules,
+                    &rules,
                     client_order_id("stop", &plan.candidate_id),
                 )
                 .await?;
@@ -5580,7 +5820,7 @@ impl BinanceDemoExecution {
                         plan.side.opposite(),
                         *take_profit,
                         floor_step(executed * fraction, rules.quantity_step),
-                        rules,
+                        &rules,
                         client_order_id(&format!("take{index}"), &plan.candidate_id),
                     )
                     .await?,
@@ -5606,7 +5846,7 @@ impl BinanceDemoExecution {
                     &plan.symbol,
                     plan.side,
                     executed,
-                    rules,
+                    &rules,
                     &close_id,
                 )
                 .await
@@ -5635,6 +5875,8 @@ impl BinanceDemoExecution {
             maker_reprices: entry.maker_reprices,
             final_maker_limit: entry.final_maker_limit,
             size_multiplier: entry.size_multiplier,
+            sizing: entry.sizing,
+            margin_retry: entry.margin_retry,
             order_submitted_ms,
             first_fill_ms,
             entry_completed_ms,
@@ -7746,6 +7988,103 @@ fn cap_entry_quantity(desired: f64, maximum: f64, quantity_step: f64) -> Result<
     Ok(capped)
 }
 
+fn margin_aware_entry_sizing(
+    planned_notional_usd: f64,
+    reference_price: f64,
+    available_balance_usd: f64,
+    leverage: u8,
+    exchange_max_quantity: f64,
+    quantity_step: f64,
+    capacity_fraction: f64,
+) -> Result<EntrySizing> {
+    if !planned_notional_usd.is_finite()
+        || planned_notional_usd <= 0.0
+        || !reference_price.is_finite()
+        || reference_price <= 0.0
+        || !available_balance_usd.is_finite()
+        || leverage == 0
+        || !(0.0..=1.0).contains(&capacity_fraction)
+        || capacity_fraction <= 0.0
+    {
+        return Err(anyhow!("invalid margin-aware entry sizing inputs"));
+    }
+    let planned_quantity = floor_step(planned_notional_usd / reference_price, quantity_step);
+    let margin_capacity_notional_usd =
+        available_balance_usd.max(0.0) * f64::from(leverage) * capacity_fraction;
+    let capacity_quantity = floor_step(
+        margin_capacity_notional_usd / reference_price,
+        quantity_step,
+    );
+    let submitted_quantity = cap_entry_quantity(
+        planned_quantity.min(capacity_quantity),
+        exchange_max_quantity,
+        quantity_step,
+    )?;
+    let submitted_notional_usd = submitted_quantity * reference_price;
+    Ok(EntrySizing {
+        planned_notional_usd,
+        planned_quantity,
+        submitted_notional_usd,
+        submitted_quantity,
+        available_balance_usd,
+        estimated_initial_margin_usd: submitted_notional_usd / f64::from(leverage),
+        margin_capacity_notional_usd,
+        size_multiplier: submitted_quantity / planned_quantity.max(f64::EPSILON),
+        margin_capped: submitted_quantity + quantity_step * 0.5 < planned_quantity,
+    })
+}
+
+fn margin_retry_sizing(
+    initial: EntrySizing,
+    reference_price: f64,
+    available_balance_usd: f64,
+    leverage: u8,
+    exchange_max_quantity: f64,
+    quantity_step: f64,
+) -> Result<EntrySizing> {
+    let retry_notional = initial.submitted_notional_usd * INSUFFICIENT_MARGIN_RETRY_FRACTION;
+    margin_aware_entry_sizing(
+        retry_notional,
+        reference_price,
+        available_balance_usd,
+        leverage,
+        exchange_max_quantity,
+        quantity_step,
+        INSUFFICIENT_MARGIN_RETRY_CAPACITY_FRACTION,
+    )
+    .map(|mut retry| {
+        // Keep the original strategy plan in diagnostics and express the
+        // effective multiplier against that original quantity.
+        retry.planned_notional_usd = initial.planned_notional_usd;
+        retry.planned_quantity = initial.planned_quantity;
+        retry.size_multiplier =
+            retry.submitted_quantity / initial.planned_quantity.max(f64::EPSILON);
+        retry.margin_capped = true;
+        retry
+    })
+}
+
+fn is_insufficient_margin_error(error: &anyhow::Error) -> bool {
+    let text = format!("{error:#}");
+    text.contains("-2019") || text.to_ascii_lowercase().contains("margin is insufficient")
+}
+
+fn entry_sizing_context(sizing: EntrySizing, leverage: u8, retried: bool) -> String {
+    format!(
+        "planned_notional_usd={:.8}, planned_quantity={:.8}, submitted_notional_usd={:.8}, submitted_quantity={:.8}, available_balance_usd={:.8}, estimated_initial_margin_usd={:.8}, margin_capacity_notional_usd={:.8}, leverage={}x, margin_capped={}, margin_retry={}",
+        sizing.planned_notional_usd,
+        sizing.planned_quantity,
+        sizing.submitted_notional_usd,
+        sizing.submitted_quantity,
+        sizing.available_balance_usd,
+        sizing.estimated_initial_margin_usd,
+        sizing.margin_capacity_notional_usd,
+        leverage,
+        sizing.margin_capped,
+        retried
+    )
+}
+
 fn market_close_chunk(remaining: f64, rules: &SymbolRules) -> Result<f64> {
     if !remaining.is_finite() || remaining <= f64::EPSILON {
         return Err(anyhow!("market close has no positive remaining quantity"));
@@ -7769,7 +8108,7 @@ fn market_close_chunk(remaining: f64, rules: &SymbolRules) -> Result<f64> {
 // Infer from persisted numerical settings, not an ephemeral candidate tag.
 // A real exchange stop is still mandatory in the account protection check.
 fn managed_stop_only_exit(
-    max_hold_ms: i64,
+    _max_hold_ms: i64,
     shield: Option<f64>,
     floor: f64,
     activation: Option<f64>,
@@ -7777,10 +8116,9 @@ fn managed_stop_only_exit(
 ) -> bool {
     match (shield, activation, distance) {
         (Some(shield), Some(activation), Some(distance)) => {
-            max_hold_ms > 0
-                && [shield, floor, activation, distance]
-                    .iter()
-                    .all(|v| v.is_finite())
+            [shield, floor, activation, distance]
+                .iter()
+                .all(|v| v.is_finite())
                 && floor >= 0.0
                 && shield > floor
                 && activation >= shield
@@ -8853,6 +9191,8 @@ mod tests {
             min_notional: 5.0,
         };
         assert!(validate_entry_quantity_and_exits(&plan, 10.0, 100.0, &rules).is_ok());
+        plan.max_hold_ms = 0;
+        assert!(validate_entry_quantity_and_exits(&plan, 10.0, 100.0, &rules).is_ok());
         plan.trailing_distance_pct = None;
         assert!(validate_entry_quantity_and_exits(&plan, 10.0, 100.0, &rules).is_err());
         assert!(!managed_stop_only_exit(
@@ -8894,6 +9234,39 @@ mod tests {
             max_hold_review(&restored, 901_000, 100.0, None),
             MaxHoldReview::Exit
         );
+    }
+
+    #[test]
+    fn entry_sizing_respects_exchange_available_margin() {
+        let sizing = margin_aware_entry_sizing(30_000.0, 3.0, 1_000.0, 5, 100_000.0, 1.0, 0.90)
+            .expect("valid margin-aware sizing");
+        assert_eq!(sizing.planned_quantity, 10_000.0);
+        assert_eq!(sizing.submitted_quantity, 1_500.0);
+        assert_eq!(sizing.submitted_notional_usd, 4_500.0);
+        assert_eq!(sizing.estimated_initial_margin_usd, 900.0);
+        assert!(sizing.margin_capped);
+    }
+
+    #[test]
+    fn insufficient_margin_retry_halves_an_already_safe_request() {
+        let initial = margin_aware_entry_sizing(
+            30_000.0,
+            3.0,
+            10_000.0,
+            5,
+            100_000.0,
+            1.0,
+            ENTRY_MARGIN_CAPACITY_FRACTION,
+        )
+        .expect("valid initial sizing");
+        let retry = margin_retry_sizing(initial, 3.0, 10_000.0, 5, 100_000.0, 1.0)
+            .expect("valid retry sizing");
+        assert_eq!(retry.submitted_quantity, 5_000.0);
+        assert_eq!(retry.submitted_notional_usd, 15_000.0);
+        assert!((retry.size_multiplier - 0.5).abs() < 1e-12);
+        assert!(is_insufficient_margin_error(&anyhow!(
+            "Binance returned -2019: Margin is insufficient"
+        )));
     }
 
     #[test]
