@@ -14,6 +14,64 @@ use std::collections::BTreeMap;
 // planner converts this account-level objective into a price target after the
 // actual liquidity-sized notional and estimated round-trip cost are known.
 const FAST_TARGET_ACCOUNT_PROFIT_PCT: f64 = 0.004;
+const CONFIRMATION_WINDOW_MS: i64 = 3 * 60_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ConfirmationState {
+    NotArmed,
+    DataMissing,
+    DataStale,
+    Awaiting,
+    Rejected,
+    Confirmed,
+    ConfirmedExpired,
+}
+
+impl ConfirmationState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::NotArmed => "not_armed",
+            Self::DataMissing => "data_missing",
+            Self::DataStale => "data_stale",
+            Self::Awaiting => "awaiting_terminal_1m",
+            Self::Rejected => "pattern_not_confirmed",
+            Self::Confirmed => "confirmed",
+            Self::ConfirmedExpired => "confirmed_entry_expired",
+        }
+    }
+}
+
+fn confirmation_state(
+    ignition: bool,
+    series_present: bool,
+    series_usable: bool,
+    confirmation_close_ms: Option<i64>,
+    ignition_close_ms: i64,
+    now_ms: i64,
+    entry_timeout_seconds: u32,
+) -> ConfirmationState {
+    if !ignition {
+        return ConfirmationState::NotArmed;
+    }
+    if !series_present {
+        return ConfirmationState::DataMissing;
+    }
+    if !series_usable {
+        return ConfirmationState::DataStale;
+    }
+    if let Some(close_ms) = confirmation_close_ms {
+        return if now_ms - close_ms > i64::from(entry_timeout_seconds) * 1_000 {
+            ConfirmationState::ConfirmedExpired
+        } else {
+            ConfirmationState::Confirmed
+        };
+    }
+    if now_ms > ignition_close_ms + CONFIRMATION_WINDOW_MS {
+        ConfirmationState::Rejected
+    } else {
+        ConfirmationState::Awaiting
+    }
+}
 
 pub struct FastTrendActivationNode {
     id: String,
@@ -229,8 +287,13 @@ impl StrategyNode for FastTrendActivationNode {
             .filter(|symbol| !is_major(symbol))
             .filter_map(|symbol| ctx.frame.instrument(symbol))
             .filter_map(|instrument| instrument.fast_perpetual.as_ref())
+            .filter(|series| series.meta.usable_at(ctx.frame.as_of_ms))
             .filter_map(|series| {
-                let closed: Vec<_> = series.values.iter().filter(|bar| bar.closed).collect();
+                let closed: Vec<_> = series
+                    .values
+                    .iter()
+                    .filter(|bar| bar.closed && bar.close_ms <= ctx.frame.as_of_ms)
+                    .collect();
                 (closed.len() >= 13).then(|| {
                     closed.last().expect("length checked").close / closed[closed.len() - 13].close
                         - 1.0
@@ -256,10 +319,18 @@ impl StrategyNode for FastTrendActivationNode {
             let Some(instrument) = ctx.frame.instrument(symbol) else {
                 continue;
             };
-            let Some(fast) = instrument.fast_perpetual.as_ref() else {
+            let Some(fast) = instrument
+                .fast_perpetual
+                .as_ref()
+                .filter(|series| series.meta.usable_at(ctx.frame.as_of_ms))
+            else {
                 continue;
             };
-            let closed: Vec<_> = fast.values.iter().filter(|bar| bar.closed).collect();
+            let closed: Vec<_> = fast
+                .values
+                .iter()
+                .filter(|bar| bar.closed && bar.close_ms <= ctx.frame.as_of_ms)
+                .collect();
             if closed.len() < 90 {
                 continue;
             }
@@ -356,25 +427,41 @@ impl StrategyNode for FastTrendActivationNode {
                 &self.config,
             );
 
+            let confirmation_series = instrument
+                .micro_perpetual
+                .as_ref()
+                .filter(|series| series.meta.usable_at(ctx.frame.as_of_ms));
             let confirmation_source = instrument
                 .micro_perpetual
                 .as_ref()
                 .map(|series| series.meta.source.as_str())
                 .unwrap_or("missing");
-            let confirmation = instrument
-                .micro_perpetual
-                .as_ref()
+            let confirmation = confirmation_series
                 .into_iter()
                 .flat_map(|series| series.values.iter())
                 .filter(|minute| {
                     minute.closed
+                        && minute.close_ms <= ctx.frame.as_of_ms
                         && minute.close_ms > bar.close_ms
-                        && minute.close_ms <= bar.close_ms + 3 * 60_000
+                        && minute.close_ms <= bar.close_ms + CONFIRMATION_WINDOW_MS
                 })
-                .find_map(|minute| {
+                .filter_map(|minute| {
                     confirmation_pattern(minute, side, breakout_level, direct_reacceleration_ready)
                         .map(|(pattern, flow)| (minute, pattern, flow))
-                });
+                })
+                // A newer valid terminal minute refreshes the executable
+                // entry window. Using the first match could report an expired
+                // signal even when a later 1m candle had just reconfirmed it.
+                .next_back();
+            let confirmation_state = confirmation_state(
+                ignition,
+                instrument.micro_perpetual.is_some(),
+                confirmation_series.is_some(),
+                confirmation.map(|(minute, _, _)| minute.close_ms),
+                bar.close_ms,
+                ctx.frame.as_of_ms,
+                self.config.fast_entry_timeout_seconds,
+            );
             confirmation_hits += u64::from(ignition && confirmation.is_some());
             let entry_pattern = confirmation
                 .map(|(_, pattern, _)| pattern)
@@ -389,9 +476,12 @@ impl StrategyNode for FastTrendActivationNode {
                 &self.config,
             );
 
-            let oi_values: Vec<_> = instrument
+            let oi_series_present = instrument.open_interest.is_some();
+            let oi_series = instrument
                 .open_interest
                 .as_ref()
+                .filter(|series| series.meta.usable_at(ctx.frame.as_of_ms));
+            let oi_values: Vec<_> = oi_series
                 .map(|series| {
                     series
                         .values
@@ -475,28 +565,51 @@ impl StrategyNode for FastTrendActivationNode {
             {
                 blockers.push("move is already mature; the fast lane will not chase it".into());
             }
-            if ignition && confirmation.is_none() {
-                if ignition_pattern == Some("trend_reacceleration") && !direct_reacceleration_ready
-                {
-                    blockers.push(format!(
-                        "late reacceleration requires a 1m touch-and-reclaim: breadth {:.0}%, directional market 1h {:.2}%, extension {:.2}%",
-                        directional_market_breadth * 100.0,
-                        directional_market_return_1h * 100.0,
-                        directional_extension * 100.0
-                    ));
-                } else {
-                    blockers
-                        .push("waiting up to 3m for a 1m reclaim or direct continuation".into());
+            match confirmation_state {
+                ConfirmationState::DataMissing => {
+                    blockers.push("1m confirmation data is unavailable".into());
                 }
+                ConfirmationState::DataStale => {
+                    blockers.push("1m confirmation data is stale".into());
+                }
+                ConfirmationState::Awaiting => {
+                    if ignition_pattern == Some("trend_reacceleration")
+                        && !direct_reacceleration_ready
+                    {
+                        blockers.push(format!(
+                            "waiting for a 1m touch-and-reclaim: breadth {:.0}%, directional market 1h {:.2}%, extension {:.2}%",
+                            directional_market_breadth * 100.0,
+                            directional_market_return_1h * 100.0,
+                            directional_extension * 100.0
+                        ));
+                    } else {
+                        blockers.push(
+                            "waiting up to 3m for a completed 1m reclaim or direct continuation"
+                                .into(),
+                        );
+                    }
+                }
+                ConfirmationState::Rejected => blockers.push(
+                    "the 1m confirmation window closed without a valid reclaim or continuation"
+                        .into(),
+                ),
+                ConfirmationState::ConfirmedExpired => {
+                    blockers.push("the confirmed 1m entry window expired".into());
+                }
+                ConfirmationState::NotArmed | ConfirmationState::Confirmed => {}
             }
-            if oi_15m.is_none() || oi_60m.is_none() {
-                blockers.push("open-interest history is warming".into());
-            } else if !oi_ok {
-                blockers.push(format!(
+            match (oi_series_present, oi_series.is_some(), oi_15m, oi_60m) {
+                (false, _, _, _) => blockers.push("open-interest data is unavailable".into()),
+                (true, false, _, _) => blockers.push("open-interest data is stale".into()),
+                (_, _, None, _) | (_, _, _, None) => {
+                    blockers.push("open-interest history is still warming".into());
+                }
+                _ if !oi_ok => blockers.push(format!(
                     "OI shock is too large: require |15m| <= {:.1}% and |60m| <= {:.1}%",
                     self.config.fast_max_oi_change_15m * 100.0,
                     self.config.fast_max_oi_change_15m * 200.0
-                ));
+                )),
+                _ => {}
             }
 
             match instrument.book.as_ref() {
@@ -508,15 +621,11 @@ impl StrategyNode for FastTrendActivationNode {
                         blockers.push(format!("spread {spread:.1} bps is too wide"));
                     }
                 }
-                _ => blockers.push("order book is warming".into()),
+                Some(_) => blockers.push("order book is stale".into()),
+                None => blockers.push("order book is unavailable".into()),
             }
 
             let signal_ms = confirmation.map_or(bar.close_ms, |(value, _, _)| value.close_ms);
-            if ctx.frame.as_of_ms - signal_ms
-                > i64::from(self.config.fast_entry_timeout_seconds) * 1_000
-            {
-                blockers.push("the 1m confirmation expired".into());
-            }
             let reference_price =
                 confirmation.map_or(instrument.price, |(value, _, _)| value.close);
             let verdict = if blockers.is_empty() {
@@ -554,6 +663,10 @@ impl StrategyNode for FastTrendActivationNode {
                 (
                     "confirmation_terminal_verified".into(),
                     confirmation.is_some().to_string(),
+                ),
+                (
+                    "confirmation_state".into(),
+                    confirmation_state.label().into(),
                 ),
                 ("market_return_1h".into(), market_return_1h.to_string()),
                 (
@@ -687,7 +800,12 @@ impl StrategyNode for FastTrendActivationNode {
                 symbol: symbol.clone(),
                 side,
                 signal_ms,
-                expires_ms: signal_ms + i64::from(self.config.fast_entry_timeout_seconds) * 1_000,
+                expires_ms: confirmation.map_or(
+                    bar.close_ms + CONFIRMATION_WINDOW_MS,
+                    |(minute, _, _)| {
+                        minute.close_ms + i64::from(self.config.fast_entry_timeout_seconds) * 1_000
+                    },
+                ),
                 reference_price,
                 score,
                 confidence: if verdict == Verdict::Pass {
@@ -800,6 +918,38 @@ mod tests {
         let values = [(0, 100.0), (300_000, 101.0), (900_000, 102.0)];
         let change = oi_change(&values, 900_000, 900_000).unwrap();
         assert!((change - 0.02).abs() < 1e-9);
+    }
+
+    #[test]
+    fn confirmation_clock_starts_only_after_a_valid_terminal_minute() {
+        assert_eq!(
+            confirmation_state(true, true, true, None, 300_000, 325_000, 20),
+            ConfirmationState::Awaiting
+        );
+        assert_eq!(
+            confirmation_state(true, true, true, Some(359_999), 300_000, 375_000, 20),
+            ConfirmationState::Confirmed
+        );
+        assert_eq!(
+            confirmation_state(true, true, true, Some(359_999), 300_000, 381_000, 20),
+            ConfirmationState::ConfirmedExpired
+        );
+    }
+
+    #[test]
+    fn confirmation_failure_distinguishes_market_data_from_pattern_rejection() {
+        assert_eq!(
+            confirmation_state(true, false, false, None, 300_000, 325_000, 20),
+            ConfirmationState::DataMissing
+        );
+        assert_eq!(
+            confirmation_state(true, true, false, None, 300_000, 325_000, 20),
+            ConfirmationState::DataStale
+        );
+        assert_eq!(
+            confirmation_state(true, true, true, None, 300_000, 480_001, 20),
+            ConfirmationState::Rejected
+        );
     }
 
     fn candle(open: f64, high: f64, low: f64, close: f64) -> Candle {

@@ -142,11 +142,14 @@ impl StrategyNode for TrendContinuationNode {
             .iter()
             .filter_map(|symbol| {
                 let instrument = ctx.frame.instrument(symbol)?;
+                if !instrument.perpetual.meta.usable_at(ctx.frame.as_of_ms) {
+                    return None;
+                }
                 let closed: Vec<_> = instrument
                     .perpetual
                     .values
                     .iter()
-                    .filter(|value| value.closed)
+                    .filter(|value| value.closed && value.close_ms <= ctx.frame.as_of_ms)
                     .collect();
                 let i = closed.len().checked_sub(1)?;
                 (i >= 16).then(|| (symbol.clone(), closed[i].close / closed[i - 16].close - 1.0))
@@ -171,11 +174,14 @@ impl StrategyNode for TrendContinuationNode {
             let Some(instrument) = ctx.frame.instrument(symbol) else {
                 continue;
             };
+            if !instrument.perpetual.meta.usable_at(ctx.frame.as_of_ms) {
+                continue;
+            }
             let closed: Vec<_> = instrument
                 .perpetual
                 .values
                 .iter()
-                .filter(|value| value.closed)
+                .filter(|value| value.closed && value.close_ms <= ctx.frame.as_of_ms)
                 .collect();
             if closed.len() < 97 {
                 continue;

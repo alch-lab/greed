@@ -152,7 +152,8 @@ impl StrategyNode for LiquidationExhaustionReversalNode {
                         blockers.push(format!("spread {spread:.1} bps is too wide"));
                     }
                 }
-                _ => blockers.push("order book is warming".into()),
+                Some(_) => blockers.push("order book is stale".into()),
+                None => blockers.push("order book is unavailable".into()),
             }
             if age_ms < min_age_ms {
                 blockers.push("waiting for the one-second anti-lookahead delay".into());

@@ -2206,12 +2206,22 @@ impl BinanceDemoExecution {
                 continue;
             }
             if frame.as_of_ms > campaign.expires_ms {
+                let reason = match frame.instrument(&symbol) {
+                    None => "instrument_missing_during_confirmation_window",
+                    Some(instrument) => match instrument.fast_perpetual.as_ref() {
+                        None => "five_minute_confirmation_data_missing",
+                        Some(series) if !series.meta.usable_at(frame.as_of_ms) => {
+                            "five_minute_confirmation_data_stale"
+                        }
+                        Some(_) => "confirmation_window_expired_without_valid_pattern",
+                    },
+                };
                 changed = true;
                 events.push(reentry_state_event(
                     frame.as_of_ms,
                     &campaign,
                     "expired",
-                    serde_json::json!({"reason":"confirmation_window_expired"}),
+                    serde_json::json!({"reason":reason}),
                 ));
                 continue;
             }
@@ -2248,10 +2258,18 @@ impl BinanceDemoExecution {
             }
 
             if campaign.signal.is_none() {
-                if let (Some(reset_ms), Some(series)) =
-                    (campaign.reset_ms, instrument.fast_perpetual.as_ref())
-                {
-                    let closed: Vec<_> = series.values.iter().filter(|bar| bar.closed).collect();
+                if let (Some(reset_ms), Some(series)) = (
+                    campaign.reset_ms,
+                    instrument
+                        .fast_perpetual
+                        .as_ref()
+                        .filter(|series| series.meta.usable_at(frame.as_of_ms)),
+                ) {
+                    let closed: Vec<_> = series
+                        .values
+                        .iter()
+                        .filter(|bar| bar.closed && bar.close_ms <= frame.as_of_ms)
+                        .collect();
                     let lookback = self.lanes.trend_reentry_lookback_bars;
                     for index in lookback..closed.len() {
                         let bar = closed[index];
@@ -2624,12 +2642,22 @@ impl BinanceDemoExecution {
                 continue;
             };
             if frame.as_of_ms > campaign.expires_ms {
+                let reason = match frame.instrument(&symbol) {
+                    None => "instrument_missing_during_resume_window",
+                    Some(instrument) => match instrument.micro_perpetual.as_ref() {
+                        None => "one_minute_resume_data_missing",
+                        Some(series) if !series.meta.usable_at(frame.as_of_ms) => {
+                            "one_minute_resume_data_stale"
+                        }
+                        Some(_) => "one_minute_resume_not_confirmed",
+                    },
+                };
                 changed = true;
                 events.push(liquidation_reentry_state_event(
                     frame.as_of_ms,
                     &campaign,
                     "expired",
-                    serde_json::json!({"reason":"one_minute_resume_not_confirmed"}),
+                    serde_json::json!({"reason":reason}),
                 ));
                 continue;
             }
@@ -2638,8 +2666,16 @@ impl BinanceDemoExecution {
                 continue;
             };
             if campaign.signal.is_none() {
-                if let Some(series) = instrument.micro_perpetual.as_ref() {
-                    for bar in series.values.iter().filter(|bar| bar.closed) {
+                if let Some(series) = instrument
+                    .micro_perpetual
+                    .as_ref()
+                    .filter(|series| series.meta.usable_at(frame.as_of_ms))
+                {
+                    for bar in series
+                        .values
+                        .iter()
+                        .filter(|bar| bar.closed && bar.close_ms <= frame.as_of_ms)
+                    {
                         if bar.close_ms <= campaign.armed_ms
                             || bar.close_ms <= campaign.last_evaluated_bar_ms
                         {
@@ -2783,6 +2819,12 @@ impl BinanceDemoExecution {
                 } else {
                     campaign.signal = None;
                     changed = true;
+                    events.push(liquidation_reentry_state_event(
+                        frame.as_of_ms,
+                        &campaign,
+                        "waiting_for_resume",
+                        serde_json::json!({"reason":"confirmed_entry_window_expired"}),
+                    ));
                 }
             }
             self.state.liquidation_reentries.insert(symbol, campaign);
