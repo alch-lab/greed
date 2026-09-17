@@ -820,6 +820,37 @@ impl BinanceDemoExecution {
                 if self.state.baseline_wallet_usd.is_none() {
                     self.state.baseline_wallet_usd = Some(account.wallet_balance);
                 }
+                // Rolling deployments may restore positions created by an
+                // older recipe that persisted a managed-position deadline.
+                // Managed positions are now owned exclusively by their hard
+                // stop and executable-profit lifecycle. Remove the legacy
+                // deadline before evaluating it so a restart cannot revive a
+                // time-based close that the current strategy no longer uses.
+                let migrated_deadlines: Vec<_> = self
+                    .state
+                    .positions
+                    .iter_mut()
+                    .filter_map(|(symbol, meta)| {
+                        disable_managed_max_hold(meta).map(|previous_max_hold_ms| {
+                            (symbol.clone(), meta.recipe.clone(), previous_max_hold_ms)
+                        })
+                    })
+                    .collect();
+                let mut hold_review_changed = !migrated_deadlines.is_empty();
+                for (symbol, recipe, previous_max_hold_ms) in migrated_deadlines {
+                    events.push(ExchangeEvent {
+                        kind: "exchange_max_hold_disabled".into(),
+                        payload: serde_json::json!({
+                            "ts_ms":now_ms,
+                            "symbol":symbol,
+                            "recipe":recipe,
+                            "previous_max_hold_ms":previous_max_hold_ms,
+                            "reason":"managed_positions_use_protective_exits_only",
+                            "venue":"binance_demo",
+                            "paper_only":true
+                        }),
+                    });
+                }
                 // A Fast deadline may be released only after executable-value
                 // protection is genuinely armed. A mark-price excursion alone
                 // is not bankable and must never extend an unprotected trade.
@@ -835,7 +866,6 @@ impl BinanceDemoExecution {
                     })
                     .map(|(symbol, _)| symbol.clone())
                     .collect();
-                let mut hold_review_changed = false;
                 for symbol in due_for_review {
                     let hold_context = self.state.positions.get(&symbol).and_then(|meta| {
                         self.market_stream.as_ref().and_then(|stream| {
@@ -2683,7 +2713,7 @@ impl BinanceDemoExecution {
                                     "stop_pct".into(),
                                     self.lanes.liquidation_stop_pct.to_string(),
                                 ),
-                                ("max_notional_multiple".into(), "1.0".into()),
+                                ("max_notional_multiple".into(), "3.0".into()),
                                 ("managed_exit_only".into(), "true".into()),
                                 ("disable_take_profit".into(), "false".into()),
                                 ("take_profit_fraction".into(), "1.0".into()),
@@ -2718,11 +2748,6 @@ impl BinanceDemoExecution {
                                 (
                                     "trailing_distance_pct".into(),
                                     (self.lanes.liquidation_trailing_distance_bps / 10_000.0)
-                                        .to_string(),
-                                ),
-                                (
-                                    "max_hold_ms".into(),
-                                    (i64::from(self.lanes.liquidation_hold_minutes) * 60_000)
                                         .to_string(),
                                 ),
                                 ("entry_timeout_ms".into(), "0".into()),
@@ -6886,6 +6911,19 @@ enum MaxHoldReview {
     Exit,
 }
 
+fn disable_managed_max_hold(meta: &mut ExecutionMeta) -> Option<i64> {
+    if meta.fixed_time_exit || meta.max_hold_ms <= 0 {
+        return None;
+    }
+    let previous_max_hold_ms = meta.max_hold_ms;
+    meta.max_hold_ms = 0;
+    meta.max_hold_reviews = 0;
+    if !meta.exit_requested && meta.pending_exit_reason.as_deref() == Some("max_hold") {
+        meta.pending_exit_reason = None;
+    }
+    Some(previous_max_hold_ms)
+}
+
 const FAST_TREND_EXECUTABLE_GRACE_MS: i64 = 90_000;
 const FAST_TREND_PROGRESS_REVIEW_MS: i64 = 10 * 60_000;
 const FAST_TREND_MAX_PROGRESS_REVIEWS: u8 = 2;
@@ -8331,6 +8369,29 @@ mod tests {
             legacy.holding_time_source(),
             "legacy_entry_ms_unknown_semantics"
         );
+    }
+
+    #[test]
+    fn rolling_restore_disables_legacy_deadline_for_managed_position() {
+        let mut meta: ExecutionMeta = serde_json::from_value(serde_json::json!({
+            "candidate_id":"liquidation:1",
+            "recipe":"liquidation_exhaustion_reversal",
+            "side":"buy",
+            "entry_ms":1_000,
+            "first_fill_ms":1_000,
+            "entry_price":100.0,
+            "stop_price":98.0,
+            "max_hold_ms":900_000,
+            "max_hold_reviews":1,
+            "pending_exit_reason":"max_hold",
+            "fixed_time_exit":false
+        }))
+        .unwrap();
+        assert_eq!(disable_managed_max_hold(&mut meta), Some(900_000));
+        assert_eq!(meta.max_hold_ms, 0);
+        assert_eq!(meta.max_hold_reviews, 0);
+        assert_eq!(meta.pending_exit_reason, None);
+        assert_eq!(disable_managed_max_hold(&mut meta), None);
     }
 
     #[test]

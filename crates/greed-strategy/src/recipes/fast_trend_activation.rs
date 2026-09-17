@@ -640,7 +640,10 @@ impl StrategyNode for FastTrendActivationNode {
                     "risk_per_trade_pct".into(),
                     self.config.fast_risk_per_trade_pct.to_string(),
                 ),
-                ("max_notional_multiple".into(), "1.0".into()),
+                // Strong Fast entries may use more than one account turn of
+                // notional, but the planner still enforces live exit-depth,
+                // impact and the shared 4x portfolio gross ceiling.
+                ("max_notional_multiple".into(), "3.0".into()),
                 (
                     "entry_timeout_ms".into(),
                     (i64::from(self.config.fast_entry_timeout_seconds) * 1_000).to_string(),
@@ -656,7 +659,6 @@ impl StrategyNode for FastTrendActivationNode {
                 ("entry_invalidation_bps".into(), "25".into()),
                 ("max_entry_adverse_bps".into(), "6".into()),
                 ("taker_fallback".into(), "false".into()),
-                ("max_hold_ms".into(), (10 * 60_000).to_string()),
             ]);
             if verdict == Verdict::Pass {
                 if let Some(book) = instrument.book.as_ref() {

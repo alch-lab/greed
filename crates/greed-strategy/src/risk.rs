@@ -706,10 +706,18 @@ impl StrategyNode for PositionPlannerNode {
                 } else {
                     stop_pct * early_failure_max_mfe_r
                 },
-                max_hold_ms: tag_i64(c, "max_hold_ms")
-                    .unwrap_or_else(|| i64::from(self.config.max_hold_minutes) * 60_000)
-                    * lifecycle_multiplier
-                    / 5,
+                // Managed production positions are thesis/protection driven,
+                // never clock driven. A deadline is retained only for an
+                // explicitly fixed-horizon research plan. This also prevents
+                // recipe-local legacy tags from silently re-enabling Max hold.
+                max_hold_ms: if fixed_time_exit {
+                    tag_i64(c, "max_hold_ms")
+                        .unwrap_or_else(|| i64::from(self.config.max_hold_minutes) * 60_000)
+                        * lifecycle_multiplier
+                        / 5
+                } else {
+                    0
+                },
                 fixed_time_exit,
             };
             out.push(ArtifactRecord {
@@ -1272,7 +1280,7 @@ mod tests {
     }
 
     #[test]
-    fn liquidation_plan_has_state_protection_and_a_bounded_deadline() {
+    fn managed_liquidation_plan_ignores_legacy_deadline_tag() {
         let mut record = candidate(
             "liquidation_exhaustion_reversal:ALTUSDT:1000",
             "liquidation_exhaustion_reversal",
@@ -1326,7 +1334,7 @@ mod tests {
         assert!((plan.notional_usd - 2_500.0).abs() < 1e-9);
         assert!(plan.take_profit_prices.is_empty());
         assert_eq!(plan.break_even_after_fraction, None);
-        assert_eq!(plan.max_hold_ms, 900_000);
+        assert_eq!(plan.max_hold_ms, 0);
         assert!(!plan.fixed_time_exit);
         assert_eq!(plan.profit_shield_activation_pct, Some(0.0025));
         assert_eq!(plan.trailing_activation_pct, Some(0.005));

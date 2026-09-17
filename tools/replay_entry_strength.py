@@ -62,7 +62,7 @@ def score(entry):
         return "unchanged", 1.0
     value = sum(checks) / len(checks) if checks else 0.5
     strength = "conviction" if value >= cutoffs[1] else "confirmed" if value >= cutoffs[0] else "probe"
-    new_risk = {"probe": 0.00075, "confirmed": 0.0015, "conviction": 0.003}[strength]
+    new_risk = {"probe": 0.015, "confirmed": 0.030, "conviction": 0.060}[strength]
     old_risk = number(context, "risk_per_trade_pct") or {
         "fast_trend_activation": 0.002,
         "liquidation_exhaustion_reversal": 0.0025,

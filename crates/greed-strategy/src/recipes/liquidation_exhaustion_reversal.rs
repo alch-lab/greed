@@ -302,10 +302,10 @@ impl StrategyNode for LiquidationExhaustionReversalNode {
                         "risk_per_trade_pct".into(),
                         self.config.liquidation_risk_per_trade_pct.to_string(),
                     ),
-                    ("max_notional_multiple".into(), "1.0".into()),
+                    ("max_notional_multiple".into(), "3.0".into()),
                     // This lane has no fixed price target, but it is not an
-                    // unmanaged fixed-horizon bet: favorable excursion owns
-                    // a profit shield and a trailing stop before the deadline.
+                    // unmanaged bet: favorable excursion owns a profit shield
+                    // and a trailing stop for the full position lifecycle.
                     (
                         "managed_exit_only".into(),
                         self.config.liquidation_managed_exit_enabled.to_string(),
@@ -352,10 +352,6 @@ impl StrategyNode for LiquidationExhaustionReversalNode {
                     (
                         "trailing_distance_pct".into(),
                         (self.config.liquidation_trailing_distance_bps / 10_000.0).to_string(),
-                    ),
-                    (
-                        "max_hold_ms".into(),
-                        (i64::from(self.config.liquidation_hold_minutes) * 60_000).to_string(),
                     ),
                     ("entry_timeout_ms".into(), "0".into()),
                     (
@@ -542,7 +538,6 @@ mod tests {
             &["ALTUSDT".into()],
             LaneConfig {
                 liquidation_managed_exit_enabled: true,
-                liquidation_hold_minutes: 15,
                 ..LaneConfig::default()
             },
         );

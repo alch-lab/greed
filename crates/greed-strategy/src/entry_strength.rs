@@ -10,13 +10,14 @@ pub struct EntryAssessment {
 }
 
 impl EntryAssessment {
-    /// Account-risk budget.  Even the strongest setup risks only 30 bps of
-    /// equity, so one stopped trade cannot erase several normal $10-$20 wins.
+    /// Shared account-risk budget for all funded strategies. The paper account
+    /// deliberately uses meaningful size while entry strength, live exit-depth
+    /// and the portfolio gross cap keep weaker/thinner setups smaller.
     pub fn risk_pct(self) -> f64 {
         match self.strength {
-            EntryStrength::Probe => 0.00075,
-            EntryStrength::Confirmed => 0.0015,
-            EntryStrength::Conviction => 0.003,
+            EntryStrength::Probe => 0.015,
+            EntryStrength::Confirmed => 0.030,
+            EntryStrength::Conviction => 0.060,
         }
     }
 
@@ -225,6 +226,8 @@ mod tests {
         };
         assert!(probe.risk_pct() < confirmed.risk_pct());
         assert!(confirmed.risk_pct() < conviction.risk_pct());
-        assert_eq!(conviction.risk_pct(), 0.003);
+        assert_eq!(probe.risk_pct(), 0.015);
+        assert_eq!(confirmed.risk_pct(), 0.030);
+        assert_eq!(conviction.risk_pct(), 0.060);
     }
 }

@@ -115,7 +115,6 @@ pub struct LaneConfig {
     pub liquidation_max_signal_age_seconds: u32,
     pub liquidation_cooldown_seconds: u32,
     pub liquidation_stop_pct: f64,
-    pub liquidation_hold_minutes: u32,
     pub liquidation_managed_exit_enabled: bool,
     pub liquidation_profit_shield_activation_bps: f64,
     pub liquidation_profit_shield_floor_bps: f64,
@@ -228,7 +227,6 @@ impl Default for LaneConfig {
             liquidation_max_signal_age_seconds: 12,
             liquidation_cooldown_seconds: 30,
             liquidation_stop_pct: 0.020,
-            liquidation_hold_minutes: 1,
             liquidation_managed_exit_enabled: false,
             liquidation_profit_shield_activation_bps: 25.0,
             liquidation_profit_shield_floor_bps: 10.0,
@@ -420,7 +418,6 @@ impl StrategyConfig {
             || lanes.liquidation_max_signal_age_seconds > 30
             || !(10..=600).contains(&lanes.liquidation_cooldown_seconds)
             || !(0.005..=0.03).contains(&lanes.liquidation_stop_pct)
-            || !(1..=60).contains(&lanes.liquidation_hold_minutes)
             || !(5.0..=100.0).contains(&lanes.liquidation_profit_shield_activation_bps)
             || !(0.0..lanes.liquidation_profit_shield_activation_bps)
                 .contains(&lanes.liquidation_profit_shield_floor_bps)
@@ -484,7 +481,7 @@ impl StrategyConfig {
         if !(0.001..=0.01).contains(&risk.risk_per_trade_pct)
             || risk.high_confidence_risk_per_trade_pct < risk.risk_per_trade_pct
             || risk.high_confidence_risk_per_trade_pct > 0.015
-            || !(0.20..=1.5).contains(&risk.max_notional_per_trade_multiple)
+            || !(0.20..=3.0).contains(&risk.max_notional_per_trade_multiple)
             || !(0.5..=4.0).contains(&risk.max_total_gross_multiple)
             || !(0.05..=0.50).contains(&risk.max_book_participation_pct)
             || !(1.0..=25.0).contains(&risk.max_book_slippage_bps)
@@ -500,7 +497,7 @@ impl StrategyConfig {
             || (risk.runner_take_profit_r > 0.0
                 && risk.runner_take_profit_r <= risk.first_take_profit_r)
             || !(0.1..=0.9).contains(&risk.first_take_profit_fraction)
-            || risk.daily_loss_limit_pct > 0.04
+            || risk.daily_loss_limit_pct > 0.06
             || risk.peak_drawdown_halt_pct > 0.10
         {
             return Err("portfolio risk parameters are outside demo limits".into());

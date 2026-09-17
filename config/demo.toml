@@ -122,10 +122,10 @@ fast_shock_absorption_max_directional_close_location = 0.45
 fast_max_prebreak_return_1h = 0.03
 fast_max_return_4h = 0.06
 fast_max_oi_change_15m = 0.03
-# Keep the Fast sleeve's initial risk near $20 per $10,000 of equity while the
-# full net objective is $40. Executable break-even memory and an early dynamic
-# ratchet may realize smaller wins; position notional still adapts to stop
-# distance and depth.
+# Compatibility fallback only. The shared Probe/Confirmed/Conviction model is
+# the live sizing authority whenever classification evidence is available.
+# Executable break-even memory and the dynamic ratchet remain responsible for
+# banking smaller wins; position notional still adapts to stop distance/depth.
 fast_risk_per_trade_pct = 0.002
 fast_entry_timeout_seconds = 20
 fast_min_fill_ratio = 0.80
@@ -135,7 +135,8 @@ fast_min_managed_fill_ratio = 0.50
 # from Binance public force-order and top-20 depth streams, enters through a
 # bounded IOC after at least one second. A 2% exchange-side stop covers the
 # catastrophe case. Paper validation enables the managed lifecycle: protect
-# 22 bps after a 45 bps move, trail by 50 bps from 90 bps, exit by 15 minutes.
+# 22 bps after a 45 bps move and trail by 50 bps from 90 bps. There is no
+# time-based exit; the exchange-side stop and profit protection own the exit.
 # The wider lifecycle retained the same entries while improving both the
 # earlier calibration days and the later validation days in executable-book
 # replay; the 2% catastrophe stop and all admission gates remain unchanged.
@@ -149,15 +150,15 @@ liquidation_min_entry_delay_seconds = 1
 liquidation_max_signal_age_seconds = 12
 liquidation_cooldown_seconds = 30
 liquidation_stop_pct = 0.020
-liquidation_hold_minutes = 15
-# Enabled for Binance Demo; existing positions retain persisted exit settings.
+# Enabled for Binance Demo. Rolling positions retain their protective prices;
+# any legacy Max-hold deadline is removed by the runtime migration.
 liquidation_managed_exit_enabled = true
 liquidation_profit_shield_activation_bps = 45.0
 liquidation_profit_shield_floor_bps = 22.0
 liquidation_trailing_activation_bps = 90.0
 liquidation_trailing_distance_bps = 50.0
-# Keep this higher-frequency lane at probe risk until the larger sample confirms
-# the lifecycle replay without letting it dominate the trend lane.
+# Compatibility fallback only. The shared strength classifier is the live
+# sizing authority whenever entry evidence is available.
 liquidation_risk_per_trade_pct = 0.0025
 # Mainnet produces the signal while Binance Demo executes it. Refuse the
 # trade when the Demo top-of-book differs by more than 15 bps, and use an IOC
@@ -265,7 +266,7 @@ trend_reentry_entry_timeout_seconds = 30
 risk_per_trade_pct = 0.010
 high_confidence_risk_per_trade_pct = 0.010
 high_confidence_threshold = 0.85
-max_notional_per_trade_multiple = 1.50
+max_notional_per_trade_multiple = 3.00
 max_total_gross_multiple = 4.00
 # Size against the actual protective-exit side of the live top-20 book. Orders
 # may shrink, but may not consume more than 35% of visible depth or simulate
@@ -292,7 +293,7 @@ pre_tp_trailing_activation_r = 0.80
 trailing_distance_pct = 0.005
 # Zero disables time-based exits. Hard stop, cost shield, and trailing protection remain exchange-side.
 max_hold_minutes = 0
-daily_loss_limit_pct = 0.025
+daily_loss_limit_pct = 0.06
 peak_drawdown_halt_pct = 0.10
 rolling_pf_window = 20
 rolling_pf_min_trades = 8
