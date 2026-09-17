@@ -769,39 +769,13 @@ impl BinanceDemoExecution {
             Ok(value) => {
                 let mut account = parse_account(&value)?;
                 let now_ms = chrono::Utc::now().timestamp_millis();
-                let (mut events, pending_changed) = match self
-                    .progress_pending_entries(now_ms, &account.positions)
-                    .await
-                {
-                    Ok(events) => {
-                        let changed = !events.is_empty();
-                        (events, changed)
-                    }
-                    Err(error) => (
-                        vec![ExchangeEvent {
-                            kind: "exchange_pending_entry_error".into(),
-                            payload: serde_json::json!({
-                                "ts_ms":now_ms,
-                                // Preserve the full anyhow chain. `to_string()` only
-                                // exposes the outer context and previously hid the
-                                // actual Binance rejection (for example an invalid
-                                // clientAlgoId), making a protection failure impossible
-                                // to diagnose from a production bundle.
-                                "reason":format!("{error:#}"),
-                                "pending_entries":self.state.pending_entries.len(),
-                                "existing_position_management_continued":true,
-                                "venue":"binance_demo",
-                                "paper_only":true
-                            }),
-                        }],
-                        false,
-                    ),
-                };
-                if pending_changed {
-                    let refreshed = self.signed_read("/fapi/v2/account", vec![]).await?;
-                    account = parse_account(&refreshed)?;
-                }
-                events.extend(self.progress_pending_accounting(now_ms).await);
+                // Open positions are the highest-priority owner of the private
+                // request budget. Pending-entry reconciliation can require
+                // several order queries/cancels during a slow or rate-limited
+                // venue response, so it is deliberately advanced only after
+                // every already-open position has had its protection and exit
+                // state reviewed below.
+                let mut events = Vec::new();
                 let foreign: Vec<_> = account
                     .positions
                     .keys()
@@ -2063,6 +2037,44 @@ impl BinanceDemoExecution {
                         });
                     }
                 }
+                let (pending_events, pending_changed) = match self
+                    .progress_pending_entries(now_ms, &account.positions)
+                    .await
+                {
+                    Ok(events) => {
+                        let changed = !events.is_empty();
+                        (events, changed)
+                    }
+                    Err(error) => (
+                        vec![ExchangeEvent {
+                            kind: "exchange_pending_entry_error".into(),
+                            payload: serde_json::json!({
+                                "ts_ms":now_ms,
+                                // Preserve the full anyhow chain. `to_string()` only
+                                // exposes the outer context and previously hid the
+                                // actual Binance rejection (for example an invalid
+                                // clientAlgoId), making a protection failure impossible
+                                // to diagnose from a production bundle.
+                                "reason":format!("{error:#}"),
+                                "pending_entries":self.state.pending_entries.len(),
+                                "existing_position_management_continued":true,
+                                "venue":"binance_demo",
+                                "paper_only":true
+                            }),
+                        }],
+                        false,
+                    ),
+                };
+                events.extend(pending_events);
+                if pending_changed {
+                    // A fill promoted at the end of this cycle receives its
+                    // provisional exchange protection inside the pending state
+                    // machine. Refresh the account snapshot so UI/risk state is
+                    // current without making existing positions wait for it.
+                    let refreshed = self.signed_read("/fapi/v2/account", vec![]).await?;
+                    account = parse_account(&refreshed)?;
+                }
+                events.extend(self.progress_pending_accounting(now_ms).await);
                 self.account = Some(account);
                 self.last_error = None;
                 self.last_sync_ms = Some(chrono::Utc::now().timestamp_millis());

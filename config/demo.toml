@@ -301,4 +301,4 @@ loss_cooldown_minutes = 180
 rolling_pf_probe_size_multiplier = 1.00
 # Epoch 20 starts a clean $10,000 virtual performance window. Historical journals
 # remain on disk; only the live performance baseline resets.
-rolling_pf_epoch = 20
+rolling_pf_epoch = 21
